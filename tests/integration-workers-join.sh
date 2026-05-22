@@ -80,13 +80,47 @@ dump_failure_context() {
   if [[ -n "${CP_IP}" ]]; then
     log "--- kubectl get nodes -o wide ---"
     ssh -i "${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=5 "root@${CP_IP}" \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+        "root@${CP_IP}" \
         'KUBECONFIG=/etc/kubernetes/admin.conf kubectl get nodes -o wide' >&2 2>/dev/null || true
     log "--- last 20 lines of k8s-init journal ---"
     ssh -i "${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=5 "root@${CP_IP}" \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+        "root@${CP_IP}" \
         'journalctl -u k8s-init --no-pager -n 20' >&2 2>/dev/null || true
   fi
+  # CP console log (best-effort — only useful if CP boot itself failed).
+  local cp_console="${LIBVIRT_POOL_DIR}/${CP_VM}-console.log"
+  if [[ -s "${cp_console}" ]]; then
+    log "--- last 80 lines of CP console (${cp_console}) ---"
+    tail -n 80 "${cp_console}" >&2 || true
+  fi
+  # When workers never register, the ONLY way to know why is to look at each
+  # worker's worker-init.service journal (#166). The CP can't tell us
+  # anything — kubeadm join is initiated FROM the worker, not the CP. First
+  # try the on-host console log (no SSH dependency), then fall back to ssh.
+  for w in "${SPAWNED_WORKERS[@]:-}"; do
+    [[ -z "$w" ]] && continue
+    local w_console="${LIBVIRT_POOL_DIR}/${w}-console.log"
+    if [[ -s "${w_console}" ]]; then
+      log "--- last 120 lines of worker ${w} console (${w_console}) ---"
+      tail -n 120 "${w_console}" >&2 || true
+    fi
+    local w_ip=""
+    w_ip=$(virsh -c qemu:///system domifaddr "$w" 2>/dev/null \
+            | awk '/ipv4/ {print $4}' | head -1 | cut -d/ -f1 || true)
+    log "--- worker ${w} ip=${w_ip:-<none>} ---"
+    if [[ -n "$w_ip" ]]; then
+      ssh -i "${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+          "root@${w_ip}" \
+          'ls -l /etc/hummingbird/worker-join.env 2>&1 | head -3
+           systemctl status worker-init.service --no-pager 2>&1 | head -15
+           echo "--- worker-init journal ---"
+           journalctl -u worker-init.service --no-pager -n 60 2>&1' \
+          >&2 2>/dev/null || log "(could not ssh root@${w_ip})"
+    fi
+  done
   log "------------------------------------------------"
 }
 
@@ -100,11 +134,13 @@ cleanup() {
     [[ -z "$w" ]] && continue
     virsh -c qemu:///system destroy "${w}" >/dev/null 2>&1 || true
     virsh -c qemu:///system undefine --nvram "${w}" >/dev/null 2>&1 || true
-    rm -f "${LIBVIRT_POOL_DIR}/${w}.qcow2" || true
+    rm -f "${LIBVIRT_POOL_DIR}/${w}.qcow2" \
+          "${LIBVIRT_POOL_DIR}/${w}-console.log" || true
   done
   virsh -c qemu:///system destroy "${CP_VM}" >/dev/null 2>&1 || true
   virsh -c qemu:///system undefine --nvram "${CP_VM}" >/dev/null 2>&1 || true
-  rm -f "${CP_POOL_QCOW}" "${WK_TEMPLATE_QCOW}" || true
+  rm -f "${CP_POOL_QCOW}" "${WK_TEMPLATE_QCOW}" \
+        "${LIBVIRT_POOL_DIR}/${CP_VM}-console.log" || true
   rm -rf "${WORK}" || true
   rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}" 2>/dev/null || true
   exit "$rc"
@@ -203,6 +239,13 @@ log "building CP qcow2 from ${CP_IMAGE}"
 bib_build "${CP_IMAGE}" "${CP_BIB_CFG}" "${CP_POOL_QCOW}"
 
 log "virt-installing CP ${CP_VM}"
+# Console-to-file so we can post-mortem when sshd never comes up (#165/#166
+# share the same opaque-boot failure mode). Place the log file under
+# LIBVIRT_POOL_DIR so it's host-visible from the runner.
+CP_CONSOLE_LOG="${LIBVIRT_POOL_DIR}/${CP_VM}-console.log"
+: >"${CP_CONSOLE_LOG}"
+chown qemu:qemu "${CP_CONSOLE_LOG}" 2>/dev/null || true
+chmod 0660 "${CP_CONSOLE_LOG}"
 virt-install --connect qemu:///system \
   --name "${CP_VM}" \
   --memory 4096 --vcpus 2 \
@@ -211,6 +254,7 @@ virt-install --connect qemu:///system \
   --os-variant fedora-unknown \
   --network network=default,model=virtio \
   --graphics none \
+  --console "pty,log.file=${CP_CONSOLE_LOG}" \
   --noautoconsole \
   --noreboot
 virsh -c qemu:///system start "${CP_VM}" >/dev/null 2>&1 || true
@@ -332,23 +376,41 @@ spawn_worker() {
   local idx="$1"
   local name="hummingbird-it-workers-${RUN_ID}-w${idx}"
   local qcow="${LIBVIRT_POOL_DIR}/${name}.qcow2"
+  # Per-worker console log so we can post-mortem first-boot failures (#166).
+  # Under LIBVIRT_POOL_DIR so it's host-visible from the runner.
+  local console_log="${LIBVIRT_POOL_DIR}/${name}-console.log"
+  : >"${console_log}"
+  chown qemu:qemu "${console_log}" 2>/dev/null || true
+  chmod 0660 "${console_log}"
 
-  cp --reflink=auto "${WK_TEMPLATE_QCOW}" "${qcow}"
-  chown root:root "${qcow}"
-  chmod 0644 "${qcow}"
+  # NB: send EVERY noisy subcommand's stdout to stderr so the function's
+  # own stdout is reserved exclusively for the `echo "${name}"` at the end.
+  # The previous code let virt-install's "Starting install... Domain
+  # creation completed..." text pollute the .name capture file, which made
+  # SPAWNED_WORKERS contain multi-line garbage instead of clean VM names —
+  # so the later `virsh destroy "${w}"` calls in cleanup silently no-op'd
+  # and the post-failure SSH-into-worker diagnostic could never look up
+  # the right host (#166).
+  cp --reflink=auto "${WK_TEMPLATE_QCOW}" "${qcow}" >&2
+  chown root:root "${qcow}" >&2
+  chmod 0644 "${qcow}" >&2
 
-  inject_join_env "${qcow}" "${JOIN_CMD}"
+  inject_join_env "${qcow}" "${JOIN_CMD}" >&2
 
+  # Production scripts/spawn-workers.sh uses --memory 4096 for workers; the
+  # initial 2048 here was too tight and would have OOMed first-boot in the
+  # already-resource-constrained runner host.
   virt-install --connect qemu:///system \
     --name "${name}" \
-    --memory 2048 --vcpus 2 \
+    --memory 4096 --vcpus 2 \
     --disk "${qcow},format=qcow2,bus=virtio" \
     --import \
     --os-variant fedora-unknown \
     --network network=default,model=virtio \
     --graphics none \
+    --console "pty,log.file=${console_log}" \
     --noautoconsole \
-    --noreboot
+    --noreboot >&2
   virsh -c qemu:///system start "${name}" >/dev/null 2>&1 || true
   echo "${name}"
 }

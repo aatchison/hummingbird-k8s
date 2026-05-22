@@ -58,6 +58,10 @@ POOL_QCOW="${LIBVIRT_POOL_DIR}/${VM_NAME}.qcow2"
 BIB_IMAGE="${BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
 
 VM_IP=""
+SHARED_DIR=""
+# SERIAL_LOG is computed once we know LIBVIRT_POOL_DIR+VM_NAME and the dir
+# exists; kept as a global so dump_failure_context + cleanup can find it.
+SERIAL_LOG=""
 
 log() { printf '[integration-boot-k3s] %s\n' "$*" >&2; }
 
@@ -69,13 +73,34 @@ dump_failure_context() {
   if virsh -c qemu:///system dominfo "${VM_NAME}" >/dev/null 2>&1; then
     log "--- virsh dominfo ---"
     virsh -c qemu:///system dominfo "${VM_NAME}" >&2 || true
+    log "--- virsh domstate ---"
+    virsh -c qemu:///system domstate "${VM_NAME}" >&2 || true
+  fi
+  # The guest console is logged to ${SERIAL_LOG} via virt-install's
+  # `--console pty,log.file=...`. Dump the tail so we can see boot messages
+  # even when sshd never came up (#165). This is the single most important
+  # diagnostic when SSH times out — without it we have zero visibility into
+  # what's happening inside the VM.
+  if [[ -s "${SERIAL_LOG}" ]]; then
+    log "--- last 200 lines of VM serial console (${SERIAL_LOG}) ---"
+    tail -n 200 "${SERIAL_LOG}" >&2 || true
+  else
+    log "(no serial console log at ${SERIAL_LOG})"
   fi
   if [[ -n "${VM_IP}" ]]; then
+    log "--- attempting ssh root@${VM_IP} 'systemctl --failed' ---"
+    ssh -i "${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+        "root@${VM_IP}" "systemctl --failed --no-pager" >&2 2>/dev/null || \
+        log "(SSH unreachable; nothing more to gather over SSH)"
+    log "--- last 60 lines of journalctl -b (via SSH) ---"
+    ssh -i "${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+        "root@${VM_IP}" "journalctl -b --no-pager -n 60" >&2 2>/dev/null || true
     log "--- last 40 lines of journalctl k3s via SSH ---"
     ssh -i "${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=5 "root@${VM_IP}" \
-        "journalctl -u k3s --no-pager -n 40" >&2 2>/dev/null || \
-        log "(could not pull journal — VM unreachable)"
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+        "root@${VM_IP}" "journalctl -u k3s --no-pager -n 40" >&2 2>/dev/null || true
   fi
   log "------------------------------------------------"
 }
@@ -88,7 +113,10 @@ cleanup() {
   log "tearing down VM ${VM_NAME}"
   virsh -c qemu:///system destroy "${VM_NAME}" >/dev/null 2>&1 || true
   virsh -c qemu:///system undefine --nvram "${VM_NAME}" >/dev/null 2>&1 || true
-  rm -f "${POOL_QCOW}" || true
+  rm -f "${POOL_QCOW}" "${SERIAL_LOG}" || true
+  if [[ -n "${SHARED_DIR}" ]] && [[ -d "${SHARED_DIR}" ]]; then
+    rm -rf "${SHARED_DIR}" 2>/dev/null || true
+  fi
   rm -rf "${WORK}" || true
   rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}" 2>/dev/null || true
   exit "$rc"
@@ -126,12 +154,15 @@ rm -rf "${LIBVIRT_POOL_DIR}/qcow2"
 # the full rationale.
 if command -v docker >/dev/null && [[ -S /var/run/docker.sock ]]; then
   log "using host docker daemon for bib (sibling-of-runner)"
+  # NB: SHARED_DIR is declared at top-of-script so cleanup() can rm it without
+  # us overwriting the parent's EXIT trap (the previous code did exactly that
+  # and silently disabled both dump_failure_context AND the VM teardown, which
+  # is why failure runs leaked their VMs and produced no diagnostics — #165).
   SHARED_DIR="${LIBVIRT_POOL_DIR}/integration-runs/${RUN_ID}-k3s"
   mkdir -p "${SHARED_DIR}"
   cp "${BIB_CFG}" "${SHARED_DIR}/config.toml"
   BIB_STORAGE="${SHARED_DIR}/storage"
   mkdir -p "${BIB_STORAGE}"
-  trap 'rm -rf "'"${SHARED_DIR}"'" 2>/dev/null || true' EXIT
   log "pre-pulling ${IMAGE} into bib storage via sibling podman"
   docker run --rm --privileged \
     -v "${BIB_STORAGE}:/var/lib/containers/storage" \
@@ -171,6 +202,17 @@ log "virt-installing ${VM_NAME}"
 # coredns, metrics-server all come up in a single process). The
 # scripts/define-vm.sh production default is 6144M/4vCPUs; match that here
 # so the integration VM doesn't OOM-stall before sshd is reachable.
+#
+# --console pty,log.file=…  wires the guest's primary console to a host
+# file (via libvirt's char-dev `<log file=…/>`) so we can tail boot/console
+# output when sshd never comes up. Without this, an early-boot failure
+# (OOM, sshd-disabled, dependency cycle, …) is completely opaque (#165).
+# Place the log under LIBVIRT_POOL_DIR (host-visible from the runner) and
+# pre-create so SELinux file_type matches libvirt's expectations.
+SERIAL_LOG="${LIBVIRT_POOL_DIR}/${VM_NAME}-console.log"
+: >"${SERIAL_LOG}"
+chown qemu:qemu "${SERIAL_LOG}" 2>/dev/null || true
+chmod 0660 "${SERIAL_LOG}"
 virt-install --connect qemu:///system \
   --name "${VM_NAME}" \
   --memory 6144 --vcpus 4 \
@@ -179,6 +221,7 @@ virt-install --connect qemu:///system \
   --os-variant fedora-unknown \
   --network network=default,model=virtio \
   --graphics none \
+  --console "pty,log.file=${SERIAL_LOG}" \
   --noautoconsole \
   --noreboot
 
