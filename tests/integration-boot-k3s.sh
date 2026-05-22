@@ -167,9 +167,13 @@ chmod 0644 "${POOL_QCOW}"
 ln -sf "${POOL_QCOW}" "${QCOW}"
 
 log "virt-installing ${VM_NAME}"
+# k3s needs more breathing room than k8s at boot (embedded sqlite, traefik,
+# coredns, metrics-server all come up in a single process). The
+# scripts/define-vm.sh production default is 6144M/4vCPUs; match that here
+# so the integration VM doesn't OOM-stall before sshd is reachable.
 virt-install --connect qemu:///system \
   --name "${VM_NAME}" \
-  --memory 4096 --vcpus 2 \
+  --memory 6144 --vcpus 4 \
   --disk "${POOL_QCOW},format=qcow2,bus=virtio" \
   --import \
   --os-variant fedora-unknown \
