@@ -91,6 +91,12 @@ state — see [`docs/rollback.md`](rollback.md) and issue #95):
   on the next write; reverting without a snapshot taken on the
   pre-flip side requires the prior key material. See
   [`docs/etcd-encryption.md`](etcd-encryption.md).
+- **Rotating the etcd encryption key** — `make rotate-etcd-key`
+  rewrites every Secret and ConfigMap with a fresh key and then drops
+  the old key from the providers list. If Stage 3 runs before Stage 2
+  finishes, rows still under the old key become unreadable; a
+  `pre-key-rotation` snapshot is the recovery path. See
+  [`docs/etcd-encryption.md#rotating-the-key`](etcd-encryption.md#rotating-the-key).
 
 Use the `--label` flag to make the purpose obvious in your backup
 directory:

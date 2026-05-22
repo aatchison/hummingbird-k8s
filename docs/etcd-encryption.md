@@ -75,12 +75,107 @@ is initialized fresh.
 - The encryption key is generated **inside the VM** at first boot. It
   is never baked into the bootc image.
 - The key file is 0600 root:root on the VM root filesystem.
-- There is no key rotation in this round. Rotating requires editing
-  the EncryptionConfiguration to add a new key as the first provider
-  entry, restarting the apiserver, then rewriting every Secret /
-  ConfigMap (`kubectl get secrets -A -o json | kubectl replace -f -`)
-  before removing the old key. A follow-up issue will cover that.
+- Key rotation is supported via
+  `scripts/rotate-etcd-encryption-key.sh` (`make rotate-etcd-key`).
+  See [Rotating the key](#rotating-the-key) below.
 - There is no KMS provider in this round. Single-node lab scope.
+
+## Rotating the key
+
+The bootstrap key written by `k8s-init.sh` is never automatically
+rotated — `k8s-init.service` is one-shot and gated by
+`/var/lib/k8s-init.done`, so a `bootc upgrade` does not regenerate it.
+Rotate manually when:
+
+- You suspect the on-disk key material was exposed (an attacker had
+  root on the CP VM, an etcd snapshot leaked alongside the key file,
+  etc.).
+- You're on a scheduled rotation cadence for compliance.
+- You're decommissioning the bootstrap key in favor of a named key
+  before migrating to KMS later.
+
+### The flow
+
+Run `make rotate-etcd-key` (or `bash scripts/rotate-etcd-encryption-key.sh`).
+The script is **operator-driven**: it prompts at every stage so a
+wrong-order step doesn't make every existing Secret unreadable.
+
+1. **Pre-flight** — take a labeled snapshot first:
+
+   ```
+   make backup-etcd LABEL=pre-key-rotation
+   ```
+
+   Off-host the resulting `.db` file before continuing. See
+   [`docs/backup-restore.md`](backup-restore.md#when-to-snapshot)
+   ("When to snapshot").
+
+2. **Stage 1 — dual-key config.** The script generates a fresh
+   32-byte key, builds a new `EncryptionConfiguration` with the **new
+   key as the primary** provider entry and the **old key as the
+   secondary**, copies it to the CP, and touches
+   `/etc/kubernetes/manifests/kube-apiserver.yaml` so the kubelet
+   reloads the apiserver. The old key stays in the providers list so
+   existing rows (still encrypted under it) keep decoding.
+
+3. **Stage 2 — re-encrypt every Secret and ConfigMap.** On the CP:
+
+   ```
+   kubectl get secrets    -A -o json | kubectl replace -f -
+   kubectl get configmaps -A -o json | kubectl replace -f -
+   ```
+
+   Each `replace` triggers an etcd rewrite under the now-primary new
+   key. `--force` is intentionally avoided — it would recreate
+   resources and break selectors/UIDs.
+
+4. **Stage 3 — drop the old key.** The script writes a final
+   `EncryptionConfiguration` with only the new key in the providers'
+   `keys` array (the trailing `identity` fallback is preserved),
+   reloads the apiserver again, and waits for `/healthz`.
+
+5. **Stage 4 — verify.** The script runs
+   `/usr/libexec/verify-encryption.sh` on the CP with
+   `EXPECTED_PREFIX=k8s:enc:aesgcm:v1:<new-key-name>:` so the
+   verifier asserts the specific new keyname, not just the algorithm.
+
+### After rotation
+
+- Take another labeled snapshot:
+  `make backup-etcd LABEL=post-key-rotation`.
+- The old key material no longer appears in
+  `/etc/kubernetes/encryption-config.yaml`, but rotation does not
+  shred copies that may exist in pre-rotation etcd snapshots — those
+  snapshots still contain rows encrypted under the old key and remain
+  decryptable by anyone who has both the snapshot and the old key
+  file.
+- If Stage 2 dies partway, the cluster is still functional (every
+  pre-existing row decrypts under the old key, which is still in the
+  providers list as secondary). You can re-run the script — it
+  always derives the new key from the current on-CP config, so a
+  partial run is recoverable.
+
+### Failure modes
+
+- **Stage 1 health check fails.** The new config is malformed or the
+  apiserver couldn't load it. The script exits non-zero before
+  touching any rows. Restore the prior
+  `/etc/kubernetes/encryption-config.yaml` from your snapshot or
+  rebuild the CP from the pre-rotation image.
+- **Stage 2 mid-flight failure.** Some rows are already re-encrypted
+  under the new key, some are still under the old key. Both keys are
+  in the providers list, so reads continue to work. Re-run the
+  script.
+- **Stage 3 dropped the old key but Stage 2 never finished.** This
+  is the dangerous case the prompts exist to prevent. Rows still
+  encrypted under the old key become unreadable. Restore from the
+  pre-rotation etcd snapshot you took in the pre-flight.
+
+### Algorithm note
+
+The script (and `k8s-init.sh`) use `aesgcm`. The provider name is
+hard-coded in the YAML rewrite — switching to a different algorithm
+requires editing the script.
 
 ## Upgrade path for existing VMs
 

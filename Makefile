@@ -56,7 +56,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         nodes kubectl \
         verify-encryption verify-hardening verify-app-deploy verify-all \
         kube-bench \
-        backup-etcd restore-etcd \
+        backup-etcd restore-etcd rotate-etcd-key \
         ci-build-k3s ci-build-k8s ci-build-worker \
         print-containerfile-k3s print-containerfile-k8s print-containerfile-worker \
         test-lib \
@@ -166,6 +166,9 @@ backup-etcd: ## Snapshot etcd; optional LABEL=<text> appends to filename
 restore-etcd: ## Restore etcd from a snapshot (SNAP=path.db required)
 	@[ -n "$(SNAP)" ] || { echo 'SNAP=<path-to-snapshot.db> required' >&2; exit 2; }
 	bash scripts/restore-etcd.sh "$(SNAP)"
+
+rotate-etcd-key: ## Walk the operator through etcd encryption-key rotation (#120)
+	bash scripts/rotate-etcd-encryption-key.sh
 
 # ---- CI integration ----------------------------------------------------
 # The redhat-actions/buildah-build action in .github/workflows/build-*.yml
