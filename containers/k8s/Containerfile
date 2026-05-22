@@ -74,6 +74,14 @@ RUN systemctl preset crio.service kubelet.service k8s-init.service || true
 COPY containers/shared/kubernetes/admission-control-config.yaml /etc/kubernetes/admission-control-config.yaml
 COPY containers/shared/kubernetes/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
 
+# Cluster-wide baseline posture applied by k8s-init.sh after Cilium is up:
+#   - metrics-server (kubectl top) — upstream v0.7.2, patched for --kubelet-insecure-tls
+#   - default namespace LimitRange + ResourceQuota
+#   - default ServiceAccount in default namespace: automountServiceAccountToken=false
+COPY containers/shared/kubernetes/metrics-server.yaml /etc/kubernetes/metrics-server.yaml
+COPY containers/shared/kubernetes/default-ns-quota.yaml /etc/kubernetes/default-ns-quota.yaml
+COPY containers/shared/kubernetes/restrict-sa-token-mount.yaml /etc/kubernetes/restrict-sa-token-mount.yaml
+
 # cilium-cli (single binary) used by k8s-init.sh to install Cilium CNI on first boot.
 ARG CILIUM_CLI_VERSION=v0.16.16
 RUN curl -fsSL -o /tmp/cilium-linux-amd64.tar.gz \
