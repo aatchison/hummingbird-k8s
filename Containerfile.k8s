@@ -31,9 +31,13 @@ RUN dnf install -y \
 # bootc's read-only /usr. Creating it at image build avoids the mkdir entirely.
 RUN mkdir -p /usr/libexec/kubernetes/kubelet-plugins/volume/exec
 
-# Kernel modules + sysctls required by kubeadm
+# Kernel modules + sysctls required by kubeadm.
+# The vm.* / kernel.panic* / kernel.keys.* entries match the values the kubelet
+# expects when --protect-kernel-defaults=true (CIS 4.2.6): with that flag set
+# the kubelet refuses to mutate kernel parameters at runtime and instead
+# requires the host to have them pre-set to the expected values.
 RUN printf 'overlay\nbr_netfilter\n' > /etc/modules-load.d/k8s.conf \
- && printf 'net.bridge.bridge-nf-call-iptables  = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward                 = 1\n' \
+ && printf 'net.bridge.bridge-nf-call-iptables  = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward                 = 1\nvm.overcommit_memory                = 1\nvm.panic_on_oom                     = 0\nkernel.panic                        = 10\nkernel.panic_on_oops                = 1\nkernel.keys.root_maxkeys            = 1000000\nkernel.keys.root_maxbytes           = 25000000\n' \
       > /etc/sysctl.d/k8s.conf
 
 # Bake build-time config into an env file the first-boot script sources.
@@ -57,6 +61,11 @@ RUN systemctl preset crio.service kubelet.service k8s-init.service || true
 RUN install -d /etc/systemd/system/timers.target.wants \
  && ln -sf /usr/lib/systemd/system/bootc-fetch-apply-updates.timer \
        /etc/systemd/system/timers.target.wants/bootc-fetch-apply-updates.timer
+
+# Security hardening config files (PodSecurity Admission + apiserver audit policy).
+# Read-only references mounted into the apiserver static pod by k8s-init.sh.
+COPY etc/kubernetes/admission-control-config.yaml /etc/kubernetes/admission-control-config.yaml
+COPY etc/kubernetes/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
 
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s

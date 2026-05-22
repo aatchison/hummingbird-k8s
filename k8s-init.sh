@@ -89,6 +89,9 @@ apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 nodeRegistration:
   criSocket: unix:///var/run/crio/crio.sock
+  kubeletExtraArgs:
+    - name: protect-kernel-defaults
+      value: "true"
 ---
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
@@ -98,12 +101,37 @@ apiServer:
   extraArgs:
     - name: encryption-provider-config
       value: /etc/kubernetes/encryption-config.yaml
+    - name: admission-control-config-file
+      value: /etc/kubernetes/admission-control-config.yaml
+    - name: audit-policy-file
+      value: /etc/kubernetes/audit-policy.yaml
+    - name: audit-log-path
+      value: /var/log/k8s-audit.log
+    - name: audit-log-maxsize
+      value: "100"
+    - name: audit-log-maxbackup
+      value: "5"
   extraVolumes:
     - name: encryption-config
       hostPath: /etc/kubernetes/encryption-config.yaml
       mountPath: /etc/kubernetes/encryption-config.yaml
       readOnly: true
       pathType: File
+    - name: admission-control-config
+      hostPath: /etc/kubernetes/admission-control-config.yaml
+      mountPath: /etc/kubernetes/admission-control-config.yaml
+      readOnly: true
+      pathType: File
+    - name: audit-policy
+      hostPath: /etc/kubernetes/audit-policy.yaml
+      mountPath: /etc/kubernetes/audit-policy.yaml
+      readOnly: true
+      pathType: File
+    - name: audit-log
+      hostPath: /var/log
+      mountPath: /var/log
+      readOnly: false
+      pathType: DirectoryOrCreate
   certSANs:
 ${CERT_SANS_YAML}
 EOF
