@@ -133,12 +133,20 @@ if command -v docker >/dev/null && [[ -S /var/run/docker.sock ]]; then
   log "using host docker daemon for bib (sibling-of-runner)"
   BIB_STORAGE="$(mktemp -d -t bib-storage-XXXX)"
   trap 'rm -rf "'"$BIB_STORAGE"'" 2>/dev/null || true' EXIT
+  # bib needs the IMAGE already in podman storage. Pre-pull it into BIB_STORAGE
+  # via a sibling podman container so bib's --local can find it.
+  log "pre-pulling ${IMAGE} into bib storage via sibling podman"
+  docker run --rm --privileged \
+    -v "${BIB_STORAGE}:/var/lib/containers/storage" \
+    quay.io/podman/stable:latest \
+    podman --root /var/lib/containers/storage pull "${IMAGE}"
   docker run --rm --privileged --pull=always \
     -v "${BIB_CFG}:/config.toml:ro" \
     -v "${LIBVIRT_POOL_DIR}:/output" \
     -v "${BIB_STORAGE}:/var/lib/containers/storage" \
     "${BIB_IMAGE}" \
     --type qcow2 --rootfs ext4 \
+    --local \
     "${IMAGE}"
 else
   log "using podman for bib (bare-metal path)"
