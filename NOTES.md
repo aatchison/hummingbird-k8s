@@ -1,4 +1,4 @@
-# hummingbird-test — findings
+# hummingbird-k8s — findings
 
 Notes from setting up Fedora Hummingbird VMs on `<kvm-host>` (KVM host) with
 two flavors of single-node Kubernetes layered into the bootc image.
@@ -103,10 +103,10 @@ Both base on `quay.io/fedora/fedora-bootc:43` rather than Hummingbird, since Hum
 sudo virsh -c qemu:///system net-dhcp-leases default | grep <vm-name>
 
 # Force rebuild + redefine
-sudo bash ~/hummingbird-test/redo.sh                 # k3s
-sudo bash ~/hummingbird-test/redo-k8s.sh             # upstream k8s control-plane
-sudo bash ~/hummingbird-test/redo-workers.sh 2       # wipe + build + spawn N workers
-sudo bash ~/hummingbird-test/spawn-workers.sh 3      # spawn N more workers from the existing template
+sudo bash ~/hummingbird-k8s/redo.sh                 # k3s
+sudo bash ~/hummingbird-k8s/redo-k8s.sh             # upstream k8s control-plane
+sudo bash ~/hummingbird-k8s/redo-workers.sh 2       # wipe + build + spawn N workers
+sudo bash ~/hummingbird-k8s/spawn-workers.sh 3      # spawn N more workers from the existing template
 
 # Enable bootc auto-update timer at runtime
 sudo systemctl enable --now bootc-fetch-apply-updates.timer

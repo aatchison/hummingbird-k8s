@@ -22,3 +22,5 @@ RUN install -d /etc/systemd/system/multi-user.target.wants \
        /etc/systemd/system/multi-user.target.wants/k3s.service
 
 LABEL containers.bootc=1
+LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s
+LABEL org.opencontainers.image.description="Fedora Hummingbird bootc image with k3s"

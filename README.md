@@ -1,4 +1,4 @@
-# hummingbird-test
+# hummingbird-k8s
 
 Build Fedora Hummingbird-based bootc VMs with Kubernetes baked in. Two flavors:
 
