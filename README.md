@@ -64,6 +64,9 @@ Before running `make k3s` / `make k8s`, the KVM host needs:
 
 - Minimum host capacity for a 1 CP + 2 worker cluster: **16 GB RAM, 4 vCPU,
   60 GB free disk** in `POOL_DIR` (default `/var/lib/libvirt/images/`).
+- Host architecture: **linux/amd64 or linux/arm64**. Published images are
+  multi-arch manifest indexes; `bootc switch` resolves the right child
+  automatically. See [`docs/multi-arch.md`](docs/multi-arch.md).
 - An SSH keypair on the host (`~/.ssh/id_ed25519` by default) registered with
   GitHub — the build/publish flow and the SSH commit-signing config both
   consume it.
@@ -193,6 +196,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/backup-restore.md`](docs/backup-restore.md) — etcd snapshot + restore.
 - [`docs/k8s-version-upgrade.md`](docs/k8s-version-upgrade.md) — K8s major-version upgrade strategy.
 - [`docs/cloud-init.md`](docs/cloud-init.md) — opt-in cloud-init support (`ENABLE_CLOUD_INIT=1`) for per-VM user-data injection via libvirt seed ISO.
+- [`docs/multi-arch.md`](docs/multi-arch.md) — multi-arch (linux/amd64 + linux/arm64) manifest index, cosign verification, and CI boot-test coverage.
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.

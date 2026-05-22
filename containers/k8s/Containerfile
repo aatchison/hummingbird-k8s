@@ -133,6 +133,12 @@ RUN chmod +x /usr/libexec/health-check-rollback.sh \
 
 # cilium-cli (single binary) used by k8s-init.sh to install Cilium CNI on first boot.
 #
+# Arch-aware: cilium-cli ships per-arch tarballs (cilium-linux-amd64.tar.gz,
+# cilium-linux-arm64.tar.gz) plus matching .sha256sum files. TARGETARCH is
+# set automatically by buildah/podman when --platform is passed (linux/amd64
+# → amd64, linux/arm64 → arm64), so a single Containerfile services both
+# manifests in the multi-arch index. Closes #111.
+#
 # Integrity floor: sha256 from the upstream-published .sha256sum (verified below).
 # Cosign verification is NOT applied here: cilium-cli releases through v0.16.x do
 # not publish detached .sig/.pem artifacts in their GitHub release assets (only
@@ -144,14 +150,15 @@ RUN chmod +x /usr/libexec/health-check-rollback.sh \
 # blips. There is no independent third-party mirror for cilium-cli release
 # artifacts (the project distributes only via github.com), so the "fallback"
 # here is in-attempt retry rather than a second host. Tracked in #97.
+ARG TARGETARCH
 ARG CILIUM_CLI_VERSION=v0.16.16
-RUN curl -fsSL --retry 3 --retry-delay 2 -o /tmp/cilium-linux-amd64.tar.gz \
-      "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz" \
- && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/cilium-linux-amd64.tar.gz.sha256sum \
-      "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz.sha256sum" \
- && (cd /tmp && sha256sum -c cilium-linux-amd64.tar.gz.sha256sum) \
- && tar -C /usr/bin -xzf /tmp/cilium-linux-amd64.tar.gz cilium \
- && rm -f /tmp/cilium-linux-amd64.tar.gz /tmp/cilium-linux-amd64.tar.gz.sha256sum \
+RUN curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/cilium-linux-${TARGETARCH}.tar.gz" \
+      "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${TARGETARCH}.tar.gz" \
+ && curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/cilium-linux-${TARGETARCH}.tar.gz.sha256sum" \
+      "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${TARGETARCH}.tar.gz.sha256sum" \
+ && (cd /tmp && sha256sum -c "cilium-linux-${TARGETARCH}.tar.gz.sha256sum") \
+ && tar -C /usr/bin -xzf "/tmp/cilium-linux-${TARGETARCH}.tar.gz" cilium \
+ && rm -f "/tmp/cilium-linux-${TARGETARCH}.tar.gz" "/tmp/cilium-linux-${TARGETARCH}.tar.gz.sha256sum" \
  && /usr/bin/cilium version --client
 
 LABEL containers.bootc=1

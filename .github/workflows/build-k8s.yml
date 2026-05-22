@@ -67,6 +67,15 @@ jobs:
         id: cf
         run: echo "path=$(make -s print-containerfile-k8s)" >> "$GITHUB_OUTPUT"
 
+      # Multi-arch (amd64 + arm64) cross-builds require qemu-user-static so
+      # buildah can execute foreign-arch binaries during RUN steps. The
+      # GitHub-hosted ubuntu-latest runner ships binfmt_misc handlers but
+      # not the static interpreters; this action installs them.
+      - name: Set up QEMU for cross-arch builds
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: arm64
+
       - name: Build
         id: build
         uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
@@ -75,6 +84,11 @@ jobs:
           tags: ${{ steps.v.outputs.version }} latest
           containerfiles: ${{ steps.cf.outputs.path }}
           context: .
+          # Multi-arch: emit a manifest index containing both linux/amd64
+          # and linux/arm64 child manifests. The Containerfile uses
+          # TARGETARCH to fetch the right cilium-cli tarball per arch.
+          # Closes #107.
+          platforms: linux/amd64,linux/arm64
           # Reuse layers from the previously published :latest when available.
           # buildah tolerates a missing remote (first-time cache miss); no
           # --pull-always so a registry hiccup doesn't break a real publish.
@@ -115,9 +129,9 @@ jobs:
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
-      # Signing is by digest, which covers the single-arch (amd64) image
-      # produced here. If multi-arch builds are added later, both the manifest
-      # index AND each per-arch child manifest must be signed.
+      # Signing is by digest with --recursive, which walks the multi-arch
+      # manifest index and signs both the index itself AND each per-arch
+      # child manifest. See the cosign sign step below.
       - name: Trivy vulnerability scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -155,7 +169,10 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s
           DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
-          cosign sign --yes "${IMAGE}@${DIGEST}"
+          # --recursive walks the multi-arch manifest index and signs both
+          # the index itself and each referenced per-arch child manifest.
+          # cosign 2.x flag; v3.10.1 of cosign-installer pins cosign 2.6.1.
+          cosign sign --yes --recursive "${IMAGE}@${DIGEST}"
 
       # Attest the SBOM against the pushed digest so consumers can verify
       # provenance via `cosign verify-attestation --type spdx`.
