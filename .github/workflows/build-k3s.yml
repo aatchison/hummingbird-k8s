@@ -59,7 +59,7 @@ jobs:
         with:
           image: hummingbird-k3s
           tags: ${{ steps.v.outputs.version }} latest
-          containerfiles: Containerfile
+          containerfiles: Containerfile.k3s
           context: .
 
       - name: Push to GHCR

@@ -7,7 +7,7 @@ two flavors of single-node Kubernetes layered into the bootc image.
 
 | File | Role |
 |---|---|
-| `Containerfile` / `build.sh` / `define-vm.sh` / `redo.sh` | `hummingbird-k3s` VM (k3s baked in) |
+| `Containerfile.k3s` / `build.sh` / `define-vm.sh` / `redo.sh` | `hummingbird-k3s` VM (k3s baked in) |
 | `Containerfile.k8s` / `build-k8s.sh` / `define-vm-k8s.sh` / `redo-k8s.sh` | `hummingbird-k8s` VM (upstream kubelet/kubeadm/cri-o, control-plane) |
 | `Containerfile.k8s-worker` / `build-worker.sh` / `spawn-workers.sh` / `redo-workers.sh` | Worker template image + spawner — clones one qcow2 into N VMs, each auto-joins the CP |
 | `k8s-init.sh` / `k8s-init.service` | First-boot `kubeadm init` + flannel + untaint (CP only) |
@@ -79,7 +79,7 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 
 ## Two install styles
 
-### k3s (`Containerfile`)
+### k3s (`Containerfile.k3s`)
 - Upstream installer drops single `/usr/bin/k3s` binary + systemd unit.
 - Cluster up in ~10s after boot. CNI = flannel (k3s default), ingress = traefik, storage = local-path — all auto-deployed.
 - Best fit for "single node with containers."

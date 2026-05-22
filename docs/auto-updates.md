@@ -1,8 +1,14 @@
 # Automatic bootc updates
 
-All three hummingbird-k8s flavors (`hummingbird-k3s`, `hummingbird-k8s` control
-plane, `hummingbird-k8s-worker`) ship with `bootc-fetch-apply-updates.timer`
-enabled by default. Each booted VM will, without operator intervention:
+`hummingbird-k3s` and `hummingbird-k8s-worker` ship with
+`bootc-fetch-apply-updates.timer` **enabled by default**. The
+`hummingbird-k8s` control-plane image ships with the timer **disabled by
+default** — opt in per host via `systemctl enable --now` (see below). The
+rationale: a single-CP cluster suffers a full apiserver outage during the
+CP reboot, so auto-update on the CP needs to be an explicit operator
+choice (#48).
+
+Each booted VM with the timer enabled will, without operator intervention:
 
 1. Wake up on the timer (default cadence: roughly once a day, with a small
    randomized delay built into the upstream unit).
@@ -68,18 +74,48 @@ flavor's Containerfile and rebuild.
 
 ### Recommendation for production control planes
 
-For anything beyond demo / lab use, disable the timer on the CP and drive
-upgrades manually:
+The CP image ships with the timer **disabled** for exactly this reason:
+on a single-CP cluster, an unattended reboot is a full apiserver outage.
+For production CPs, leave the timer off and drive upgrades manually at a
+maintenance window:
 
 ```bash
-sudo systemctl disable --now bootc-fetch-apply-updates.timer
 sudo bootc upgrade --check       # ad-hoc: see what's available
 sudo bootc upgrade && sudo reboot   # apply at your chosen maintenance window
+```
+
+To opt in to auto-update on a lab CP, enable the timer per host:
+
+```bash
+sudo systemctl enable --now bootc-fetch-apply-updates.timer
 ```
 
 Workers are generally safer to leave on auto-update once you have more than one
 of them, since the kubelet will reschedule pods elsewhere — but staggering is
 still your responsibility.
+
+### Important: per-host disable does NOT survive bootc upgrade
+
+If you run `sudo systemctl disable bootc-fetch-apply-updates.timer` on a
+deployed VM, then a later `bootc upgrade` rolls in a new image, the preset
+in the new image re-enables the timer. `systemctl preset` is re-applied
+against units in the new image layer, and the unit will end up enabled
+again whether or not the prior host had disabled it.
+
+Workarounds:
+
+1. **Mask the unit** — preset cannot override a masked unit, so this
+   sticks across `bootc upgrade`:
+
+   ```bash
+   sudo systemctl mask bootc-fetch-apply-updates.timer
+   ```
+
+2. **Rebuild the image with the preset entry removed** — drop
+   `enable bootc-fetch-apply-updates.timer` from the corresponding
+   `10-*.preset` and from the matching `systemctl preset ...` line in
+   that flavor's Containerfile. The control-plane image already ships
+   this way (see #48).
 
 ## Rolling back
 

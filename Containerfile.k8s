@@ -60,7 +60,7 @@ COPY k8s-init.service /etc/systemd/system/k8s-init.service
 # Hummingbird ships a 99-default-disable.preset that strips unenabled symlinks
 # during image build. Override with a low-numbered preset that wins.
 COPY 10-k8s.preset /usr/lib/systemd/system-preset/10-k8s.preset
-RUN systemctl preset crio.service kubelet.service k8s-init.service bootc-fetch-apply-updates.timer || true
+RUN systemctl preset crio.service kubelet.service k8s-init.service || true
 
 # Security hardening config files (PodSecurity Admission + apiserver audit policy).
 # Read-only references mounted into the apiserver static pod by k8s-init.sh.
