@@ -70,12 +70,18 @@ mount the qcow2 offline, write `/etc/hummingbird/worker-join.env` (mode
 0600, owner root), and unmount cleanly. No cloud-init, no second CD-ROM,
 no extra metadata server.
 
-`guestfish` is preferred because it mounts the raw root partition directly
-and does not require libguestfs OS introspection. `virt-customize` relies
-on introspection to identify the guest OS layout, which fails on the
+`guestfish` is preferred because it can mount the raw root partition
+directly. `virt-customize` (and `guestfish -i`) rely on libguestfs OS
+introspection to identify the guest OS layout, which fails on the
 bootc/ostree-based Hummingbird worker image with `no operating systems
-were found in the guest image`. `guestfish` sidesteps that entirely by
-just writing to the filesystem.
+were found in the guest image`. `spawn-workers.sh` therefore invokes
+`guestfish` without `-i`: it explicitly mounts `/dev/sda4` (the root
+partition), discovers the active ostree deployment dir
+(`/ostree/deploy/<stateroot>/deploy/<commit>.0/`) by listing the on-disk
+ostree tree, and writes `worker-join.env` into that deployment's `/etc`.
+At boot the kernel mounts the deployment dir as `/`, so the file appears
+at the live `/etc/hummingbird/worker-join.env`. For non-ostree images
+the script falls back to writing to the partition's `/etc` directly.
 
 ## What if someone boots the bare template?
 
