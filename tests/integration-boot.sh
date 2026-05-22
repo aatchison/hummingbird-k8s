@@ -130,7 +130,7 @@ podman_isolated pull "${IMAGE}"
 # Bind-mount the isolated graph root into bib at the path it expects so
 # `--local` resolves to the image we just pulled.
 podman_isolated run --rm --privileged --pull=newer \
-  --net=host --cgroupns=host \
+  --net=host --cgroupns=host --cgroup-manager=cgroupfs \
   --security-opt label=type:unconfined_t \
   -v "${BIB_CFG}:/config.toml:ro" \
   -v "${LIBVIRT_POOL_DIR}:/output" \
