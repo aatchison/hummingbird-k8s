@@ -23,6 +23,23 @@ set -euo pipefail
 # (#124).
 export STORAGE_DRIVER="${STORAGE_DRIVER:-vfs}"
 
+# Use isolated per-run podman graph + run roots so a stale libpod database on
+# the host (e.g. from a prior overlay-driver session) cannot silently override
+# our vfs choice. See tests/integration-boot.sh / #139 for the full backstory.
+RUN_ID_TAG="${GITHUB_RUN_ID:-local-$$}"
+PODMAN_ROOT="${PODMAN_ROOT:-/var/lib/integration-storage/${RUN_ID_TAG}}"
+PODMAN_RUNROOT="${PODMAN_RUNROOT:-/run/integration-storage/${RUN_ID_TAG}}"
+export PODMAN_ROOT PODMAN_RUNROOT
+mkdir -p "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
+
+podman_isolated() {
+  podman \
+    --storage-driver "${STORAGE_DRIVER}" \
+    --root "${PODMAN_ROOT}" \
+    --runroot "${PODMAN_RUNROOT}" \
+    "$@"
+}
+
 FROM_TAG="${1:?from_tag required (e.g. v0.1.9)}"
 TO_TAG="${2:?to_tag required (e.g. v0.1.10)}"
 RUN_ID="${GITHUB_RUN_ID:-local}"
@@ -73,6 +90,9 @@ cleanup() {
   virsh -c qemu:///system undefine --nvram "${VM_NAME}" >/dev/null 2>&1 || true
   rm -f "${POOL_QCOW}" || true
   rm -rf "${WORK}" || true
+  # Best-effort: drop the per-run isolated podman roots (the workflow also
+  # cleans these up in an always() step, but local invocations rely on us).
+  rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}" 2>/dev/null || true
   exit "$rc"
 }
 trap cleanup EXIT
@@ -109,13 +129,15 @@ EOF
 log "building qcow2 from ${FROM_IMAGE} via bib"
 mkdir -p "${LIBVIRT_POOL_DIR}"
 rm -rf "${LIBVIRT_POOL_DIR}/qcow2"
-podman pull "${FROM_IMAGE}"
+podman_isolated pull "${FROM_IMAGE}"
 
-podman run --rm --privileged --pull=newer \
+# Bind-mount the isolated graph root into bib at the path it expects so
+# `--local` resolves to the image we just pulled.
+podman_isolated run --rm --privileged --pull=newer \
   --security-opt label=type:unconfined_t \
   -v "${BIB_CFG}:/config.toml:ro" \
   -v "${LIBVIRT_POOL_DIR}:/output" \
-  -v /var/lib/containers/storage:/var/lib/containers/storage \
+  -v "${PODMAN_ROOT}:/var/lib/containers/storage" \
   "${BIB_IMAGE}" \
   --type qcow2 --rootfs ext4 \
   --local \
