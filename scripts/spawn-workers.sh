@@ -16,8 +16,8 @@ fi
 
 : "${SUDO_USER:?must be invoked via sudo so ssh uses the calling user known_hosts/key}"
 
-cd "$(dirname "$(readlink -f "$0")")"
-# shellcheck source=lib/build-common.sh
+cd "$(dirname "$(readlink -f "$0")")/.."
+# shellcheck source=../lib/build-common.sh
 source lib/build-common.sh
 
 : "${CP_VM_NAME:=hummingbird-k8s}"

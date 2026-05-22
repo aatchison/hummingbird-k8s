@@ -7,8 +7,10 @@
 # virt-install. See docs/worker-tokens.md for the rationale (no static
 # long-lived secret embedded in the published image).
 set -euo pipefail
-cd "$(dirname "$(readlink -f "$0")")"
-# shellcheck source=lib/build-common.sh
+# Run from the repo root so the build context (and `lib/`, `containers/`
+# paths) resolves consistently regardless of where the operator invokes us.
+cd "$(dirname "$(readlink -f "$0")")/.."
+# shellcheck source=../lib/build-common.sh
 source lib/build-common.sh
 
 require_root
@@ -19,6 +21,6 @@ NAME=hummingbird-k8s-worker
 render_bib_config > bib-config-worker.toml
 
 podman pull "$BASE_IMAGE"
-podman build -t "$LOCAL_IMAGE" -f Containerfile.k8s-worker .
+podman build -t "$LOCAL_IMAGE" -f containers/k8s-worker/Containerfile .
 
 build_qcow2 "$LOCAL_IMAGE" "$NAME" "$(pwd)/bib-config-worker.toml"

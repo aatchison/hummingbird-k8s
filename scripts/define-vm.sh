@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # shellcheck disable=SC1091
 [[ -r "${_ROOT}/config.local.sh" ]] && source "${_ROOT}/config.local.sh"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
