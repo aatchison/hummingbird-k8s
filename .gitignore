@@ -11,6 +11,9 @@ admin.conf.*
 # Local kubectl wrapper cache (server URLs vary)
 /tmp/k8s-kubeconfig
 
+# Per-host config overrides
+config.local.sh
+
 # OS/editor noise
 .DS_Store
 *.swp

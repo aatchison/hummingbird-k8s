@@ -31,8 +31,8 @@ GitHub Actions builds an OCI image for each flavor and pushes to GHCR on tagged 
 
 | Tag pattern | Published image |
 |---|---|
-| `k3s/vX.Y.Z` | `ghcr.io/aatchison/hummingbird-k3s:vX.Y.Z` |
-| `k8s/vX.Y.Z` | `ghcr.io/aatchison/hummingbird-k8s:vX.Y.Z` |
-| `worker/vX.Y.Z` | `ghcr.io/aatchison/hummingbird-k8s-worker:vX.Y.Z` |
+| `k3s/vX.Y.Z` | `ghcr.io/<OWNER>/hummingbird-k3s:vX.Y.Z` |
+| `k8s/vX.Y.Z` | `ghcr.io/<OWNER>/hummingbird-k8s:vX.Y.Z` |
+| `worker/vX.Y.Z` | `ghcr.io/<OWNER>/hummingbird-k8s-worker:vX.Y.Z` |
 
 Bump a flavor independently: `git tag k3s/v0.2.0 && git push --tags`.

@@ -27,6 +27,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Refuse to publish if the tagged commit isn't on main
+        if: github.event_name == 'push'
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $GITHUB_REF points to $GITHUB_SHA, not reachable from origin/main." >&2
+            echo "Only tags on commits merged to main may publish." >&2
+            exit 1
+          fi
 
       - name: Parse flavor + version from tag (or workflow_dispatch)
         id: parse

@@ -4,7 +4,15 @@ set -euo pipefail
 MARKER=/var/lib/k8s-init.done
 [[ -f "$MARKER" ]] && { echo "k8s-init already ran"; exit 0; }
 
+# Build-time configuration: APISERVER_EXTRA_SANS is baked into /etc/hummingbird/k8s-init.env
+# at image build time (Containerfile.k8s ARG → write env file).
+if [[ -r /etc/hummingbird/k8s-init.env ]]; then
+  # shellcheck disable=SC1091
+  source /etc/hummingbird/k8s-init.env
+fi
+
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+APISERVER_EXTRA_SANS="${APISERVER_EXTRA_SANS:-127.0.0.1,localhost}"
 
 swapoff -a || true
 modprobe overlay
@@ -20,7 +28,7 @@ done
 kubeadm init \
   --pod-network-cidr="$POD_CIDR" \
   --cri-socket=unix:///var/run/crio/crio.sock \
-  --apiserver-cert-extra-sans=geary,geary.mtcr.lan,127.0.0.1,localhost
+  --apiserver-cert-extra-sans="$APISERVER_EXTRA_SANS"
 
 # Single-node: let workloads schedule on the control-plane
 KUBECONFIG=/etc/kubernetes/admin.conf kubectl taint nodes --all \

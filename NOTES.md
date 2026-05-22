@@ -1,6 +1,6 @@
 # hummingbird-test — findings
 
-Notes from setting up Fedora Hummingbird VMs on `geary` (KVM host) with
+Notes from setting up Fedora Hummingbird VMs on `<kvm-host>` (KVM host) with
 two flavors of single-node Kubernetes layered into the bootc image.
 
 ## What's here
@@ -17,30 +17,30 @@ two flavors of single-node Kubernetes layered into the bootc image.
 | `migrate-to-system.sh` | One-time helper that moved the original VM from `qemu:///session` to system |
 | `k8s-bootc-talk.transcript.txt` | KubeCon India 2025 talk transcript (Berkus + Kumar) |
 
-## Host setup (geary)
+## Host setup (<kvm-host>)
 
 - Fedora 44 Server, libvirt + cockpit-machines already installed.
 - Two libvirt connections in use:
   - `qemu:///session` — pools `iso`, `userspace` (rootless; existing `molty` VM lives here)
-  - `qemu:///system` — pools `iso`, `iso-1`, `mass2` (`/mnt/mass2/vms`), `secondary`; network `default` (NAT 192.168.122.0/24)
+  - `qemu:///system` — pools `iso`, `iso-1`, `mass2` (`/var/lib/libvirt/images`), `secondary`; network `default` (NAT 192.168.122.0/24)
 - All our VMs live under **system libvirt** so they get a real bridge with DHCP, libvirt sees the IP, and Cockpit lists them in the host's main VM panel.
 
 ## Build pipeline (what actually works)
 
 1. `podman build` a layered OCI image `FROM quay.io/hummingbird-community/bootc-os:latest`, tagged `localhost/hummingbird-<flavor>:latest`.
 2. `bootc-image-builder` converts that local image to a qcow2. Critical flag: pass `--local` so bib reads from local podman storage instead of trying to pull. Bind-mount `/var/lib/containers/storage` so the bib container can see the local image.
-3. Output goes to `/mnt/mass2/vms/<name>.qcow2`. `chown root:root` + `chmod 0644` so system qemu can read it.
+3. Output goes to `/var/lib/libvirt/images/<name>.qcow2`. `chown root:root` + `chmod 0644` so system qemu can read it.
 4. `virsh -c qemu:///system pool-refresh mass2` so libvirt picks up the new volume.
 5. `virt-install --connect qemu:///system ... --network network=default --import` defines and starts the VM.
 
-## Accessing the cluster from another machine (judah → geary VM)
+## Accessing the cluster from another machine (<kvm-client> → <kvm-host> VM)
 
-`192.168.122.0/24` is libvirt's NAT inside geary, not routable from outside. We tunnel + use kubectl in a container so judah doesn't need kubectl installed.
+libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm-host>, not routable from outside. We tunnel + use kubectl in a container so <kvm-client> doesn't need kubectl installed.
 
-1. `kubeadm init --apiserver-cert-extra-sans=geary,127.0.0.1,localhost` — adds SANs so the apiserver cert is valid for the tunnel endpoint (baked into `k8s-init.sh`).
+1. `kubeadm init --apiserver-cert-extra-sans=<kvm-host>,127.0.0.1,localhost` — adds SANs so the apiserver cert is valid for the tunnel endpoint (baked into `k8s-init.sh`).
 2. Pull `/etc/kubernetes/admin.conf` from the VM to a local file.
 3. Rewrite `server:` to `https://localhost:6443`.
-4. `ssh -fNL 6443:<vm-ip>:6443 thegeary`.
+4. `ssh -fNL 6443:<vm-ip>:6443 <kvm-host>`.
 5. `podman run --rm --net=host -v /tmp/k8s-kubeconfig:/kc:ro,Z -e KUBECONFIG=/kc docker.io/bitnami/kubectl:latest get nodes`.
 
 `./kubectl-k8s.sh <args>` wraps all of this — auto-discovers the VM IP, sets up the tunnel if missing, runs kubectl in a container with the right kubeconfig.
@@ -54,7 +54,7 @@ two flavors of single-node Kubernetes layered into the bootc image.
 - **bib's `<portForward>` doesn't work with the default slirp `<interface type='user'>`.** It requires `backend='passt'`. Don't bother with port-forwarding for `qemu:///session` user-mode VMs — switch to `qemu:///system` and use the default NAT network instead.
 - **`/usr/local` on Hummingbird is wired to `/var`.** Writes there at image-build time don't end up in the OCI layer. Always install to `/usr/bin` or `/usr/libexec`.
 - **`bib-config.toml` `key =` accepts multi-line strings** for multiple authorized_keys entries (verified working). Hashed password works in `password =`.
-- **First SSH from geary to a freshly-recreated VM** trips on stale host keys at `192.168.122.x` from prior VMs. `ssh-keygen -R <ip>` clears it.
+- **First SSH from <kvm-host> to a freshly-recreated VM** trips on stale host keys (libvirt re-issues IPs from its NAT pool) from prior VMs. `ssh-keygen -R <ip>` clears it.
 - **bib produces all formats** (qcow2, vmdk, vpc, ovf, archive, gce) even when you only ask for one — just `mv` the qcow2 you care about.
 
 ## How bootc auto-update works
@@ -92,8 +92,8 @@ Both base on `quay.io/fedora/fedora-bootc:43` rather than Hummingbird, since Hum
 
 ## SSH access summary
 
-- From **judah**: `ssh -J thegeary aatchison@<vm-ip>` (uses judah's id_ed25519, baked into image)
-- From **geary**: `ssh aatchison@<vm-ip>` (uses geary's id_ed25519, also baked in)
+- From **<kvm-client>**: `ssh -J <kvm-host> <user>@<vm-ip>` (uses <kvm-client>'s id_ed25519, baked into image)
+- From **<kvm-host>**: `ssh <user>@<vm-ip>` (uses <kvm-host>'s id_ed25519, also baked in)
 - Sudo password inside guest: `1234asdf` (set in `build*.sh`).
 
 ## Useful one-liners

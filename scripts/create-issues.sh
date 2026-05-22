@@ -2,7 +2,7 @@
 # Seed the repo with backlog issues. Run once after `gh repo create`.
 set -euo pipefail
 
-REPO=${REPO:-aatchison/hummingbird-test}
+REPO="${REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 
 # Create the labels we use.
 for spec in \
@@ -27,7 +27,7 @@ issue() {
 }
 
 issue "Rename hummingbird VM to hummingbird-k3s" "k3s" \
-"The current k3s VM on geary is still under the legacy name \`hummingbird\`. Run \`sudo bash redo.sh\` once and verify the new domain name shows up in Cockpit."
+"The current k3s VM on the KVM host is still under the legacy name \`hummingbird\`. Run \`sudo bash redo.sh\` once and verify the new domain name shows up in Cockpit."
 
 issue "Drop hardcoded sudo password from build scripts" "hardening,k3s,k8s,worker" \
 "\`build*.sh\` bake \`1234asdf\` as the sudo password via \`bib-config.toml\`. Switch to SSH-key-only (drop \`password =\` from the bib config) and require explicit key auth."
@@ -60,13 +60,13 @@ issue "HA control plane: 3 CPs + keepalived/haproxy VIP" "k8s,verify" \
 "Add a \`ROLE=cp\` variant of \`Containerfile.k8s\` that also installs keepalived+haproxy, configured to front a VIP (e.g. 192.168.122.10). First CP runs \`kubeadm init --control-plane-endpoint=<vip>:6443 --upload-certs\`. Workers + subsequent CPs point at the VIP. Verify: kill one CP, cluster keeps working."
 
 issue "End-to-end bootc upgrade test" "verify,k3s,k8s,worker" \
-"Spin a VM from \`ghcr.io/aatchison/hummingbird-<flavor>:vA\`, push \`:vB\` to GHCR, run \`bootc upgrade && systemctl reboot\` in the guest, confirm the new digest is the booted deployment and that k3s/kubelet are still healthy."
+"Spin a VM from \`ghcr.io/<OWNER>/hummingbird-<flavor>:vA\`, push \`:vB\` to GHCR, run \`bootc upgrade && systemctl reboot\` in the guest, confirm the new digest is the booted deployment and that k3s/kubelet are still healthy."
 
 issue "Apiserver audit logging" "hardening,k8s" \
 "Drop an \`audit-policy.yaml\` and pass \`--audit-policy-file\` + \`--audit-log-path\` via the kubeadm config. Logs to \`/var/log/k8s-audit.log\`, mounted as a HostPath."
 
-issue "Self-hosted GitHub runner on geary for orchestrator + upgrade tests" "ci" \
-"Register geary as a self-hosted runner so workflows that need real KVM (orchestrator, e2e upgrade test) can run. Document the registration command + service unit."
+issue "Self-hosted GitHub runner on a KVM host for orchestrator + upgrade tests" "ci" \
+"Register a KVM-capable machine as a self-hosted runner so workflows that need real KVM (orchestrator, e2e upgrade test) can run. Document the registration command + service unit."
 
 issue "Orchestrator workflow: iterate open 'verify' issues and run each issue's test script" "ci" \
 "\`.github/workflows/orchestrator.yml\`. Triggered nightly + workflow_dispatch. For each open issue labeled \`verify\`, look up a script under \`tests/issue-<n>.sh\`, run it on the self-hosted runner, post pass/fail back to the issue as a comment."
