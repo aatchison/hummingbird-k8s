@@ -132,8 +132,10 @@ render_bib_config() {
 build_qcow2() {
   local local_image="$1" name="$2" cfg="$3"
   local qcow="${POOL_DIR}/${name}.qcow2"
+  local stage="${POOL_DIR}/qcow2"
+  local disk="${stage}/disk.qcow2"
 
-  rm -rf "${POOL_DIR}/qcow2"
+  rm -rf "$stage"
   mkdir -p "$POOL_DIR"
 
   podman run --rm --privileged --pull=newer \
@@ -146,8 +148,21 @@ build_qcow2() {
     --local \
     "$local_image"
 
-  mv -f "${POOL_DIR}/qcow2/disk.qcow2" "$qcow"
-  rmdir "${POOL_DIR}/qcow2"
+  # Promote the staged disk to its final path. Each step is explicitly checked so
+  # that a failure cannot silently leave stale state in $stage that would poison
+  # subsequent builds (issue #103).
+  if [[ ! -f "$disk" ]]; then
+    echo "build_qcow2: expected $disk to exist after bib run" >&2
+    return 1
+  fi
+  if ! mv -f "$disk" "$qcow"; then
+    echo "build_qcow2: failed to move $disk to $qcow" >&2
+    return 1
+  fi
+  if ! rmdir "$stage"; then
+    echo "build_qcow2: failed to remove staging dir $stage" >&2
+    return 1
+  fi
   chown root:root "$qcow"
   chmod 0644 "$qcow"
 
