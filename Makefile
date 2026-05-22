@@ -137,8 +137,8 @@ kube-bench: ## Run CIS Kubernetes Benchmark (kube-bench) against the cluster
 # etcd snapshot lifecycle. See docs/backup-restore.md for cadence,
 # encryption-key handling, and full DR walkthrough.
 
-backup-etcd: ## Snapshot etcd to ./backups/etcd-snapshot-<ts>.db
-	bash scripts/backup-etcd.sh
+backup-etcd: ## Snapshot etcd; optional LABEL=<text> appends to filename
+	bash scripts/backup-etcd.sh $(if $(LABEL),--label $(LABEL),)
 
 restore-etcd: ## Restore etcd from a snapshot (SNAP=path.db required)
 	@[ -n "$(SNAP)" ] || { echo 'SNAP=<path-to-snapshot.db> required' >&2; exit 2; }

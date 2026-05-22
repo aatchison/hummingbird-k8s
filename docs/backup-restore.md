@@ -63,6 +63,52 @@ For anything beyond a lab, also offload to object storage (e.g.
 `aws s3 cp $DST s3://bucket/etcd/`) — a snapshot that lives only on
 the same host as the cluster does not protect you from host loss.
 
+## When to snapshot
+
+Take a **labeled** snapshot **before** any of these operations — they
+alter etcd state in ways `bootc rollback` cannot undo (`bootc
+rollback` restores the previous filesystem deployment, not etcd
+state — see [`docs/rollback.md`](rollback.md) and issue #95):
+
+- **CNI swap** (e.g. flannel ↔ Cilium) — Cilium CRDs, IP allocations,
+  and policy objects persist in etcd across a `bootc rollback`;
+  without a pre-swap snapshot the swap is effectively one-way. See
+  [`docs/cilium-migration.md#rollback-limitations`](cilium-migration.md#rollback-limitations).
+- **Kubernetes major-version upgrade** — `kubeadm upgrade` rewrites
+  resources in etcd to the new storage version; rolling the binaries
+  back without rolling etcd back leaves the apiserver looking at
+  newer-shape data than it can decode. See `docs/k8s-version-upgrade.md`
+  once it lands.
+- **Bulk CRD changes** — installing, upgrading, or removing CRDs is
+  irreversible from etcd's point of view once the schema version
+  changes. Resources written under an old schema may not decode
+  under the new one and vice versa.
+- **Restoring a custom admission policy** (PSA, ValidatingAdmission,
+  webhook configs) that could mass-reject existing workloads on
+  re-admission.
+- **Disabling or enabling encryption-at-rest** — flipping the
+  EncryptionConfiguration provider rewrites Secret/ConfigMap envelopes
+  on the next write; reverting without a snapshot taken on the
+  pre-flip side requires the prior key material. See
+  [`docs/etcd-encryption.md`](etcd-encryption.md).
+
+Use the `--label` flag to make the purpose obvious in your backup
+directory:
+
+```bash
+scripts/backup-etcd.sh ~/backups --label pre-cni-swap
+# -> ~/backups/etcd-snapshot-20260522T180000Z-pre-cni-swap.db
+
+# Or via make:
+make backup-etcd LABEL=pre-cni-swap
+```
+
+Labels are sanitized to `[A-Za-z0-9._-]` — anything outside that set
+is replaced with `-`. After taking the snapshot, **off-host it** (copy
+to a different machine or object storage) before performing the
+operation, so a rollback that wipes the CP's working directory
+doesn't also lose the backup.
+
 ## Backing up
 
 ```bash
@@ -71,6 +117,10 @@ make backup-etcd
 
 # or, explicit outdir + via the script:
 scripts/backup-etcd.sh ~/etcd-backups
+
+# labeled snapshot for a high-risk operation (see "When to snapshot"):
+make backup-etcd LABEL=pre-cni-swap
+scripts/backup-etcd.sh ~/etcd-backups --label pre-cni-swap
 ```
 
 What happens:
