@@ -158,3 +158,5 @@ clean-vms: ## Destroy + undefine all hummingbird-* VMs (sudo)
 clean-images: ## Remove the local OCI build outputs
 	-podman image rm $(IMAGE_K3S) $(IMAGE_K8S) $(IMAGE_WORKER) 2>/dev/null || true
 
+clean: clean-vms clean-images ## Destroy all VMs and remove local images
+

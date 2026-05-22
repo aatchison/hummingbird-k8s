@@ -1,10 +1,9 @@
 # Makefile cheatsheet
 
 The top-level `Makefile` is a thin wrapper over the driver scripts under
-`scripts/` (`build-*.sh`, `define-vm*.sh`, `redo-*.sh`, `spawn-workers.sh`,
-`kubectl-k8s.sh`, `verify-*.sh`). Both still work — the Makefile just gives
-operators a stable, discoverable entrypoint. Run `make help` to print the
-full cheatsheet.
+`scripts/`. Both the `make` targets and the underlying scripts still work —
+the Makefile just gives operators a stable, discoverable entrypoint. Run
+`make help` to print the full cheatsheet, or browse `scripts/` directly.
 
 ## Common flows
 
