@@ -3,8 +3,11 @@
 #
 # Strategy:
 #   1. Create a probe Secret with a distinctive value via kubectl.
-#   2. Read it raw from etcd (either via `etcdctl` on PATH or via
-#      `kubectl exec` into the static etcd pod).
+#   2. Read it raw from etcd, in this order:
+#        a. `etcdctl` on PATH (rare on bootc CP), OR
+#        b. host-side `crictl exec` into the etcd container (k8s 1.31's
+#           etcd static pod is distroless, so `kubectl exec ... -- sh` is
+#           never available — must go through crictl on the host).
 #   3. Assert the stored blob starts with the expected envelope prefix
 #      (`k8s:enc:aesgcm:` for AESGCM).
 #   4. Clean up the probe Secret either way.
@@ -18,6 +21,11 @@ NS="${NS:-default}"
 PROBE_NAME="${PROBE_NAME:-etcd-encryption-probe-$$}"
 PROBE_KEY="${PROBE_KEY:-probe}"
 PROBE_VALUE="${PROBE_VALUE:-hummingbird-encryption-probe-value}"
+# The full envelope prefix on the row is
+# `k8s:enc:aesgcm:v1:<keyname>:<binary>`. Our keyname is `bootstrap` (see
+# k8s-init.sh). A substring check on `k8s:enc:aesgcm:` is sufficient to
+# prove encryption is active, but we accept an override for stricter
+# callers (e.g. CI gating on the specific keyname).
 EXPECTED_PREFIX="${EXPECTED_PREFIX:-k8s:enc:aesgcm:}"
 
 KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
@@ -61,33 +69,36 @@ read_etcd_local() {
     get "$ETCD_KEY" --print-value-only
 }
 
-read_etcd_via_pod() {
-  local node etcd_pod
-  node="$(kubectl get nodes \
-    -l node-role.kubernetes.io/control-plane \
-    -o jsonpath='{.items[0].metadata.name}')"
-  if [[ -z "$node" ]]; then
-    log "no control-plane node found"
+read_etcd_via_crictl() {
+  # k8s 1.31's etcd static pod image is distroless: no /bin/sh, so
+  # `kubectl exec etcd-$node -- sh -c '...'` exits with "exec: ...: not
+  # found in $PATH". Instead we go through the host CRI: find the etcd
+  # container ID via crictl and exec etcdctl in it directly (no shell).
+  local etcd_id
+  etcd_id="$(crictl ps --name '^etcd$' -q 2>/dev/null | head -n1)"
+  if [[ -z "$etcd_id" ]]; then
+    log "could not find running etcd container via crictl"
     return 1
   fi
-  etcd_pod="etcd-${node}"
-  kubectl -n kube-system exec "$etcd_pod" -- sh -c "
-    ETCDCTL_API=3 etcdctl \
-      --endpoints=$ETCD_ENDPOINT \
-      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
-      --cert=/etc/kubernetes/pki/etcd/server.crt \
-      --key=/etc/kubernetes/pki/etcd/server.key \
-      get '$ETCD_KEY' --print-value-only
-  "
+  crictl exec "$etcd_id" etcdctl \
+    --endpoints="$ETCD_ENDPOINT" \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    get "$ETCD_KEY" --print-value-only
 }
 
 raw=""
 if command -v etcdctl >/dev/null 2>&1 && [[ -r "$PKI/ca.crt" ]]; then
   log "reading via local etcdctl"
   raw="$(read_etcd_local || true)"
+elif command -v crictl >/dev/null 2>&1; then
+  log "local etcdctl unavailable, falling back to crictl exec on etcd container"
+  raw="$(read_etcd_via_crictl || true)"
 else
-  log "local etcdctl unavailable, falling back to kubectl exec"
-  raw="$(read_etcd_via_pod || true)"
+  log "FAIL: need etcdctl or crictl on PATH (run as root on the CP VM)"
+  log "      manual workaround: sudo crictl ps | grep etcd ; sudo crictl exec <id> etcdctl ..."
+  exit 1
 fi
 
 if [[ -z "$raw" ]]; then
