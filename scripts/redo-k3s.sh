@@ -8,6 +8,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# Sit in scripts/ so we can invoke our sibling scripts by relative name.
 cd "$(dirname "$(readlink -f "$0")")"
 
 for name in hummingbird-k3s hummingbird; do
@@ -16,5 +17,5 @@ for name in hummingbird-k3s hummingbird; do
 done
 rm -f /mnt/mass2/vms/hummingbird-k3s.qcow2 /mnt/mass2/vms/hummingbird.qcow2
 
-bash build.sh
+bash build-k3s.sh
 bash define-vm.sh

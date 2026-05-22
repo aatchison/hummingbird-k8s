@@ -22,9 +22,9 @@ Cilium NetworkPolicy #6, …). Running kube-bench gives us a single
 authoritative checklist instead of curating one ourselves.
 
 Important: kube-bench grades the **actual running config**, not the
-image. Anything you change in `k8s-init.sh` — kubeadm flags, file
+image. Anything you change in `containers/k8s/k8s-init.sh` — kubeadm flags, file
 modes, encryption config — will show up in the next run. Rerun after
-every `k8s-init.sh` change.
+every `containers/k8s/k8s-init.sh` change.
 
 ## How to run
 
@@ -35,7 +35,7 @@ etc.):
 KVM_HOST=thegeary bash scripts/run-kube-bench.sh
 ```
 
-The script uses `kubectl-k8s.sh` under the hood (SSH tunnel + podman
+The script uses `scripts/kubectl-k8s.sh` under the hood (SSH tunnel + podman
 kubectl, no local kubectl install required).
 
 What it does:
@@ -77,8 +77,8 @@ KVM_HOST=thegeary bash scripts/run-kube-bench.sh > scripts/kube-bench-baseline.t
 | `KUBE_BENCH_TIMEOUT` | `5m`                 | `kubectl wait` budget per Job.           |
 | `KUBE_BENCH_NS`      | `default`            | Namespace to run the Jobs in.            |
 | `KUBE_BENCH_TARGETS` | `master node`        | Space-separated subset of `{master, node}`. Skip a half if you only want one. |
-| `KUBECTL`            | `./kubectl-k8s.sh`   | Override if you have a local kubectl.    |
-| `KVM_HOST`           | (none)               | Required by `kubectl-k8s.sh`. See `config.example.sh`. |
+| `KUBECTL`            | `scripts/kubectl-k8s.sh` | Override if you have a local kubectl.    |
+| `KVM_HOST`           | (none)               | Required by `scripts/kubectl-k8s.sh`. See `config.example.sh`. |
 
 ## How to read the output
 
@@ -118,8 +118,8 @@ cluster state, kept in the repo so that:
 - Future runs can be diffed against it (`diff baseline.txt
   <(bash scripts/run-kube-bench.sh)`) to spot regressions.
 
-When `k8s-init.sh`, the kubeadm config, or any default policy changes,
-rerun the script and refresh the baseline file.
+When `containers/k8s/k8s-init.sh`, the kubeadm config, or any default
+policy changes, rerun the script and refresh the baseline file.
 
 ### Current baseline status (2026-05-22)
 
@@ -173,5 +173,5 @@ check is irrelevant"; let the operator triage.
   don't currently verify its signature (cf. #5). Worth keeping in mind
   when interpreting the baseline.
 - Results depend on the cluster's actual config, **not** on the bootc
-  image alone. A VM still running an older `k8s-init.sh` will produce
+  image alone. A VM still running an older `containers/k8s/k8s-init.sh` will produce
   a different baseline than one rebuilt against current `main`.

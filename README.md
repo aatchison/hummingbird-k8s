@@ -53,29 +53,34 @@ On a freshly-set-up KVM host (libvirtd running, `qemu:///system` reachable,
 
 ```bash
 make help                      # cheatsheet of all targets
+sudo make k3s                  # build + define hummingbird-k3s VM
 sudo make k8s                  # build + define hummingbird-k8s control plane
-sudo make workers COUNT=2      # build worker image and spawn 2 workers
+sudo make workers COUNT=2      # spawn 2 workers (depends on k8s being up)
 make verify-all                # encryption + hardening + app-deploy smoke test
 ```
 
-For the k3s single-node flavor, `sudo make k3s`. The underlying `*.sh` scripts
-still work for advanced operators; see [`docs/makefile.md`](docs/makefile.md)
-for the full target list and honored env vars.
+The Makefile is the operator entry point — every recipe delegates to a script
+under [`scripts/`](scripts/). Run `make help` for the full target list. Direct
+script invocations still work (`sudo bash scripts/redo-k8s.sh`); see
+[`docs/makefile.md`](docs/makefile.md) for honored env vars.
 
 From a client machine with `KVM_HOST` pointed at the KVM host SSH alias:
 
 ```bash
-./kubectl-k8s.sh get nodes
+make nodes
+# or, for arbitrary kubectl:
+make kubectl ARGS='get pods -A'
 ```
 
-`kubectl-k8s.sh` opens an SSH tunnel to the CP's apiserver on `127.0.0.1:6443`
-and runs `kubectl` in a container against the fetched admin kubeconfig.
+`scripts/kubectl-k8s.sh` opens an SSH tunnel to the CP's apiserver on
+`127.0.0.1:6443` and runs `kubectl` in a container against the fetched
+admin kubeconfig.
 
 ## Configuration
 
 Per-host overrides live in `config.local.sh` (gitignored). Copy
 [`config.example.sh`](config.example.sh) to start. Variables are sourced by
-the `build-*.sh` and `define-vm*.sh` scripts.
+the `scripts/build-*.sh` and `scripts/define-vm*.sh` scripts.
 
 | Variable | Default | Controls | Override when |
 | --- | --- | --- | --- |
@@ -135,12 +140,27 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/worker-tokens.md`](docs/worker-tokens.md) — short-TTL, per-VM kubeadm join tokens.
 - [`docs/self-hosted-runner.md`](docs/self-hosted-runner.md) — register a KVM-capable GitHub Actions runner.
 - [`docs/auto-updates.md`](docs/auto-updates.md) — bootc auto-update timer behavior.
-- [`docs/security-hardening.md`](docs/security-hardening.md) — PodSecurity restricted + apiserver audit + kubelet protect-kernel-defaults; run `scripts/verify-hardening.sh` after each redeploy.
+- [`docs/security-hardening.md`](docs/security-hardening.md) — PodSecurity restricted + apiserver audit + kubelet protect-kernel-defaults; run `make verify-hardening` (or `scripts/verify-hardening.sh`) after each redeploy.
 - [`docs/app-deploy-verify.md`](docs/app-deploy-verify.md) — end-to-end smoke test of a PSA-restricted nginx deploy + pod-to-pod networking.
 - [`docs/cilium-migration.md`](docs/cilium-migration.md) — Cilium CNI (NetworkPolicy enforcement, eBPF datapath).
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.
+
+## Repo layout
+
+```
+containers/<flavor>/   per-flavor Containerfile + first-boot scripts
+                       (k3s, k8s, k8s-worker). Shared in-image assets
+                       under containers/shared/.
+scripts/               every driver script (build, define, redo, spawn,
+                       kubectl wrapper, verifiers, kube-bench).
+lib/                   build-common.sh — sourced by scripts/build-*.sh.
+docs/                  day-2 docs (image verification, hardening, etc.).
+references/            external materials referenced by docs.
+Makefile               canonical operator entry point; all targets call
+                       scripts/. `make help` lists them.
+```
 
 ## License
 

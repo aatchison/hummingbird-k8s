@@ -20,7 +20,7 @@ The runner machine must already be a working KVM host for this project:
   and `virsh -c qemu:///system list` works without sudo.
 - `podman` installed (used to build the bootc images).
 - The operator's SSH public key is in the host's authorized list (see
-  `etc/ssh/`).
+  `containers/shared/ssh/`).
 - `curl`, `jq`, `tar`, `sudo`, and `gh` on `PATH`.
 - `gh auth status` is logged in as a user with `repo` scope on
   `aatchison/hummingbird-k8s` (needed to mint a runner registration token).

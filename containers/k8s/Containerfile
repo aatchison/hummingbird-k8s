@@ -6,7 +6,7 @@ ARG APISERVER_EXTRA_SANS=127.0.0.1,localhost
 
 # Drop in the sshd config early so changes here don't bust the (much bigger)
 # package-install layer cache below.
-COPY etc/ssh/sshd_config.d/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
+COPY containers/shared/ssh/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
 
 # Hummingbird's curated repo doesn't carry the standard k8s deps (iptables, socat,
 # conntrack-tools, ethtool). Add Fedora Rawhide as a secondary source — Hummingbird
@@ -46,7 +46,7 @@ RUN mkdir -p /etc/hummingbird \
       > /etc/hummingbird/k8s-init.env
 
 # First-boot script: kubeadm init + flannel + untaint, then mark complete.
-COPY k8s-init.sh /usr/libexec/k8s-init.sh
+COPY containers/k8s/k8s-init.sh /usr/libexec/k8s-init.sh
 RUN chmod +x /usr/libexec/k8s-init.sh
 
 # Ship the etcd encryption verifier in the image so the deploy verifier can
@@ -55,17 +55,17 @@ RUN chmod +x /usr/libexec/k8s-init.sh
 COPY scripts/verify-encryption.sh /usr/libexec/verify-encryption.sh
 RUN chmod +x /usr/libexec/verify-encryption.sh
 
-COPY k8s-init.service /etc/systemd/system/k8s-init.service
+COPY containers/k8s/k8s-init.service /etc/systemd/system/k8s-init.service
 
 # Hummingbird ships a 99-default-disable.preset that strips unenabled symlinks
 # during image build. Override with a low-numbered preset that wins.
-COPY 10-k8s.preset /usr/lib/systemd/system-preset/10-k8s.preset
+COPY containers/k8s/10-k8s.preset /usr/lib/systemd/system-preset/10-k8s.preset
 RUN systemctl preset crio.service kubelet.service k8s-init.service || true
 
 # Security hardening config files (PodSecurity Admission + apiserver audit policy).
 # Read-only references mounted into the apiserver static pod by k8s-init.sh.
-COPY etc/kubernetes/admission-control-config.yaml /etc/kubernetes/admission-control-config.yaml
-COPY etc/kubernetes/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
+COPY containers/shared/kubernetes/admission-control-config.yaml /etc/kubernetes/admission-control-config.yaml
+COPY containers/shared/kubernetes/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
 
 # cilium-cli (single binary) used by k8s-init.sh to install Cilium CNI on first boot.
 ARG CILIUM_CLI_VERSION=v0.16.16

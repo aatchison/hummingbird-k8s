@@ -53,13 +53,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Resolve the canonical Containerfile path from the Makefile so the
+      # build-* workflows track repo layout changes via a single source.
+      - name: Resolve Containerfile path from Makefile
+        id: cf
+        run: echo "path=$(make -s print-containerfile-k3s)" >> "$GITHUB_OUTPUT"
+
       - name: Build
         id: build
         uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
         with:
           image: hummingbird-k3s
           tags: ${{ steps.v.outputs.version }} latest
-          containerfiles: Containerfile.k3s
+          containerfiles: ${{ steps.cf.outputs.path }}
           context: .
 
       - name: Push to GHCR

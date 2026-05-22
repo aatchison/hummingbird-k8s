@@ -29,7 +29,7 @@
 #   KUBECTL=kubectl bash scripts/run-kube-bench.sh
 #
 # Env:
-#   KUBECTL              — kubectl command to use. Default: ./kubectl-k8s.sh
+#   KUBECTL              — kubectl command to use. Default: scripts/kubectl-k8s.sh
 #                          (the SSH-tunnel-through-KVM-host wrapper).
 #   KUBE_BENCH_VERSION   — kube-bench release tag. Default: v0.15.5.
 #   KUBE_BENCH_TIMEOUT   — `kubectl wait` timeout. Default: 5m.
@@ -52,7 +52,7 @@ REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 : "${KUBE_BENCH_TIMEOUT:=5m}"
 : "${KUBE_BENCH_NS:=default}"
 : "${KUBE_BENCH_TARGETS:=master node}"
-: "${KUBECTL:=${REPO_ROOT}/kubectl-k8s.sh}"
+: "${KUBECTL:=${REPO_ROOT}/scripts/kubectl-k8s.sh}"
 
 BASE_URL="https://raw.githubusercontent.com/aquasecurity/kube-bench/${KUBE_BENCH_VERSION}"
 

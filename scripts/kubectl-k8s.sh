@@ -10,7 +10,7 @@
 #   VM_NAME       — libvirt domain of the control plane (default: hummingbird-k8s)
 set -euo pipefail
 
-_KK_REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+_KK_REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 if [[ -r "${_KK_REPO_ROOT}/config.local.sh" ]]; then
   # shellcheck disable=SC1091
   source "${_KK_REPO_ROOT}/config.local.sh"
