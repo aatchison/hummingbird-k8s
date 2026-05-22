@@ -45,8 +45,9 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # Third-party actions pinned to commit SHAs (bump via Renovate/Dependabot).
       - name: Log in to GHCR
-        uses: redhat-actions/podman-login@v1
+        uses: redhat-actions/podman-login@4934294ad0449894bcd1e9f191899d7292469603 # v1.7
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -54,7 +55,7 @@ jobs:
 
       - name: Build
         id: build
-        uses: redhat-actions/buildah-build@v2
+        uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
         with:
           image: hummingbird-k8s
           tags: ${{ steps.v.outputs.version }} latest
@@ -63,15 +64,18 @@ jobs:
 
       - name: Push to GHCR
         id: push
-        uses: redhat-actions/push-to-registry@v2
+        uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2.8
         with:
           image: ${{ steps.build.outputs.image }}
           tags: ${{ steps.build.outputs.tags }}
           registry: ghcr.io/${{ github.repository_owner }}
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
+      # Signing is by digest, which covers the single-arch (amd64) image
+      # produced here. If multi-arch builds are added later, both the manifest
+      # index AND each per-arch child manifest must be signed.
       - name: Sign image with cosign (keyless, OIDC)
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s
