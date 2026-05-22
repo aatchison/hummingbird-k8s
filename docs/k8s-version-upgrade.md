@@ -33,10 +33,14 @@ Before any upgrade, regardless of path:
 - **Audit workload manifests.** Confirm every workload sets
   `imagePullPolicy` and resource `requests`/`limits` explicitly — defaults
   can shift across K8s minors and silently change scheduling behavior.
-- **Check the Cilium compatibility matrix.** Hummingbird currently ships
-  Cilium 1.16.x, which supports K8s 1.27–1.32. A `v1.31` → `v1.32` bump is
-  safe; a `v1.32` → `v1.33` bump requires Cilium 1.17+ — bump Cilium first
-  in a separate PR. See [`docs/cilium-migration.md`](cilium-migration.md).
+- **Check the Cilium compatibility matrix.** Each K8s minor is only
+  supported by a specific Cilium version window. Consult the upstream
+  matrix at <https://docs.cilium.io/en/stable/network/kubernetes/compatibility/>
+  for the current Cilium release Hummingbird ships (see
+  [`containers/k8s/k8s-init.sh`](../containers/k8s/k8s-init.sh) for the
+  pinned version) before any K8s bump. If the target K8s minor falls
+  outside that window, bump Cilium first in a separate PR. See
+  [`docs/cilium-migration.md`](cilium-migration.md).
 - **Read the upstream changelog.** Removed/graduated APIs (`storage.k8s.io`,
   `flowcontrol.apiserver.k8s.io`, `policy/v1beta1`-style deprecations) bite
   hardest on minor bumps.
@@ -63,6 +67,46 @@ This is the path Hummingbird is built around: VMs are cattle, not pets.
 This skips the `kubeadm upgrade` dance entirely. Clean-slate VMs are
 simpler than in-place upgrades for a homelab, and the etcd snapshot taken in
 pre-flight is the safety net if a workload needs to be re-hydrated.
+
+### Fallback / rollback procedure
+
+If the rebuilt CP fails to come up healthy, or workloads fail to reconcile
+after redeploy, follow this ordered procedure to get back to the prior
+known-good state.
+
+Triggers (any of):
+
+- `kubectl get --raw=/readyz` from the host doesn't return `ok` within
+  10 minutes of CP boot.
+- Apiserver / etcd / controller-manager / scheduler static pods in
+  `CrashLoopBackOff`.
+- Workload data missing (PVs, configmaps, secrets not present after
+  reconcile).
+
+Steps:
+
+1. **Re-pin the previous image.** Boot the prior `hummingbird-k8s:vX.Y.Z`
+   tag into the CP VM:
+
+   ```bash
+   sudo bootc switch ghcr.io/aatchison/hummingbird-k8s:vX.Y.Z-prev
+   sudo systemctl reboot
+   ```
+
+   This restores the old K8s-version binaries + static-pod manifests. See
+   [`docs/rollback.md`](rollback.md) for the bootc rollback flow (including
+   `bootc rollback` if the previous deployment is still on disk).
+2. **Restore etcd from the pre-flight snapshot.** On the CP, run
+   `etcdctl snapshot restore` against the snapshot taken in pre-flight, then
+   restart the static apiserver/etcd pods. Full procedure in
+   [`docs/backup-restore.md`](backup-restore.md).
+3. **Re-roll the workers.** Workers are stateless — destroy + recreate the
+   worker VMs from the previous-tag worker image so their kubelet matches
+   the rolled-back CP minor.
+4. **Re-tag.** Once the cluster is healthy on the previous image, mark the
+   failed Hummingbird release as yanked (GitHub release → "Set as
+   pre-release") and open an issue describing the failure mode before
+   retrying the upgrade.
 
 ## In-place upgrade path (advanced; not currently automated)
 
