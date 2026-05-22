@@ -34,6 +34,8 @@ COPY worker-init.service /etc/systemd/system/worker-init.service
 COPY 10-k8s-worker.preset /usr/lib/systemd/system-preset/10-k8s-worker.preset
 RUN systemctl preset crio.service kubelet.service worker-init.service || true
 
+COPY etc/ssh/sshd_config.d/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
+
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s
 LABEL org.opencontainers.image.description="Fedora Hummingbird bootc worker that auto-joins the hummingbird-k8s cluster"

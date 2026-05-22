@@ -3,9 +3,13 @@
 #
 # Environment variables (all optional, sensible defaults):
 #   VM_USER           — Username of the initial account in the guest (default: core)
-#   VM_USER_GROUPS    — Comma-separated groups for that user (default: wheel)
+#   VM_USER_GROUPS    — Comma-separated groups for that user (default: empty — no wheel
+#                       membership, no sudo. Set to "wheel" to opt back in.)
 #   VM_PASSWORD       — Plaintext password for the initial user (default: unset = no password,
 #                       key-only auth). Hashed with `openssl passwd -6` before embedding.
+#   ENABLE_ROOT_SSH   — If "1" (default), bake the same pubkeys into root's authorized_keys
+#                       and rely on PermitRootLogin=prohibit-password (set in the Containerfile)
+#                       for admin access. Set to "0" to disable.
 #   SSH_PUBKEY_FILES  — Colon-separated list of pubkey files to bake into authorized_keys.
 #                       Default: ~/.ssh/id_ed25519.pub of the SUDO_USER.
 #   POOL_DIR          — libvirt storage pool target directory.
@@ -25,7 +29,8 @@ if [[ -r "${_HC_REPO_ROOT}/config.local.sh" ]]; then
 fi
 
 : "${VM_USER:=core}"
-: "${VM_USER_GROUPS:=wheel}"
+: "${VM_USER_GROUPS:=}"
+: "${ENABLE_ROOT_SSH:=1}"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
 : "${BASE_IMAGE:=quay.io/hummingbird-community/bootc-os:latest}"
 : "${BIB:=quay.io/centos-bootc/bootc-image-builder:latest}"
@@ -57,21 +62,33 @@ ssh_pubkey_blob() {
   done < <(ssh_pubkey_files)
 }
 
-# Print a TOML bib-config.toml on stdout. Honors VM_PASSWORD (if set) and VM_USER_GROUPS.
-render_bib_config() {
-  local keys groups pw_line=''
+# Render a single [[customizations.user]] block. $1 = username, $2 = include password (0/1).
+_render_user_block() {
+  local name="$1" want_pw="$2" keys groups
   keys="$(ssh_pubkey_blob)"
-  if [[ -n "${VM_PASSWORD:-}" ]]; then
-    pw_line=$(printf 'password = "%s"\n' "$(openssl passwd -6 "$VM_PASSWORD")")
-  fi
-  # groups TOML array literal
-  groups="[$(awk -v RS=, '{printf "%s\"%s\"", (NR>1?", ":""), $0}' <<<"$VM_USER_GROUPS")]"
 
   printf '[[customizations.user]]\n'
-  printf 'name = "%s"\n' "$VM_USER"
-  [[ -n "$pw_line" ]] && printf '%s' "$pw_line"
-  printf 'groups = %s\n' "$groups"
+  printf 'name = "%s"\n' "$name"
+  if [[ "$want_pw" = 1 && -n "${VM_PASSWORD:-}" ]]; then
+    printf 'password = "%s"\n' "$(openssl passwd -6 "$VM_PASSWORD")"
+  fi
+  if [[ -n "$VM_USER_GROUPS" && "$name" != "root" ]]; then
+    # comma-separated → TOML array of quoted strings
+    local groups
+    groups="[$(awk -v RS=, '{printf "%s\"%s\"", (NR>1?", ":""), $0}' <<<"$VM_USER_GROUPS")]"
+    printf 'groups = %s\n' "$groups"
+  fi
   printf 'key = """%s"""\n' "$keys"
+}
+
+# Print a complete bib-config.toml on stdout. Always includes the VM_USER; also
+# includes root if ENABLE_ROOT_SSH=1, sharing the same pubkeys.
+render_bib_config() {
+  _render_user_block "$VM_USER" 1
+  if [[ "$ENABLE_ROOT_SSH" = 1 ]]; then
+    printf '\n'
+    _render_user_block root 0
+  fi
 }
 
 # Run bib to turn a local OCI image into a qcow2 under $POOL_DIR/$NAME.qcow2

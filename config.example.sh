@@ -3,8 +3,11 @@
 
 # Initial user account inside the VM.
 # export VM_USER=core
-# export VM_USER_GROUPS=wheel
-# export VM_PASSWORD=changeme     # omit to disable password (SSH-key-only)
+# export VM_USER_GROUPS=                # empty = no sudo via wheel (default)
+                                        # set "wheel" if you want the user able to sudo
+# export VM_PASSWORD=                   # empty = SSH-key-only auth (default; recommended)
+# export ENABLE_ROOT_SSH=1              # bake same pubkeys into root@; PermitRootLogin
+                                        # prohibit-password drop-in is in the image already
 
 # Pubkey files to embed. Colon-separated.
 # export SSH_PUBKEY_FILES=~/.ssh/id_ed25519.pub:~/.ssh/id_rsa.pub

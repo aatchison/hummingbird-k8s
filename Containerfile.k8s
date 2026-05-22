@@ -48,6 +48,8 @@ COPY k8s-init.service /etc/systemd/system/k8s-init.service
 COPY 10-k8s.preset /usr/lib/systemd/system-preset/10-k8s.preset
 RUN systemctl preset crio.service kubelet.service k8s-init.service || true
 
+COPY etc/ssh/sshd_config.d/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
+
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s
 LABEL org.opencontainers.image.description="Fedora Hummingbird bootc image with upstream Kubernetes (kubelet/kubeadm/cri-o), control plane"
