@@ -243,3 +243,79 @@ the recovery path (`kubeadm reset` + remove generated YAML) deletes
 **not** remove the bake-in image files
 (`admission-control-config.yaml`, `audit-policy.yaml`) — they live in
 the read-only image layer and survive untouched.
+
+## Cluster-wide policies
+
+After `kubeadm init` and the Cilium install, `k8s-init.sh` applies three
+additional manifests that establish a baseline in-cluster posture. The
+manifests are baked into the image at build time (so first-boot does
+not depend on reachability to upstream registries) and applied with
+`kubectl apply` on the admin kubeconfig.
+
+| Control | Manifest | Closes |
+|---|---|---|
+| metrics-server v0.7.2 (kubectl top) | `containers/shared/kubernetes/metrics-server.yaml` | #73 |
+| Default-ns `LimitRange` + `ResourceQuota` | `containers/shared/kubernetes/default-ns-quota.yaml` | #87 |
+| `default` SA in `default` ns: `automountServiceAccountToken: false` | `containers/shared/kubernetes/restrict-sa-token-mount.yaml` | #84 |
+
+### metrics-server (closes #73)
+
+The upstream `components.yaml` for v0.7.2 is vendored into the repo with
+one local patch: `--kubelet-insecure-tls` is appended to the Deployment's
+container args. The kubelet's serving cert is signed by the cluster's
+own CA, which metrics-server does not trust by default; we accept that
+on a single-node lab cluster rather than wire up a cert-rotation flow.
+
+Verify:
+
+```bash
+kubectl top nodes
+```
+
+A non-empty table (CPU and memory columns populated) means metrics-server
+is scraping the kubelet and the API aggregator path is healthy. If you
+see `error: Metrics API not available`, wait ~30s and retry —
+metrics-server needs one scrape interval before it can answer.
+
+### Default-namespace LimitRange + ResourceQuota (closes #87)
+
+`default-ns-quota.yaml` installs two objects in `default`:
+
+- A `LimitRange` named `defaults` — every Container in the namespace gets
+  a default request (`10m` CPU / `64Mi` memory) and default limit
+  (`500m` / `512Mi`) if the pod spec doesn't set its own. This keeps a
+  forgotten `kubectl run` from getting Best-Effort QoS.
+- A `ResourceQuota` named `caps` — the namespace as a whole is capped at
+  `4`/`8` CPU (requests/limits), `8Gi`/`16Gi` memory, and 50 pods. A
+  runaway controller can't exhaust the node from the default namespace.
+
+Verify:
+
+```bash
+kubectl describe ns default | grep -A3 'Resource Limits\|Resource Quotas'
+```
+
+You should see both the LimitRange's defaults and the ResourceQuota's
+hard caps listed.
+
+### Restrict default SA token mounting (closes #84)
+
+`restrict-sa-token-mount.yaml` patches *only* the `default` ServiceAccount
+in the `default` namespace to opt out of automatic token mounting. Pods
+that don't declare a `serviceAccountName` and don't set
+`automountServiceAccountToken: true` will not get a kube API token
+projected into them. Workloads that legitimately need a token must
+declare a different SA or opt back in explicitly.
+
+This is deliberately scoped to one SA: SAs in other namespaces (including
+all system namespaces) keep their default of `automountServiceAccountToken: true`
+so that controllers and operators that rely on the projected token
+continue to work.
+
+Verify:
+
+```bash
+kubectl get sa default -n default -o jsonpath='{.automountServiceAccountToken}'
+```
+
+Should print `false`.

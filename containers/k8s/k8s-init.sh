@@ -174,4 +174,14 @@ KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
   --wait \
   --wait-duration 5m
 
+echo "applying baseline cluster posture (metrics-server, quotas, SA token restriction)..."
+KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /etc/kubernetes/metrics-server.yaml
+KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /etc/kubernetes/default-ns-quota.yaml
+KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /etc/kubernetes/restrict-sa-token-mount.yaml
+
+# Best-effort wait for metrics-server to become Ready. Don't fail the whole
+# init if it's slow — the deployment is applied and will reconcile.
+KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n kube-system rollout status \
+  deployment/metrics-server --timeout=120s || true
+
 touch "$MARKER"
