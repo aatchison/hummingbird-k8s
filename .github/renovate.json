@@ -1,0 +1,38 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["before 6am on monday"],
+  "labels": ["dependencies", "renovate"],
+  "prConcurrentLimit": 5,
+  "rebaseWhen": "behind-base-branch",
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "matchPackageNames": ["k3s-io/k3s", "kubernetes/kubernetes", "cilium/cilium-cli"],
+      "groupName": "kubernetes-tooling"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": ["^containers/.*/Containerfile$"],
+      "matchStrings": [
+        "ARG CILIUM_CLI_VERSION=(?<currentValue>v[0-9.]+)"
+      ],
+      "depNameTemplate": "cilium/cilium-cli",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["^containers/.*/Containerfile$"],
+      "matchStrings": [
+        "ARG K8S_VERSION=(?<currentValue>v[0-9.]+)"
+      ],
+      "depNameTemplate": "kubernetes/kubernetes",
+      "datasourceTemplate": "github-releases"
+    }
+  ]
+}
