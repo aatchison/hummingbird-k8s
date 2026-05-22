@@ -78,7 +78,7 @@ jobs:
           # buildah tolerates a missing remote (first-time cache miss); no
           # --pull-always so a registry hiccup doesn't break a real publish.
           extra-args: |
-            --cache-from ghcr.io/${{ github.repository_owner }}/hummingbird-k8s:latest
+            --cache-from ghcr.io/${{ github.repository_owner }}/hummingbird-k8s
 
       # Vulnerability scan the locally-built image before push. exit-code=0
       # keeps this report-only for now (future PR can ratchet to fail-on-HIGH).
