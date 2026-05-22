@@ -106,7 +106,7 @@ apiServer:
     - name: audit-policy-file
       value: /etc/kubernetes/audit-policy.yaml
     - name: audit-log-path
-      value: /var/log/k8s-audit.log
+      value: /var/log/kubernetes/k8s-audit.log
     - name: audit-log-maxsize
       value: "100"
     - name: audit-log-maxbackup
@@ -128,8 +128,8 @@ apiServer:
       readOnly: true
       pathType: File
     - name: audit-log
-      hostPath: /var/log
-      mountPath: /var/log
+      hostPath: /var/log/kubernetes
+      mountPath: /var/log/kubernetes
       readOnly: false
       pathType: DirectoryOrCreate
   certSANs:
@@ -153,8 +153,8 @@ install -m 0644 /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.world
 ln -sf /etc/kubernetes/admin.conf.world /etc/profile.d/kubeconfig-symlink-target
 chmod 0644 /etc/kubernetes/admin.conf
 
-# Install flannel CNI
+# CNI: Cilium (quick-install). Replaces flannel — supports NetworkPolicy enforcement (#6).
 KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f \
-  https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+  https://raw.githubusercontent.com/cilium/cilium/main/install/kubernetes/quick-install.yaml
 
 touch "$MARKER"
