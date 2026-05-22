@@ -32,7 +32,7 @@ two flavors of single-node Kubernetes layered into the bootc image.
 
 ## Build pipeline (what actually works)
 
-1. `podman build` a layered OCI image `FROM quay.io/hummingbird-community/bootc-os:latest`, tagged `localhost/hummingbird-<flavor>:latest`.
+1. `podman build` a layered OCI image `FROM quay.io/hummingbird-community/bootc-os@sha256:<digest>` (pinned in each Containerfile and in `lib/build-common.sh`'s `BASE_IMAGE` default), tagged `localhost/hummingbird-<flavor>:latest`.
 2. `bootc-image-builder` converts that local image to a qcow2. Critical flag: pass `--local` so bib reads from local podman storage instead of trying to pull. Bind-mount `/var/lib/containers/storage` so the bib container can see the local image.
 3. Output goes to `/var/lib/libvirt/images/<name>.qcow2`. `chown root:root` + `chmod 0644` so system qemu can read it.
 4. `virsh -c qemu:///system pool-refresh mass2` so libvirt picks up the new volume.

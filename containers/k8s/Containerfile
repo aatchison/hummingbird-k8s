@@ -1,5 +1,12 @@
-FROM quay.io/hummingbird-community/bootc-os:latest
+# Pinned by digest (OCI index, multi-arch) for reproducibility. Bump deliberately;
+# see PR description for the procedure (`skopeo inspect docker://...:latest`).
+FROM quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0f22286fb41c9e00b4f3c9a862696e3bfb84
 
+# K8S_VERSION is the pkgs.k8s.io repo channel (major.minor only — the upstream
+# repo URL doesn't accept a patch version). At build time dnf installs the
+# newest 1.31.x available; the resulting image is reproducible as long as the
+# base digest above is pinned and the upstream repo is content-addressable per
+# build. Bump deliberately (e.g., v1.32) when promoting to a new minor release.
 ARG K8S_VERSION=v1.31
 ARG POD_CIDR=10.244.0.0/16
 ARG APISERVER_EXTRA_SANS=127.0.0.1,localhost
