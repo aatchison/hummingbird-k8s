@@ -7,15 +7,20 @@ two flavors of single-node Kubernetes layered into the bootc image.
 
 | File | Role |
 |---|---|
-| `Containerfile.k3s` / `build.sh` / `define-vm.sh` / `redo.sh` | `hummingbird-k3s` VM (k3s baked in) |
-| `Containerfile.k8s` / `build-k8s.sh` / `define-vm-k8s.sh` / `redo-k8s.sh` | `hummingbird-k8s` VM (upstream kubelet/kubeadm/cri-o, control-plane) |
-| `Containerfile.k8s-worker` / `build-worker.sh` / `spawn-workers.sh` / `redo-workers.sh` | Worker template image + spawner — clones one qcow2 into N VMs, each auto-joins the CP |
-| `k8s-init.sh` / `k8s-init.service` | First-boot `kubeadm init` + Cilium + untaint (CP only) |
-| `worker-init.sh` / `worker-init.service` | First-boot `kubeadm join` against the embedded token (workers only) |
-| `worker-join.env` | Cached kubeadm join command. `build-worker.sh` refreshes it from the running CP at build time. |
+| `containers/k3s/Containerfile` + `containers/k3s/10-k3s.preset` | `hummingbird-k3s` image inputs (k3s baked in) |
+| `containers/k8s/Containerfile` + `k8s-init.sh` / `k8s-init.service` / `10-k8s.preset` | `hummingbird-k8s` image inputs (upstream kubelet/kubeadm/cri-o, control-plane) |
+| `containers/k8s-worker/Containerfile` + `worker-init.sh` / `worker-init.service` / `10-k8s-worker.preset` | Worker template image inputs |
+| `containers/shared/ssh/99-no-passwords.conf` | sshd drop-in COPYd into every flavor |
+| `containers/shared/kubernetes/{admission-control-config,audit-policy}.yaml` | Apiserver hardening configs COPYd into the k8s image |
+| `scripts/build-k3s.sh` / `scripts/define-vm.sh` / `scripts/redo-k3s.sh` | `hummingbird-k3s` build + define + redo |
+| `scripts/build-k8s.sh` / `scripts/define-vm-k8s.sh` / `scripts/redo-k8s.sh` | `hummingbird-k8s` control plane build + define + redo |
+| `scripts/build-worker.sh` / `scripts/spawn-workers.sh` / `scripts/redo-workers.sh` | Worker build + spawner |
+| `scripts/kubectl-k8s.sh` | SSH-tunnel-through-KVM-host kubectl wrapper |
+| `scripts/migrate-to-system.sh` | One-time helper that moved the original VM from `qemu:///session` to system |
+| `Makefile` | Canonical operator entry point — every target wraps a `scripts/` script. `make help` lists them. |
+| `worker-join.env` | Cached kubeadm join command. `spawn-workers.sh` mints one per-VM at qcow2 build time. |
 | `bib-config.toml` | Generated at build time — initial user, SSH keys, hashed sudo password |
-| `migrate-to-system.sh` | One-time helper that moved the original VM from `qemu:///session` to system |
-| `k8s-bootc-talk.transcript.txt` | KubeCon India 2025 talk transcript (Berkus + Kumar) |
+| `references/k8s-bootc-talk.transcript.txt` | KubeCon India 2025 talk transcript (Berkus + Kumar) |
 
 ## Host setup (<kvm-host>)
 
@@ -43,7 +48,7 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 4. `ssh -fNL 6443:<vm-ip>:6443 <kvm-host>`.
 5. `podman run --rm --net=host -v /tmp/k8s-kubeconfig:/kc:ro,Z -e KUBECONFIG=/kc docker.io/bitnami/kubectl:latest get nodes`.
 
-`./kubectl-k8s.sh <args>` wraps all of this — auto-discovers the VM IP, sets up the tunnel if missing, runs kubectl in a container with the right kubeconfig.
+`./scripts/kubectl-k8s.sh <args>` (or `make kubectl ARGS='<args>'`) wraps all of this — auto-discovers the VM IP, sets up the tunnel if missing, runs kubectl in a container with the right kubeconfig.
 
 ## Gotchas hit along the way
 
@@ -79,12 +84,12 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 
 ## Two install styles
 
-### k3s (`Containerfile.k3s`)
+### k3s (`containers/k3s/Containerfile`)
 - Upstream installer drops single `/usr/bin/k3s` binary + systemd unit.
 - Cluster up in ~10s after boot. CNI = flannel (k3s default), ingress = traefik, storage = local-path — all auto-deployed.
 - Best fit for "single node with containers."
 
-### Upstream kubeadm (`Containerfile.k8s`)
+### Upstream kubeadm (`containers/k8s/Containerfile`)
 - Adds Fedora Rawhide as a secondary repo (Hummingbird's curated set lacks `iptables-nft`, `socat`, `conntrack-tools`, `ethtool`).
 - Adds `pkgs.k8s.io` RPM repos for `core` (kubelet/kubeadm/kubectl) and `addons:cri-o`.
 - Pre-creates `/usr/libexec/kubernetes/kubelet-plugins/volume/exec` so kube-controller-manager doesn't fail on read-only `/usr`.
@@ -115,11 +120,17 @@ Both base on `quay.io/fedora/fedora-bootc:43` rather than Hummingbird, since Hum
 # Find a VM's IP
 sudo virsh -c qemu:///system net-dhcp-leases default | grep <vm-name>
 
-# Force rebuild + redefine
-sudo bash ~/hummingbird-k8s/redo.sh                 # k3s
-sudo bash ~/hummingbird-k8s/redo-k8s.sh             # upstream k8s control-plane
-sudo bash ~/hummingbird-k8s/redo-workers.sh 2       # wipe + build + spawn N workers
-sudo bash ~/hummingbird-k8s/spawn-workers.sh 3      # spawn N more workers from the existing template
+# Force rebuild + redefine (via Makefile)
+sudo make -C ~/hummingbird-k8s k3s                 # k3s
+sudo make -C ~/hummingbird-k8s k8s                 # upstream k8s control-plane
+sudo make -C ~/hummingbird-k8s workers COUNT=2     # wipe + build + spawn N workers
+sudo make -C ~/hummingbird-k8s spawn COUNT=3       # spawn N more workers from the existing template
+
+# Direct script invocation still works:
+sudo bash ~/hummingbird-k8s/scripts/redo-k3s.sh
+sudo bash ~/hummingbird-k8s/scripts/redo-k8s.sh
+sudo bash ~/hummingbird-k8s/scripts/redo-workers.sh 2
+sudo bash ~/hummingbird-k8s/scripts/spawn-workers.sh 3
 
 # Enable bootc auto-update timer at runtime
 sudo systemctl enable --now bootc-fetch-apply-updates.timer

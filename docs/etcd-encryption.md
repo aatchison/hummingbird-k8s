@@ -37,7 +37,7 @@ ssh root@<cp> /usr/libexec/verify-encryption.sh
 
 No `scp` from the host repo is needed — the script ships with every
 redeploy. The source of truth still lives at `scripts/verify-encryption.sh`
-in this repo; `Containerfile.k8s` copies it into the image at build time.
+in this repo; `containers/k8s/Containerfile` copies it into the image at build time.
 
 The script reads the probe Secret back out of etcd to confirm the
 on-disk envelope. It tries, in order:

@@ -23,16 +23,18 @@ On the CP host (kubectl on `PATH`, kubeconfig at the default location):
 
 ```bash
 ./scripts/verify-app-deploy.sh
+# or, via the Makefile:
+make verify-app-deploy
 ```
 
 From a client laptop via the tunnel:
 
 ```bash
-KUBECTL=./kubectl-k8s.sh ./scripts/verify-app-deploy.sh
+KUBECTL=./scripts/kubectl-k8s.sh ./scripts/verify-app-deploy.sh
 ```
 
 The script honors `KUBECTL` (default: `kubectl`) so it can be routed
-through `kubectl-k8s.sh` or any other wrapper.
+through `scripts/kubectl-k8s.sh` or any other wrapper.
 
 ## Expected output
 

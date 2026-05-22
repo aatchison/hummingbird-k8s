@@ -72,7 +72,7 @@ The kubelet is started with `--protect-kernel-defaults=true` via
 set, the kubelet refuses to *modify* kernel parameters at runtime — it
 will only start if the host already has the values it expects.
 
-`Containerfile.k8s` therefore pre-sets the relevant sysctls in
+`containers/k8s/Containerfile` therefore pre-sets the relevant sysctls in
 `/etc/sysctl.d/k8s.conf`:
 
 ```
@@ -92,10 +92,10 @@ sysctl values have drifted from these — `sysctl --system` to reapply.
 
 | Path inside image | Source in repo |
 |---|---|
-| `/etc/kubernetes/admission-control-config.yaml` | `etc/kubernetes/admission-control-config.yaml` |
-| `/etc/kubernetes/audit-policy.yaml` | `etc/kubernetes/audit-policy.yaml` |
-| `/etc/sysctl.d/k8s.conf` | inline in `Containerfile.k8s` |
-| `/etc/kubernetes/kubeadm-init.yaml` | generated at first boot by `k8s-init.sh` |
+| `/etc/kubernetes/admission-control-config.yaml` | `containers/shared/kubernetes/admission-control-config.yaml` |
+| `/etc/kubernetes/audit-policy.yaml` | `containers/shared/kubernetes/audit-policy.yaml` |
+| `/etc/sysctl.d/k8s.conf` | inline in `containers/k8s/Containerfile` |
+| `/etc/kubernetes/kubeadm-init.yaml` | generated at first boot by `containers/k8s/k8s-init.sh` |
 
 All three files baked into the image are read-only references; the
 apiserver static pod mounts them via `extraVolumes` in

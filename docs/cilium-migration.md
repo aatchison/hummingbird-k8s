@@ -33,9 +33,9 @@ Cilium replaces flannel as the CNI and brings:
 
 This rolls in #6 (CNI swap) and #50 (audit log mount scope) together
 because both edit the same kubeadm `extraVolumes` region of
-`k8s-init.sh`.
+`containers/k8s/k8s-init.sh` (referred to as `k8s-init.sh` below).
 
-### `k8s-init.sh`
+### `containers/k8s/k8s-init.sh`
 
 - The flannel install step:
   ```bash
@@ -59,7 +59,7 @@ because both edit the same kubeadm `extraVolumes` region of
   `pathType: DirectoryOrCreate` is retained so the directory is
   auto-created on first boot.
 
-### `Containerfile.k8s`
+### `containers/k8s/Containerfile`
 
 - The cilium-cli binary is pre-baked into the image at `/usr/bin/cilium`
   via a `curl + tar` extraction from the upstream GitHub release tarball.
@@ -68,7 +68,7 @@ because both edit the same kubeadm `extraVolumes` region of
   first-boot path offline-friendly: it does not need to fetch a CLI
   tarball before installing the CNI.
 
-### `etc/kubernetes/admission-control-config.yaml`
+### `containers/shared/kubernetes/admission-control-config.yaml`
 
 - The `kube-flannel` namespace exemption (it carried the flannel
   daemonset, which runs with elevated privileges incompatible with
@@ -84,7 +84,7 @@ boot.
 How it's installed:
 
 - The `cilium-cli` single static binary is downloaded during
-  `Containerfile.k8s` build (`curl` + `tar -xzf`) and placed at
+  `containers/k8s/Containerfile` build (`curl` + `tar -xzf`) and placed at
   `/usr/bin/cilium`. The version is pinned via the
   `CILIUM_CLI_VERSION` build-arg (default `v0.16.16`).
 - On first boot `k8s-init.sh` calls
@@ -213,7 +213,7 @@ Two versions are pinned independently:
   cluster. The CLI version and the Cilium version do not have to
   move in lockstep.
 
-Bumping either version is a deliberate edit to `Containerfile.k8s` or
+Bumping either version is a deliberate edit to `containers/k8s/Containerfile` or
 `k8s-init.sh`. There is no `latest` / `main` fetch at first boot, so
 two VMs built from the same image are reproducible regardless of when
 they are provisioned.

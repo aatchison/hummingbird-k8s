@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copy to config.local.sh (gitignored) and adjust per-host. Sourced by build-*.sh.
+# Copy to config.local.sh (gitignored) and adjust per-host. Sourced by scripts/build-*.sh.
 
 # Initial user account inside the VM.
 # export VM_USER=core
@@ -28,7 +28,7 @@ export ENABLE_ROOT_SSH=1                # 1 = bake same pubkeys into root@ (defa
 # Add the hostname/IP of any client that will hit the cluster via SSH tunnel.
 # export APISERVER_EXTRA_SANS=127.0.0.1,localhost
 
-# For kubectl-k8s.sh (run from a client): the KVM host SSH alias to tunnel through.
+# For scripts/kubectl-k8s.sh (run from a client): the KVM host SSH alias to tunnel through.
 # export KVM_HOST=kvm.example.com
 
 # ---- Restoring pre-#17 "classic lab" defaults ---------------------------------

@@ -24,7 +24,7 @@ if [[ ! -f "$MARKER" && -f /etc/kubernetes/kubeadm-init.yaml ]]; then
 fi
 
 # Build-time configuration: APISERVER_EXTRA_SANS is baked into /etc/hummingbird/k8s-init.env
-# at image build time (Containerfile.k8s ARG → write env file).
+# at image build time (containers/k8s/Containerfile ARG → write env file).
 if [[ -r /etc/hummingbird/k8s-init.env ]]; then
   # shellcheck disable=SC1091
   source /etc/hummingbird/k8s-init.env
