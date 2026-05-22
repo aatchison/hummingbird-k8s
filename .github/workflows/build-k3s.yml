@@ -10,6 +10,13 @@ on:
         required: true
         type: string
 
+# Serialize tag-driven publishes on the same ref. cancel-in-progress is
+# deliberately false: a real tag push that is mid-publish must finish
+# (sign, attest, etc.) — a second invocation should queue, not pre-empt.
+concurrency:
+  group: build-k3s-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
@@ -67,6 +74,44 @@ jobs:
           tags: ${{ steps.v.outputs.version }} latest
           containerfiles: ${{ steps.cf.outputs.path }}
           context: .
+          # Reuse layers from the previously published :latest when available.
+          # buildah tolerates a missing remote (first-time cache miss); no
+          # --pull-always so a registry hiccup doesn't break a real publish.
+          extra-args: |
+            --cache-from ghcr.io/${{ github.repository_owner }}/hummingbird-k3s:latest
+
+      # Vulnerability scan the locally-built image before push. exit-code=0
+      # keeps this report-only for now (future PR can ratchet to fail-on-HIGH).
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: localhost/hummingbird-k3s:${{ steps.v.outputs.version }}
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57 # v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-hummingbird-k3s
+
+      # Generate an SPDX SBOM of the locally-built image. Uploaded as a
+      # workflow artifact and later cosign-attested against the pushed digest.
+      - name: Generate SBOM with syft
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: localhost/hummingbird-k3s:${{ steps.v.outputs.version }}
+          output-file: sbom-${{ steps.v.outputs.version }}.spdx.json
+          format: spdx-json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-k3s-${{ steps.v.outputs.version }}
+          path: sbom-${{ steps.v.outputs.version }}.spdx.json
 
       - name: Push to GHCR
         id: push
@@ -79,21 +124,46 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
+      # Resolve the pushed image digest once, share it with sign + attest.
+      # Falls back to `podman manifest inspect` if push-to-registry didn't
+      # emit one (older versions / single-tag pushes).
+      - name: Resolve pushed image digest
+        id: digest
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/hummingbird-k3s
+          PUSH_DIGEST: ${{ steps.push.outputs.digest }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          digest="$PUSH_DIGEST"
+          if [ -z "$digest" ]; then
+            echo "push step did not emit a digest; falling back to podman manifest inspect" >&2
+            digest="$(podman manifest inspect --verbose "${IMAGE}:${VERSION}" \
+              | jq -r '.Digest // .digest')"
+          fi
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "could not determine image digest" >&2; exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
       # Signing is by digest, which covers the single-arch (amd64) image
       # produced here. If multi-arch builds are added later, both the manifest
       # index AND each per-arch child manifest must be signed.
       - name: Sign image with cosign (keyless, OIDC)
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/hummingbird-k3s
-          DIGEST: ${{ steps.push.outputs.digest }}
-          VERSION: ${{ steps.v.outputs.version }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
-          if [ -z "$DIGEST" ]; then
-            echo "push step did not emit a digest; falling back to podman manifest inspect" >&2
-            DIGEST="$(podman manifest inspect --verbose "${IMAGE}:${VERSION}" \
-              | jq -r '.Digest // .digest')"
-          fi
-          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
-            echo "could not determine image digest" >&2; exit 1
-          fi
           cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      # Attest the SBOM against the pushed digest so consumers can verify
+      # provenance via `cosign verify-attestation --type spdx`.
+      - name: cosign attest SBOM
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/hummingbird-k3s
+          DIGEST: ${{ steps.digest.outputs.digest }}
+          VERSION: ${{ steps.v.outputs.version }}
+          COSIGN_EXPERIMENTAL: 'true'
+        run: |
+          cosign attest --yes --type spdxjson \
+            --predicate "sbom-${VERSION}.spdx.json" \
+            "${IMAGE}@${DIGEST}"
