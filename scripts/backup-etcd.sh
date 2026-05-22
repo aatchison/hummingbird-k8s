@@ -9,7 +9,18 @@
 # wrapper), then scp the file back.
 #
 # Usage:
-#   scripts/backup-etcd.sh [outdir]    # default outdir: ./backups
+#   scripts/backup-etcd.sh [outdir] [--label <text>]
+#   # default outdir: ./backups
+#
+# Flags:
+#   --label <text>  Append `-<text>` to the snapshot filename so the
+#                   reason for the snapshot is obvious on disk. The
+#                   label is sanitized to [A-Za-z0-9._-]. Example:
+#                     scripts/backup-etcd.sh ~/backups --label pre-cni-swap
+#                     -> ~/backups/etcd-snapshot-20260522T180000Z-pre-cni-swap.db
+#                   See docs/backup-restore.md ("When to snapshot")
+#                   for the high-risk operations that warrant a
+#                   labeled snapshot first.
 #
 # Env:
 #   CP_IP     — CP node IP. Defaults to the InternalIP of the first
@@ -20,15 +31,60 @@
 #               libvirt NAT (the common topology for this repo).
 #
 # Output:
-#   $outdir/etcd-snapshot-<UTC-timestamp>.db
+#   $outdir/etcd-snapshot-<UTC-timestamp>[-<label>].db
 #
 # See docs/backup-restore.md for cadence / restore guidance.
 set -euo pipefail
 
-OUTDIR="${1:-./backups}"
+OUTDIR=""
+LABEL=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --label)
+      [[ $# -ge 2 ]] || { echo "--label requires a value" >&2; exit 2; }
+      LABEL="$2"
+      shift 2
+      ;;
+    --label=*)
+      LABEL="${1#--label=}"
+      shift
+      ;;
+    -h|--help)
+      sed -n '2,30p' "$0"
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown flag: $1" >&2
+      exit 2
+      ;;
+    *)
+      if [[ -z "$OUTDIR" ]]; then
+        OUTDIR="$1"
+        shift
+      else
+        echo "Unexpected positional arg: $1" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
+OUTDIR="${OUTDIR:-./backups}"
 mkdir -p "$OUTDIR"
 TS=$(date -u +%Y%m%dT%H%M%SZ)
-DST="$OUTDIR/etcd-snapshot-$TS.db"
+
+# Sanitize label: keep only [A-Za-z0-9._-]; reject empty post-sanitize.
+SUFFIX=""
+if [[ -n "$LABEL" ]]; then
+  CLEAN_LABEL=$(printf '%s' "$LABEL" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')
+  [[ -n "$CLEAN_LABEL" ]] || { echo "--label resolved to empty after sanitize" >&2; exit 2; }
+  SUFFIX="-$CLEAN_LABEL"
+fi
+DST="$OUTDIR/etcd-snapshot-$TS$SUFFIX.db"
 
 CP_IP="${CP_IP:-$(./scripts/kubectl-k8s.sh get nodes \
   -l node-role.kubernetes.io/control-plane \

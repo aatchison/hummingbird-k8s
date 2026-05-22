@@ -173,11 +173,44 @@ won't start — the `cilium` daemonset will go CrashLoopBackOff with
 
 ### Rollback limitations
 
-`bootc rollback` restores the previous filesystem deployment (the prior
-image's `/usr`, `/etc` baseline, baked-in binaries, etc.) and reboots
-into it. It does **not** roll back cluster state stored in etcd. See
-`docs/rollback.md` for the rollback path itself (manual + auto). After
-a rollback from a Cilium-enabled image to a flannel-era image:
+> **Warning — a CNI swap is one-way without a pre-swap etcd snapshot.**
+> `bootc rollback` restores the previous filesystem deployment (the
+> prior image's `/usr`, `/etc` baseline, baked-in binaries, etc.) and
+> reboots into it. It does **not** roll back cluster state stored in
+> etcd. The CRDs, Deployments, IP allocations, and policy objects that
+> Cilium writes to etcd survive a `bootc rollback` to a flannel-era
+> image. Without an etcd snapshot taken **before** the swap, there is
+> no clean path back to a flannel-only cluster — see issue #95.
+
+**Before swapping the CNI on a live cluster:**
+
+1. Snapshot etcd:
+   `make backup-etcd LABEL=pre-cni-swap`
+   (or `scripts/backup-etcd.sh ~/backups --label pre-cni-swap`).
+   The label makes the snapshot's purpose obvious on disk:
+   `~/backups/etcd-snapshot-20260522T180000Z-pre-cni-swap.db`.
+2. Verify the snapshot integrity:
+   `etcdctl --write-out=table snapshot status <snapshot.db>`
+   (or via the podman-in-place invocation in
+   [`docs/backup-restore.md`](backup-restore.md) if `etcdctl` isn't
+   installed locally).
+3. Off-host the snapshot — copy it to a different host before
+   proceeding, so a `bootc rollback` that wipes the CP's working
+   directory doesn't also lose the backup.
+4. Apply the CNI swap (rebuild the image with the Cilium change,
+   redeploy the CP).
+5. If the swap breaks workloads: `bootc rollback` + reboot the CP
+   into the pre-swap image, then restore via
+   `scripts/restore-etcd.sh <snapshot.db>` to return the cluster to
+   its pre-swap state.
+
+See [`docs/backup-restore.md#when-to-snapshot`](backup-restore.md#when-to-snapshot)
+for the broader list of high-risk operations (CNI swaps, k8s upgrades,
+bulk CRD changes, etc.) that warrant a labeled snapshot first.
+
+See `docs/rollback.md` for the rollback path itself (manual + auto).
+After a rollback from a Cilium-enabled image to a flannel-era image
+**without** a pre-swap snapshot:
 
 - Cilium CRDs installed at first boot (e.g. `CiliumNetworkPolicy`,
   `CiliumEndpoint`, `CiliumIdentity`, …) remain registered with the
@@ -191,17 +224,24 @@ The result is a cluster with a flannel-era binary surface but Cilium
 detritus in etcd — both CNIs nominally trying to manage the same
 podCIDR. This is not a clean state.
 
-Recommended approach if a rollback across the CNI swap is needed:
+Recommended approach if a rollback across the CNI swap is needed
+(the canonical path; the numbered procedure above is the same):
 
-1. Before upgrading, take an etcd snapshot of the pre-Cilium cluster
-   (`etcdctl snapshot save`) and stash it off the VM.
+1. Before upgrading, take a **labeled** etcd snapshot of the
+   pre-Cilium cluster
+   (`make backup-etcd LABEL=pre-cni-swap` or
+   `scripts/backup-etcd.sh ~/backups --label pre-cni-swap`)
+   and stash it off the VM.
 2. If a rollback becomes necessary, `bootc rollback` + reboot, then
-   restore the snapshot into the rolled-back image's etcd before any
-   workloads come up.
+   restore the snapshot into the rolled-back image's etcd via
+   `scripts/restore-etcd.sh <snapshot.db>` before any workloads come
+   up.
 
-Automating snapshot-and-restore is out of scope for this image. In
-practice, the simpler path for a lab cluster is to rebuild from the
-old image rather than attempt a CNI-crossing rollback.
+For a lab cluster the simpler path is often to rebuild from the old
+image rather than attempt a CNI-crossing rollback — but that still
+loses any workload state created after the swap. The labeled
+snapshot above is the only way to preserve that state across the
+rollback.
 
 ### Version pinning is explicit
 
