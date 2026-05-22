@@ -20,8 +20,18 @@
 
 SHELL := /usr/bin/env bash
 
+# ---- Worker count knob (#96) -------------------------------------------
 # Number of workers spawn / re-spawn targets should create. Override on
-# the command line: `sudo make workers COUNT=3`.
+# the command line: `sudo make workers COUNT=3`. Threads through:
+#   make workers COUNT=N
+#     -> bash scripts/redo-workers.sh N
+#       -> bash scripts/spawn-workers.sh N
+#         -> for i in 1..N: virt-install hummingbird-k8s-worker-${i}
+# Same chain applies to `make spawn COUNT=N`, which skips the template
+# rebuild and only spawns additional workers.
+#
+# Per-worker memory / vCPUs are knobbed separately via WORKER_MEMORY /
+# WORKER_VCPUS env vars — see config.example.sh.
 COUNT ?= 2
 
 # Mirror the LOCAL_IMAGE names build-*.sh use, so image-* targets agree
