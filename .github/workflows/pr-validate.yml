@@ -17,7 +17,10 @@ jobs:
       - name: Run shellcheck (errors fail; warnings printed)
         run: |
           shopt -s nullglob
-          files=( *.sh )
+          # All shell lives under scripts/, lib/, and the in-image init
+          # scripts under containers/<flavor>/. Pick them up by glob so
+          # adding a new flavor automatically gets coverage.
+          files=( scripts/*.sh lib/*.sh containers/*/*.sh )
           [ ${#files[@]} -eq 0 ] && { echo "No shell scripts found."; exit 0; }
           # Show all findings for visibility, then fail only on errors.
           shellcheck --severity=warning "${files[@]}" || true
@@ -31,7 +34,8 @@ jobs:
         run: |
           shopt -s nullglob
           rc=0
-          for f in Containerfile*; do
+          # Per-flavor Containerfiles live under containers/<flavor>/.
+          for f in containers/*/Containerfile; do
             echo "::group::hadolint $f"
             docker run --rm -i hadolint/hadolint:latest hadolint --failure-threshold error - < "$f" || rc=$?
             echo "::endgroup::"
@@ -78,13 +82,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        flavor:
-          - { name: k3s,        containerfile: Containerfile.k3s }
-          - { name: k8s,        containerfile: Containerfile.k8s }
-          - { name: k8s-worker, containerfile: Containerfile.k8s-worker }
+        flavor: [k3s, k8s, k8s-worker]
     steps:
       - uses: actions/checkout@v4
-      - name: Build OCI image (no push) — ${{ matrix.flavor.name }}
+      - name: Build OCI image (no push) — ${{ matrix.flavor }}
         run: |
           # worker image references worker-join.env via COPY — synthesize a stub
           # so the build can validate the Containerfile without a live CP.
@@ -93,4 +94,9 @@ jobs:
               > worker-join.env
           fi
           mkdir -p /etc/hummingbird || true
-          podman build -t local/${{ matrix.flavor.name }}:ci -f ${{ matrix.flavor.containerfile }} .
+          # Build via the Makefile target so CI and operator share one path.
+          case "${{ matrix.flavor }}" in
+            k3s)        make image-k3s ;;
+            k8s)        make image-k8s ;;
+            k8s-worker) make image-worker ;;
+          esac
