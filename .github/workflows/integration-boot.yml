@@ -1,0 +1,65 @@
+name: Integration — boot-time CP (#32)
+
+# Verifies that a freshly-built hummingbird-k8s image actually boots into a
+# single-node control plane: bib → qcow2 → virt-install → wait for
+# /var/lib/k8s-init.done → assert one Ready node + hardening checks. Runs on
+# every k8s/v* tag push as an auto-verification of the release, and also via
+# workflow_dispatch for ad-hoc runs.
+#
+# Self-hosted runner only (needs /dev/kvm + libvirt + virt-install). The
+# `kvm,libvirt` labels gate selection.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to test (e.g. v0.1.10). Defaults to latest.'
+        required: false
+        type: string
+        default: latest
+  push:
+    tags: ['k8s/v*']
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  boot:
+    # Fork PRs would never get here (no pull_request trigger), but the guard
+    # is a cheap defense-in-depth marker per docs/self-hosted-runner.md.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, kvm, libvirt]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF#refs/tags/k8s/}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          if [ -z "$tag" ]; then
+            echo "Could not resolve image tag" >&2; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $tag"
+
+      - name: Pull image
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          sudo podman pull "ghcr.io/aatchison/hummingbird-k8s:${TAG}"
+
+      - name: Run boot integration test
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          sudo --preserve-env=TAG,GITHUB_RUN_ID \
+            tests/integration-boot.sh "${TAG}"

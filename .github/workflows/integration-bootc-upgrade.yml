@@ -1,0 +1,54 @@
+name: Integration — bootc upgrade end-to-end (#12)
+
+# Stands up a CP VM on `from_tag`, runs `bootc switch` + `bootc upgrade` to
+# `to_tag`, reboots, and verifies the new image is booted and k8s is still
+# healthy. Manual-only (workflow_dispatch) — it's slower than the boot test
+# and only useful when explicitly validating a release pair.
+#
+# Self-hosted runner only (needs /dev/kvm + libvirt + virt-install). The
+# `kvm,libvirt` labels gate selection.
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_tag:
+        description: 'Starting image tag (e.g. v0.1.9). Without v-prefix is OK.'
+        required: true
+        type: string
+      to_tag:
+        description: 'Target image tag (e.g. v0.1.10).'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  upgrade:
+    # No pull_request trigger here, but keep the fork-guard marker per
+    # docs/self-hosted-runner.md so additions of a PR trigger stay safe.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, kvm, libvirt]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pull both images
+        env:
+          FROM_TAG: ${{ inputs.from_tag }}
+          TO_TAG: ${{ inputs.to_tag }}
+        run: |
+          set -euo pipefail
+          sudo podman pull "ghcr.io/aatchison/hummingbird-k8s:${FROM_TAG}"
+          sudo podman pull "ghcr.io/aatchison/hummingbird-k8s:${TO_TAG}"
+
+      - name: Run bootc upgrade integration test
+        env:
+          FROM_TAG: ${{ inputs.from_tag }}
+          TO_TAG: ${{ inputs.to_tag }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          sudo --preserve-env=FROM_TAG,TO_TAG,GITHUB_RUN_ID \
+            tests/integration-bootc-upgrade.sh "${FROM_TAG}" "${TO_TAG}"

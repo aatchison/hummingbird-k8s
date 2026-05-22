@@ -1,0 +1,7 @@
+# Self-hosted runner labels we use. Declare them here so actionlint stops
+# flagging `runs-on: [self-hosted, kvm, libvirt]` as an unknown label.
+# See docs/self-hosted-runner.md for what each one means.
+self-hosted-runner:
+  labels:
+    - kvm
+    - libvirt
