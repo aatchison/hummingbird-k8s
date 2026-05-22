@@ -18,6 +18,7 @@ render_bib_config > bib-config.toml
 podman pull "$BASE_IMAGE"
 podman build \
   --build-arg "APISERVER_EXTRA_SANS=${APISERVER_EXTRA_SANS}" \
+  --build-arg "ENABLE_CLOUD_INIT=${ENABLE_CLOUD_INIT}" \
   -t "$LOCAL_IMAGE" -f containers/k8s/Containerfile .
 
 build_qcow2 "$LOCAL_IMAGE" "$NAME" "$(pwd)/bib-config.toml"

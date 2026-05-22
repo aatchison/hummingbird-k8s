@@ -25,6 +25,12 @@
 #                       the `FROM` lines in containers/*/Containerfile.
 #   BIB               — bootc-image-builder image.
 #                       Default: quay.io/centos-bootc/bootc-image-builder:latest
+#   ENABLE_CLOUD_INIT — "1" to opt into cloud-init in the built image (see
+#                       docs/cloud-init.md). Default "0" — the resulting
+#                       image is byte-identical to pre-cloud-init builds.
+#                       Threaded through to `podman build` as a build-arg
+#                       by each containers/*/Containerfile's conditional
+#                       dnf install + preset block.
 
 set -euo pipefail
 
@@ -41,6 +47,7 @@ fi
 : "${POOL_DIR:=/var/lib/libvirt/images}"
 : "${BASE_IMAGE:=quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0f22286fb41c9e00b4f3c9a862696e3bfb84}"
 : "${BIB:=quay.io/centos-bootc/bootc-image-builder:latest}"
+: "${ENABLE_CLOUD_INIT:=0}"
 
 # Require root for the build (bootc-image-builder needs --privileged + loopback mounts).
 require_root() {
