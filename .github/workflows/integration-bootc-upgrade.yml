@@ -33,13 +33,25 @@ jobs:
     timeout-minutes: 45
     # podman in the geary-docker runner container hits
     # `'overlay' is not supported over overlayfs` because the runner's rootfs
-    # is itself overlayfs. Force vfs for the whole job; slower but avoids
-    # needing fuse-overlayfs on the runner image (#124).
+    # is itself overlayfs. Force vfs *and* point podman at an isolated,
+    # per-run graph root so a stale libpod database (left over with
+    # graphDriver=overlay) can't override our vfs choice with the error:
+    #   "User-selected graph driver \"vfs\" overwritten by graph driver
+    #    \"overlay\" from database — delete libpod local files to resolve"
+    # (#124, #139).
     env:
       STORAGE_DRIVER: vfs
+      PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}
+      PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Prepare isolated podman storage
+        run: |
+          set -euo pipefail
+          sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
+          sudo mkdir -p "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
 
       - name: Pull both images
         env:
@@ -47,10 +59,18 @@ jobs:
           TO_TAG: ${{ inputs.to_tag }}
         run: |
           set -euo pipefail
-          sudo --preserve-env=STORAGE_DRIVER \
-            podman pull "ghcr.io/aatchison/hummingbird-k8s:${FROM_TAG}"
-          sudo --preserve-env=STORAGE_DRIVER \
-            podman pull "ghcr.io/aatchison/hummingbird-k8s:${TO_TAG}"
+          sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+            podman \
+              --storage-driver "${STORAGE_DRIVER}" \
+              --root "${PODMAN_ROOT}" \
+              --runroot "${PODMAN_RUNROOT}" \
+              pull "ghcr.io/aatchison/hummingbird-k8s:${FROM_TAG}"
+          sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+            podman \
+              --storage-driver "${STORAGE_DRIVER}" \
+              --root "${PODMAN_ROOT}" \
+              --runroot "${PODMAN_RUNROOT}" \
+              pull "ghcr.io/aatchison/hummingbird-k8s:${TO_TAG}"
 
       - name: Run bootc upgrade integration test
         env:
@@ -58,5 +78,10 @@ jobs:
           TO_TAG: ${{ inputs.to_tag }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          sudo --preserve-env=FROM_TAG,TO_TAG,GITHUB_RUN_ID,STORAGE_DRIVER \
+          sudo --preserve-env=FROM_TAG,TO_TAG,GITHUB_RUN_ID,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
             tests/integration-bootc-upgrade.sh "${FROM_TAG}" "${TO_TAG}"
+
+      - name: Clean up isolated podman storage
+        if: always()
+        run: |
+          sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}" || true

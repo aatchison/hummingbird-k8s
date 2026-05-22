@@ -54,7 +54,18 @@ nested overlay mounts fail.
   non-zero before producing any output.
 - Fix: export `STORAGE_DRIVER=vfs` before invoking `make k8s` (or the
   underlying `scripts/build-*.sh`). `vfs` is slower but always works.
-- Reference: [PR #127](https://github.com/aatchison/hummingbird-k8s/pull/127).
+- Caveat: setting `STORAGE_DRIVER=vfs` alone is not enough if a previous
+  podman run already initialized the libpod database with `overlay`.
+  Symptom is the misleading error:
+  `User-selected graph driver "vfs" overwritten by graph driver "overlay"
+  from database — delete libpod local files to resolve`. The integration
+  tests work around this by routing podman through a fresh, per-run
+  `--root`/`--runroot` and passing `--storage-driver vfs` on every
+  invocation. For ad-hoc builds either wipe the local libpod database
+  (`sudo podman system reset --force` — destructive) or use a dedicated
+  `--root`.
+- Reference: [PR #127](https://github.com/aatchison/hummingbird-k8s/pull/127),
+  [issue #139](https://github.com/aatchison/hummingbird-k8s/issues/139).
 
 ### sha256sum filename mismatch
 
