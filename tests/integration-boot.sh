@@ -124,21 +124,33 @@ log "building qcow2 from ${IMAGE} via bib"
 mkdir -p "${LIBVIRT_POOL_DIR}"
 rm -rf "${LIBVIRT_POOL_DIR}/qcow2"
 
-# Pull explicitly so bib can find the image locally with --local.
-podman_isolated pull "${IMAGE}"
-
-# Bind-mount the isolated graph root into bib at the path it expects so
-# `--local` resolves to the image we just pulled.
-podman_isolated run --rm --privileged --pull=newer \
-  --net=host --cgroupns=host --cgroup-manager=cgroupfs \
-  --security-opt label=disable \
-  -v "${BIB_CFG}:/config.toml:ro" \
-  -v "${LIBVIRT_POOL_DIR}:/output" \
-  -v "${PODMAN_ROOT}:/var/lib/containers/storage" \
-  "${BIB_IMAGE}" \
-  --type qcow2 --rootfs ext4 \
-  --local \
-  "${IMAGE}"
+# When running inside the containerized self-hosted runner, nested podman hits
+# vfs+SELinux+cgroup limits we can't work around (#150). Instead, launch bib as
+# a SIBLING container on the host docker daemon (socket is mounted into the
+# runner). bib pulls IMAGE from GHCR itself — no --local needed.
+# For local/bare-metal runs we still prefer podman.
+if command -v docker >/dev/null && [[ -S /var/run/docker.sock ]]; then
+  log "using host docker daemon for bib (sibling-of-runner)"
+  docker run --rm --privileged --pull=always \
+    -v "${BIB_CFG}:/config.toml:ro" \
+    -v "${LIBVIRT_POOL_DIR}:/output" \
+    "${BIB_IMAGE}" \
+    --type qcow2 --rootfs ext4 \
+    "${IMAGE}"
+else
+  log "using podman for bib (bare-metal path)"
+  podman_isolated pull "${IMAGE}"
+  podman_isolated run --rm --privileged --pull=newer \
+    --net=host --cgroupns=host --cgroup-manager=cgroupfs \
+    --security-opt label=disable \
+    -v "${BIB_CFG}:/config.toml:ro" \
+    -v "${LIBVIRT_POOL_DIR}:/output" \
+    -v "${PODMAN_ROOT}:/var/lib/containers/storage" \
+    "${BIB_IMAGE}" \
+    --type qcow2 --rootfs ext4 \
+    --local \
+    "${IMAGE}"
+fi
 
 mv -f "${LIBVIRT_POOL_DIR}/qcow2/disk.qcow2" "${POOL_QCOW}"
 rmdir "${LIBVIRT_POOL_DIR}/qcow2" 2>/dev/null || true
