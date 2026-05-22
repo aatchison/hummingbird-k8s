@@ -118,4 +118,4 @@ jobs:
           # available. Tolerates a missing remote (first-time cache miss);
           # no --pull-always so a PR build is robust to transient GHCR issues.
           extra-args: |
-            --cache-from ghcr.io/${{ github.repository_owner }}/${{ steps.cf.outputs.image }}:latest
+            --cache-from ghcr.io/${{ github.repository_owner }}/${{ steps.cf.outputs.image }}
