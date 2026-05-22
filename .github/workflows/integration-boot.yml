@@ -71,6 +71,19 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Using tag: $tag"
 
+      - name: Install containernetworking-plugins
+        # myoung34/github-runner container ships without CNI plugins; bib's
+        # internal podman calls fail with "CNI network 'podman' not found"
+        # (#150). Install on demand — idempotent on subsequent runs.
+        run: |
+          set -euo pipefail
+          if ! ls /usr/lib/cni/bridge >/dev/null 2>&1 \
+            && ! ls /usr/libexec/cni/bridge >/dev/null 2>&1 \
+            && ! ls /opt/cni/bin/bridge >/dev/null 2>&1; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q containernetworking-plugins
+          fi
+
       - name: Prepare isolated podman storage
         run: |
           set -euo pipefail
