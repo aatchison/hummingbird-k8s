@@ -160,7 +160,7 @@ jobs:
           echo "body=$body" >> "$GITHUB_OUTPUT"
 
       - name: Post or update aggregated PR comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           BODY_PATH: ${{ steps.assemble.outputs.body }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
