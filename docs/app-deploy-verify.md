@@ -13,9 +13,10 @@ that the apiserver answers and nodes report Ready.
   scheduling, kubelet, runtime all healthy).
 - A second PSA-restricted Pod (busybox probe) can resolve the Service
   name and reach the backend Pod over the ClusterIP — i.e. pod-to-pod
-  networking and CoreDNS both work. This is CNI-agnostic and is
-  expected to pass against both flannel (current) and Cilium (after
-  the migration in #50/#56).
+  networking and CoreDNS both work. This is CNI-agnostic: the cluster
+  currently runs Cilium (see [`cilium-migration.md`](cilium-migration.md)),
+  but the same checks passed against the legacy flannel install before
+  the migration landed in #50/#56.
 
 ## How to run
 
