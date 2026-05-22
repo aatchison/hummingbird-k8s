@@ -1,0 +1,25 @@
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - RequestReceived
+rules:
+  # Don't log read requests for built-in resources
+  - level: None
+    verbs: [get, list, watch]
+    resources:
+      - group: ""
+  # Don't log events themselves
+  - level: None
+    resources:
+      - group: ""
+        resources: [events]
+  # Auth + secret access: metadata only, to avoid logging secret data
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: [secrets, configmaps]
+      - group: authentication.k8s.io
+      - group: authorization.k8s.io
+  # Everything else: Request level (no response body)
+  - level: Request
+    omitStages: [RequestReceived]
