@@ -39,25 +39,27 @@ if [[ -z "$CP_IP" ]]; then
 fi
 
 # Ensure we have a tool capable of mutating the qcow2's filesystem out-of-band.
-# virt-customize (from libguestfs-tools / libguestfs-tools-c) is preferred;
-# guestfish is a fallback. Best-effort install if the operator has not already.
+# Prefer guestfish: it mounts the raw root partition and writes files without
+# needing libguestfs OS introspection, which fails on bootc/ostree images
+# ("no operating systems were found in the guest image"). virt-customize is
+# the fallback for non-bootc layouts.
 INJECTOR=""
-if command -v virt-customize >/dev/null 2>&1; then
-  INJECTOR=virt-customize
-elif command -v guestfish >/dev/null 2>&1; then
+if command -v guestfish >/dev/null 2>&1; then
   INJECTOR=guestfish
+elif command -v virt-customize >/dev/null 2>&1; then
+  INJECTOR=virt-customize
 else
-  echo "Neither virt-customize nor guestfish found; attempting to install libguestfs-tools-c..." >&2
+  echo "Neither guestfish nor virt-customize found; attempting to install libguestfs-tools-c..." >&2
   if command -v dnf >/dev/null 2>&1; then
     dnf install -y libguestfs-tools-c >/dev/null 2>&1 || \
       dnf install -y libguestfs-tools >/dev/null 2>&1 || true
   fi
-  if command -v virt-customize >/dev/null 2>&1; then
-    INJECTOR=virt-customize
-  elif command -v guestfish >/dev/null 2>&1; then
+  if command -v guestfish >/dev/null 2>&1; then
     INJECTOR=guestfish
+  elif command -v virt-customize >/dev/null 2>&1; then
+    INJECTOR=virt-customize
   else
-    echo "ERROR: virt-customize/guestfish unavailable and could not be installed." >&2
+    echo "ERROR: guestfish/virt-customize unavailable and could not be installed." >&2
     echo "Install libguestfs-tools-c (or libguestfs-tools) on this KVM host and retry." >&2
     exit 1
   fi
@@ -93,10 +95,11 @@ inject_join_env() {
         >/dev/null
       ;;
     guestfish)
-      guestfish --rw -a "$qcow" -i <<EOF >/dev/null
+      guestfish --rw -a "$qcow" -i <<EOF
 mkdir-p /etc/hummingbird
 upload ${tmpfile} /etc/hummingbird/worker-join.env
 chmod 0600 /etc/hummingbird/worker-join.env
+chown 0 0 /etc/hummingbird/worker-join.env
 EOF
       ;;
   esac
