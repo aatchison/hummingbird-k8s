@@ -299,10 +299,20 @@ if ! ssh "${ssh_opts[@]}" "root@${VM_IP}" \
   exit 1
 fi
 
-log "assert: kubelet active"
-if ! ssh "${ssh_opts[@]}" "root@${VM_IP}" \
-       'systemctl is-active kubelet' >/dev/null 2>&1; then
+log "assert: kubelet active (wait up to 2 min)"
+kubelet_ok=0
+for _ in $(seq 1 24); do
+  if ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+         'systemctl is-active kubelet' >/dev/null 2>&1; then
+    kubelet_ok=1
+    break
+  fi
+  sleep 5
+done
+if [[ "${kubelet_ok}" -ne 1 ]]; then
   log "FAIL: kubelet is not active after upgrade"
+  ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+      'systemctl status kubelet --no-pager 2>&1 | tail -30' >&2 || true
   exit 1
 fi
 
