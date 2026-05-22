@@ -41,9 +41,14 @@ because both edit the same kubeadm `extraVolumes` region of
   ```bash
   kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/.../kube-flannel.yml
   ```
-  is replaced with the Cilium quick-install:
+  is replaced with a `cilium install` invocation that calls the
+  cilium-cli binary baked into the image:
   ```bash
-  kubectl apply -f https://raw.githubusercontent.com/cilium/cilium/main/install/kubernetes/quick-install.yaml
+  KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
+    --version 1.16.5 \
+    --set kubeProxyReplacement=false \
+    --wait \
+    --wait-duration 5m
   ```
 - The apiserver audit log path moves from `/var/log/k8s-audit.log` to
   `/var/log/kubernetes/k8s-audit.log` (#50).
@@ -54,6 +59,15 @@ because both edit the same kubeadm `extraVolumes` region of
   `pathType: DirectoryOrCreate` is retained so the directory is
   auto-created on first boot.
 
+### `Containerfile.k8s`
+
+- The cilium-cli binary is pre-baked into the image at `/usr/bin/cilium`
+  via a `curl + tar` extraction from the upstream GitHub release tarball.
+  The version is controlled by the `CILIUM_CLI_VERSION` build-arg
+  (default `v0.16.16`). Baking the binary in keeps `k8s-init.sh`'s
+  first-boot path offline-friendly: it does not need to fetch a CLI
+  tarball before installing the CNI.
+
 ### `etc/kubernetes/admission-control-config.yaml`
 
 - The `kube-flannel` namespace exemption (it carried the flannel
@@ -63,15 +77,36 @@ because both edit the same kubeadm `extraVolumes` region of
 
 ## Install method
 
-The change keeps the same install pattern as before: a single
-`kubectl apply -f <upstream URL>` from `k8s-init.sh` during first
-boot. No new packages are added to the image (no `helm`, no
-`cilium-cli`), so `Containerfile.k8s` is untouched.
+The CNI is installed via the `cilium-cli` binary, which is baked
+into the image at build time and invoked from `k8s-init.sh` on first
+boot.
 
-Trade-off: the upstream URL points at `main`, not a pinned release
-tag. The flannel install had the same property (`master` branch URL),
-so this is a like-for-like behavior. See "Pin to a release tag?"
-below.
+How it's installed:
+
+- The `cilium-cli` single static binary is downloaded during
+  `Containerfile.k8s` build (`curl` + `tar -xzf`) and placed at
+  `/usr/bin/cilium`. The version is pinned via the
+  `CILIUM_CLI_VERSION` build-arg (default `v0.16.16`).
+- On first boot `k8s-init.sh` calls
+  `cilium install --version 1.16.5 --set kubeProxyReplacement=false
+   --wait --wait-duration 5m`. The `--version` flag pins the Cilium
+  agent/operator image version (independent of the CLI version).
+- The Cilium CLI internally renders the upstream Helm chart with the
+  supplied `--set key=value` values and applies the resulting
+  manifests to the cluster. Anything the chart exposes is reachable
+  via more `--set` flags — no Helm binary needed in the image.
+- Future PRs can enable Cilium features (`kubeProxyReplacement=true`,
+  Hubble observability, transparent encryption, BPF host routing
+  toggles, …) by adding more `--set` flags to the `cilium install`
+  invocation. No new packages required.
+
+Why this approach (instead of `kubectl apply -f <quick-install.yaml>`):
+upstream Cilium retired the `install/kubernetes/quick-install.yaml`
+manifest from the `cilium/cilium` repo and now expects installs to go
+through Helm or `cilium-cli`. The previous URL
+(`raw.githubusercontent.com/cilium/cilium/main/install/kubernetes/quick-install.yaml`)
+returns HTTP 404. `cilium-cli` is the single-binary path that doesn't
+require a Helm install in the image.
 
 ## What changes from flannel
 
@@ -80,14 +115,15 @@ below.
   Any external tooling that grepped for `kube-flannel` will need to
   point at `kube-system` (label selector `k8s-app=cilium` for the
   agent).
-- **kube-proxy still present.** The quick-install variant keeps
-  kube-proxy running. Cilium can replace kube-proxy entirely
-  (`kubeProxyReplacement=true`), but that's a Helm-values change and
-  the quick-install manifest doesn't toggle it. Operators who want
-  kube-proxy-free should switch to a Helm-based install.
-- **No Hubble by default.** The quick-install variant does not enable
-  Hubble (observability) or transparent encryption (WireGuard /
-  IPsec). Both require Helm.
+- **kube-proxy still present.** This image explicitly passes
+  `--set kubeProxyReplacement=false` to keep kube-proxy as the L4
+  plane (same behavior as flannel). Cilium can replace kube-proxy
+  entirely (`--set kubeProxyReplacement=true`); enabling that is a
+  follow-up PR.
+- **No Hubble by default.** Hubble (observability) and transparent
+  encryption (WireGuard / IPsec) are not enabled. Both can be turned
+  on by adding the corresponding `--set` flags to the `cilium
+  install` invocation in `k8s-init.sh` in a follow-up PR.
 - **NetworkPolicy is now real.** A deny-all policy in any namespace
   will actually drop traffic. Existing workloads that assumed an
   open network (which is most lab workloads) should be unaffected
@@ -96,19 +132,22 @@ below.
 
 ## Operational caveats
 
-### Quick-install defaults only
+### cilium-cli defaults only
 
-The upstream `quick-install.yaml` is opinionated and ships with
-**defaults only**:
+`cilium install` with the flags this image passes ships with
+**defaults plus one explicit override**:
 
-- kube-proxy is **not** replaced.
+- kube-proxy replacement is explicitly **off**
+  (`--set kubeProxyReplacement=false`) to match prior flannel
+  behavior.
 - Hubble is **not** enabled.
 - Transparent encryption (WireGuard/IPsec) is **not** enabled.
 - BPF host routing is on by default in current Cilium versions, but
   is **not** explicitly configured here.
 
-If you need any of those, switch to a Helm install later. That is a
-follow-up issue and out of scope for #6.
+If you need any of those, add the appropriate `--set` flag(s) to the
+`cilium install` call in `k8s-init.sh`. That is a follow-up issue and
+out of scope for #6.
 
 ### Existing single-node clusters must rebuild
 
@@ -132,29 +171,21 @@ currently ships these. If a future minimal base drops them, Cilium
 won't start — the `cilium` daemonset will go CrashLoopBackOff with
 "BPF filesystem not mounted" or similar in the logs.
 
-### Quick-install URL is upstream-controlled
+### Version pinning is explicit
 
-The manifest is fetched from `cilium/cilium`'s `main` branch at first
-boot. Upstream is free to break it. This matches the previous
-flannel behavior (also fetched from `master`). Pinning is a separate
-issue — see below.
+Two versions are pinned independently:
 
-## Pin to a release tag?
+- `CILIUM_CLI_VERSION` (build-arg, default `v0.16.16`) — the version
+  of the cilium-cli binary baked into the image.
+- `--version 1.16.5` in the `cilium install` call — the version of
+  the Cilium agent/operator images that get deployed into the
+  cluster. The CLI version and the Cilium version do not have to
+  move in lockstep.
 
-The current behavior matches what was there before flannel: fetch
-from `main`. That has two known weaknesses:
-
-1. Reproducibility — two VMs built from the same image but
-   provisioned days apart can pick up different Cilium versions if
-   upstream pushes during that window.
-2. Availability — if upstream restructures the repo (this has
-   happened with Cilium specifically; the `quick-install.yaml` path
-   has moved before), first-boot init breaks.
-
-A follow-up issue should pin to a specific tag, e.g.
-`https://raw.githubusercontent.com/cilium/cilium/v1.19.4/install/kubernetes/quick-install.yaml`,
-and bump it deliberately. That bump cadence is outside the scope of
-the initial swap.
+Bumping either version is a deliberate edit to `Containerfile.k8s` or
+`k8s-init.sh`. There is no `latest` / `main` fetch at first boot, so
+two VMs built from the same image are reproducible regardless of when
+they are provisioned.
 
 ## Verifying the install
 

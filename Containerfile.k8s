@@ -67,6 +67,14 @@ RUN systemctl preset crio.service kubelet.service k8s-init.service || true
 COPY etc/kubernetes/admission-control-config.yaml /etc/kubernetes/admission-control-config.yaml
 COPY etc/kubernetes/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
 
+# cilium-cli (single binary) used by k8s-init.sh to install Cilium CNI on first boot.
+ARG CILIUM_CLI_VERSION=v0.16.16
+RUN curl -fsSL -o /tmp/cilium-cli.tar.gz \
+      "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz" \
+ && tar -C /usr/bin -xzf /tmp/cilium-cli.tar.gz cilium \
+ && rm -f /tmp/cilium-cli.tar.gz \
+ && /usr/bin/cilium version --client
+
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s
 LABEL org.opencontainers.image.description="Fedora Hummingbird bootc image with upstream Kubernetes (kubelet/kubeadm/cri-o), control plane"

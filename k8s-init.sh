@@ -153,8 +153,14 @@ install -m 0644 /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.world
 ln -sf /etc/kubernetes/admin.conf.world /etc/profile.d/kubeconfig-symlink-target
 chmod 0644 /etc/kubernetes/admin.conf
 
-# CNI: Cilium (quick-install). Replaces flannel — supports NetworkPolicy enforcement (#6).
-KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f \
-  https://raw.githubusercontent.com/cilium/cilium/main/install/kubernetes/quick-install.yaml
+# CNI: Cilium installed via cilium-cli (baked at image build time).
+# --wait blocks until pods become Ready; --set kubeProxyReplacement=false to
+# keep kube-proxy as the L4 plane (matches what flannel did; Cilium's
+# kube-proxy-replacement is opt-in via a separate PR).
+KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
+  --version 1.16.5 \
+  --set kubeProxyReplacement=false \
+  --wait \
+  --wait-duration 5m
 
 touch "$MARKER"
