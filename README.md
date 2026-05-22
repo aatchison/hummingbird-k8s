@@ -134,7 +134,7 @@ the `scripts/build-*.sh` and `scripts/define-vm*.sh` scripts.
 | `ENABLE_ROOT_SSH` | `1` | Bake pubkeys into `root@`. | Set `0` to disable root SSH. |
 | `SSH_PUBKEY_FILES` | `~/.ssh/id_ed25519.pub` | Pubkey files (colon-sep). | Multiple or non-default keys. |
 | `POOL_DIR` | `/var/lib/libvirt/images` | libvirt pool for qcow2. | Larger volume. |
-| `BASE_IMAGE` | `quay.io/hummingbird-community/bootc-os:latest` | Upstream bootc base. | Pinning a digest. |
+| `BASE_IMAGE` | `quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1…` (digest-pinned) | Upstream bootc base. | Bumping to a newer digest. |
 | `BIB` | `quay.io/centos-bootc/bootc-image-builder:latest` | OCI-to-qcow2 builder. | Pinning bib. |
 | `KVM_HOST` | unset | SSH alias of KVM host (client-side). | Always on client running `kubectl-k8s.sh`. |
 | `APISERVER_EXTRA_SANS` | `127.0.0.1,localhost` | Extra SANs in apiserver cert. | Adding client host/IP for tunnel. |

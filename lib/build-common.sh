@@ -19,8 +19,10 @@
 #                       Default: empty (opt-in). A bad/404 username fails the build.
 #   POOL_DIR          — libvirt storage pool target directory.
 #                       Default: /var/lib/libvirt/images
-#   BASE_IMAGE        — Upstream bootc-os base.
-#                       Default: quay.io/hummingbird-community/bootc-os:latest
+#   BASE_IMAGE        — Upstream bootc-os base. Pinned by digest (OCI index,
+#                       multi-arch) for reproducibility. Override only when
+#                       deliberately bumping the base; keep it in lockstep with
+#                       the `FROM` lines in containers/*/Containerfile.
 #   BIB               — bootc-image-builder image.
 #                       Default: quay.io/centos-bootc/bootc-image-builder:latest
 
@@ -37,7 +39,7 @@ fi
 : "${VM_USER_GROUPS:=}"
 : "${ENABLE_ROOT_SSH:=1}"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
-: "${BASE_IMAGE:=quay.io/hummingbird-community/bootc-os:latest}"
+: "${BASE_IMAGE:=quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0f22286fb41c9e00b4f3c9a862696e3bfb84}"
 : "${BIB:=quay.io/centos-bootc/bootc-image-builder:latest}"
 
 # Require root for the build (bootc-image-builder needs --privileged + loopback mounts).
