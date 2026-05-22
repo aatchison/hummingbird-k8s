@@ -1,0 +1,87 @@
+name: Build & publish image
+
+on:
+  push:
+    tags:
+      - 'k3s/v*'
+      - 'k8s/v*'
+      - 'worker/v*'
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'Flavor to build (k3s | k8s | worker)'
+        required: true
+        type: choice
+        options: [k3s, k8s, worker]
+      version:
+        description: 'Semver tag (vX.Y.Z)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse flavor + version from tag (or workflow_dispatch)
+        id: parse
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            flavor="${{ inputs.flavor }}"
+            version="${{ inputs.version }}"
+          else
+            # tag is refs/tags/<flavor>/<version>
+            tag="${GITHUB_REF#refs/tags/}"
+            flavor="${tag%%/*}"
+            version="${tag#*/}"
+          fi
+          case "$flavor" in
+            k3s)    containerfile=Containerfile         ; image=hummingbird-k3s        ;;
+            k8s)    containerfile=Containerfile.k8s     ; image=hummingbird-k8s        ;;
+            worker) containerfile=Containerfile.k8s-worker; image=hummingbird-k8s-worker ;;
+            *) echo "Unknown flavor $flavor" >&2; exit 1 ;;
+          esac
+          # Validate semver-ish.
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "Version $version is not vX.Y.Z[-pre]" >&2
+            exit 1
+          fi
+          echo "flavor=$flavor"               >> "$GITHUB_OUTPUT"
+          echo "version=$version"             >> "$GITHUB_OUTPUT"
+          echo "containerfile=$containerfile" >> "$GITHUB_OUTPUT"
+          echo "image=$image"                 >> "$GITHUB_OUTPUT"
+
+      - name: Stub worker-join.env for worker build
+        if: steps.parse.outputs.flavor == 'worker'
+        run: |
+          # Real worker images get a fresh join token baked at qcow2 time
+          # on the host. The published OCI image is a template only.
+          echo '# placeholder — refresh at qcow2 build time' > worker-join.env
+
+      - name: Log in to GHCR
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        id: build
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: ${{ steps.parse.outputs.image }}
+          tags: ${{ steps.parse.outputs.version }} latest
+          containerfiles: ${{ steps.parse.outputs.containerfile }}
+          context: .
+
+      - name: Push to GHCR
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ steps.build.outputs.image }}
+          tags: ${{ steps.build.outputs.tags }}
+          registry: ghcr.io/${{ github.repository_owner }}

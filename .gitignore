@@ -1,0 +1,17 @@
+# Generated at runtime / per-host secrets
+bib-config.toml
+bib-config-*.toml
+worker-join.env
+admin.conf
+admin.conf.*
+
+# Logs from build/redo scripts
+*.log
+
+# Local kubectl wrapper cache (server URLs vary)
+/tmp/k8s-kubeconfig
+
+# OS/editor noise
+.DS_Store
+*.swp
+.vscode/

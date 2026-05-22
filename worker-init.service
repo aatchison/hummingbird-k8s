@@ -1,0 +1,14 @@
+[Unit]
+Description=Join the Hummingbird Kubernetes cluster as a worker
+After=crio.service network-online.target
+Wants=crio.service network-online.target
+ConditionPathExists=!/var/lib/worker-init.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/worker-init.sh
+RemainAfterExit=yes
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

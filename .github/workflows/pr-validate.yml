@@ -1,0 +1,69 @@
+name: PR validate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: |
+          shopt -s nullglob
+          files=( *.sh )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No shell scripts found."
+            exit 0
+          fi
+          shellcheck --severity=warning "${files[@]}"
+
+  hadolint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run hadolint on each Containerfile
+        run: |
+          shopt -s nullglob
+          rc=0
+          for f in Containerfile*; do
+            echo "::group::hadolint $f"
+            docker run --rm -i hadolint/hadolint:latest hadolint - --no-fail < "$f" || rc=$?
+            echo "::endgroup::"
+          done
+          exit $rc
+
+  yamllint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install --quiet yamllint
+      - run: yamllint -d '{extends: default, rules: {line-length: disable, document-start: disable, truthy: {check-keys: false}}}' .github/
+
+  containerfile-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor:
+          - { name: k3s,        containerfile: Containerfile }
+          - { name: k8s,        containerfile: Containerfile.k8s }
+          - { name: k8s-worker, containerfile: Containerfile.k8s-worker }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build OCI image (no push) — ${{ matrix.flavor.name }}
+        run: |
+          # worker image references worker-join.env via COPY — synthesize a stub
+          # so the build can validate the Containerfile without a live CP.
+          if [ ! -s worker-join.env ]; then
+            echo 'kubeadm join 127.0.0.1:6443 --token aaaaaa.bbbbbbbbbbbbbbbb --discovery-token-ca-cert-hash sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+              > worker-join.env
+          fi
+          mkdir -p /etc/hummingbird || true
+          podman build -t local/${{ matrix.flavor.name }}:ci -f ${{ matrix.flavor.containerfile }} .
