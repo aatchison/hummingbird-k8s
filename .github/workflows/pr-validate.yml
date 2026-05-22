@@ -77,6 +77,21 @@ jobs:
           diff -u .github/fixtures/render_bib_config/with-password.toml <(render_with 'VM_USER_GROUPS=wheel VM_PASSWORD=secret')
           diff -u .github/fixtures/render_bib_config/no-root-ssh.toml   <(render_with 'ENABLE_ROOT_SSH=0')
 
+  makefile-tests:
+    # Static integration tests for the top-level Makefile (issue #110).
+    # Pure `make -n` dry-runs — no libvirt / podman / sudo required, so
+    # this catches recipe-wiring regressions in seconds without the full
+    # containerfile-build matrix below.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats
+      - name: Run bats Makefile tests
+        run: bats tests/makefile.bats
+
   containerfile-build:
     runs-on: ubuntu-latest
     strategy:
