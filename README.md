@@ -36,3 +36,9 @@ GitHub Actions builds an OCI image for each flavor and pushes to GHCR on tagged 
 | `worker/vX.Y.Z` | `ghcr.io/<OWNER>/hummingbird-k8s-worker:vX.Y.Z` |
 
 Bump a flavor independently: `git tag k3s/v0.2.0 && git push --tags`.
+
+## Operations
+
+Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
+run on a self-hosted runner on the operator's KVM host. To register one, see
+[`docs/self-hosted-runner.md`](docs/self-hosted-runner.md).
