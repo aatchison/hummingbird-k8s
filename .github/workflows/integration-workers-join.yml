@@ -1,0 +1,104 @@
+name: Integration — workers join CP
+
+# Builds a CP from hummingbird-k8s:<cp_tag>, mints a kubeadm join token, then
+# builds N worker VMs from hummingbird-k8s-worker:<worker_tag> with the join
+# command injected via guestfish, and asserts the CP sees worker_count + 1
+# Ready nodes.
+#
+# Manual-only (workflow_dispatch) — this is heavier than integration-boot
+# and we only have one runner slot.
+#
+# Self-hosted runner only (needs /dev/kvm + libvirt + virt-install + guestfish).
+
+on:
+  workflow_dispatch:
+    inputs:
+      cp_tag:
+        description: 'hummingbird-k8s tag for the CP (without k8s/ prefix, e.g. v0.1.33)'
+        required: true
+        type: string
+        default: v0.1.33
+      worker_tag:
+        description: 'hummingbird-k8s-worker tag (without worker/ prefix, e.g. v0.1.9)'
+        required: true
+        type: string
+        default: v0.1.9
+      worker_count:
+        description: 'Number of worker VMs to spawn'
+        required: true
+        type: string
+        default: '2'
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  workers-join:
+    # Fork-PR defense-in-depth marker (no pull_request trigger here, but keep
+    # the guard so additions of one stay safe).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, kvm, libvirt]
+    timeout-minutes: 60
+    env:
+      STORAGE_DRIVER: vfs
+      PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}
+      PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install runner deps (CNI + virtinst + libguestfs)
+        run: |
+          set -euo pipefail
+          need=()
+          { ls /usr/lib/cni/bridge >/dev/null 2>&1 \
+              || ls /usr/libexec/cni/bridge >/dev/null 2>&1 \
+              || ls /opt/cni/bin/bridge >/dev/null 2>&1 ; } \
+              || need+=(containernetworking-plugins)
+          command -v virt-install >/dev/null 2>&1 || need+=(virtinst)
+          command -v virsh        >/dev/null 2>&1 || need+=(libvirt-clients)
+          command -v guestfish    >/dev/null 2>&1 || need+=(libguestfs-tools)
+          if [[ ${#need[@]} -gt 0 ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q "${need[@]}"
+          fi
+
+      - name: Prepare isolated podman storage
+        run: |
+          set -euo pipefail
+          sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
+          sudo mkdir -p "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
+
+      - name: Pull CP + worker images
+        env:
+          CP_TAG: ${{ inputs.cp_tag }}
+          WORKER_TAG: ${{ inputs.worker_tag }}
+        run: |
+          sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+            podman \
+              --storage-driver "${STORAGE_DRIVER}" \
+              --root "${PODMAN_ROOT}" \
+              --runroot "${PODMAN_RUNROOT}" \
+              pull "ghcr.io/aatchison/hummingbird-k8s:${CP_TAG}"
+          sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+            podman \
+              --storage-driver "${STORAGE_DRIVER}" \
+              --root "${PODMAN_ROOT}" \
+              --runroot "${PODMAN_RUNROOT}" \
+              pull "ghcr.io/aatchison/hummingbird-k8s-worker:${WORKER_TAG}"
+
+      - name: Run workers-join integration test
+        env:
+          CP_TAG: ${{ inputs.cp_tag }}
+          WORKER_TAG: ${{ inputs.worker_tag }}
+          WORKER_COUNT: ${{ inputs.worker_count }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          sudo --preserve-env=CP_TAG,WORKER_TAG,WORKER_COUNT,GITHUB_RUN_ID,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+            tests/integration-workers-join.sh "${CP_TAG}" "${WORKER_TAG}" "${WORKER_COUNT}"
+
+      - name: Clean up isolated podman storage
+        if: always()
+        run: |
+          sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}" || true

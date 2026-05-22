@@ -275,5 +275,162 @@ scp "${ssh_opts[@]}" \
 ssh "${ssh_opts[@]}" "root@${VM_IP}" \
   'chmod +x /tmp/verify-hardening.sh && KUBECONFIG=/etc/kubernetes/admin.conf CP_IP=127.0.0.1 /tmp/verify-hardening.sh'
 
+# --- C. NetworkPolicy enforcement (#6, #94) --------------------------------
+#
+# Cilium's job is to actually enforce NetworkPolicy resources. A naked
+# kubernetes cluster with a non-enforcing CNI happily ignores them, which
+# would silently turn the project's "we run Cilium" claim into a lie.
+# Smoke test:
+#   1. Apply deny-all NetworkPolicy in `default`
+#   2. Create curl-source + nginx-target pods (PSA-restricted-compliant)
+#   3. Assert curl from source → target TIMES OUT
+#   4. Delete the policy
+#   5. Assert curl now succeeds
+#   6. Clean up
+log "assert: NetworkPolicy deny-all is enforced by Cilium"
+NP_NS="np-smoke-${RUN_ID}"
+
+np_cleanup() {
+  ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+    "KUBECONFIG=/etc/kubernetes/admin.conf kubectl delete ns ${NP_NS} --wait=false --ignore-not-found" \
+    >/dev/null 2>&1 || true
+}
+
+# Layer a per-section cleanup on top of the global teardown trap.
+NP_CLEANUP_REGISTERED=1
+trap '{ np_cleanup; cleanup; }' EXIT
+
+ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+  "KUBECONFIG=/etc/kubernetes/admin.conf kubectl create ns ${NP_NS}" >/dev/null
+
+# nginx target — PSA-restricted-compliant. Listens on 8080.
+ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+  "KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -n ${NP_NS} -f -" <<'YAML' >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: target
+  labels:
+    app: target
+spec:
+  automountServiceAccountToken: false
+  containers:
+  - name: nginx
+    image: nginxinc/nginx-unprivileged:stable
+    ports:
+    - containerPort: 8080
+    securityContext:
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+      seccompProfile:
+        type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: target
+spec:
+  selector:
+    app: target
+  ports:
+  - port: 8080
+    targetPort: 8080
+YAML
+
+log "waiting for target pod Ready (up to 2 min)"
+if ! ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+       "KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n ${NP_NS} wait --for=condition=ready --timeout=2m pod/target" \
+       >&2; then
+  log "FAIL: target pod never became Ready"
+  ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+      "KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n ${NP_NS} get events --sort-by=.lastTimestamp" >&2 || true
+  exit 1
+fi
+
+# Apply deny-all ingress NetworkPolicy in NP_NS.
+ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+  "KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -n ${NP_NS} -f -" <<'YAML' >/dev/null
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+YAML
+
+# Give Cilium a moment to translate the policy into its endpoint state. The
+# CiliumNetworkPolicy controller reconciles within a few seconds.
+sleep 5
+
+# Probe with deny-all in place — expect a curl timeout (exit non-zero).
+# `--connect-timeout 3` + `--max-time 5` keeps a hung connection bounded.
+curl_overrides='{"spec":{"automountServiceAccountToken":false,"containers":[{"name":"probe","image":"curlimages/curl:8.10.1","stdin":true,"command":["sh","-c","curl --connect-timeout 3 --max-time 5 -fsS http://target:8080"],"securityContext":{"runAsNonRoot":true,"runAsUser":65534,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}}]}}'
+
+log "probe with deny-all in place — expect curl to TIMEOUT"
+set +e
+deny_out=$(ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+  "KUBECONFIG=/etc/kubernetes/admin.conf kubectl run probe-deny -n ${NP_NS} --rm -i --restart=Never --image=curlimages/curl:8.10.1 --overrides='${curl_overrides}'" \
+  2>&1)
+deny_rc=$?
+set -e
+log "deny probe rc=${deny_rc}"
+if [[ "${deny_rc}" -eq 0 ]] && printf '%s' "${deny_out}" | grep -q '<html'; then
+  log "FAIL: deny-all NetworkPolicy did not block traffic — got an HTTP response"
+  printf '%s\n' "${deny_out}" >&2
+  exit 1
+fi
+log "PASS: deny-all NetworkPolicy blocked traffic as expected"
+
+# Remove the policy.
+ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+  "KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n ${NP_NS} delete networkpolicy deny-all" >/dev/null
+
+# Cilium needs a moment to re-converge after the policy goes away.
+sleep 5
+
+log "probe without policy — expect curl to SUCCEED"
+allow_rc=0
+allow_out=""
+for attempt in 1 2 3; do
+  set +e
+  allow_out=$(ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+    "KUBECONFIG=/etc/kubernetes/admin.conf kubectl run probe-allow-${attempt} -n ${NP_NS} --rm -i --restart=Never --image=curlimages/curl:8.10.1 --overrides='${curl_overrides}'" \
+    2>&1)
+  allow_rc=$?
+  set -e
+  if [[ "${allow_rc}" -eq 0 ]] && printf '%s' "${allow_out}" | grep -q '<html'; then
+    break
+  fi
+  sleep 3
+done
+
+if [[ "${allow_rc}" -ne 0 ]] || ! printf '%s' "${allow_out}" | grep -q '<html'; then
+  log "FAIL: traffic did not flow after removing NetworkPolicy"
+  printf '%s\n' "${allow_out}" >&2
+  exit 1
+fi
+log "PASS: traffic flows after policy removed"
+
+np_cleanup
+# Restore the original teardown trap.
+trap cleanup EXIT
+unset NP_CLEANUP_REGISTERED
+
+# --- D. App-deploy smoke (#NEW) --------------------------------------------
+#
+# Run scripts/verify-app-deploy.sh against the test VM. This exercises a
+# normal nginx Deployment + Service + busybox probe under PSA-restricted —
+# i.e. the realistic happy path for a tenant workload.
+log "assert: verify-app-deploy.sh PASS (run on CP via SSH)"
+scp "${ssh_opts[@]}" \
+  "$(dirname "$0")/../scripts/verify-app-deploy.sh" \
+  "root@${VM_IP}:/tmp/verify-app-deploy.sh" >/dev/null
+ssh "${ssh_opts[@]}" "root@${VM_IP}" \
+  'chmod +x /tmp/verify-app-deploy.sh && KUBECONFIG=/etc/kubernetes/admin.conf /tmp/verify-app-deploy.sh'
+
 log "ALL CHECKS PASSED"
 exit 0

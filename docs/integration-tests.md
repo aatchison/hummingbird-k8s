@@ -1,24 +1,75 @@
 # Integration tests
 
-Two integration workflows exercise the published `hummingbird-k8s` image on a
-real KVM host. Both run on the self-hosted runner gated by the `kvm,libvirt`
+Five integration workflows exercise the published Hummingbird images on a
+real KVM host. All run on the self-hosted runner gated by the `kvm,libvirt`
 labels (see `docs/self-hosted-runner.md`).
 
 ## Workflows
 
-### `integration-boot.yml` (#32 — boot-time CP)
+### `integration-boot.yml` (#32 — boot-time CP, k8s flavor)
 
-Verifies that a freshly-built image actually boots into a single-node
-control plane.
+Verifies that a freshly-built `hummingbird-k8s` image actually boots into a
+single-node control plane and that the cluster's networking + workload
+posture is healthy.
 
 - **Triggers:**
-  - `push` to tags matching `k8s/v*` — auto-verifies every release.
+  - `workflow_run` on a successful `Build & publish — hummingbird-k8s`
+    (which itself runs on `k8s/v*` tag pushes) — auto-verifies every
+    release.
   - `workflow_dispatch` — for ad-hoc runs against any tag or `latest`.
 - **What it exercises:** bib → qcow2 → virt-install → wait for
   `/var/lib/k8s-init.done` → assert exactly one Ready node → run
   `scripts/verify-hardening.sh` (PodSecurity restricted, apiserver audit log,
-  kubelet `--protect-kernel-defaults=true`).
+  kubelet `--protect-kernel-defaults=true`) → NetworkPolicy enforcement
+  (deny-all blocks, removal restores) → `scripts/verify-app-deploy.sh`
+  (nginx Deployment + Service + PSA-restricted probe).
 - **Driver:** `tests/integration-boot.sh <tag>`.
+
+### `integration-boot-k3s.yml` (boot-time CP, k3s flavor)
+
+Same shape as the k8s boot test but for the k3s flavor.
+
+- **Triggers:**
+  - `workflow_run` on a successful `Build & publish — hummingbird-k3s`
+    (which itself runs on `k3s/v*` tag pushes).
+  - `workflow_dispatch`.
+- **What it exercises:** bib → qcow2 → virt-install → wait for
+  `k3s.service active` → assert exactly one Ready node (via `k3s kubectl`) →
+  smoke-deploy a tiny PSA-compliant nginx pod + Service and curl it from an
+  in-cluster busybox pod. `verify-hardening.sh` is intentionally NOT run —
+  the hardening suite is specific to the kubeadm-based k8s stack.
+- **Driver:** `tests/integration-boot-k3s.sh <tag>`.
+
+Manual run:
+
+```bash
+gh workflow run integration-boot-k3s.yml -f tag=k3s/v0.1.12
+```
+
+### `integration-workers-join.yml` (worker join flow)
+
+Stands up a CP and N worker VMs from the published worker template, with
+the kubeadm join command injected via guestfish raw-partition mount (the
+same approach `scripts/spawn-workers.sh` uses — libguestfs OS introspection
+breaks on the bootc/ostree layout). Asserts `kubectl get nodes` ends up
+showing `worker_count + 1` Ready nodes.
+
+- **Triggers:** `workflow_dispatch` only (heavier; ~30 min wall-time).
+- **Inputs:** `cp_tag` (default `v0.1.33`), `worker_tag` (default `v0.1.9`),
+  `worker_count` (default `2`).
+- **What it exercises:** bib build of CP + worker images → CP boot → mint
+  a 2h kubeadm join token → bib build of worker template → for each
+  worker: cp --reflink the template, inject `worker-join.env` into the
+  active ostree deployment dir via guestfish, virt-install (parallel) →
+  wait for N+1 Ready nodes.
+- **Driver:** `tests/integration-workers-join.sh <cp_tag> <worker_tag> <count>`.
+
+Manual run:
+
+```bash
+gh workflow run integration-workers-join.yml \
+  -f cp_tag=v0.1.33 -f worker_tag=v0.1.9 -f worker_count=2
+```
 
 Manual run:
 
@@ -90,9 +141,12 @@ Beyond the baseline in `docs/self-hosted-runner.md`:
 ## Teardown + isolation
 
 All drivers use a unique VM name keyed on `GITHUB_RUN_ID`
-(`hummingbird-it-boot-<run_id>` / `hummingbird-it-upgrade-<run_id>` /
-`hummingbird-it-rollback-<run_id>`), so parallel runs don't collide. A
-trap-based cleanup always:
+(`hummingbird-it-boot-<run_id>`, `hummingbird-it-boot-k3s-<run_id>`,
+`hummingbird-it-upgrade-<run_id>`, `hummingbird-it-rollback-<run_id>`,
+`hummingbird-it-workers-<run_id>-{cp,wN}`), so parallel runs don't collide
+and the long-lived cluster VMs on the host (`hummingbird-k3s`,
+`hummingbird-k8s`, `hummingbird-k8s-worker-{1,2}`) are NEVER touched.
+A trap-based cleanup always:
 
 - `virsh destroy` + `virsh undefine --nvram`
 - removes the per-test qcow2 from the libvirt pool
