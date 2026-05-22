@@ -118,18 +118,41 @@ EOF
 log "building qcow2 from ${FROM_IMAGE} via bib"
 mkdir -p "${LIBVIRT_POOL_DIR}"
 rm -rf "${LIBVIRT_POOL_DIR}/qcow2"
-podman pull "${FROM_IMAGE}"
 
-podman run --rm --privileged --pull=newer \
-  --net=host --cgroupns=host --cgroup-manager=cgroupfs \
-  --security-opt label=disable \
-  -v "${BIB_CFG}:/config.toml:ro" \
-  -v "${LIBVIRT_POOL_DIR}:/output" \
-  -v /var/lib/containers/storage:/var/lib/containers/storage \
-  "${BIB_IMAGE}" \
-  --type qcow2 --rootfs ext4 \
-  --local \
-  "${FROM_IMAGE}"
+if command -v docker >/dev/null && [[ -S /var/run/docker.sock ]]; then
+  log "using host docker daemon for bib (sibling-of-runner)"
+  SHARED_DIR="${LIBVIRT_POOL_DIR}/integration-runs/${RUN_ID}"
+  mkdir -p "${SHARED_DIR}"
+  cp "${BIB_CFG}" "${SHARED_DIR}/config.toml"
+  BIB_STORAGE="${SHARED_DIR}/storage"
+  mkdir -p "${BIB_STORAGE}"
+  trap 'rm -rf "'"${SHARED_DIR}"'" 2>/dev/null || true' EXIT
+  docker run --rm --privileged \
+    -v "${BIB_STORAGE}:/var/lib/containers/storage" \
+    quay.io/podman/stable:latest \
+    podman --root /var/lib/containers/storage pull "${FROM_IMAGE}"
+  docker run --rm --privileged --pull=always \
+    -v "${SHARED_DIR}/config.toml:/config.toml:ro" \
+    -v "${LIBVIRT_POOL_DIR}:/output" \
+    -v "${BIB_STORAGE}:/var/lib/containers/storage" \
+    "${BIB_IMAGE}" \
+    --type qcow2 --rootfs ext4 \
+    --local \
+    "${FROM_IMAGE}"
+else
+  log "using podman for bib (bare-metal path)"
+  podman pull "${FROM_IMAGE}"
+  podman run --rm --privileged --pull=newer \
+    --net=host --cgroupns=host --cgroup-manager=cgroupfs \
+    --security-opt label=disable \
+    -v "${BIB_CFG}:/config.toml:ro" \
+    -v "${LIBVIRT_POOL_DIR}:/output" \
+    -v /var/lib/containers/storage:/var/lib/containers/storage \
+    "${BIB_IMAGE}" \
+    --type qcow2 --rootfs ext4 \
+    --local \
+    "${FROM_IMAGE}"
+fi
 
 mv -f "${LIBVIRT_POOL_DIR}/qcow2/disk.qcow2" "${POOL_QCOW}"
 rmdir "${LIBVIRT_POOL_DIR}/qcow2" 2>/dev/null || true

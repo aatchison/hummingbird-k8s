@@ -47,16 +47,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install containernetworking-plugins
-        # myoung34/github-runner ships without CNI plugins (#150).
+      - name: Install runner deps (CNI + virtinst)
+        # myoung34/github-runner is minimal; install bib + integration deps
+        # on demand. Idempotent.
         run: |
           set -euo pipefail
-          if ! ls /usr/lib/cni/bridge >/dev/null 2>&1 \
-            && ! ls /usr/libexec/cni/bridge >/dev/null 2>&1 \
-            && ! ls /opt/cni/bin/bridge >/dev/null 2>&1; then
+          need=()
+          { ls /usr/lib/cni/bridge >/dev/null 2>&1 \
+              || ls /usr/libexec/cni/bridge >/dev/null 2>&1 \
+              || ls /opt/cni/bin/bridge >/dev/null 2>&1 ; } \
+              || need+=(containernetworking-plugins)
+          command -v virt-install >/dev/null 2>&1 || need+=(virtinst)
+          command -v virsh        >/dev/null 2>&1 || need+=(libvirt-clients)
+          if [[ ${#need[@]} -gt 0 ]]; then
             sudo apt-get update -q
-            sudo apt-get install -y -q containernetworking-plugins
+            sudo apt-get install -y -q "${need[@]}"
           fi
+
 
       - name: Prepare isolated podman storage
         run: |
