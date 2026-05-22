@@ -26,6 +26,10 @@ done
 rm -f /mnt/mass2/vms/hummingbird-k8s-worker-*.qcow2 /mnt/mass2/vms/hummingbird-k8s-worker.qcow2
 
 bash build-worker.sh
+# spawn-workers.sh runs scripts/switch-to-ghcr.sh per worker once each VM
+# has booted, so freshly-spawned workers track ghcr.io/aatchison/
+# hummingbird-k8s-worker:latest rather than the install-time
+# `localhost/...:latest`. See #138.
 bash spawn-workers.sh "$COUNT"
 
 # Explicit "we got here" sentinel so an operator piping through tee can

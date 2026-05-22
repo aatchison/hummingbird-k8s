@@ -19,3 +19,11 @@ rm -f /mnt/mass2/vms/hummingbird-k3s.qcow2 /mnt/mass2/vms/hummingbird.qcow2
 
 bash build-k3s.sh
 bash define-vm.sh
+
+# Fresh VMs install from `localhost/hummingbird-k3s:latest` (the local podman
+# build), which means the bootc auto-update timer has no remote to pull from.
+# Switch the new VM to track the GHCR-published image so subsequent
+# `bootc upgrade`s (manual or via the timer) actually do something. See #138.
+# Set BOOTC_SWITCH_TO_GHCR=0 to skip (offline lab use).
+bash switch-to-ghcr.sh hummingbird-k3s ghcr.io/aatchison/hummingbird-k3s:latest || \
+  echo "WARN: bootc switch failed; VM still tracks localhost:latest" >&2

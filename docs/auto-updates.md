@@ -8,6 +8,52 @@ rationale: a single-CP cluster suffers a full apiserver outage during the
 CP reboot, so auto-update on the CP needs to be an explicit operator
 choice (#48).
 
+## Tracking GHCR vs localhost
+
+The local build path (`scripts/build-*.sh` → `bib`) produces qcow2s that
+install with their bootc image reference set to `localhost/hummingbird-<flavor>:latest`.
+That reference doesn't resolve from inside the VM, so the auto-update
+timer fires on schedule but has nothing to pull — every GHCR release sits
+on the registry while the VM stays frozen at whatever was last built
+locally (#138).
+
+To make auto-updates actually work, the VM has to track a remote ref. The
+`redo-*.sh` deploy scripts now run `scripts/switch-to-ghcr.sh` against each
+freshly-installed VM as their last step, which does:
+
+```bash
+bootc switch ghcr.io/aatchison/hummingbird-<flavor>:latest
+```
+
+After that, the next `bootc upgrade` (manual or via the timer) pulls from
+GHCR. To verify on any node:
+
+```bash
+sudo bootc status --json | jq .status.booted.image.image.image
+# → "ghcr.io/aatchison/hummingbird-k3s:latest"   (good)
+# → "localhost/hummingbird-k3s:latest"           (bad — timer can't pull)
+```
+
+### Switching an already-deployed cluster
+
+For a cluster deployed before this auto-switch existed, run the Makefile
+target on the KVM host. It iterates every running `hummingbird-*` VM,
+SSHes in, and `bootc switch`es each one. Already-correct VMs are skipped:
+
+```bash
+make switch-to-ghcr
+```
+
+The script is best-effort per VM: if `bootc switch` fails for one (e.g.
+the GHCR image hasn't been published for that flavor yet, or the VM is
+unreachable), the others still get switched and the failure is logged.
+
+### Opting out
+
+Set `BOOTC_SWITCH_TO_GHCR=0` in the environment when running `redo-*.sh`
+(or `make switch-to-ghcr`) to skip the post-install switch — appropriate
+for offline labs where the VM intentionally tracks the local build.
+
 Each booted VM with the timer enabled will, without operator intervention:
 
 1. Wake up on the timer (default cadence: roughly once a day, with a small

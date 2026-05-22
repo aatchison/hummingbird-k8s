@@ -221,3 +221,15 @@ for i in $(seq 1 "$COUNT"); do
 done
 
 virsh -c qemu:///system pool-refresh mass2 >/dev/null || true
+
+# Each freshly-spawned worker tracks `localhost/hummingbird-k8s-worker:latest`
+# (the local podman build), so the bootc auto-update timer has nothing to
+# pull from GHCR. Switch each worker to the GHCR-published image so updates
+# actually flow. See #138. Best-effort per worker: if one fails (e.g. GHCR
+# ref hasn't been published yet for this flavor) we continue with the rest.
+# Set BOOTC_SWITCH_TO_GHCR=0 to skip.
+for i in $(seq 1 "$COUNT"); do
+  NAME="hummingbird-k8s-worker-${i}"
+  bash scripts/switch-to-ghcr.sh "$NAME" ghcr.io/aatchison/hummingbird-k8s-worker:latest || \
+    echo "WARN: bootc switch failed for $NAME; VM still tracks localhost:latest" >&2
+done
