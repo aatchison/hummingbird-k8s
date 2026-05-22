@@ -82,37 +82,6 @@ jobs:
 
       # Vulnerability scan the locally-built image before push. exit-code=0
       # keeps this report-only for now (future PR can ratchet to fail-on-HIGH).
-      - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: localhost/hummingbird-k8s:${{ steps.v.outputs.version }}
-          severity: HIGH,CRITICAL
-          exit-code: '0'
-          format: sarif
-          output: trivy-results.sarif
-
-      - name: Upload Trivy SARIF
-        uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57 # v3
-        if: always()
-        with:
-          sarif_file: trivy-results.sarif
-          category: trivy-hummingbird-k8s
-
-      # Generate an SPDX SBOM of the locally-built image. Uploaded as a
-      # workflow artifact and later cosign-attested against the pushed digest.
-      - name: Generate SBOM with syft
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
-        with:
-          image: localhost/hummingbird-k8s:${{ steps.v.outputs.version }}
-          output-file: sbom-${{ steps.v.outputs.version }}.spdx.json
-          format: spdx-json
-
-      - name: Upload SBOM artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: sbom-k8s-${{ steps.v.outputs.version }}
-          path: sbom-${{ steps.v.outputs.version }}.spdx.json
-
       - name: Push to GHCR
         id: push
         uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2.8
@@ -148,6 +117,37 @@ jobs:
       # Signing is by digest, which covers the single-arch (amd64) image
       # produced here. If multi-arch builds are added later, both the manifest
       # index AND each per-arch child manifest must be signed.
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s@${{ steps.digest.outputs.digest }}
+          severity: HIGH,CRITICAL
+          exit-code: '0'
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57 # v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-hummingbird-k8s
+
+      # Generate an SPDX SBOM of the locally-built image. Uploaded as a
+      # workflow artifact and later cosign-attested against the pushed digest.
+      - name: Generate SBOM with syft
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s@${{ steps.digest.outputs.digest }}
+          output-file: sbom-${{ steps.v.outputs.version }}.spdx.json
+          format: spdx-json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-k8s-${{ steps.v.outputs.version }}
+          path: sbom-${{ steps.v.outputs.version }}.spdx.json
+
       - name: Sign image with cosign (keyless, OIDC)
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s
