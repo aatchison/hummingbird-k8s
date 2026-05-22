@@ -14,11 +14,32 @@
 # If CP_IP is unset the script tries to auto-detect the first control-plane
 # node's InternalIP via `kubectl get nodes`.
 #
+# SSH transport:
+#   The CP normally lives on the libvirt default NAT subnet
+#   (192.168.122.0/24), which is not routable from a dev host. Set
+#   `KVM_HOST` to the SSH alias of the KVM hypervisor and the script
+#   will tunnel SSH through it with `ssh -o ProxyJump=$KVM_HOST`:
+#
+#     KVM_HOST=thegeary ./scripts/verify-hardening.sh
+#
+#   This is the same env var `kubectl-k8s.sh` uses. If `KVM_HOST` is
+#   unset the script falls back to direct SSH (works when run from the
+#   KVM host itself or from any host with a route to the CP).
+#
 # Exits 0 only if all three checks pass. Prints a summary either way.
 
 set -euo pipefail
 
 log() { printf '[verify-hardening] %s\n' "$*" >&2; }
+
+# Build SSH option array. When KVM_HOST is set we tunnel through it as a
+# jump host so the libvirt NAT subnet doesn't need to be routable from
+# the dev machine. When KVM_HOST is unset the array stays empty and ssh
+# behaves exactly as before (direct connection to root@$CP_IP).
+SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no)
+if [[ -n "${KVM_HOST:-}" ]]; then
+  SSH_OPTS+=(-o "ProxyJump=${KVM_HOST}")
+fi
 
 # Tracks each check independently so the summary shows partial state.
 ps_ok=0
@@ -83,7 +104,7 @@ audit_cmd='for p in /var/log/kubernetes/k8s-audit.log /var/log/k8s-audit.log; do
   if [ -s "$p" ]; then printf "OK %s\n" "$p"; exit 0; fi
 done
 exit 1'
-if audit_path="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+if audit_path="$(ssh "${SSH_OPTS[@]}" \
                      "root@$CP_IP" "$audit_cmd" 2>/dev/null)"; then
   log "  PASS: audit log present (${audit_path#OK })"
   audit_ok=1
@@ -98,7 +119,7 @@ log "check 3/3: kubelet running with --protect-kernel-defaults=true"
 # `ps -ef | grep | head` lets ssh return the matched argv line, which the
 # local shell then asserts is non-empty.
 kubelet_cmd="ps -ef | grep -- '--protect-kernel-defaults=true' | grep -v grep | head -1"
-if kubelet_line="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+if kubelet_line="$(ssh "${SSH_OPTS[@]}" \
                        "root@$CP_IP" "$kubelet_cmd" 2>/dev/null)" \
    && [[ -n "$kubelet_line" ]]; then
   log "  PASS: kubelet has --protect-kernel-defaults=true"
