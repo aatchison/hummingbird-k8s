@@ -191,6 +191,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — known failure modes and fixes from operating the cluster.
 - [`docs/vm-sizing.md`](docs/vm-sizing.md) — VM resource defaults, tunables, sizing guidance.
 - [`docs/backup-restore.md`](docs/backup-restore.md) — etcd snapshot + restore.
+- [`docs/k8s-version-upgrade.md`](docs/k8s-version-upgrade.md) — K8s major-version upgrade strategy.
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.
