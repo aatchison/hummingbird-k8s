@@ -51,6 +51,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
 .PHONY: help \
         image-k3s image-k8s image-worker image-all \
         k3s k8s workers spawn \
+        switch-to-ghcr \
         nodes kubectl \
         verify-encryption verify-hardening verify-app-deploy verify-all \
         kube-bench \
@@ -104,6 +105,9 @@ workers: ## Rebuild worker template and spawn $(COUNT) workers (sudo)
 
 spawn: ## Spawn $(COUNT) more workers without rebuilding the template (sudo)
 	bash scripts/spawn-workers.sh $(COUNT)
+
+switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
+	bash scripts/switch-to-ghcr.sh
 
 # ---- convenience -------------------------------------------------------
 
