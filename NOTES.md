@@ -57,6 +57,17 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 - **First SSH from <kvm-host> to a freshly-recreated VM** trips on stale host keys (libvirt re-issues IPs from its NAT pool) from prior VMs. `ssh-keygen -R <ip>` clears it.
 - **bib produces all formats** (qcow2, vmdk, vpc, ovf, archive, gce) even when you only ask for one — just `mv` the qcow2 you care about.
 
+## `POOL_DIR` — libvirt storage pool location
+
+- `POOL_DIR` controls where qcow2 disks are written and where `virt-install --disk`
+  expects to find them. It is honored by `lib/build-common.sh` (build phase), by
+  `define-vm.sh` / `define-vm-k8s.sh` (define phase), and — once PR #28 lands — by
+  `spawn-workers.sh`.
+- Default: `/var/lib/libvirt/images` (libvirt's stock pool dir).
+- Override per host by exporting `POOL_DIR=/your/path` in `config.local.sh`. All
+  build + define scripts source that file from the repo root, so a single setting
+  keeps build/define/spawn pointing at the same directory.
+
 ## How bootc auto-update works
 
 - Image lives in any OCI registry (ghcr.io, quay.io, your own). GitHub repos *themselves* aren't pullable — publish to GHCR.
