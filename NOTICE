@@ -1,0 +1,12 @@
+hummingbird-k8s
+Copyright 2026 Arron Atchison
+
+This product includes software developed by Arron Atchison
+(https://github.com/aatchison/hummingbird-k8s).
+
+Portions of this codebase were generated with the assistance of
+AI coding tools. Per Red Hat's guidance on AI-assisted development
+and open-source licensing
+(https://www.redhat.com/en/blog/ai-assisted-development-and-open-source-navigating-legal-issues),
+this NOTICE and the accompanying LICENSE file at the repository
+root declare the project under Apache License 2.0.
