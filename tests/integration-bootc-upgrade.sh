@@ -17,6 +17,12 @@
 
 set -euo pipefail
 
+# Force podman onto vfs when running inside a containerized self-hosted runner
+# whose rootfs is overlayfs (the geary-docker runner). Overriding only when
+# unset lets a caller still pick overlay/fuse-overlayfs on a bare-metal host
+# (#124).
+export STORAGE_DRIVER="${STORAGE_DRIVER:-vfs}"
+
 FROM_TAG="${1:?from_tag required (e.g. v0.1.9)}"
 TO_TAG="${2:?to_tag required (e.g. v0.1.10)}"
 RUN_ID="${GITHUB_RUN_ID:-local}"
