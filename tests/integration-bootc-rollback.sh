@@ -122,7 +122,7 @@ podman pull "${FROM_IMAGE}"
 
 podman run --rm --privileged --pull=newer \
   --net=host --cgroupns=host --cgroup-manager=cgroupfs \
-  --security-opt label=type:unconfined_t \
+  --security-opt label=disable \
   -v "${BIB_CFG}:/config.toml:ro" \
   -v "${LIBVIRT_POOL_DIR}:/output" \
   -v /var/lib/containers/storage:/var/lib/containers/storage \

@@ -135,7 +135,7 @@ podman_isolated pull "${FROM_IMAGE}"
 # `--local` resolves to the image we just pulled.
 podman_isolated run --rm --privileged --pull=newer \
   --net=host --cgroupns=host --cgroup-manager=cgroupfs \
-  --security-opt label=type:unconfined_t \
+  --security-opt label=disable \
   -v "${BIB_CFG}:/config.toml:ro" \
   -v "${LIBVIRT_POOL_DIR}:/output" \
   -v "${PODMAN_ROOT}:/var/lib/containers/storage" \
