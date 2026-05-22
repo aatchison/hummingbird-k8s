@@ -1,0 +1,65 @@
+# Per-VM short-TTL kubeadm join tokens
+
+## What changed
+
+The `hummingbird-k8s-worker` template image no longer contains a kubeadm join
+token. `build-worker.sh` produces a pure template qcow2 — the same bits ship
+to every host. `spawn-workers.sh` mints a fresh, short-TTL token per VM and
+injects it into that VM's cloned qcow2 at `/etc/hummingbird/worker-join.env`
+just before `virt-install`. On first boot, `worker-init.sh` reads that file
+and runs the join exactly as before.
+
+## Why
+
+Previously, `build-worker.sh` ran `kubeadm token create --ttl 0
+--print-join-command` against the control plane and baked the resulting
+never-expiring join command into the worker image. That meant:
+
+- The published image embedded a long-lived secret valid until the CP CA
+  rotates or the cluster is rebuilt.
+- Every worker spawned from one build shared the same token (one leak =
+  unbounded blast radius).
+- Anyone who pulled the OCI image (or the qcow2) could join the cluster.
+
+The new flow:
+
+- Image carries no token. Compromising the registry/image yields nothing
+  useful against the cluster.
+- Each VM gets its own short-TTL token (`--ttl 2h` by default, override via
+  the `TOKEN_TTL` env var). After two hours, an unused token is dead.
+- Token never touches the image registry or any shared artifact — it lives
+  only inside one VM's per-instance qcow2.
+
+## Adding a worker
+
+The control plane VM must be running. From the KVM host:
+
+```sh
+sudo bash spawn-workers.sh 1
+```
+
+That clones the template, asks the running CP for a fresh ~2h token, injects
+it into the new VM's disk, and starts the VM. Repeat with a higher count to
+add several at once. To add a single worker alongside existing workers, set
+the count appropriately (the script skips names already defined in libvirt).
+
+Override the token TTL or the CP VM name if needed:
+
+```sh
+sudo TOKEN_TTL=30m CP_VM_NAME=hummingbird-k8s bash spawn-workers.sh 1
+```
+
+## How injection works
+
+`spawn-workers.sh` prefers `virt-customize` (from `libguestfs-tools-c` /
+`libguestfs-tools`) and falls back to `guestfish`. If neither is installed,
+it attempts `dnf install -y libguestfs-tools-c` once. Both tools mount the
+qcow2 offline, write `/etc/hummingbird/worker-join.env` (mode 0600), and
+unmount cleanly. No cloud-init, no second CD-ROM, no extra metadata server.
+
+## What if someone boots the bare template?
+
+`worker-init.service` carries `ConditionPathExists=/etc/hummingbird/worker-join.env`,
+so on a template qcow2 (no token injected) the join unit silently skips
+instead of failing the boot. `worker-init.sh` itself also prints an
+actionable error pointing the operator at `spawn-workers.sh`.
