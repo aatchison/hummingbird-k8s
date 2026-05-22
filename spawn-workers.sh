@@ -81,11 +81,58 @@ mint_join_command() {
 }
 
 # Write the join command into the given qcow2 at /etc/hummingbird/worker-join.env.
+#
+# The Hummingbird worker image is bootc/ostree-based, so neither libguestfs
+# OS introspection (`-i`, used by virt-customize and `guestfish -i`) works.
+# Both bail with "no operating systems were found in the guest image" because
+# the on-disk layout puts the rootfs under /ostree/deploy/<stateroot>/deploy/
+# <commit>.0/, not at the partition root. At runtime the kernel mounts that
+# deployment dir as /, with its /etc bind-merged on top.
+#
+# We sidestep introspection entirely: open the qcow2 with guestfish, mount
+# /dev/sda4 (the 'root' partition) manually, locate the active deployment
+# dir, and write into <deployment>/etc/hummingbird/worker-join.env. That
+# path becomes /etc/hummingbird/worker-join.env on the booted guest.
 inject_join_env() {
   local qcow="$1" join_cmd="$2" tmpfile
   tmpfile="$(mktemp)"
   printf '%s\n' "$join_cmd" > "$tmpfile"
   case "$INJECTOR" in
+    guestfish)
+      # Discover the active deployment dir from the qcow2 itself so we don't
+      # hard-code per-build hashes. We expect exactly one stateroot (typically
+      # 'default') and one deployment dir (named '<commit-sha>.0') inside it.
+      local stateroot deploy_basename etc_path
+      stateroot=$(guestfish --ro -a "$qcow" <<'GF' 2>/dev/null | grep -v '^$' | head -1
+run
+mount /dev/sda4 /
+ls /ostree/deploy
+GF
+)
+      if [[ -n "$stateroot" ]]; then
+        deploy_basename=$(guestfish --ro -a "$qcow" <<GF 2>/dev/null | grep -v '\.origin$' | grep -v '^$' | head -1
+run
+mount /dev/sda4 /
+ls /ostree/deploy/${stateroot}/deploy
+GF
+)
+      fi
+      if [[ -n "$stateroot" && -n "$deploy_basename" ]]; then
+        etc_path="/ostree/deploy/${stateroot}/deploy/${deploy_basename}/etc/hummingbird"
+      else
+        # Non-bootc layout (or unexpected): write to the partition root's /etc,
+        # which is the live /etc on traditional (non-ostree) images.
+        etc_path="/etc/hummingbird"
+      fi
+      guestfish --rw -a "$qcow" <<EOF
+run
+mount /dev/sda4 /
+mkdir-p ${etc_path}
+upload ${tmpfile} ${etc_path}/worker-join.env
+chmod 0600 ${etc_path}/worker-join.env
+chown 0 0 ${etc_path}/worker-join.env
+EOF
+      ;;
     virt-customize)
       virt-customize -a "$qcow" \
         --mkdir /etc/hummingbird \
@@ -93,14 +140,6 @@ inject_join_env() {
         --run-command 'chmod 0600 /etc/hummingbird/worker-join.env' \
         --run-command 'chown root:root /etc/hummingbird/worker-join.env' \
         >/dev/null
-      ;;
-    guestfish)
-      guestfish --rw -a "$qcow" -i <<EOF
-mkdir-p /etc/hummingbird
-upload ${tmpfile} /etc/hummingbird/worker-join.env
-chmod 0600 /etc/hummingbird/worker-join.env
-chown 0 0 /etc/hummingbird/worker-join.env
-EOF
       ;;
   esac
   rm -f "$tmpfile"
