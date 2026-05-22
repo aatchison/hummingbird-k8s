@@ -115,7 +115,7 @@ jobs:
           echo "findings=$out" >> "$GITHUB_OUTPUT"
 
       - name: Upload lens findings artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: findings-${{ matrix.lens }}
           path: ${{ steps.review.outputs.findings }}
