@@ -77,3 +77,26 @@ existing rows and is out of scope for this round.
 is missing but `/etc/kubernetes/kubeadm-init.yaml` exists, a previous
 `kubeadm init` died partway. The script runs `kubeadm reset --force`
 and removes the half-written config files so the retry starts clean.
+
+## Gotchas
+
+### `--config` and `--cri-socket` are mutually exclusive (kubeadm v1.31+)
+
+When `kubeadm init` is invoked with `--config=`, kubeadm v1.31 rejects
+any CLI flag whose value is also expressible in the configuration
+file. Passing `--cri-socket=unix:///var/run/crio/crio.sock` alongside
+`--config=` now hard-errors with:
+
+```
+can not mix '--config' with arguments [cri-socket]
+```
+
+The canonical place to set the CRI socket under `--config` is the
+`InitConfiguration.nodeRegistration.criSocket` field of the generated
+kubeadm YAML — which `k8s-init.sh` already writes (see the
+`nodeRegistration:` block in the heredoc). Do not also pass
+`--cri-socket` on the CLI.
+
+Note that `kubeadm reset` is unaffected and still accepts (and in
+fact needs) `--cri-socket` when multiple runtimes could be present,
+because `reset` does not consume a config file.
