@@ -18,13 +18,23 @@ COPY containers/k3s/ssh-hostkey-regen.service /etc/systemd/system/ssh-hostkey-re
 
 # Install k3s into /usr/bin (bootc keeps /usr in the OCI layer; /usr/local
 # is wired to /var on Hummingbird and would not survive into the image).
-RUN curl -fsSL https://get.k3s.io | \
-      INSTALL_K3S_VERSION="${K3S_VERSION}" \
+#
+# Download install.sh with a fallback: get.k3s.io is the canonical entry point
+# (it redirects to raw.githubusercontent.com for the latest), but we pin to a
+# version-tagged raw URL as the second source so a get.k3s.io outage or DNS
+# blip doesn't break the build. Both URLs ultimately serve the same
+# upstream-signed installer that performs its own sha256-pinned binary fetch.
+# --retry handles transient network errors on each individual attempt.
+RUN { curl -fsSL --retry 3 --retry-delay 2 -o /tmp/k3s-install.sh https://get.k3s.io \
+      || curl -fsSL --retry 3 --retry-delay 2 -o /tmp/k3s-install.sh \
+           "https://raw.githubusercontent.com/k3s-io/k3s/${K3S_VERSION}/install.sh"; } \
+ && INSTALL_K3S_VERSION="${K3S_VERSION}" \
       INSTALL_K3S_BIN_DIR=/usr/bin \
       INSTALL_K3S_SKIP_ENABLE=true \
       INSTALL_K3S_SKIP_START=true \
       INSTALL_K3S_SELINUX_WARN=true \
-      sh - \
+      sh /tmp/k3s-install.sh \
+ && rm -f /tmp/k3s-install.sh \
  && /usr/bin/k3s --version
 
 # Default config: world-readable kubeconfig so the wheel user can use kubectl.
