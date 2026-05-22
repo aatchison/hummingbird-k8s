@@ -47,6 +47,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Install containernetworking-plugins
+        # myoung34/github-runner ships without CNI plugins (#150).
+        run: |
+          set -euo pipefail
+          if ! ls /usr/lib/cni/bridge >/dev/null 2>&1 \
+            && ! ls /usr/libexec/cni/bridge >/dev/null 2>&1 \
+            && ! ls /opt/cni/bin/bridge >/dev/null 2>&1; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q containernetworking-plugins
+          fi
+
       - name: Prepare isolated podman storage
         run: |
           set -euo pipefail
