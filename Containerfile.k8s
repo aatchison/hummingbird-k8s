@@ -69,13 +69,13 @@ COPY etc/kubernetes/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
 
 # cilium-cli (single binary) used by k8s-init.sh to install Cilium CNI on first boot.
 ARG CILIUM_CLI_VERSION=v0.16.16
-RUN curl -fsSL -o /tmp/cilium-cli.tar.gz \
+RUN curl -fsSL -o /tmp/cilium-linux-amd64.tar.gz \
       "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz" \
- && curl -fsSL -o /tmp/cilium-cli.tar.gz.sha256sum \
+ && curl -fsSL -o /tmp/cilium-linux-amd64.tar.gz.sha256sum \
       "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz.sha256sum" \
  && (cd /tmp && sha256sum -c cilium-cli.tar.gz.sha256sum) \
- && tar -C /usr/bin -xzf /tmp/cilium-cli.tar.gz cilium \
- && rm -f /tmp/cilium-cli.tar.gz /tmp/cilium-cli.tar.gz.sha256sum \
+ && tar -C /usr/bin -xzf /tmp/cilium-linux-amd64.tar.gz cilium \
+ && rm -f /tmp/cilium-linux-amd64.tar.gz /tmp/cilium-linux-amd64.tar.gz.sha256sum \
  && /usr/bin/cilium version --client
 
 LABEL containers.bootc=1
