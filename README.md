@@ -129,6 +129,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/worker-tokens.md`](docs/worker-tokens.md) — short-TTL, per-VM kubeadm join tokens.
 - [`docs/self-hosted-runner.md`](docs/self-hosted-runner.md) — register a KVM-capable GitHub Actions runner.
 - [`docs/auto-updates.md`](docs/auto-updates.md) — bootc auto-update timer behavior.
+- [`docs/security-hardening.md`](docs/security-hardening.md) — PodSecurity restricted + apiserver audit + kubelet protect-kernel-defaults; run `scripts/verify-hardening.sh` after each redeploy.
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.

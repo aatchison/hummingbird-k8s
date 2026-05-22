@@ -12,6 +12,6 @@ NAME=hummingbird-k3s
 render_bib_config > bib-config.toml
 
 podman pull "$BASE_IMAGE"
-podman build -t "$LOCAL_IMAGE" -f Containerfile .
+podman build -t "$LOCAL_IMAGE" -f Containerfile.k3s .
 
 build_qcow2 "$LOCAL_IMAGE" "$NAME" "$(pwd)/bib-config.toml"

@@ -101,6 +101,21 @@ apiserver static pod mounts them via `extraVolumes` in
 
 ## Verifying each control
 
+All three controls can be checked in one shot with
+[`scripts/verify-hardening.sh`](../scripts/verify-hardening.sh):
+
+```bash
+CP_IP=192.168.122.42 ./scripts/verify-hardening.sh
+```
+
+The script requires `kubectl` access to the cluster and SSH-as-root to the
+CP host. It exits 0 only if PodSecurity rejects a privileged pod, the
+apiserver audit log is non-empty, and the kubelet is running with
+`--protect-kernel-defaults=true`. Run it after every redeploy.
+
+The individual checks below are the same controls, broken out for manual
+debugging.
+
 ### PodSecurity restricted
 
 A privileged pod into a non-exempt namespace must be rejected:
@@ -124,6 +139,37 @@ namespace:
 kubectl label namespace my-ns \
   pod-security.kubernetes.io/enforce=privileged --overwrite
 ```
+
+### Debugging blocked workloads
+
+When a pod fails admission, the operator should:
+
+1. Look at recent admission failures across the cluster:
+
+   ```bash
+   kubectl get events -A | grep ForbiddenError
+   ```
+
+2. Grep the apiserver audit log on the CP for the failed CreatePod (path
+   becomes `/var/log/kubernetes/k8s-audit.log` after #50; today's path is
+   `/var/log/k8s-audit.log`):
+
+   ```bash
+   ssh root@<cp> "grep ForbiddenError /var/log/kubernetes/k8s-audit.log"
+   ```
+
+3. Decide between two paths:
+   - **Harden the workload** so it satisfies `restricted` (`runAsNonRoot`,
+     `seccompProfile`, `capabilities.drop: [ALL]`, etc.) — preferred for
+     anything you control or want to keep auditable.
+   - **Relax the namespace** to `baseline` or `privileged` if it is an
+     internal, trusted namespace where hardening the workload is not
+     feasible:
+
+     ```bash
+     kubectl label namespace my-ns \
+       pod-security.kubernetes.io/enforce=privileged --overwrite
+     ```
 
 ### Audit logging
 
