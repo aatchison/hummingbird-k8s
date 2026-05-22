@@ -17,7 +17,7 @@
 #   4. virt-install the VM with the seed ISO attached as a CD-ROM.
 #   5. SSH in (using the key injected into user-data) and assert:
 #        - /var/lib/cloud-init-verified exists (runcmd: applied)
-#        - `command -v tree` succeeds (packages: applied)
+#        - (no package check — bootc /usr is read-only)
 #        - `cloud-init status` reports done (final stage succeeded)
 #
 # Tears the VM, qcow2, and seed ISO down unconditionally via trap.
@@ -358,12 +358,11 @@ if ! ssh "${ssh_opts[@]}" "root@${VM_IP}" \
   exit 1
 fi
 
-log "assert: tree package installed (packages: applied)"
-if ! ssh "${ssh_opts[@]}" "root@${VM_IP}" \
-     'command -v tree >/dev/null'; then
-  log "FAIL: tree not installed — cloud-init packages: section did not apply"
-  exit 1
-fi
+# NOTE: We do NOT assert package install here. bootc/ostree images have a
+# read-only /usr; cloud-init's package_update_upgrade_install module always
+# fails on them. That's expected — operators wanting package overlays should
+# layer them into the Containerfile, not via cloud-init user-data.
+log "(skipping package-install check — bootc /usr is read-only by design)"
 
 log "ALL CHECKS PASSED"
 exit 0

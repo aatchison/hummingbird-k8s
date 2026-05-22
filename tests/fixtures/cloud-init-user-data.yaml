@@ -8,7 +8,7 @@
 #
 # Assertions made by the driver after cloud-init completes:
 #   - /var/lib/cloud-init-verified exists (runcmd ran)
-#   - `command -v tree` resolves (packages: applied)
+#   - (no package check — bootc /usr is read-only)
 #   - `cloud-init status` reports done (final stage succeeded)
 # Allow root login (test driver SSHes as root, matching the hummingbird
 # sudoless model). cloud-init's default `disable_root: true` would force the
@@ -20,7 +20,5 @@ users:
       - SSH_KEY_PLACEHOLDER
 ssh_authorized_keys:
   - SSH_KEY_PLACEHOLDER
-packages:
-  - tree
 runcmd:
   - touch /var/lib/cloud-init-verified
