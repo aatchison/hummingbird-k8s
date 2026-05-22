@@ -24,6 +24,25 @@ ARG ENABLE_CLOUD_INIT=0
 # package-install layer cache below.
 COPY containers/shared/ssh/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
 
+# Import Fedora's GPG keyring (release-aligned public-key bundle from
+# fedoraproject.org) so every dnf install from the Rawhide repo below — and
+# from the optional cloud-init repo — is signature-verified at install time
+# (#70). The bundle ships keys for the current and adjacent Fedora releases
+# (currently F42-F45); dnf picks the right one by the package's signing-key
+# fingerprint at install time. Pinning the bundle URL avoids the previous
+# "gpgcheck=0 to skip bootstrap" posture that left Rawhide RPMs unverified.
+#
+# The upstream bundle is binary-OpenPGP, but rpm --import only accepts
+# ASCII-armored keys, so we re-armor via gpg before importing.
+RUN curl -fsSL --retry 3 --retry-delay 2 -o /tmp/fedora.gpg \
+      https://fedoraproject.org/fedora.gpg \
+ && GNUPGHOME=$(mktemp -d) \
+ && gpg --homedir "$GNUPGHOME" --import /tmp/fedora.gpg \
+ && gpg --homedir "$GNUPGHOME" --armor --export \
+      > /etc/pki/rpm-gpg/RPM-GPG-KEY-fedora \
+ && rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-fedora \
+ && rm -rf "$GNUPGHOME" /tmp/fedora.gpg
+
 # Optional cloud-init package + units. The shared datasource config + preset
 # are COPY'd unconditionally (they're tiny and inert without the package),
 # but the dnf install + `systemctl preset` only fire when the build arg is
@@ -35,11 +54,11 @@ COPY containers/shared/ssh/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-pas
 # the repo file before the layer commits. The k8s flavor's main RUN below
 # adds its own permanent Rawhide repo for iptables/socat/etc; this
 # self-contained drop-in keeps the cloud-init block independent of step
-# ordering. gpgcheck=0 matches the policy of the main Rawhide block.
+# ordering. gpgcheck=1 against the Fedora keyring imported above (#70).
 COPY containers/shared/cloud-init/10-cloud-init.preset /usr/lib/systemd/system-preset/10-cloud-init.preset
 COPY containers/shared/cloud-init/99-hummingbird-datasource.cfg /etc/cloud/cloud.cfg.d/99-hummingbird-datasource.cfg
 RUN if [ "${ENABLE_CLOUD_INIT}" = "1" ]; then \
-      printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=0\nskip_if_unavailable=False\n' \
+      printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\n' \
         > /etc/yum.repos.d/fedora-rawhide-cloudinit.repo \
       && dnf install -y cloud-init cloud-utils-growpart \
       && dnf clean all \
@@ -54,9 +73,9 @@ RUN if [ "${ENABLE_CLOUD_INIT}" = "1" ]; then \
 
 # Hummingbird's curated repo doesn't carry the standard k8s deps (iptables, socat,
 # conntrack-tools, ethtool). Add Fedora Rawhide as a secondary source — Hummingbird
-# is Rawhide-based so versions are compatible. gpgcheck=0 to avoid bootstrapping
-# Fedora's GPG keyring into this image; flip on once the workflow is settled.
-RUN printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=0\nskip_if_unavailable=False\n' \
+# is Rawhide-based so versions are compatible. gpgcheck=1 against the Fedora
+# keyring imported above (#70).
+RUN printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\n' \
       > /etc/yum.repos.d/fedora-rawhide.repo
 
 # Upstream Kubernetes + CRI-O RPM repos (version-aligned)

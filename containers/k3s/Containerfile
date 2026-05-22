@@ -26,16 +26,27 @@ COPY containers/shared/ssh/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-pas
 # in Hummingbird's curated repo, so the conditional drops in Fedora Rawhide
 # as a one-shot secondary source (Hummingbird is Rawhide-based) and removes
 # the repo file before the layer commits — the resulting image has no
-# baked-in Rawhide repo dangling around. gpgcheck=0 to avoid bootstrapping
-# Fedora's keyring into a k3s image that otherwise has no Fedora repo.
+# baked-in Rawhide repo dangling around. gpgcheck=1 against Fedora's keyring
+# (fetched inside the same conditional + removed alongside the repo, so the
+# default-OFF image is still byte-identical to pre-cloud-init) (#70). The
+# upstream bundle is binary-OpenPGP, so we re-armor via gpg before importing.
 COPY containers/shared/cloud-init/10-cloud-init.preset /usr/lib/systemd/system-preset/10-cloud-init.preset
 COPY containers/shared/cloud-init/99-hummingbird-datasource.cfg /etc/cloud/cloud.cfg.d/99-hummingbird-datasource.cfg
 RUN if [ "${ENABLE_CLOUD_INIT}" = "1" ]; then \
-      printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=0\nskip_if_unavailable=False\n' \
+      curl -fsSL --retry 3 --retry-delay 2 -o /tmp/fedora.gpg \
+           https://fedoraproject.org/fedora.gpg \
+      && GNUPGHOME=$(mktemp -d) \
+      && gpg --homedir "$GNUPGHOME" --import /tmp/fedora.gpg \
+      && gpg --homedir "$GNUPGHOME" --armor --export \
+           > /etc/pki/rpm-gpg/RPM-GPG-KEY-fedora \
+      && rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-fedora \
+      && rm -rf "$GNUPGHOME" /tmp/fedora.gpg \
+      && printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\n' \
         > /etc/yum.repos.d/fedora-rawhide-cloudinit.repo \
       && dnf install -y cloud-init cloud-utils-growpart \
       && dnf clean all \
       && rm -f /etc/yum.repos.d/fedora-rawhide-cloudinit.repo \
+              /etc/pki/rpm-gpg/RPM-GPG-KEY-fedora \
       && systemctl preset cloud-init-local.service \
            cloud-init-main.service cloud-init-network.service \
            cloud-config.service cloud-final.service ; \

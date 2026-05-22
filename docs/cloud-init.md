@@ -173,7 +173,10 @@ that drop-in is in place before `kubeadm init` reads it.
   configuration. This works uniformly across k3s, k8s, and
   k8s-worker (the latter two already have a permanent Rawhide
   repo for iptables/socat/etc, but the cloud-init block stays
-  self-contained so it's resilient to reordering).
+  self-contained so it's resilient to reordering). The Fedora
+  GPG keyring is imported and the repo runs with `gpgcheck=1`,
+  so cloud-init's RPM dependencies are signature-verified at
+  install time (#70).
 
 ## Disabling at runtime on an enabled image
 
