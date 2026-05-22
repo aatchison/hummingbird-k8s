@@ -75,10 +75,22 @@ COPY containers/shared/kubernetes/admission-control-config.yaml /etc/kubernetes/
 COPY containers/shared/kubernetes/audit-policy.yaml /etc/kubernetes/audit-policy.yaml
 
 # cilium-cli (single binary) used by k8s-init.sh to install Cilium CNI on first boot.
+#
+# Integrity floor: sha256 from the upstream-published .sha256sum (verified below).
+# Cosign verification is NOT applied here: cilium-cli releases through v0.16.x do
+# not publish detached .sig/.pem artifacts in their GitHub release assets (only
+# .sha256sum). When the cilium-cli release stream starts shipping Sigstore
+# signatures (or moves to a Rekor-bundle workflow), this block should grow a
+# `cosign verify-blob` step. Tracked in #72.
+#
+# Network resilience: each curl uses --retry to ride out transient GitHub
+# blips. There is no independent third-party mirror for cilium-cli release
+# artifacts (the project distributes only via github.com), so the "fallback"
+# here is in-attempt retry rather than a second host. Tracked in #97.
 ARG CILIUM_CLI_VERSION=v0.16.16
-RUN curl -fsSL -o /tmp/cilium-linux-amd64.tar.gz \
+RUN curl -fsSL --retry 3 --retry-delay 2 -o /tmp/cilium-linux-amd64.tar.gz \
       "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz" \
- && curl -fsSL -o /tmp/cilium-linux-amd64.tar.gz.sha256sum \
+ && curl -fsSL --retry 3 --retry-delay 2 -o /tmp/cilium-linux-amd64.tar.gz.sha256sum \
       "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-amd64.tar.gz.sha256sum" \
  && (cd /tmp && sha256sum -c cilium-linux-amd64.tar.gz.sha256sum) \
  && tar -C /usr/bin -xzf /tmp/cilium-linux-amd64.tar.gz cilium \
