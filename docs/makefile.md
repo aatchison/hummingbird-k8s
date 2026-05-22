@@ -34,6 +34,16 @@ Tear it all down:
 sudo make clean               # destroys + undefines VMs and removes local images
 ```
 
+Unit tests for `lib/build-common.sh` (no sudo, runs in a pinned bats
+container — same job CI runs as `unit-tests-lib`):
+
+```bash
+make test-lib
+```
+
+See [`integration-tests.md`](integration-tests.md#unit-tests) for the
+test surface.
+
 ## Variables
 
 | Variable   | Default                       | Used by                       |
