@@ -41,6 +41,17 @@ if [[ -n "${KVM_HOST:-}" ]]; then
   SSH_OPTS+=(-o "ProxyJump=${KVM_HOST}")
 fi
 
+# Helper: run a command "on the CP host". If CP_IP looks like localhost (the
+# script is itself executing on the CP, e.g. driven by integration-boot.sh
+# via scp+ssh), run locally to avoid an SSH-back-to-self that needs a key.
+on_cp() {
+  if [[ "${CP_IP}" == "127.0.0.1" || "${CP_IP}" == "localhost" ]]; then
+    bash -c "$1"
+  else
+    ssh "${SSH_OPTS[@]}" "root@${CP_IP}" "$1"
+  fi
+}
+
 # Tracks each check independently so the summary shows partial state.
 ps_ok=0
 audit_ok=0
@@ -104,8 +115,7 @@ audit_cmd='for p in /var/log/kubernetes/k8s-audit.log /var/log/k8s-audit.log; do
   if [ -s "$p" ]; then printf "OK %s\n" "$p"; exit 0; fi
 done
 exit 1'
-if audit_path="$(ssh "${SSH_OPTS[@]}" \
-                     "root@$CP_IP" "$audit_cmd" 2>/dev/null)"; then
+if audit_path="$(on_cp "$audit_cmd" 2>/dev/null)"; then
   log "  PASS: audit log present (${audit_path#OK })"
   audit_ok=1
 else
@@ -119,8 +129,7 @@ log "check 3/3: kubelet running with --protect-kernel-defaults=true"
 # `ps -ef | grep | head` lets ssh return the matched argv line, which the
 # local shell then asserts is non-empty.
 kubelet_cmd="ps -ef | grep -- '--protect-kernel-defaults=true' | grep -v grep | head -1"
-if kubelet_line="$(ssh "${SSH_OPTS[@]}" \
-                       "root@$CP_IP" "$kubelet_cmd" 2>/dev/null)" \
+if kubelet_line="$(on_cp "$kubelet_cmd" 2>/dev/null)" \
    && [[ -n "$kubelet_line" ]]; then
   log "  PASS: kubelet has --protect-kernel-defaults=true"
   kubelet_ok=1
