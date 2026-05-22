@@ -54,13 +54,7 @@ COPY k8s-init.service /etc/systemd/system/k8s-init.service
 # Hummingbird ships a 99-default-disable.preset that strips unenabled symlinks
 # during image build. Override with a low-numbered preset that wins.
 COPY 10-k8s.preset /usr/lib/systemd/system-preset/10-k8s.preset
-RUN systemctl preset crio.service kubelet.service k8s-init.service || true
-
-# Enable bootc auto-update timer (daily, applies + reboots automatically).
-# Operators who want manual control should override via systemctl disable.
-RUN install -d /etc/systemd/system/timers.target.wants \
- && ln -sf /usr/lib/systemd/system/bootc-fetch-apply-updates.timer \
-       /etc/systemd/system/timers.target.wants/bootc-fetch-apply-updates.timer
+RUN systemctl preset crio.service kubelet.service k8s-init.service bootc-fetch-apply-updates.timer || true
 
 # Security hardening config files (PodSecurity Admission + apiserver audit policy).
 # Read-only references mounted into the apiserver static pod by k8s-init.sh.
