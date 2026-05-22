@@ -1,0 +1,83 @@
+name: Integration — cloud-init path (#163)
+
+# Exercises the optional ENABLE_CLOUD_INIT=1 build arg shipped in PR #164.
+# This is workflow_dispatch ONLY because the cloud-init path is opt-in and
+# not part of the canonical Hummingbird release surface; we don't want a
+# release tag to gate on it.
+#
+# The driver builds the flavor's image LOCALLY with ENABLE_CLOUD_INIT=1
+# (GHCR doesn't publish a cloud-init variant), builds a qcow2 via bib,
+# generates a NoCloud seed ISO from tests/fixtures/cloud-init-user-data.yaml,
+# virt-installs the VM, then asserts that runcmd ran + packages applied.
+#
+# Self-hosted runner only (needs /dev/kvm + libvirt + virt-install +
+# genisoimage). The `kvm,libvirt` labels gate selection.
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'Image flavor to test (k3s | k8s | k8s-worker)'
+        required: true
+        type: choice
+        default: k8s
+        options:
+          - k3s
+          - k8s
+          - k8s-worker
+
+permissions:
+  contents: read
+
+jobs:
+  cloud-init:
+    runs-on: [self-hosted, kvm, libvirt]
+    timeout-minutes: 45
+    # Same isolated podman storage trick as integration-boot — the runner
+    # container's rootfs is overlayfs so we force vfs into a per-run graph
+    # root (#124, #139).
+    env:
+      STORAGE_DRIVER: vfs
+      PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}
+      PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install runner deps (CNI + virtinst + genisoimage)
+        # genisoimage is the seed-ISO builder for the cloud-init test;
+        # cloud-localds would also work but isn't in the minimal runner
+        # image, and falling back to genisoimage avoids the extra package.
+        run: |
+          set -euo pipefail
+          need=()
+          { ls /usr/lib/cni/bridge >/dev/null 2>&1 \
+              || ls /usr/libexec/cni/bridge >/dev/null 2>&1 \
+              || ls /opt/cni/bin/bridge >/dev/null 2>&1 ; } \
+              || need+=(containernetworking-plugins)
+          command -v virt-install >/dev/null 2>&1 || need+=(virtinst)
+          command -v virsh        >/dev/null 2>&1 || need+=(libvirt-clients)
+          command -v genisoimage  >/dev/null 2>&1 || need+=(genisoimage)
+          if [[ ${#need[@]} -gt 0 ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q "${need[@]}"
+          fi
+
+      - name: Prepare isolated podman storage
+        run: |
+          set -euo pipefail
+          sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
+          sudo mkdir -p "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
+
+      - name: Run cloud-init integration test
+        env:
+          FLAVOR: ${{ inputs.flavor }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          sudo --preserve-env=FLAVOR,GITHUB_RUN_ID,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+            tests/integration-cloud-init.sh "${FLAVOR}"
+
+      - name: Clean up isolated podman storage
+        if: always()
+        run: |
+          sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}" || true

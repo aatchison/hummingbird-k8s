@@ -1,0 +1,18 @@
+#cloud-config
+# Minimal NoCloud user-data for tests/integration-cloud-init.sh.
+#
+# The driver substitutes SSH_KEY_PLACEHOLDER with the ephemeral pubkey it
+# generates per run before mkisofs builds the seed ISO. Keep this file
+# free of any other dynamic fields so the substitution stays a single
+# string-replace.
+#
+# Assertions made by the driver after cloud-init completes:
+#   - /var/lib/cloud-init-verified exists (runcmd ran)
+#   - `command -v tree` resolves (packages: applied)
+#   - `cloud-init status` reports done (final stage succeeded)
+ssh_authorized_keys:
+  - SSH_KEY_PLACEHOLDER
+packages:
+  - tree
+runcmd:
+  - touch /var/lib/cloud-init-verified
