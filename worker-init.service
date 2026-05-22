@@ -3,6 +3,9 @@ Description=Join the Hummingbird Kubernetes cluster as a worker
 After=crio.service network-online.target
 Wants=crio.service network-online.target
 ConditionPathExists=!/var/lib/worker-init.done
+# Skip cleanly when an operator boots the bare template qcow2 (no token
+# injected). spawn-workers.sh writes this file per-VM before virt-install.
+ConditionPathExists=/etc/hummingbird/worker-join.env
 
 [Service]
 Type=oneshot

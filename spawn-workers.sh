@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Clones the worker template qcow2 into N copies and virt-installs each.
+# Clones the worker template qcow2 into N copies, mints a fresh short-TTL
+# kubeadm join token per VM, injects it into the VM's qcow2 at
+# /etc/hummingbird/worker-join.env, then virt-installs each.
+#
 # Usage: sudo bash spawn-workers.sh [count]
+#
+# See docs/worker-tokens.md for the design rationale (no static long-lived
+# token baked into the published worker image).
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -8,11 +14,89 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+: "${SUDO_USER:?must be invoked via sudo so ssh uses the calling user known_hosts/key}"
+
+cd "$(dirname "$(readlink -f "$0")")"
+# shellcheck source=lib/build-common.sh
+source lib/build-common.sh
+
+: "${CP_VM_NAME:=hummingbird-k8s}"
+: "${TOKEN_TTL:=2h}"
+
 COUNT="${1:-2}"
-POOL_DIR=/mnt/mass2/vms
+: "${POOL_DIR:=/var/lib/libvirt/images}"
 TEMPLATE="${POOL_DIR}/hummingbird-k8s-worker.qcow2"
 
 [[ -r "$TEMPLATE" ]] || { echo "Missing template $TEMPLATE — run build-worker.sh first." >&2; exit 1; }
+
+# Resolve the control plane IP so we can ask it for fresh join tokens.
+CP_IP=$(virsh -c qemu:///system domifaddr "$CP_VM_NAME" 2>/dev/null \
+          | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}' || true)
+if [[ -z "$CP_IP" ]]; then
+  echo "Could not resolve IP of CP VM '$CP_VM_NAME' via virsh domifaddr." >&2
+  echo "Is the control plane running? Set CP_VM_NAME=... if you renamed it." >&2
+  exit 1
+fi
+
+# Ensure we have a tool capable of mutating the qcow2's filesystem out-of-band.
+# virt-customize (from libguestfs-tools / libguestfs-tools-c) is preferred;
+# guestfish is a fallback. Best-effort install if the operator has not already.
+INJECTOR=""
+if command -v virt-customize >/dev/null 2>&1; then
+  INJECTOR=virt-customize
+elif command -v guestfish >/dev/null 2>&1; then
+  INJECTOR=guestfish
+else
+  echo "Neither virt-customize nor guestfish found; attempting to install libguestfs-tools-c..." >&2
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y libguestfs-tools-c >/dev/null 2>&1 || \
+      dnf install -y libguestfs-tools >/dev/null 2>&1 || true
+  fi
+  if command -v virt-customize >/dev/null 2>&1; then
+    INJECTOR=virt-customize
+  elif command -v guestfish >/dev/null 2>&1; then
+    INJECTOR=guestfish
+  else
+    echo "ERROR: virt-customize/guestfish unavailable and could not be installed." >&2
+    echo "Install libguestfs-tools-c (or libguestfs-tools) on this KVM host and retry." >&2
+    exit 1
+  fi
+fi
+
+# Mint a fresh kubeadm join token from the CP via SSH and echo the full join
+# command (one line, starts with 'kubeadm join ...').
+mint_join_command() {
+  sudo -u "$SUDO_USER" ssh \
+    -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=10 \
+    "${VM_USER}@${CP_IP}" \
+    "${VM_PASSWORD:+echo $VM_PASSWORD | sudo -S }kubeadm token create --ttl ${TOKEN_TTL} --print-join-command 2>/dev/null"
+}
+
+# Write the join command into the given qcow2 at /etc/hummingbird/worker-join.env.
+inject_join_env() {
+  local qcow="$1" join_cmd="$2" tmpfile
+  tmpfile="$(mktemp)"
+  printf '%s\n' "$join_cmd" > "$tmpfile"
+  case "$INJECTOR" in
+    virt-customize)
+      virt-customize -a "$qcow" \
+        --mkdir /etc/hummingbird \
+        --upload "${tmpfile}:/etc/hummingbird/worker-join.env" \
+        --run-command 'chmod 0600 /etc/hummingbird/worker-join.env' \
+        --run-command 'chown root:root /etc/hummingbird/worker-join.env' \
+        >/dev/null
+      ;;
+    guestfish)
+      guestfish --rw -a "$qcow" -i <<EOF >/dev/null
+mkdir-p /etc/hummingbird
+upload ${tmpfile} /etc/hummingbird/worker-join.env
+chmod 0600 /etc/hummingbird/worker-join.env
+EOF
+      ;;
+  esac
+  rm -f "$tmpfile"
+}
 
 for i in $(seq 1 "$COUNT"); do
   NAME="hummingbird-k8s-worker-${i}"
@@ -27,6 +111,17 @@ for i in $(seq 1 "$COUNT"); do
   cp --reflink=auto "$TEMPLATE" "$QCOW"
   chown root:root "$QCOW"
   chmod 0644 "$QCOW"
+
+  echo "Minting fresh ${TOKEN_TTL}-TTL join token for $NAME..."
+  JOIN_CMD="$(mint_join_command)"
+  if ! grep -q '^kubeadm join' <<<"$JOIN_CMD"; then
+    echo "ERROR: did not get a valid 'kubeadm join' command from CP at ${CP_IP}." >&2
+    echo "Got: $JOIN_CMD" >&2
+    rm -f "$QCOW"
+    exit 1
+  fi
+
+  inject_join_env "$QCOW" "$JOIN_CMD"
 
   virt-install --connect qemu:///system \
     --name "$NAME" \

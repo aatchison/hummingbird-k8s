@@ -5,7 +5,13 @@ MARKER=/var/lib/worker-init.done
 [[ -f "$MARKER" ]] && { echo "worker-init already ran"; exit 0; }
 
 JOIN_CMD_FILE=/etc/hummingbird/worker-join.env
-[[ -s "$JOIN_CMD_FILE" ]] || { echo "Missing $JOIN_CMD_FILE"; exit 1; }
+if [[ ! -s "$JOIN_CMD_FILE" ]]; then
+  echo "Missing or empty $JOIN_CMD_FILE." >&2
+  echo "Did spawn-workers.sh inject the per-VM kubeadm join token into this" >&2
+  echo "qcow2 before virt-install? The published template image intentionally" >&2
+  echo "ships without a token; see docs/worker-tokens.md." >&2
+  exit 1
+fi
 
 swapoff -a || true
 modprobe overlay
