@@ -46,6 +46,50 @@ k3s single-node:
         client laptop --(ssh)--> KVM host --> hummingbird-k3s VM
 ```
 
+## Prerequisites
+
+Before running `make k3s` / `make k8s`, the KVM host needs:
+
+- Fedora 41+ or RHEL 9.x with libvirt 10+ and `qemu:///system` reachable
+  (`virsh -c qemu:///system list` should succeed without errors).
+- Tooling on `$PATH`: `podman`, `virt-install`, `qemu-img`, `gh`, `git`.
+  `bootc-image-builder` can be installed locally or pulled on demand
+  (`quay.io/centos-bootc/bootc-image-builder:latest`).
+- User in the `libvirt` group, or run the operator targets with `sudo`:
+
+  ```bash
+  sudo usermod -aG libvirt "$USER"
+  newgrp libvirt
+  ```
+
+- Minimum host capacity for a 1 CP + 2 worker cluster: **16 GB RAM, 4 vCPU,
+  60 GB free disk** in `POOL_DIR` (default `/var/lib/libvirt/images/`).
+- An SSH keypair on the host (`~/.ssh/id_ed25519` by default) registered with
+  GitHub — the build/publish flow and the SSH commit-signing config both
+  consume it.
+
+## Resource requirements
+
+VM sizing defaults are tuned for a small homelab cluster. Override per host
+via `config.local.sh`.
+
+| Flavor | RAM | vCPU | qcow2 disk |
+| --- | --- | --- | --- |
+| `hummingbird-k8s` (control plane) | 8 GB | 4 | 30 GB |
+| `hummingbird-k8s-worker` (each) | 4 GB | 2 | 20 GB |
+| `hummingbird-k3s` (single-node) | 4 GB | 2 | 20 GB |
+
+Sizing guidance:
+
+- CP RAM is dominated by etcd + apiserver; do not drop below 4 GB.
+- Each worker reserves ~500 MB for kubelet/cri-o + Cilium; 4 GB leaves
+  ~3 GB for workloads.
+- qcow2 files live in `POOL_DIR`. Point `POOL_DIR=/mnt/ssd/libvirt` at an SSD
+  for noticeably better etcd write latency; HDDs work but `etcdctl defrag`
+  cadence matters more.
+- CP/worker memory and vCPU are tunable via `CP_MEMORY`, `CP_VCPUS`,
+  `WORKER_MEMORY`, `WORKER_VCPUS` (see #91 once configurable sizing lands).
+
 ## Quick start (operator)
 
 On a freshly-set-up KVM host (libvirtd running, `qemu:///system` reachable,
@@ -161,6 +205,38 @@ references/            external materials referenced by docs.
 Makefile               canonical operator entry point; all targets call
                        scripts/. `make help` lists them.
 ```
+
+## Troubleshooting
+
+Common failures and the first thing to try. For deeper context, see
+[`NOTES.md`](NOTES.md) and the per-topic docs under [`docs/`](docs).
+
+- **`kubectl` context "connection refused" from the client.** The SSH tunnel
+  or fetched kubeconfig is stale. Re-run `make kubectl ARGS='get nodes'`
+  (which refreshes `/tmp/k8s-kubeconfig` and the tunnel via
+  [`scripts/kubectl-k8s.sh`](scripts/kubectl-k8s.sh)).
+- **Cilium pods `CrashLoopBackOff` on the CP.** Usually a kernel BPF
+  capability gap — rare on the Hummingbird base, common on minimal Fedora
+  hosts. Check `kubectl -n kube-system logs ds/cilium` and confirm
+  `CONFIG_BPF_SYSCALL=y` on the VM kernel.
+- **`k8s-init.service` failed in `cilium install`.** Fixed in v0.1.10+
+  (`$HOME` was unset under the systemd unit). Upgrade the CP image.
+- **Worker stays `NotReady` after `make workers`.** The Cilium daemonset
+  hasn't scheduled there yet; wait ~60s after join, then re-check
+  `kubectl get nodes`.
+- **`bootc-image-builder` qcow2 build fails inside a container.** Usually
+  the podman storage driver — overlay-on-overlay can't run bib. Export
+  `STORAGE_DRIVER=vfs` before `make k8s` (see #124).
+- **`ssh-keygen` host-key conflict on a freshly redefined VM.** The libvirt
+  NAT lease was reused; clear the stale entry:
+
+  ```bash
+  ssh-keygen -R 192.168.122.10
+  ```
+
+- **Multi-host clusters.** Not supported today — `qemu:///system` and the
+  libvirt NAT topology assume one host. HA CP across hosts is tracked in
+  #11.
 
 ## License
 
