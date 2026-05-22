@@ -48,6 +48,31 @@ jobs:
           shellcheck: false
           pyflakes: false
 
+  render-bib-config-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render bib-config fixtures and diff against committed snapshots
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rbc
+          cat > /tmp/rbc/fake-key.pub <<'EOF'
+          ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEYDOESNOTWORKBUTISTHELIKELYSIZE test@example
+          EOF
+          export SUDO_USER=fake SSH_PUBKEY_FILES=/tmp/rbc/fake-key.pub
+
+          # Mask the random crypt(3) salt+hash so the fixture stays deterministic.
+          normalize() { sed -E 's|^password = "\$6\$[^"]*"|password = "<HASH>"|'; }
+
+          render_with() {
+            # shellcheck disable=SC1091
+            ( eval "$1"; source lib/build-common.sh; render_bib_config ) | normalize
+          }
+
+          diff -u .github/fixtures/render_bib_config/default.toml       <(render_with ':')
+          diff -u .github/fixtures/render_bib_config/with-password.toml <(render_with 'VM_USER_GROUPS=wheel VM_PASSWORD=secret')
+          diff -u .github/fixtures/render_bib_config/no-root-ssh.toml   <(render_with 'ENABLE_ROOT_SSH=0')
+
   containerfile-build:
     runs-on: ubuntu-latest
     strategy:

@@ -64,7 +64,7 @@ ssh_pubkey_blob() {
 
 # Render a single [[customizations.user]] block. $1 = username, $2 = include password (0/1).
 _render_user_block() {
-  local name="$1" want_pw="$2" keys groups
+  local name="$1" want_pw="$2" keys
   keys="$(ssh_pubkey_blob)"
 
   printf '[[customizations.user]]\n'
@@ -73,10 +73,14 @@ _render_user_block() {
     printf 'password = "%s"\n' "$(openssl passwd -6 "$VM_PASSWORD")"
   fi
   if [[ -n "$VM_USER_GROUPS" && "$name" != "root" ]]; then
-    # comma-separated → TOML array of quoted strings
+    # comma-separated → TOML array of quoted strings. Trim whitespace around each
+    # token, and strip trailing newlines so we never emit `"wheel\n"`.
     local groups
-    groups="[$(awk -v RS=, '{printf "%s\"%s\"", (NR>1?", ":""), $0}' <<<"$VM_USER_GROUPS")]"
-    printf 'groups = %s\n' "$groups"
+    groups="$(awk -v RS=, '{
+                gsub(/^[ \t\n]+|[ \t\n]+$/, "")
+                printf "%s\"%s\"", (NR>1?", ":""), $0
+              }' <<<"$VM_USER_GROUPS" | tr -d '\n')"
+    printf 'groups = [%s]\n' "$groups"
   fi
   printf 'key = """%s"""\n' "$keys"
 }
