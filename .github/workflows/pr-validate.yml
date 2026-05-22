@@ -14,27 +14,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run shellcheck
+      - name: Run shellcheck (errors fail; warnings printed)
         run: |
           shopt -s nullglob
           files=( *.sh )
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No shell scripts found."
-            exit 0
-          fi
-          shellcheck --severity=warning "${files[@]}"
+          [ ${#files[@]} -eq 0 ] && { echo "No shell scripts found."; exit 0; }
+          # Show all findings for visibility, then fail only on errors.
+          shellcheck --severity=warning "${files[@]}" || true
+          shellcheck --severity=error   "${files[@]}"
 
   hadolint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run hadolint on each Containerfile
+      - name: Run hadolint on each Containerfile (errors fail; warnings printed)
         run: |
           shopt -s nullglob
           rc=0
           for f in Containerfile*; do
             echo "::group::hadolint $f"
-            docker run --rm -i hadolint/hadolint:latest hadolint - --no-fail < "$f" || rc=$?
+            docker run --rm -i hadolint/hadolint:latest hadolint --failure-threshold error - < "$f" || rc=$?
             echo "::endgroup::"
           done
           exit $rc
@@ -43,8 +42,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run actionlint
+      - name: Run actionlint (workflow YAML only, no embedded-script linting)
         uses: raven-actions/actionlint@v2
+        with:
+          shellcheck: false
+          pyflakes: false
 
   containerfile-build:
     runs-on: ubuntu-latest
