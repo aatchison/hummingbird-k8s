@@ -25,6 +25,12 @@ RUN install -d /etc/systemd/system/multi-user.target.wants \
  && ln -sf /etc/systemd/system/k3s.service \
        /etc/systemd/system/multi-user.target.wants/k3s.service
 
+# Enable bootc auto-update timer (daily, applies + reboots automatically).
+# Operators who want manual control should override via systemctl disable.
+RUN install -d /etc/systemd/system/timers.target.wants \
+ && ln -sf /usr/lib/systemd/system/bootc-fetch-apply-updates.timer \
+       /etc/systemd/system/timers.target.wants/bootc-fetch-apply-updates.timer
+
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s
 LABEL org.opencontainers.image.description="Fedora Hummingbird bootc image with k3s"

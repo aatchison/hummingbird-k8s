@@ -75,6 +75,7 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 - `bootc upgrade --check` queries the registry; `bootc upgrade` stages the new image (chunked, only changed layers); reboot applies.
 - `bootc-fetch-apply-updates.timer` ships with Hummingbird but is **disabled by default**. Enable it (via Containerfile or runtime) for daily auto-update + auto-reboot. Most fleets want to enable the fetch but orchestrate the reboot externally.
 - `bootc rollback` swaps to the prior deployment; reboot finalizes.
+- As of #4 the timer is **ENABLED by default** in all three flavors (k3s, CP, worker). See `docs/auto-updates.md` for caveats — notably that control planes reboot without draining themselves.
 
 ## Two install styles
 
