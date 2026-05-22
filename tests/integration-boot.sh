@@ -131,17 +131,22 @@ rm -rf "${LIBVIRT_POOL_DIR}/qcow2"
 # For local/bare-metal runs we still prefer podman.
 if command -v docker >/dev/null && [[ -S /var/run/docker.sock ]]; then
   log "using host docker daemon for bib (sibling-of-runner)"
-  BIB_STORAGE="$(mktemp -d -t bib-storage-XXXX)"
-  trap 'rm -rf "'"$BIB_STORAGE"'" 2>/dev/null || true' EXIT
-  # bib needs the IMAGE already in podman storage. Pre-pull it into BIB_STORAGE
-  # via a sibling podman container so bib's --local can find it.
+  # docker socket sees the HOST fs (geary), not the runner container's. Use
+  # LIBVIRT_POOL_DIR (mounted into runner from host) for all bib-visible paths.
+  SHARED_DIR="${LIBVIRT_POOL_DIR}/integration-runs/${RUN_ID}"
+  mkdir -p "${SHARED_DIR}"
+  cp "${BIB_CFG}" "${SHARED_DIR}/config.toml"
+  BIB_STORAGE="${SHARED_DIR}/storage"
+  mkdir -p "${BIB_STORAGE}"
+  trap 'rm -rf "'"${SHARED_DIR}"'" 2>/dev/null || true' EXIT
+  # Pre-pull image into bib storage via a sibling podman container.
   log "pre-pulling ${IMAGE} into bib storage via sibling podman"
   docker run --rm --privileged \
     -v "${BIB_STORAGE}:/var/lib/containers/storage" \
     quay.io/podman/stable:latest \
     podman --root /var/lib/containers/storage pull "${IMAGE}"
   docker run --rm --privileged --pull=always \
-    -v "${BIB_CFG}:/config.toml:ro" \
+    -v "${SHARED_DIR}/config.toml:/config.toml:ro" \
     -v "${LIBVIRT_POOL_DIR}:/output" \
     -v "${BIB_STORAGE}:/var/lib/containers/storage" \
     "${BIB_IMAGE}" \
