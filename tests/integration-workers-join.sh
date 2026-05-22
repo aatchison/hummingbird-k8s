@@ -69,6 +69,20 @@ CP_IP=""
 
 log() { printf '[integration-workers-join] %s\n' "$*" >&2; }
 
+# Compute the per-domain console log path. /var/log/libvirt/qemu/ has the
+# right SELinux context for qemu-user writes; fall back to /tmp if that
+# directory doesn't exist (e.g. bare-metal dev box without libvirt
+# pre-installed). Used by both the start path AND dump_failure_context /
+# cleanup so they all agree on where the file lives.
+console_path() {
+  local dom="$1"
+  if [[ -d /var/log/libvirt/qemu ]]; then
+    printf '/var/log/libvirt/qemu/%s-console.log\n' "$dom"
+  else
+    printf '/tmp/%s-console.log\n' "$dom"
+  fi
+}
+
 dump_failure_context() {
   log "FAILURE CONTEXT --------------------------------"
   log "CP_VM=${CP_VM} CP_IP=${CP_IP:-<unknown>}"
@@ -90,7 +104,8 @@ dump_failure_context() {
         'journalctl -u k8s-init --no-pager -n 20' >&2 2>/dev/null || true
   fi
   # CP console log (best-effort — only useful if CP boot itself failed).
-  local cp_console="${LIBVIRT_POOL_DIR}/${CP_VM}-console.log"
+  local cp_console
+  cp_console="$(console_path "${CP_VM}")"
   if [[ -s "${cp_console}" ]]; then
     log "--- last 80 lines of CP console (${cp_console}) ---"
     tail -n 80 "${cp_console}" >&2 || true
@@ -101,7 +116,8 @@ dump_failure_context() {
   # try the on-host console log (no SSH dependency), then fall back to ssh.
   for w in "${SPAWNED_WORKERS[@]:-}"; do
     [[ -z "$w" ]] && continue
-    local w_console="${LIBVIRT_POOL_DIR}/${w}-console.log"
+    local w_console
+    w_console="$(console_path "$w")"
     if [[ -s "${w_console}" ]]; then
       log "--- last 120 lines of worker ${w} console (${w_console}) ---"
       tail -n 120 "${w_console}" >&2 || true
@@ -134,13 +150,12 @@ cleanup() {
     [[ -z "$w" ]] && continue
     virsh -c qemu:///system destroy "${w}" >/dev/null 2>&1 || true
     virsh -c qemu:///system undefine --nvram "${w}" >/dev/null 2>&1 || true
-    rm -f "${LIBVIRT_POOL_DIR}/${w}.qcow2" \
-          "${LIBVIRT_POOL_DIR}/${w}-console.log" || true
+    rm -f "${LIBVIRT_POOL_DIR}/${w}.qcow2" "$(console_path "$w")" || true
   done
   virsh -c qemu:///system destroy "${CP_VM}" >/dev/null 2>&1 || true
   virsh -c qemu:///system undefine --nvram "${CP_VM}" >/dev/null 2>&1 || true
   rm -f "${CP_POOL_QCOW}" "${WK_TEMPLATE_QCOW}" \
-        "${LIBVIRT_POOL_DIR}/${CP_VM}-console.log" || true
+        "$(console_path "${CP_VM}")" || true
   rm -rf "${WORK}" || true
   rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}" 2>/dev/null || true
   exit "$rc"
@@ -248,8 +263,11 @@ bib_build "${CP_IMAGE}" "${CP_BIB_CFG}" "${CP_POOL_QCOW}"
 attach_serial_file_to_domain() {
   local dom="$1" log_path="$2"
   : >"${log_path}"
-  chown qemu:qemu "${log_path}" 2>/dev/null || true
-  chmod 0660 "${log_path}"
+  # Mode 0666 because we don't try to predict qemu's effective uid/gid on
+  # the runner; SELinux is the other dragon, and we work around it by
+  # writing the file into /var/log/libvirt/qemu/ (handled at the call
+  # sites) rather than LIBVIRT_POOL_DIR where svirt_image_t blocks writes.
+  chmod 0666 "${log_path}"
   if ! virsh -c qemu:///system dumpxml "${dom}" >/dev/null 2>&1; then
     return 0
   fi
@@ -282,7 +300,7 @@ PY
 }
 
 log "virt-installing CP ${CP_VM}"
-CP_CONSOLE_LOG="${LIBVIRT_POOL_DIR}/${CP_VM}-console.log"
+CP_CONSOLE_LOG="$(console_path "${CP_VM}")"
 virt-install --connect qemu:///system \
   --name "${CP_VM}" \
   --memory 4096 --vcpus 2 \
@@ -417,8 +435,8 @@ spawn_worker() {
   local name="hummingbird-it-workers-${RUN_ID}-w${idx}"
   local qcow="${LIBVIRT_POOL_DIR}/${name}.qcow2"
   # Per-worker console log so we can post-mortem first-boot failures (#166).
-  # Under LIBVIRT_POOL_DIR so it's host-visible from the runner.
-  local console_log="${LIBVIRT_POOL_DIR}/${name}-console.log"
+  local console_log
+  console_log="$(console_path "${name}")"
 
   # NB: send EVERY noisy subcommand's stdout to stderr so the function's
   # own stdout is reserved exclusively for the `echo "${name}"` at the end.

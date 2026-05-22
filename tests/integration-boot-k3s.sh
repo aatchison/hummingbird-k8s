@@ -202,10 +202,21 @@ log "virt-installing ${VM_NAME}"
 # coredns, metrics-server all come up in a single process). The
 # scripts/define-vm.sh production default is 6144M/4vCPUs; match that here
 # so the integration VM doesn't OOM-stall before sshd is reachable.
-SERIAL_LOG="${LIBVIRT_POOL_DIR}/${VM_NAME}-console.log"
+#
+# Put the console log under /var/log/libvirt/qemu/ (the directory libvirt
+# already uses for per-domain logs — guaranteed to have the right SELinux
+# context + qemu-user write access) rather than LIBVIRT_POOL_DIR (where
+# the file gets svirt_image_t and qemu cannot open it for write; the
+# previous re-test got `Permission denied` on a path under
+# /var/lib/libvirt/images and the domain failed to start at all — #165).
+# Fall back to /tmp with 0666 if the libvirt log dir doesn't exist.
+if [[ -d /var/log/libvirt/qemu ]]; then
+  SERIAL_LOG="/var/log/libvirt/qemu/${VM_NAME}-console.log"
+else
+  SERIAL_LOG="/tmp/${VM_NAME}-console.log"
+fi
 : >"${SERIAL_LOG}"
-chown qemu:qemu "${SERIAL_LOG}" 2>/dev/null || true
-chmod 0660 "${SERIAL_LOG}"
+chmod 0666 "${SERIAL_LOG}"
 virt-install --connect qemu:///system \
   --name "${VM_NAME}" \
   --memory 6144 --vcpus 4 \
