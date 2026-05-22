@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# shellcheck disable=SC1091
+[[ -r "${_ROOT}/config.local.sh" ]] && source "${_ROOT}/config.local.sh"
+: "${POOL_DIR:=/var/lib/libvirt/images}"
+
 if [[ $EUID -ne 0 ]]; then
   echo "Run with sudo. Defines under qemu:///system." >&2
   exit 1
 fi
 
 NAME=hummingbird-k8s
-QCOW=/mnt/mass2/vms/${NAME}.qcow2
+QCOW=${POOL_DIR}/${NAME}.qcow2
 
 [[ -r "$QCOW" ]] || { echo "Missing/unreadable: $QCOW" >&2; exit 1; }
 
