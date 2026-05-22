@@ -184,6 +184,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/worker-tokens.md`](docs/worker-tokens.md) — short-TTL, per-VM kubeadm join tokens.
 - [`docs/self-hosted-runner.md`](docs/self-hosted-runner.md) — register a KVM-capable GitHub Actions runner.
 - [`docs/auto-updates.md`](docs/auto-updates.md) — bootc auto-update timer behavior.
+- [`docs/rollback.md`](docs/rollback.md) — manual + auto-rollback (`bootc rollback`, health-check timer).
 - [`docs/security-hardening.md`](docs/security-hardening.md) — PodSecurity restricted + apiserver audit + kubelet protect-kernel-defaults; run `make verify-hardening` (or `scripts/verify-hardening.sh`) after each redeploy.
 - [`docs/app-deploy-verify.md`](docs/app-deploy-verify.md) — end-to-end smoke test of a PSA-restricted nginx deploy + pod-to-pod networking.
 - [`docs/cilium-migration.md`](docs/cilium-migration.md) — Cilium CNI (NetworkPolicy enforcement, eBPF datapath).

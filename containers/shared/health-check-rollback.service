@@ -1,0 +1,13 @@
+[Unit]
+Description=Roll back bootc deployment if cluster is unhealthy after auto-upgrade
+Documentation=https://github.com/aatchison/hummingbird-k8s/blob/main/docs/rollback.md
+After=kubelet.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/health-check-rollback.sh
+# Don't fail the unit if the script signals "not the right time to check" via
+# nonzero — that path is already covered by the marker-file gating inside the
+# script. Failing loudly here would just spam journal with red.
+SuccessExitStatus=0 1

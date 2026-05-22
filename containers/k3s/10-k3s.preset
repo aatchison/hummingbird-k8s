@@ -1,2 +1,3 @@
 enable bootc-fetch-apply-updates.timer
 enable ssh-hostkey-regen.service
+enable health-check-rollback.timer

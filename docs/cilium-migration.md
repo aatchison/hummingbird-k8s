@@ -175,7 +175,8 @@ won't start — the `cilium` daemonset will go CrashLoopBackOff with
 
 `bootc rollback` restores the previous filesystem deployment (the prior
 image's `/usr`, `/etc` baseline, baked-in binaries, etc.) and reboots
-into it. It does **not** roll back cluster state stored in etcd. After
+into it. It does **not** roll back cluster state stored in etcd. See
+`docs/rollback.md` for the rollback path itself (manual + auto). After
 a rollback from a Cilium-enabled image to a flannel-era image:
 
 - Cilium CRDs installed at first boot (e.g. `CiliumNetworkPolicy`,

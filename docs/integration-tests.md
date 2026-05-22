@@ -47,6 +47,30 @@ gh workflow run integration-bootc-upgrade.yml \
   -f from_tag=v0.1.9 -f to_tag=v0.1.10
 ```
 
+### `integration-bootc-rollback.yml` (#100 — end-to-end bootc rollback)
+
+Same shape as the upgrade workflow but adds a rollback leg: after the VM
+has come back on `to_tag`, the driver runs `bootc rollback` + reboot and
+asserts the VM lands back on `from_tag` with the cluster still healthy.
+
+- **Triggers:** `workflow_dispatch` only.
+- **Inputs:** `from_tag`, `to_tag`.
+- **What it exercises:** boot on `from_tag` → `bootc switch ${to_tag}` +
+  `bootc upgrade` + reboot → assert on `to_tag` → `bootc rollback` +
+  reboot → assert back on `from_tag`, `/var/lib/k8s-init.done` still
+  present, kubelet active, node Ready.
+- **Driver:** `tests/integration-bootc-rollback.sh <from_tag> <to_tag>`.
+
+Manual run:
+
+```bash
+gh workflow run integration-bootc-rollback.yml \
+  -f from_tag=v0.1.11 -f to_tag=v0.1.12
+```
+
+See `docs/rollback.md` for the auto-rollback behaviour built on top of
+this path.
+
 ## What the runner needs
 
 Beyond the baseline in `docs/self-hosted-runner.md`:
@@ -65,9 +89,10 @@ Beyond the baseline in `docs/self-hosted-runner.md`:
 
 ## Teardown + isolation
 
-Both drivers use a unique VM name keyed on `GITHUB_RUN_ID`
-(`hummingbird-it-boot-<run_id>` / `hummingbird-it-upgrade-<run_id>`), so
-parallel runs don't collide. A trap-based cleanup always:
+All drivers use a unique VM name keyed on `GITHUB_RUN_ID`
+(`hummingbird-it-boot-<run_id>` / `hummingbird-it-upgrade-<run_id>` /
+`hummingbird-it-rollback-<run_id>`), so parallel runs don't collide. A
+trap-based cleanup always:
 
 - `virsh destroy` + `virsh undefine --nvram`
 - removes the per-test qcow2 from the libvirt pool
@@ -80,7 +105,7 @@ land in the GitHub Actions log for the run.
 
 ## Security note — fork PRs
 
-Neither workflow runs on `pull_request`, so fork PRs can't reach the
+None of these workflows run on `pull_request`, so fork PRs can't reach the
 self-hosted runner. The `if:` guard in each workflow keeps that property
 explicit if someone later adds a PR trigger. See the "Security caveat" in
 `docs/self-hosted-runner.md`.

@@ -115,8 +115,11 @@ flavor's Containerfile and rebuild.
   workers happen to upgrade in the same window, you can lose multiple replicas
   at once. The randomized delay in the upstream timer (~30 min jitter)
   mitigates this for a small fleet but is not a guarantee.
-- **No rollback on failure.** If the new image fails to boot, the VM may need
-  manual intervention (`bootc rollback` from a serial console / rescue boot).
+- **No rollback if the new image won't boot at all.** If the new deployment
+  panics or fails to mount root, the VM still needs manual intervention
+  (`bootc rollback` from a serial console / rescue boot). The auto-rollback
+  path in `docs/rollback.md` only fires *after* a successful boot when the
+  cluster comes up unhealthy.
 
 ### Recommendation for production control planes
 
@@ -175,3 +178,6 @@ sudo reboot
 If the VM doesn't boot at all, hold shift / select the previous entry from the
 boot menu (bootc keeps the prior deployment around) and once back in the
 working deployment, `bootc rollback` to make it sticky.
+
+For the auto-rollback behaviour that fires when a timer-driven upgrade
+brings the cluster up unhealthy, see `docs/rollback.md`.

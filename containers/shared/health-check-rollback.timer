@@ -1,0 +1,16 @@
+[Unit]
+Description=Run post-boot cluster health check (auto-rollback on failure)
+Documentation=https://github.com/aatchison/hummingbird-k8s/blob/main/docs/rollback.md
+
+[Timer]
+# Three minutes is a deliberate trade-off: long enough for kubelet/apiserver
+# to settle on a small lab VM, short enough that a stuck cluster doesn't
+# burn an indefinite "soaking" window before we roll back. Operators with
+# heavier workloads (Cilium, larger CP image, slow disk) should tune this
+# upward — see docs/rollback.md.
+OnBootSec=3min
+# We don't want this on every wake / resume — single-shot per boot is enough.
+RemainAfterElapse=true
+
+[Install]
+WantedBy=timers.target
