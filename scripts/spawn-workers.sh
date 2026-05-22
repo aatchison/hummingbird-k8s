@@ -23,6 +23,18 @@ source lib/build-common.sh
 : "${CP_VM_NAME:=hummingbird-k8s}"
 : "${TOKEN_TTL:=2h}"
 
+# Per-worker resource knobs (override via config.local.sh or environment).
+# Defaults match the pre-knob hardcoded values so behavior is unchanged
+# when unset. See config.example.sh for the full list.
+: "${WORKER_MEMORY:=4096}"
+: "${WORKER_VCPUS:=2}"
+
+# CP-readiness retry tuning (#90). SSH to the CP can fail when the control
+# plane is still coming up; retry rather than spawning a worker with a
+# missing join token. Override via env if you need to wait longer.
+: "${CP_SSH_RETRIES:=5}"
+: "${CP_SSH_RETRY_SLEEP:=10}"
+
 COUNT="${1:-2}"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
 TEMPLATE="${POOL_DIR}/hummingbird-k8s-worker.qcow2"
@@ -72,12 +84,32 @@ fi
 # core/wheel-user on the bootc image cannot sudo without a password, and
 # because kubeadm requires root to read /etc/kubernetes/pki. The CP image
 # ships with ENABLE_ROOT_SSH=1 by default; see docs/worker-tokens.md.
+#
+# Retries up to CP_SSH_RETRIES times because the CP can still be coming up
+# when redo-workers.sh chains here right after redo-k8s.sh (#90). Each
+# attempt has its own ConnectTimeout=10s; on success we emit the join
+# command on stdout, on persistent failure we exit non-zero so the caller
+# aborts rather than spawning a worker with no join token.
 mint_join_command() {
-  sudo -u "$SUDO_USER" ssh \
-    -o StrictHostKeyChecking=accept-new \
-    -o ConnectTimeout=10 \
-    "root@${CP_IP}" \
-    "kubeadm token create --ttl ${TOKEN_TTL} --print-join-command"
+  local attempt cmd=""
+  for attempt in $(seq 1 "$CP_SSH_RETRIES"); do
+    if cmd=$(sudo -u "$SUDO_USER" ssh \
+                -o StrictHostKeyChecking=accept-new \
+                -o ConnectTimeout=10 \
+                -o BatchMode=yes \
+                "root@${CP_IP}" \
+                "kubeadm token create --ttl ${TOKEN_TTL} --print-join-command" \
+                2>/dev/null) && [[ -n "$cmd" ]]; then
+      printf '%s\n' "$cmd"
+      return 0
+    fi
+    if (( attempt < CP_SSH_RETRIES )); then
+      echo "mint_join_command: attempt ${attempt}/${CP_SSH_RETRIES} to ${CP_IP} failed; retrying in ${CP_SSH_RETRY_SLEEP}s..." >&2
+      sleep "$CP_SSH_RETRY_SLEEP"
+    fi
+  done
+  echo "mint_join_command: could not reach CP at ${CP_IP} after ${CP_SSH_RETRIES} attempts" >&2
+  return 1
 }
 
 # Write the join command into the given qcow2 at /etc/hummingbird/worker-join.env.
@@ -160,7 +192,13 @@ for i in $(seq 1 "$COUNT"); do
   chmod 0644 "$QCOW"
 
   echo "Minting fresh ${TOKEN_TTL}-TTL join token for $NAME..."
-  JOIN_CMD="$(mint_join_command)"
+  # Don't let `set -e` abort before we clean up the half-cloned QCOW (#90):
+  # capture the rc explicitly and rm the staged disk on failure.
+  if ! JOIN_CMD="$(mint_join_command)"; then
+    echo "ERROR: mint_join_command failed for $NAME; removing staged $QCOW." >&2
+    rm -f "$QCOW"
+    exit 1
+  fi
   if ! grep -q '^kubeadm join' <<<"$JOIN_CMD"; then
     echo "ERROR: did not get a valid 'kubeadm join' command from CP at ${CP_IP}." >&2
     echo "Got: $JOIN_CMD" >&2
@@ -172,7 +210,7 @@ for i in $(seq 1 "$COUNT"); do
 
   virt-install --connect qemu:///system \
     --name "$NAME" \
-    --memory 4096 --vcpus 2 \
+    --memory "$WORKER_MEMORY" --vcpus "$WORKER_VCPUS" \
     --disk "$QCOW",format=qcow2,bus=virtio \
     --import \
     --os-variant fedora-unknown \
