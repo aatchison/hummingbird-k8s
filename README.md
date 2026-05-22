@@ -52,10 +52,15 @@ On a freshly-set-up KVM host (libvirtd running, `qemu:///system` reachable,
 `podman` + `bootc-image-builder` available):
 
 ```bash
-sudo bash redo.sh             # build + define hummingbird-k3s VM
-sudo bash redo-k8s.sh         # build + define hummingbird-k8s control plane
-sudo bash redo-workers.sh 2   # build worker image and spawn 2 workers
+make help                      # cheatsheet of all targets
+sudo make k8s                  # build + define hummingbird-k8s control plane
+sudo make workers COUNT=2      # build worker image and spawn 2 workers
+make verify-all                # encryption + hardening + app-deploy smoke test
 ```
+
+For the k3s single-node flavor, `sudo make k3s`. The underlying `*.sh` scripts
+still work for advanced operators; see [`docs/makefile.md`](docs/makefile.md)
+for the full target list and honored env vars.
 
 From a client machine with `KVM_HOST` pointed at the KVM host SSH alias:
 
@@ -124,6 +129,7 @@ The publish job refuses to run if the tagged commit isn't reachable from
 
 Day-2 documentation lives under [`docs/`](docs):
 
+- [`docs/makefile.md`](docs/makefile.md) — `make` cheatsheet over the underlying driver scripts.
 - [`docs/image-verification.md`](docs/image-verification.md) — verify GHCR images with cosign.
 - [`docs/etcd-encryption.md`](docs/etcd-encryption.md) — enable encryption-at-rest for etcd.
 - [`docs/worker-tokens.md`](docs/worker-tokens.md) — short-TTL, per-VM kubeadm join tokens.
