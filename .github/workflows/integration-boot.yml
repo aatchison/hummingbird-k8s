@@ -10,25 +10,22 @@ name: Integration — boot-time CP (#32)
 # `kvm,libvirt` labels gate selection.
 
 on:
+  workflow_run:
+    workflows: ["Build & publish — hummingbird-k8s"]
+    types: [completed]
+    branches: ["k8s/v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag to test (e.g. v0.1.10). Defaults to latest.'
-        required: false
+        description: 'k8s tag (e.g., k8s/v0.1.19)'
+        required: true
         type: string
-        default: latest
-  push:
-    tags: ['k8s/v*']
-
-permissions:
-  contents: read
-  packages: read
 
 jobs:
   boot:
-    # Fork PRs would never get here (no pull_request trigger), but the guard
-    # is a cheap defense-in-depth marker per docs/self-hosted-runner.md.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Only run when triggered by a SUCCESSFUL upstream build. workflow_dispatch
+    # is always allowed. Fork-PR defense-in-depth: no pull_request trigger here.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: [self-hosted, kvm, libvirt]
     timeout-minutes: 30
     # podman in the geary-docker runner container hits
@@ -51,11 +48,23 @@ jobs:
         id: tag
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
-            tag="${GITHUB_REF#refs/tags/k8s/}"
-          else
-            tag="${{ inputs.tag }}"
-          fi
+          case "${{ github.event_name }}" in
+            workflow_dispatch)
+              tag="${{ inputs.tag }}"
+              tag="${tag#k8s/}"
+              ;;
+            workflow_run)
+              # head_branch of the triggering run is e.g. "k8s/v0.1.19"
+              tag="${{ github.event.workflow_run.head_branch }}"
+              tag="${tag#k8s/}"
+              ;;
+            push)
+              tag="${GITHUB_REF#refs/tags/k8s/}"
+              ;;
+            *)
+              echo "Unhandled event: ${{ github.event_name }}" >&2; exit 1
+              ;;
+          esac
           if [ -z "$tag" ]; then
             echo "Could not resolve image tag" >&2; exit 1
           fi
