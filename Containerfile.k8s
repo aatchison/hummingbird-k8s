@@ -4,6 +4,10 @@ ARG K8S_VERSION=v1.31
 ARG POD_CIDR=10.244.0.0/16
 ARG APISERVER_EXTRA_SANS=127.0.0.1,localhost
 
+# Drop in the sshd config early so changes here don't bust the (much bigger)
+# package-install layer cache below.
+COPY etc/ssh/sshd_config.d/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
+
 # Hummingbird's curated repo doesn't carry the standard k8s deps (iptables, socat,
 # conntrack-tools, ethtool). Add Fedora Rawhide as a secondary source — Hummingbird
 # is Rawhide-based so versions are compatible. gpgcheck=0 to avoid bootstrapping

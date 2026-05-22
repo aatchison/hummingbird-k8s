@@ -2,6 +2,10 @@ FROM quay.io/hummingbird-community/bootc-os:latest
 
 ARG K8S_VERSION=v1.31
 
+# Drop in the sshd config early so changes here don't bust the (much bigger)
+# package-install layer cache below.
+COPY etc/ssh/sshd_config.d/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
+
 # Same secondary Fedora Rawhide source as the CP image (Hummingbird's curated
 # set lacks iptables/socat/etc).
 RUN printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=0\nskip_if_unavailable=False\n' \

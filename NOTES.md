@@ -92,9 +92,10 @@ Both base on `quay.io/fedora/fedora-bootc:43` rather than Hummingbird, since Hum
 
 ## SSH access summary
 
-- From **<kvm-client>**: `ssh -J <kvm-host> <user>@<vm-ip>` (uses <kvm-client>'s id_ed25519, baked into image)
-- From **<kvm-host>**: `ssh <user>@<vm-ip>` (uses <kvm-host>'s id_ed25519, also baked in)
-- Sudo password inside guest: `1234asdf` (set in `build*.sh`).
+- Default config: key-only auth (`PasswordAuthentication no`), no sudo (user is not in wheel, no password set), but `root` SSH is allowed *with the same pubkeys* via `PermitRootLogin prohibit-password`. Admin tasks happen as root.
+- Pubkeys: whatever `SSH_PUBKEY_FILES` resolves to (default: caller's `~/.ssh/id_ed25519.pub`).
+- To opt back into sudo: set `VM_USER_GROUPS=wheel` and `VM_PASSWORD=…` in `config.local.sh`.
+- To opt out of root SSH: set `ENABLE_ROOT_SSH=0`. The unprivileged user is then the only way in.
 
 ## Useful one-liners
 

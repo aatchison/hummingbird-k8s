@@ -3,8 +3,13 @@
 
 # Initial user account inside the VM.
 # export VM_USER=core
-# export VM_USER_GROUPS=wheel
-# export VM_PASSWORD=changeme     # omit to disable password (SSH-key-only)
+# export VM_USER_GROUPS=                # empty = no sudo via wheel (default)
+                                        # set "wheel" if you want the user able to sudo
+# export VM_PASSWORD=                   # empty = SSH-key-only auth (default; recommended)
+export ENABLE_ROOT_SSH=1                # 1 = bake same pubkeys into root@ (default).
+                                        # 0 = disable root SSH entirely.
+                                        # PermitRootLogin prohibit-password drop-in is
+                                        # baked into the image either way.
 
 # Pubkey files to embed. Colon-separated.
 # export SSH_PUBKEY_FILES=~/.ssh/id_ed25519.pub:~/.ssh/id_rsa.pub
@@ -18,3 +23,9 @@
 
 # For kubectl-k8s.sh (run from a client): the KVM host SSH alias to tunnel through.
 # export KVM_HOST=kvm.example.com
+
+# ---- Restoring pre-#17 "classic lab" defaults ---------------------------------
+# Older Hummingbird images shipped with a wheel-capable, password-authenticatable
+# user. PR #17 flipped both defaults off. To get the old behavior back:
+# export VM_USER_GROUPS=wheel
+# export VM_PASSWORD=changeme
