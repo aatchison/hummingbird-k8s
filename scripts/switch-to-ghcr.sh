@@ -31,6 +31,17 @@ if [[ "${BOOTC_SWITCH_TO_GHCR:-1}" = "0" ]]; then
   exit 0
 fi
 
+# When invoked via sudo (so virsh has qemu:///system access), the VM-side
+# authorized_keys was baked with the calling user's pubkey, not root's. Drop
+# back to that user for the ssh calls so the existing key authenticates. The
+# same pattern is used by spawn-workers.sh's mint_join_command. Falls through
+# to a no-op prefix when not running as root.
+SSH_PRIV_PREFIX=()
+if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
+  SSH_PRIV_PREFIX=(sudo -u "$SUDO_USER")
+fi
+_ssh() { "${SSH_PRIV_PREFIX[@]}" ssh "$@"; }
+
 # Map a VM name to its expected GHCR image ref. The naming convention is
 # `hummingbird-<flavor>` (workers are `hummingbird-k8s-worker-<N>`), so we
 # strip the trailing `-<N>` for workers and prepend the GHCR org.
@@ -72,7 +83,7 @@ wait_for_ip() {
 wait_for_ssh() {
   local tries="$1" ip="$2"
   for _ in $(seq 1 "$tries"); do
-    if ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+    if _ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
            -o ConnectTimeout=5 "root@${ip}" true >/dev/null 2>&1; then
       return 0
     fi
@@ -85,7 +96,7 @@ wait_for_ssh() {
 # empty if we can't reach it / parse it.
 current_image_ref() {
   local ip="$1"
-  ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+  _ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
       -o ConnectTimeout=5 "root@${ip}" \
       'bootc status --json 2>/dev/null' \
     | python3 -c '
@@ -123,7 +134,7 @@ switch_one() {
   fi
   log "${name}: switching from '${cur:-<unknown>}' to '${ref}'..."
 
-  if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+  if ! _ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
            -o ConnectTimeout=10 "root@${ip}" \
            "bootc switch '${ref}'" >&2; then
     log "${name}: bootc switch failed (image may not exist on GHCR yet)."
