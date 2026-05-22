@@ -39,12 +39,12 @@ jobs:
           done
           exit $rc
 
-  yamllint:
+  actionlint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: pip install --quiet yamllint
-      - run: yamllint -d '{extends: default, rules: {line-length: disable, document-start: disable, truthy: {check-keys: false}}}' .github/
+      - name: Run actionlint
+        uses: raven-actions/actionlint@v2
 
   containerfile-build:
     runs-on: ubuntu-latest
