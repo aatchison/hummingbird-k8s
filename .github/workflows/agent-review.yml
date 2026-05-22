@@ -62,7 +62,7 @@ jobs:
           - test-plan
           - supply-chain
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -128,7 +128,7 @@ jobs:
     if: needs.gate.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all lens findings
         uses: actions/download-artifact@v4
