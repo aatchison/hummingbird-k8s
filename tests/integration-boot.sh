@@ -131,9 +131,12 @@ rm -rf "${LIBVIRT_POOL_DIR}/qcow2"
 # For local/bare-metal runs we still prefer podman.
 if command -v docker >/dev/null && [[ -S /var/run/docker.sock ]]; then
   log "using host docker daemon for bib (sibling-of-runner)"
+  BIB_STORAGE="$(mktemp -d -t bib-storage-XXXX)"
+  trap 'rm -rf "'"$BIB_STORAGE"'" 2>/dev/null || true' EXIT
   docker run --rm --privileged --pull=always \
     -v "${BIB_CFG}:/config.toml:ro" \
     -v "${LIBVIRT_POOL_DIR}:/output" \
+    -v "${BIB_STORAGE}:/var/lib/containers/storage" \
     "${BIB_IMAGE}" \
     --type qcow2 --rootfs ext4 \
     "${IMAGE}"
