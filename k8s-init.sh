@@ -5,11 +5,16 @@ MARKER=/var/lib/k8s-init.done
 [[ -f "$MARKER" ]] && { echo "k8s-init already ran"; exit 0; }
 
 # Recover from a half-finished previous init.
-# If admin.conf is missing but our generated kubeadm config is present,
-# a previous kubeadm init died partway. Reset so we can retry cleanly.
-if [[ ! -f /etc/kubernetes/admin.conf && -f /etc/kubernetes/kubeadm-init.yaml ]]; then
+# If a previous run produced the kubeadm config but didn't set the done
+# marker, something failed mid-init (kubeadm init crashed, or kubeadm init
+# finished but `cilium install` later failed and we exited non-zero before
+# touching $MARKER). Either way, reset so the next attempt is clean. The
+# pki / manifests / *.conf cleanup is needed because kubeadm refuses to
+# re-init if those exist.
+if [[ ! -f "$MARKER" && -f /etc/kubernetes/kubeadm-init.yaml ]]; then
   kubeadm reset --force --cri-socket=unix:///var/run/crio/crio.sock || true
   rm -f /etc/kubernetes/kubeadm-init.yaml /etc/kubernetes/encryption-config.yaml
+  rm -rf /etc/kubernetes/pki /etc/kubernetes/manifests /etc/kubernetes/*.conf || true
 fi
 
 # Build-time configuration: APISERVER_EXTRA_SANS is baked into /etc/hummingbird/k8s-init.env
@@ -106,7 +111,7 @@ apiServer:
     - name: audit-policy-file
       value: /etc/kubernetes/audit-policy.yaml
     - name: audit-log-path
-      value: /var/log/k8s-audit.log
+      value: /var/log/kubernetes/k8s-audit.log
     - name: audit-log-maxsize
       value: "100"
     - name: audit-log-maxbackup
@@ -128,8 +133,8 @@ apiServer:
       readOnly: true
       pathType: File
     - name: audit-log
-      hostPath: /var/log
-      mountPath: /var/log
+      hostPath: /var/log/kubernetes
+      mountPath: /var/log/kubernetes
       readOnly: false
       pathType: DirectoryOrCreate
   certSANs:
@@ -153,8 +158,14 @@ install -m 0644 /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.world
 ln -sf /etc/kubernetes/admin.conf.world /etc/profile.d/kubeconfig-symlink-target
 chmod 0644 /etc/kubernetes/admin.conf
 
-# Install flannel CNI
-KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f \
-  https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+# CNI: Cilium installed via cilium-cli (baked at image build time).
+# --wait blocks until pods become Ready; --set kubeProxyReplacement=false to
+# keep kube-proxy as the L4 plane (matches what flannel did; Cilium's
+# kube-proxy-replacement is opt-in via a separate PR).
+KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
+  --version 1.16.5 \
+  --set kubeProxyReplacement=false \
+  --wait \
+  --wait-duration 5m
 
 touch "$MARKER"

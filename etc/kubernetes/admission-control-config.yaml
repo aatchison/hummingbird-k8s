@@ -17,4 +17,3 @@ plugins:
           - kube-system
           - kube-public
           - kube-node-lease
-          - kube-flannel  # remove when #6 swaps in Cilium

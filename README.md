@@ -131,6 +131,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/auto-updates.md`](docs/auto-updates.md) — bootc auto-update timer behavior.
 - [`docs/security-hardening.md`](docs/security-hardening.md) — PodSecurity restricted + apiserver audit + kubelet protect-kernel-defaults; run `scripts/verify-hardening.sh` after each redeploy.
 - [`docs/app-deploy-verify.md`](docs/app-deploy-verify.md) — end-to-end smoke test of a PSA-restricted nginx deploy + pod-to-pod networking.
+- [`docs/cilium-migration.md`](docs/cilium-migration.md) — Cilium CNI (NetworkPolicy enforcement, eBPF datapath).
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.

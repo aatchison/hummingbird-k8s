@@ -10,7 +10,7 @@ two flavors of single-node Kubernetes layered into the bootc image.
 | `Containerfile.k3s` / `build.sh` / `define-vm.sh` / `redo.sh` | `hummingbird-k3s` VM (k3s baked in) |
 | `Containerfile.k8s` / `build-k8s.sh` / `define-vm-k8s.sh` / `redo-k8s.sh` | `hummingbird-k8s` VM (upstream kubelet/kubeadm/cri-o, control-plane) |
 | `Containerfile.k8s-worker` / `build-worker.sh` / `spawn-workers.sh` / `redo-workers.sh` | Worker template image + spawner — clones one qcow2 into N VMs, each auto-joins the CP |
-| `k8s-init.sh` / `k8s-init.service` | First-boot `kubeadm init` + flannel + untaint (CP only) |
+| `k8s-init.sh` / `k8s-init.service` | First-boot `kubeadm init` + Cilium + untaint (CP only) |
 | `worker-init.sh` / `worker-init.service` | First-boot `kubeadm join` against the embedded token (workers only) |
 | `worker-join.env` | Cached kubeadm join command. `build-worker.sh` refreshes it from the running CP at build time. |
 | `bib-config.toml` | Generated at build time — initial user, SSH keys, hashed sudo password |
@@ -89,8 +89,8 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 - Adds `pkgs.k8s.io` RPM repos for `core` (kubelet/kubeadm/kubectl) and `addons:cri-o`.
 - Pre-creates `/usr/libexec/kubernetes/kubelet-plugins/volume/exec` so kube-controller-manager doesn't fail on read-only `/usr`.
 - Drops `/etc/modules-load.d/k8s.conf` + sysctls.
-- `k8s-init.service` runs once at first boot: `kubeadm init` (with `--apiserver-cert-extra-sans` for tunneled access), applies flannel, untaints the control-plane node, makes admin.conf world-readable, then touches `/var/lib/k8s-init.done` so it doesn't re-run.
-- Final cluster: 1 node, 8 pods (etcd, apiserver, controller-manager, scheduler, kube-proxy, 2x coredns, flannel daemonset).
+- `k8s-init.service` runs once at first boot: `kubeadm init` (with `--apiserver-cert-extra-sans` for tunneled access), installs Cilium via `cilium-cli` (see [`docs/cilium-migration.md`](docs/cilium-migration.md)), untaints the control-plane node, makes admin.conf world-readable, then touches `/var/lib/k8s-init.done` so it doesn't re-run.
+- Final cluster: 1 node, ~9 pods (etcd, apiserver, controller-manager, scheduler, kube-proxy, 2x coredns, cilium agent, cilium-operator).
 - Roughly matches Red Hat's "Build Your K8s Ready Distro With BootC" talk pattern — Praveen Kumar describes installing the Kubernetes RPMs straight into a fedora-bootc image.
 
 ## Reference: Praveen Kumar's public bootc demos
