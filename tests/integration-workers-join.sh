@@ -358,6 +358,12 @@ worker_out="${WORK}/worker-spawn"
 mkdir -p "${worker_out}"
 for i in $(seq 1 "${WORKER_COUNT}"); do
   (
+    # CRITICAL: drop the parent's EXIT trap before doing anything else.
+    # Otherwise the parent's `cleanup` runs in this subshell when it exits
+    # and tears down the CP VM + qcow2 + worker template — destroying the
+    # very cluster we're about to join workers to. The v0.1.33+v0.1.9 dry
+    # run hit exactly this and silently left the CP standing alone.
+    trap - EXIT
     if spawn_worker "${i}" >"${worker_out}/${i}.name" 2>"${worker_out}/${i}.log"; then
       exit 0
     else
