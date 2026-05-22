@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Convenience wrapper: kubectl against the hummingbird-k8s VM via SSH tunnel
-# through the KVM host. No local kubectl install required.
+# through the KVM host. Prefers a native `kubectl` on PATH; falls back to a
+# podman-run kubectl container for hosts without kubectl installed.
 #
 # Env:
 #   KVM_HOST      — SSH alias of the KVM host (required). Pulled from config.local.sh if present.
@@ -33,6 +34,14 @@ fi
   exit 1
 }
 
+# Prefer native kubectl when available. It reads the kubeconfig directly
+# (0600 is fine — no world-readable chmod dance needed for a container UID),
+# and stdin (heredocs, `apply -f -`) flows through without a podman wrapper.
+if command -v kubectl >/dev/null 2>&1; then
+  exec kubectl --kubeconfig "$KCFG" "$@"
+fi
+
+# Fallback: container kubectl (kept for hosts without kubectl installed).
 exec podman run --rm --net=host \
   -v "${KCFG}:/kc:ro,Z" \
   -e KUBECONFIG=/kc \

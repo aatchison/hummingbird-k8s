@@ -49,6 +49,12 @@ RUN mkdir -p /etc/hummingbird \
 COPY k8s-init.sh /usr/libexec/k8s-init.sh
 RUN chmod +x /usr/libexec/k8s-init.sh
 
+# Ship the etcd encryption verifier in the image so the deploy verifier can
+# run it directly over SSH: `ssh root@<cp> /usr/libexec/verify-encryption.sh`
+# — no scp from the host repo needed after every redeploy.
+COPY scripts/verify-encryption.sh /usr/libexec/verify-encryption.sh
+RUN chmod +x /usr/libexec/verify-encryption.sh
+
 COPY k8s-init.service /etc/systemd/system/k8s-init.service
 
 # Hummingbird ships a 99-default-disable.preset that strips unenabled symlinks

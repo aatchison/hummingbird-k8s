@@ -21,14 +21,26 @@ that first run it:
 4. Runs `kubeadm init` with that config.
 
 After init, anything the apiserver writes to etcd for `secrets` and
-`configmaps` is AES-GCM encrypted. Verify with
-`scripts/verify-encryption.sh` — it creates a probe Secret, reads it
-raw from etcd, and asserts the blob starts with `k8s:enc:aesgcm:`.
+`configmaps` is AES-GCM encrypted. Verify by running
+`/usr/libexec/verify-encryption.sh` on the CP node — it creates a probe
+Secret, reads it raw from etcd, and asserts the blob starts with
+`k8s:enc:aesgcm:`.
 
 ## Verifying encryption
 
-`scripts/verify-encryption.sh` reads the probe Secret back out of etcd
-to confirm the on-disk envelope. It tries, in order:
+The verifier is baked into the k8s control-plane image at
+`/usr/libexec/verify-encryption.sh`, so post-deploy verification is just:
+
+```
+ssh root@<cp> /usr/libexec/verify-encryption.sh
+```
+
+No `scp` from the host repo is needed — the script ships with every
+redeploy. The source of truth still lives at `scripts/verify-encryption.sh`
+in this repo; `Containerfile.k8s` copies it into the image at build time.
+
+The script reads the probe Secret back out of etcd to confirm the
+on-disk envelope. It tries, in order:
 
 1. **Local `etcdctl`** on the CP host (rare on the bootc image; only
    present if you installed `etcd` package manually).
