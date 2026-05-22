@@ -65,12 +65,17 @@ fi
 
 # Mint a fresh kubeadm join token from the CP via SSH and echo the full join
 # command (one line, starts with 'kubeadm join ...').
+#
+# We SSH as root (rather than the unprivileged VM_USER + sudo) because the
+# core/wheel-user on the bootc image cannot sudo without a password, and
+# because kubeadm requires root to read /etc/kubernetes/pki. The CP image
+# ships with ENABLE_ROOT_SSH=1 by default; see docs/worker-tokens.md.
 mint_join_command() {
   sudo -u "$SUDO_USER" ssh \
     -o StrictHostKeyChecking=accept-new \
     -o ConnectTimeout=10 \
-    "${VM_USER}@${CP_IP}" \
-    "${VM_PASSWORD:+echo $VM_PASSWORD | sudo -S }kubeadm token create --ttl ${TOKEN_TTL} --print-join-command 2>/dev/null"
+    "root@${CP_IP}" \
+    "kubeadm token create --ttl ${TOKEN_TTL} --print-join-command"
 }
 
 # Write the join command into the given qcow2 at /etc/hummingbird/worker-join.env.

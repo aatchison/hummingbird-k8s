@@ -25,6 +25,32 @@ After init, anything the apiserver writes to etcd for `secrets` and
 `scripts/verify-encryption.sh` — it creates a probe Secret, reads it
 raw from etcd, and asserts the blob starts with `k8s:enc:aesgcm:`.
 
+## Verifying encryption
+
+`scripts/verify-encryption.sh` reads the probe Secret back out of etcd
+to confirm the on-disk envelope. It tries, in order:
+
+1. **Local `etcdctl`** on the CP host (rare on the bootc image; only
+   present if you installed `etcd` package manually).
+2. **Host-side `crictl exec`** into the running etcd container. This
+   is the supported path on Kubernetes 1.31, whose etcd static pod
+   image is `registry.k8s.io/etcd:*-distroless` and contains no
+   shell — `kubectl exec etcd-<node> -- sh -c '...'` will always
+   fail with `exec: "sh": not found in $PATH`. The script runs
+   `crictl exec <etcd-container-id> etcdctl ...` directly with no
+   intermediate shell.
+
+Both paths must run as root on the CP VM (crictl needs the CRI socket
+and etcdctl needs the etcd PKI). Expected output:
+
+```
+[verify-encryption] OK: secret in etcd is encrypted (prefix=k8s:enc:aesgcm:)
+```
+
+The full prefix on the encrypted row is
+`k8s:enc:aesgcm:v1:bootstrap:<binary>` — `bootstrap` is the keyname we
+set in `k8s-init.sh`.
+
 ## Algorithm choice
 
 We use `aesgcm` (authenticated encryption) per the current Kubernetes

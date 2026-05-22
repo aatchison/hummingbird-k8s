@@ -38,7 +38,11 @@ done
 # The key lives only on disk inside the VM; it is NOT baked into the image.
 ENC_KEY="$(head -c 32 /dev/urandom | base64 -w0)"
 
-install -d -m 0700 -o root -g root /etc/kubernetes
+# /etc/kubernetes itself must be world-traversable (0755) so the unprivileged
+# wheel user can read admin.conf (mode 0644) for sudoless `kubectl get nodes`.
+# Sensitive material under /etc/kubernetes/pki/ is locked down by kubeadm
+# itself, and encryption-config.yaml below is explicitly chmod'd 0600.
+install -d -m 0755 -o root -g root /etc/kubernetes
 umask 077
 # NOTE: this heredoc is unquoted on purpose so ${ENC_KEY} expands.
 # ENC_KEY is base64 (no YAML metacharacters) — safe.
@@ -112,7 +116,11 @@ kubeadm init --config=/etc/kubernetes/kubeadm-init.yaml
 KUBECONFIG=/etc/kubernetes/admin.conf kubectl taint nodes --all \
   node-role.kubernetes.io/control-plane- 2>/dev/null || true
 
-# World-readable admin.conf for the wheel user to use kubectl
+# World-readable admin.conf for the wheel user to use kubectl.
+# kubeadm v1.31 may tighten /etc/kubernetes to 0755 (or even 0700 in some
+# distros' kubelet packaging) during init — re-assert traversability so the
+# wheel user can actually read admin.conf. See issue #36.
+chmod 0755 /etc/kubernetes
 install -m 0644 /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.world
 ln -sf /etc/kubernetes/admin.conf.world /etc/profile.d/kubeconfig-symlink-target
 chmod 0644 /etc/kubernetes/admin.conf

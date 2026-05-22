@@ -30,6 +30,18 @@ The new flow:
 - Token never touches the image registry or any shared artifact — it lives
   only inside one VM's per-instance qcow2.
 
+## Operational requirements
+
+`spawn-workers.sh` SSHes to the control-plane VM as `root` to mint each
+fresh join token. The CP image ships with root SSH enabled
+(`ENABLE_ROOT_SSH=1`, the default in `config.example.sh`); disabling it
+breaks per-VM token minting and `spawn-workers.sh` will fail with an
+empty/garbled response from the CP.
+
+We use root rather than `core` + sudo because the bootc CP image is
+sudoless by design (the wheel user cannot escalate without a password),
+and `kubeadm token create` needs to read `/etc/kubernetes/pki/`.
+
 ## Adding a worker
 
 The control plane VM must be running. From the KVM host:

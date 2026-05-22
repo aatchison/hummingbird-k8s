@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Wipe any prior workers, rebuild template, spawn N fresh workers.
 # Usage: sudo bash redo-workers.sh [count]
+#
+# Note: `set -o pipefail` is REQUIRED here. Operators commonly invoke this
+# script piped through tee (e.g. `redo-workers.sh 2 2>&1 | tee out.log`),
+# and without pipefail a failure inside spawn-workers.sh would be masked by
+# tee's exit 0 and the whole train would silently succeed with no workers
+# defined. See issue #34.
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -21,3 +27,7 @@ rm -f /mnt/mass2/vms/hummingbird-k8s-worker-*.qcow2 /mnt/mass2/vms/hummingbird-k
 
 bash build-worker.sh
 bash spawn-workers.sh "$COUNT"
+
+# Explicit "we got here" sentinel so an operator piping through tee can
+# eyeball success without having to chase $PIPESTATUS.
+echo "redo-workers.sh: spawned $COUNT worker(s) successfully"
