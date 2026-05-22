@@ -107,8 +107,14 @@ All three controls can be checked in one shot with
 [`scripts/verify-hardening.sh`](../scripts/verify-hardening.sh):
 
 ```bash
-CP_IP=192.168.122.42 ./scripts/verify-hardening.sh
+KVM_HOST=thegeary bash scripts/verify-hardening.sh
 ```
+
+If `$KVM_HOST` is set, the script tunnels SSH through that host using
+`ssh -J $KVM_HOST`. This lets you run the verifier from your dev
+machine (judah) without setting up a route to the libvirt NAT subnet.
+When run from the KVM host itself, omit `KVM_HOST` and the script
+falls back to direct SSH.
 
 The script requires `kubectl` access to the cluster and SSH-as-root to the
 CP host. It exits 0 only if PodSecurity rejects a privileged pod, the
