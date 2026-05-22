@@ -1,6 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
+# Regenerate SSH host keys on first boot so two VMs from the same image
+# don't share identical host keys (#80). Must run BEFORE any other init
+# work — if SSH is restarted later the operator's first connection would
+# otherwise pin the baked-in keys in their known_hosts.
+SSH_HOSTKEY_MARKER=/var/lib/ssh-host-keys-regenerated
+if [[ ! -f "$SSH_HOSTKEY_MARKER" ]]; then
+  rm -f /etc/ssh/ssh_host_*
+  ssh-keygen -A
+  systemctl restart sshd
+  touch "$SSH_HOSTKEY_MARKER"
+fi
+
 MARKER=/var/lib/k8s-init.done
 [[ -f "$MARKER" ]] && { echo "k8s-init already ran"; exit 0; }
 

@@ -8,6 +8,14 @@ ARG K3S_VERSION=v1.31.4+k3s1
 # package-install layer cache below.
 COPY containers/shared/ssh/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
 
+# First-boot host-key regen so two k3s VMs from the same image don't share
+# identical SSH host keys (#80). The k8s + k8s-worker flavors do this inline
+# in their existing first-boot scripts; k3s has no first-boot script of its
+# own, so ship a dedicated one-shot unit.
+COPY containers/k3s/ssh-hostkey-regen.sh /usr/libexec/ssh-hostkey-regen.sh
+RUN chmod +x /usr/libexec/ssh-hostkey-regen.sh
+COPY containers/k3s/ssh-hostkey-regen.service /etc/systemd/system/ssh-hostkey-regen.service
+
 # Install k3s into /usr/bin (bootc keeps /usr in the OCI layer; /usr/local
 # is wired to /var on Hummingbird and would not survive into the image).
 RUN curl -fsSL https://get.k3s.io | \
@@ -26,11 +34,13 @@ RUN install -d /etc/rancher/k3s \
 # Hummingbird ships a 99-default-disable.preset that strips unenabled symlinks
 # during bib's qcow2 generation. Override with a low-numbered preset that wins.
 COPY containers/k3s/10-k3s.preset /usr/lib/systemd/system-preset/10-k3s.preset
-RUN systemctl preset bootc-fetch-apply-updates.timer || true
+RUN systemctl preset bootc-fetch-apply-updates.timer ssh-hostkey-regen.service || true
 
 RUN install -d /etc/systemd/system/multi-user.target.wants \
  && ln -sf /etc/systemd/system/k3s.service \
-       /etc/systemd/system/multi-user.target.wants/k3s.service
+       /etc/systemd/system/multi-user.target.wants/k3s.service \
+ && ln -sf /etc/systemd/system/ssh-hostkey-regen.service \
+       /etc/systemd/system/multi-user.target.wants/ssh-hostkey-regen.service
 
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s

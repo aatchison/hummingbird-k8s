@@ -1,6 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
+# Regenerate SSH host keys on first boot so two workers built from the
+# same image don't share identical host keys (#80). Runs BEFORE the
+# done-marker short-circuit and BEFORE the join logic — once a worker
+# has joined we never want a key swap to surprise an operator's
+# known_hosts.
+SSH_HOSTKEY_MARKER=/var/lib/ssh-host-keys-regenerated
+if [[ ! -f "$SSH_HOSTKEY_MARKER" ]]; then
+  rm -f /etc/ssh/ssh_host_*
+  ssh-keygen -A
+  systemctl restart sshd
+  touch "$SSH_HOSTKEY_MARKER"
+fi
+
 MARKER=/var/lib/worker-init.done
 [[ -f "$MARKER" ]] && { echo "worker-init already ran"; exit 0; }
 
