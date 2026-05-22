@@ -189,6 +189,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/cilium-migration.md`](docs/cilium-migration.md) — Cilium CNI (NetworkPolicy enforcement, eBPF datapath).
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — known failure modes and fixes from operating the cluster.
 - [`docs/vm-sizing.md`](docs/vm-sizing.md) — VM resource defaults, tunables, sizing guidance.
+- [`docs/backup-restore.md`](docs/backup-restore.md) — etcd snapshot + restore.
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.

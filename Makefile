@@ -54,6 +54,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         nodes kubectl \
         verify-encryption verify-hardening verify-app-deploy verify-all \
         kube-bench \
+        backup-etcd restore-etcd \
         ci-build-k3s ci-build-k8s ci-build-worker \
         print-containerfile-k3s print-containerfile-k8s print-containerfile-worker \
         clean-vms clean-images clean
@@ -127,6 +128,17 @@ verify-all: verify-encryption verify-hardening verify-app-deploy ## All three ve
 
 kube-bench: ## Run CIS Kubernetes Benchmark (kube-bench) against the cluster
 	bash scripts/run-kube-bench.sh
+
+# ---- backup / restore --------------------------------------------------
+# etcd snapshot lifecycle. See docs/backup-restore.md for cadence,
+# encryption-key handling, and full DR walkthrough.
+
+backup-etcd: ## Snapshot etcd to ./backups/etcd-snapshot-<ts>.db
+	bash scripts/backup-etcd.sh
+
+restore-etcd: ## Restore etcd from a snapshot (SNAP=path.db required)
+	@[ -n "$(SNAP)" ] || { echo 'SNAP=<path-to-snapshot.db> required' >&2; exit 2; }
+	bash scripts/restore-etcd.sh "$(SNAP)"
 
 # ---- CI integration ----------------------------------------------------
 # The redhat-actions/buildah-build action in .github/workflows/build-*.yml
