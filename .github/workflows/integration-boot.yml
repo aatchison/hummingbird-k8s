@@ -31,6 +31,12 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, kvm, libvirt]
     timeout-minutes: 30
+    # podman in the geary-docker runner container hits
+    # `'overlay' is not supported over overlayfs` because the runner's rootfs
+    # is itself overlayfs. Force vfs for the whole job; slower but avoids
+    # needing fuse-overlayfs on the runner image (#124).
+    env:
+      STORAGE_DRIVER: vfs
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,12 +60,13 @@ jobs:
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          sudo podman pull "ghcr.io/aatchison/hummingbird-k8s:${TAG}"
+          sudo --preserve-env=STORAGE_DRIVER \
+            podman pull "ghcr.io/aatchison/hummingbird-k8s:${TAG}"
 
       - name: Run boot integration test
         env:
           TAG: ${{ steps.tag.outputs.tag }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          sudo --preserve-env=TAG,GITHUB_RUN_ID \
+          sudo --preserve-env=TAG,GITHUB_RUN_ID,STORAGE_DRIVER \
             tests/integration-boot.sh "${TAG}"
