@@ -51,10 +51,12 @@ jobs:
             echo "Version $version is not vX.Y.Z[-pre]" >&2
             exit 1
           fi
-          echo "flavor=$flavor"               >> "$GITHUB_OUTPUT"
-          echo "version=$version"             >> "$GITHUB_OUTPUT"
-          echo "containerfile=$containerfile" >> "$GITHUB_OUTPUT"
-          echo "image=$image"                 >> "$GITHUB_OUTPUT"
+          {
+            echo "flavor=$flavor"
+            echo "version=$version"
+            echo "containerfile=$containerfile"
+            echo "image=$image"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Stub worker-join.env for worker build
         if: steps.parse.outputs.flavor == 'worker'
