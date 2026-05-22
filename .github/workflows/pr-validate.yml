@@ -85,7 +85,9 @@ jobs:
         flavor: [k3s, k8s, k8s-worker]
     steps:
       - uses: actions/checkout@v4
-      - name: Build OCI image (no push) — ${{ matrix.flavor }}
+
+      - name: Stub worker-join.env for the worker OCI build
+        if: matrix.flavor == 'k8s-worker'
         run: |
           # worker image references worker-join.env via COPY — synthesize a stub
           # so the build can validate the Containerfile without a live CP.
@@ -93,10 +95,27 @@ jobs:
             echo 'kubeadm join 127.0.0.1:6443 --token aaaaaa.bbbbbbbbbbbbbbbb --discovery-token-ca-cert-hash sha256:0000000000000000000000000000000000000000000000000000000000000000' \
               > worker-join.env
           fi
-          mkdir -p /etc/hummingbird || true
-          # Build via the Makefile target so CI and operator share one path.
+
+      - name: Resolve image name and Containerfile path
+        id: cf
+        run: |
           case "${{ matrix.flavor }}" in
-            k3s)        make image-k3s ;;
-            k8s)        make image-k8s ;;
-            k8s-worker) make image-worker ;;
+            k3s)        image=hummingbird-k3s        ; path="$(make -s print-containerfile-k3s)" ;;
+            k8s)        image=hummingbird-k8s        ; path="$(make -s print-containerfile-k8s)" ;;
+            k8s-worker) image=hummingbird-k8s-worker ; path="$(make -s print-containerfile-worker)" ;;
           esac
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "path=$path"   >> "$GITHUB_OUTPUT"
+
+      - name: Build OCI image (no push) — ${{ matrix.flavor }}
+        uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
+        with:
+          image: ${{ steps.cf.outputs.image }}
+          tags: pr-${{ github.event.pull_request.number || github.run_id }}
+          containerfiles: ${{ steps.cf.outputs.path }}
+          context: .
+          # Warm the layer cache from the previously published :latest when
+          # available. Tolerates a missing remote (first-time cache miss);
+          # no --pull-always so a PR build is robust to transient GHCR issues.
+          extra-args: |
+            --cache-from ghcr.io/${{ github.repository_owner }}/${{ steps.cf.outputs.image }}
