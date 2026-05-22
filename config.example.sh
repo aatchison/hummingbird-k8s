@@ -14,6 +14,13 @@ export ENABLE_ROOT_SSH=1                # 1 = bake same pubkeys into root@ (defa
 # Pubkey files to embed. Colon-separated.
 # export SSH_PUBKEY_FILES=~/.ssh/id_ed25519.pub:~/.ssh/id_rsa.pub
 
+# Additionally (or alternatively) fetch pubkeys from GitHub user profiles.
+# Comma-separated usernames; each https://github.com/<user>.keys is fetched and
+# appended to the embedded authorized_keys (deduped against the file set).
+# Set SSH_PUBKEY_FILES= (empty) to use only GitHub keys.
+# A 404 / bad username fails the build — see docs/ssh-keys.md.
+# export SSH_PUBKEY_GH_USERS=aatchison,otheruser
+
 # libvirt storage pool target directory on this host.
 # export POOL_DIR=/var/lib/libvirt/images
 

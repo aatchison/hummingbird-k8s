@@ -12,6 +12,11 @@
 #                       for admin access. Set to "0" to disable.
 #   SSH_PUBKEY_FILES  — Colon-separated list of pubkey files to bake into authorized_keys.
 #                       Default: ~/.ssh/id_ed25519.pub of the SUDO_USER.
+#                       May be set to empty if SSH_PUBKEY_GH_USERS provides keys.
+#   SSH_PUBKEY_GH_USERS — Comma-separated GitHub usernames. For each, fetch
+#                       https://github.com/<user>.keys and append to the embedded
+#                       authorized_keys (deduped against the file-based set).
+#                       Default: empty (opt-in). A bad/404 username fails the build.
 #   POOL_DIR          — libvirt storage pool target directory.
 #                       Default: /var/lib/libvirt/images
 #   BASE_IMAGE        — Upstream bootc-os base.
@@ -44,22 +49,47 @@ require_root() {
   : "${SUDO_USER:?must be invoked via sudo so the qcow2 can be chowned to the calling user}"
 }
 
-# Resolve the list of pubkey files to embed.
+# Resolve the list of pubkey files to embed. Honors an explicitly-empty
+# SSH_PUBKEY_FILES (= no files; expect SSH_PUBKEY_GH_USERS to provide keys).
 ssh_pubkey_files() {
-  if [[ -n "${SSH_PUBKEY_FILES:-}" ]]; then
-    tr ':' '\n' <<<"$SSH_PUBKEY_FILES"
+  if [[ -n "${SSH_PUBKEY_FILES+x}" ]]; then
+    # Set (possibly empty). Empty → emit nothing.
+    if [[ -n "$SSH_PUBKEY_FILES" ]]; then
+      tr ':' '\n' <<<"$SSH_PUBKEY_FILES"
+    fi
   else
     echo "/home/${SUDO_USER}/.ssh/id_ed25519.pub"
   fi
 }
 
-# Concatenate the pubkey file contents into one newline-separated blob.
+# Fetch pubkeys from each GitHub username in SSH_PUBKEY_GH_USERS (comma-separated).
+# Uses curl -fsSL so a bad/404 username fails the whole build — better to fail
+# loud than to silently embed the wrong set of keys.
+ssh_pubkeys_from_github() {
+  [[ -n "${SSH_PUBKEY_GH_USERS:-}" ]] || return 0
+  local u
+  for u in ${SSH_PUBKEY_GH_USERS//,/ }; do
+    # Tolerate trailing comma / whitespace; skip empty tokens.
+    u="${u// /}"
+    [[ -z "$u" ]] && continue
+    curl -fsSL "https://github.com/${u}.keys"
+  done
+}
+
+# Concatenate file-based pubkeys with GitHub-sourced pubkeys into one
+# newline-separated blob. File keys come first; GitHub keys are appended.
+# Duplicate non-empty lines are removed while preserving first-seen order —
+# `sort -u` would scramble ordering, which makes diffs noisier than they need
+# to be.
 ssh_pubkey_blob() {
-  local f
-  while read -r f; do
-    [[ -r "$f" ]] || { echo "Pubkey file not readable: $f" >&2; exit 1; }
-    cat "$f"
-  done < <(ssh_pubkey_files)
+  {
+    local f
+    while read -r f; do
+      [[ -r "$f" ]] || { echo "Pubkey file not readable: $f" >&2; exit 1; }
+      cat "$f"
+    done < <(ssh_pubkey_files)
+    ssh_pubkeys_from_github
+  } | awk '!NF || !seen[$0]++'
 }
 
 # Render a single [[customizations.user]] block. $1 = username, $2 = include password (0/1).
