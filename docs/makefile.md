@@ -45,3 +45,38 @@ sudo make clean               # destroys + undefines VMs and removes local image
 
 Any other env vars honored by `config.local.sh` (e.g. `VM_USER`,
 `APISERVER_EXTRA_SANS`) flow through to the underlying scripts unchanged.
+
+## Version pinning
+
+Pinned versions live in two different places depending on whether the
+artifact is baked into a container image or fetched by a runtime
+script. This is intentional but easy to trip over, so it's worth
+calling out explicitly.
+
+| Variable             | Kind            | Defined in                              | Default    |
+| ---                  | ---             | ---                                     | ---        |
+| `K8S_VERSION`        | Containerfile `ARG` (build-arg) | `containers/k8s/Containerfile`, `containers/k8s-worker/Containerfile` | `v1.31`    |
+| `CILIUM_CLI_VERSION` | Containerfile `ARG` (build-arg) | `containers/k8s/Containerfile`          | `v0.16.16` |
+| `KUBE_BENCH_VERSION` | shell env var   | `scripts/run-kube-bench.sh`             | `v0.15.5`  |
+
+Build-args (`K8S_VERSION`, `CILIUM_CLI_VERSION`) are consumed at image
+build time and have to be passed via `podman build --build-arg
+NAME=VALUE` (or set in the build wrapper) — exporting them in the
+shell does nothing on its own. The Cilium agent/operator version
+deployed at first boot is pinned separately inside
+`containers/k8s/k8s-init.sh` (`cilium install --version ...`) and is
+deliberately not exposed as a build-arg; see
+[`cilium-migration.md`](cilium-migration.md#version-pinning-is-explicit).
+
+The env-var pattern (`KUBE_BENCH_VERSION`) is used by scripts that run
+against a live cluster *after* the image is built — they have no
+container layer to bake into, so they read the version from the
+caller's environment. Export them in the shell before running the
+script:
+
+```bash
+KUBE_BENCH_VERSION=v0.15.5 ./scripts/run-kube-bench.sh
+```
+
+See [`kube-bench.md`](kube-bench.md) for the full env-var surface of
+that script.

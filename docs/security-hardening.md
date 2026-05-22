@@ -40,13 +40,13 @@ The CNI (Cilium) runs in `kube-system`, which is already exempt — see
 
 ### 2. Apiserver audit logging (closes #13)
 
-The apiserver writes JSON audit records to `/var/log/k8s-audit.log` on
-the host, via these flags:
+The apiserver writes JSON audit records to
+`/var/log/kubernetes/k8s-audit.log` on the host, via these flags:
 
 | Flag | Value |
 |------|-------|
 | `--audit-policy-file` | `/etc/kubernetes/audit-policy.yaml` |
-| `--audit-log-path` | `/var/log/k8s-audit.log` |
+| `--audit-log-path` | `/var/log/kubernetes/k8s-audit.log` |
 | `--audit-log-maxsize` | `100` (MB per file) |
 | `--audit-log-maxbackup` | `5` (rotated files retained) |
 
@@ -61,9 +61,9 @@ the log signal-to-noise ratio reasonable on a single-node lab cluster:
   a Secret without writing the Secret's contents into the audit log.
 - Everything else lands at `Request` level (no response bodies).
 
-`/var/log` is mounted into the apiserver static pod as a writable
-HostPath so the apiserver process inside the pod can append to the log
-on the host filesystem.
+`/var/log/kubernetes` is mounted into the apiserver static pod as a
+writable HostPath so the apiserver process inside the pod can append
+to the log on the host filesystem.
 
 ### 3. Kubelet `--protect-kernel-defaults=true` (kube-bench CIS 4.2.6)
 
@@ -158,9 +158,7 @@ When a pod fails admission, the operator should:
    kubectl get events -A | grep ForbiddenError
    ```
 
-2. Grep the apiserver audit log on the CP for the failed CreatePod (path
-   becomes `/var/log/kubernetes/k8s-audit.log` after #50; today's path is
-   `/var/log/k8s-audit.log`):
+2. Grep the apiserver audit log on the CP for the failed CreatePod:
 
    ```bash
    ssh root@<cp> "grep ForbiddenError /var/log/kubernetes/k8s-audit.log"
@@ -185,7 +183,7 @@ Generate any apiserver write and tail the log on the CP host:
 
 ```bash
 kubectl create configmap audit-probe --from-literal=k=v
-sudo tail -n 5 /var/log/k8s-audit.log
+sudo tail -n 5 /var/log/kubernetes/k8s-audit.log
 ```
 
 Each line is a JSON `audit.k8s.io/v1` `Event` object. You should see
@@ -225,7 +223,7 @@ but it's not invisible to operators.
 
 ### Audit log can grow
 
-`/var/log/k8s-audit.log` is on the VM root filesystem with
+`/var/log/kubernetes/k8s-audit.log` is on the VM root filesystem with
 `--audit-log-maxsize=100` and `--audit-log-maxbackup=5` — i.e. ~600MB
 upper bound. On a busy cluster you may want to either reduce the
 policy's coverage further or ship logs off-node.
