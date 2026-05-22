@@ -61,3 +61,12 @@ export ENABLE_ROOT_SSH=1                # 1 = bake same pubkeys into root@ (defa
 # user. PR #17 flipped both defaults off. To get the old behavior back:
 # export VM_USER_GROUPS=wheel
 # export VM_PASSWORD=changeme
+
+# ---- Optional cloud-init in the built image -----------------------------------
+# Default OFF — the canonical Hummingbird customization path is the
+# `[[customizations.user]]` blocks rendered into bib-config.toml at qcow2
+# build time. Set ENABLE_CLOUD_INIT=1 to additionally bake the cloud-init
+# package + NoCloud datasource into the image so operators can inject
+# per-VM user-data (SSH keys, runcmd, packages) at `virt-install` time
+# via `--cloud-init` or a libvirt seed ISO. See docs/cloud-init.md.
+# export ENABLE_CLOUD_INIT=1

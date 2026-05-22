@@ -21,6 +21,8 @@ NAME=hummingbird-k8s-worker
 render_bib_config > bib-config-worker.toml
 
 podman pull "$BASE_IMAGE"
-podman build -t "$LOCAL_IMAGE" -f containers/k8s-worker/Containerfile .
+podman build \
+  --build-arg "ENABLE_CLOUD_INIT=${ENABLE_CLOUD_INIT}" \
+  -t "$LOCAL_IMAGE" -f containers/k8s-worker/Containerfile .
 
 build_qcow2 "$LOCAL_IMAGE" "$NAME" "$(pwd)/bib-config-worker.toml"

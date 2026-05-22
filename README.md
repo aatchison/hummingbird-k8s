@@ -192,6 +192,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/vm-sizing.md`](docs/vm-sizing.md) — VM resource defaults, tunables, sizing guidance.
 - [`docs/backup-restore.md`](docs/backup-restore.md) — etcd snapshot + restore.
 - [`docs/k8s-version-upgrade.md`](docs/k8s-version-upgrade.md) — K8s major-version upgrade strategy.
+- [`docs/cloud-init.md`](docs/cloud-init.md) — opt-in cloud-init support (`ENABLE_CLOUD_INIT=1`) for per-VM user-data injection via libvirt seed ISO.
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.

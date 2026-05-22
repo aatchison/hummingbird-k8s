@@ -50,6 +50,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
 .DEFAULT_GOAL := help
 .PHONY: help \
         image-k3s image-k8s image-worker image-all \
+        image-k3s-with-cloud-init image-k8s-with-cloud-init image-worker-with-cloud-init \
         k3s k8s workers spawn \
         switch-to-ghcr \
         nodes kubectl \
@@ -89,6 +90,27 @@ image-worker: ## podman build the k8s-worker template OCI image
 	podman build -t $(IMAGE_WORKER) -f $(CONTAINERFILE_WORKER) .
 
 image-all: image-k3s image-k8s image-worker ## podman build all three OCI images
+
+# ---- opt-in cloud-init variants ----------------------------------------
+# Convenience targets that flip ENABLE_CLOUD_INIT=1 for a single podman
+# build. The resulting image carries the cloud-init package + NoCloud
+# datasource so operators can inject per-VM user-data (SSH keys, runcmd,
+# packages) via `virt-install --cloud-init` or a libvirt seed ISO. The
+# default image-* targets stay byte-identical to pre-cloud-init builds.
+# See docs/cloud-init.md.
+
+image-k3s-with-cloud-init: ## podman build the k3s image with cloud-init opted in
+	podman build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_K3S) -f $(CONTAINERFILE_K3S) .
+
+image-k8s-with-cloud-init: ## podman build the k8s control-plane image with cloud-init opted in
+	podman build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_K8S) -f $(CONTAINERFILE_K8S) .
+
+image-worker-with-cloud-init: ## podman build the worker template image with cloud-init opted in
+	@if [ ! -s worker-join.env ]; then \
+	  echo 'kubeadm join 127.0.0.1:6443 --token aaaaaa.bbbbbbbbbbbbbbbb --discovery-token-ca-cert-hash sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+	    > worker-join.env; \
+	fi
+	podman build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_WORKER) -f $(CONTAINERFILE_WORKER) .
 
 # ---- VM lifecycle (sudo) -----------------------------------------------
 # These run the full image -> qcow2 -> virt-install dance via the same
