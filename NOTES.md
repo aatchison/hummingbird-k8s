@@ -1,0 +1,113 @@
+# hummingbird-test — findings
+
+Notes from setting up Fedora Hummingbird VMs on `<kvm-host>` (KVM host) with
+two flavors of single-node Kubernetes layered into the bootc image.
+
+## What's here
+
+| File | Role |
+|---|---|
+| `Containerfile` / `build.sh` / `define-vm.sh` / `redo.sh` | `hummingbird-k3s` VM (k3s baked in) |
+| `Containerfile.k8s` / `build-k8s.sh` / `define-vm-k8s.sh` / `redo-k8s.sh` | `hummingbird-k8s` VM (upstream kubelet/kubeadm/cri-o, control-plane) |
+| `Containerfile.k8s-worker` / `build-worker.sh` / `spawn-workers.sh` / `redo-workers.sh` | Worker template image + spawner — clones one qcow2 into N VMs, each auto-joins the CP |
+| `k8s-init.sh` / `k8s-init.service` | First-boot `kubeadm init` + flannel + untaint (CP only) |
+| `worker-init.sh` / `worker-init.service` | First-boot `kubeadm join` against the embedded token (workers only) |
+| `worker-join.env` | Cached kubeadm join command. `build-worker.sh` refreshes it from the running CP at build time. |
+| `bib-config.toml` | Generated at build time — initial user, SSH keys, hashed sudo password |
+| `migrate-to-system.sh` | One-time helper that moved the original VM from `qemu:///session` to system |
+| `k8s-bootc-talk.transcript.txt` | KubeCon India 2025 talk transcript (Berkus + Kumar) |
+
+## Host setup (<kvm-host>)
+
+- Fedora 44 Server, libvirt + cockpit-machines already installed.
+- Two libvirt connections in use:
+  - `qemu:///session` — pools `iso`, `userspace` (rootless; existing `molty` VM lives here)
+  - `qemu:///system` — pools `iso`, `iso-1`, `mass2` (`/var/lib/libvirt/images`), `secondary`; network `default` (NAT 192.168.122.0/24)
+- All our VMs live under **system libvirt** so they get a real bridge with DHCP, libvirt sees the IP, and Cockpit lists them in the host's main VM panel.
+
+## Build pipeline (what actually works)
+
+1. `podman build` a layered OCI image `FROM quay.io/hummingbird-community/bootc-os:latest`, tagged `localhost/hummingbird-<flavor>:latest`.
+2. `bootc-image-builder` converts that local image to a qcow2. Critical flag: pass `--local` so bib reads from local podman storage instead of trying to pull. Bind-mount `/var/lib/containers/storage` so the bib container can see the local image.
+3. Output goes to `/var/lib/libvirt/images/<name>.qcow2`. `chown root:root` + `chmod 0644` so system qemu can read it.
+4. `virsh -c qemu:///system pool-refresh mass2` so libvirt picks up the new volume.
+5. `virt-install --connect qemu:///system ... --network network=default --import` defines and starts the VM.
+
+## Accessing the cluster from another machine (<kvm-client> → <kvm-host> VM)
+
+libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm-host>, not routable from outside. We tunnel + use kubectl in a container so <kvm-client> doesn't need kubectl installed.
+
+1. `kubeadm init --apiserver-cert-extra-sans=<kvm-host>,127.0.0.1,localhost` — adds SANs so the apiserver cert is valid for the tunnel endpoint (baked into `k8s-init.sh`).
+2. Pull `/etc/kubernetes/admin.conf` from the VM to a local file.
+3. Rewrite `server:` to `https://localhost:6443`.
+4. `ssh -fNL 6443:<vm-ip>:6443 <kvm-host>`.
+5. `podman run --rm --net=host -v /tmp/k8s-kubeconfig:/kc:ro,Z -e KUBECONFIG=/kc docker.io/bitnami/kubectl:latest get nodes`.
+
+`./kubectl-k8s.sh <args>` wraps all of this — auto-discovers the VM IP, sets up the tunnel if missing, runs kubectl in a container with the right kubeconfig.
+
+## Gotchas hit along the way
+
+- **`systemctl enable` inside `podman build` is a no-op.** systemd isn't running in the build context, so the `multi-user.target.wants/` symlinks aren't created. Workaround: explicit `ln -sf`.
+- **But Hummingbird also ships `99-default-disable.preset`** which strips unenabled symlinks during the image-build stage. For the kubeadm VM, the manual symlinks for `kubelet.service` + `k8s-init.service` were getting wiped out. Fix: drop a lower-numbered preset file (`/usr/lib/systemd/system-preset/10-k8s.preset`) listing `enable crio.service / kubelet.service / k8s-init.service`. Lower number wins.
+- **CRI-O's unit is `crio.service`, NOT `cri-o.service`.** The Fedora RPM doesn't use the hyphen. Both the preset and `k8s-init.service`'s `After=` need to match.
+- **bootc's read-only `/usr` breaks kube-controller-manager** out of the box. Its pod mounts a HostPath `flexvolume-dir` at `/usr/libexec/kubernetes/kubelet-plugins/volume/exec` with `DirectoryOrCreate`, which tries to `mkdir /usr/libexec/kubernetes` at runtime and fails read-only. Pre-create the dir at image build (`RUN mkdir -p ...`).
+- **bib's `<portForward>` doesn't work with the default slirp `<interface type='user'>`.** It requires `backend='passt'`. Don't bother with port-forwarding for `qemu:///session` user-mode VMs — switch to `qemu:///system` and use the default NAT network instead.
+- **`/usr/local` on Hummingbird is wired to `/var`.** Writes there at image-build time don't end up in the OCI layer. Always install to `/usr/bin` or `/usr/libexec`.
+- **`bib-config.toml` `key =` accepts multi-line strings** for multiple authorized_keys entries (verified working). Hashed password works in `password =`.
+- **First SSH from <kvm-host> to a freshly-recreated VM** trips on stale host keys (libvirt re-issues IPs from its NAT pool) from prior VMs. `ssh-keygen -R <ip>` clears it.
+- **bib produces all formats** (qcow2, vmdk, vpc, ovf, archive, gce) even when you only ask for one — just `mv` the qcow2 you care about.
+
+## How bootc auto-update works
+
+- Image lives in any OCI registry (ghcr.io, quay.io, your own). GitHub repos *themselves* aren't pullable — publish to GHCR.
+- VM tracks the image reference set at install time (or via `bootc switch`).
+- `bootc upgrade --check` queries the registry; `bootc upgrade` stages the new image (chunked, only changed layers); reboot applies.
+- `bootc-fetch-apply-updates.timer` ships with Hummingbird but is **disabled by default**. Enable it (via Containerfile or runtime) for daily auto-update + auto-reboot. Most fleets want to enable the fetch but orchestrate the reboot externally.
+- `bootc rollback` swaps to the prior deployment; reboot finalizes.
+
+## Two install styles
+
+### k3s (`Containerfile`)
+- Upstream installer drops single `/usr/bin/k3s` binary + systemd unit.
+- Cluster up in ~10s after boot. CNI = flannel (k3s default), ingress = traefik, storage = local-path — all auto-deployed.
+- Best fit for "single node with containers."
+
+### Upstream kubeadm (`Containerfile.k8s`)
+- Adds Fedora Rawhide as a secondary repo (Hummingbird's curated set lacks `iptables-nft`, `socat`, `conntrack-tools`, `ethtool`).
+- Adds `pkgs.k8s.io` RPM repos for `core` (kubelet/kubeadm/kubectl) and `addons:cri-o`.
+- Pre-creates `/usr/libexec/kubernetes/kubelet-plugins/volume/exec` so kube-controller-manager doesn't fail on read-only `/usr`.
+- Drops `/etc/modules-load.d/k8s.conf` + sysctls.
+- `k8s-init.service` runs once at first boot: `kubeadm init` (with `--apiserver-cert-extra-sans` for tunneled access), applies flannel, untaints the control-plane node, makes admin.conf world-readable, then touches `/var/lib/k8s-init.done` so it doesn't re-run.
+- Final cluster: 1 node, 8 pods (etcd, apiserver, controller-manager, scheduler, kube-proxy, 2x coredns, flannel daemonset).
+- Roughly matches Red Hat's "Build Your K8s Ready Distro With BootC" talk pattern — Praveen Kumar describes installing the Kubernetes RPMs straight into a fedora-bootc image.
+
+## Reference: Praveen Kumar's public bootc demos
+
+The exact KubeCon India 2025 demo repo isn't public. Two adjacent demos from the same author show the same pattern:
+
+- [`praveenkumar/devconfin26`](https://github.com/praveenkumar/devconfin26) — Gitea dev-platform appliance. Has `.github/workflows/build.yml`, `Containerfile`, `quadlet/`, `systemd/`, `scripts/`. Best template for a GH Actions build pipeline.
+- [`praveenkumar/fossasia26`](https://github.com/praveenkumar/fossasia26) — Apache v1 vs v2 (with intentional break in v2) — minimal upgrade/rollback demo.
+
+Both base on `quay.io/fedora/fedora-bootc:43` rather than Hummingbird, since Hummingbird was announced after these were authored.
+
+## SSH access summary
+
+- From **<kvm-client>**: `ssh -J <kvm-host> <user>@<vm-ip>` (uses <kvm-client>'s id_ed25519, baked into image)
+- From **<kvm-host>**: `ssh <user>@<vm-ip>` (uses <kvm-host>'s id_ed25519, also baked in)
+- Sudo password inside guest: `1234asdf` (set in `build*.sh`).
+
+## Useful one-liners
+
+```bash
+# Find a VM's IP
+sudo virsh -c qemu:///system net-dhcp-leases default | grep <vm-name>
+
+# Force rebuild + redefine
+sudo bash ~/hummingbird-test/redo.sh                 # k3s
+sudo bash ~/hummingbird-test/redo-k8s.sh             # upstream k8s control-plane
+sudo bash ~/hummingbird-test/redo-workers.sh 2       # wipe + build + spawn N workers
+sudo bash ~/hummingbird-test/spawn-workers.sh 3      # spawn N more workers from the existing template
+
+# Enable bootc auto-update timer at runtime
+sudo systemctl enable --now bootc-fetch-apply-updates.timer
+```

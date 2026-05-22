@@ -1,0 +1,14 @@
+[Unit]
+Description=Initialize single-node kubeadm cluster on first boot
+After=crio.service network-online.target
+Wants=crio.service network-online.target
+ConditionPathExists=!/var/lib/k8s-init.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/k8s-init.sh
+RemainAfterExit=yes
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

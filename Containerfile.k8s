@@ -1,0 +1,51 @@
+FROM quay.io/hummingbird-community/bootc-os:latest
+
+ARG K8S_VERSION=v1.31
+ARG POD_CIDR=10.244.0.0/16
+ARG APISERVER_EXTRA_SANS=127.0.0.1,localhost
+
+# Hummingbird's curated repo doesn't carry the standard k8s deps (iptables, socat,
+# conntrack-tools, ethtool). Add Fedora Rawhide as a secondary source — Hummingbird
+# is Rawhide-based so versions are compatible. gpgcheck=0 to avoid bootstrapping
+# Fedora's GPG keyring into this image; flip on once the workflow is settled.
+RUN printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=0\nskip_if_unavailable=False\n' \
+      > /etc/yum.repos.d/fedora-rawhide.repo
+
+# Upstream Kubernetes + CRI-O RPM repos (version-aligned)
+RUN printf '[kubernetes]\nname=Kubernetes\nbaseurl=https://pkgs.k8s.io/core:/stable:/%s/rpm/\nenabled=1\ngpgcheck=1\ngpgkey=https://pkgs.k8s.io/core:/stable:/%s/rpm/repodata/repomd.xml.key\n' "$K8S_VERSION" "$K8S_VERSION" \
+      > /etc/yum.repos.d/kubernetes.repo \
+ && printf '[cri-o]\nname=CRI-O\nbaseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/%s/rpm/\nenabled=1\ngpgcheck=1\ngpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/%s/rpm/repodata/repomd.xml.key\n' "$K8S_VERSION" "$K8S_VERSION" \
+      > /etc/yum.repos.d/cri-o.repo
+
+RUN dnf install -y \
+      cri-o kubelet kubeadm kubectl \
+      iptables-nft iproute-tc socat conntrack-tools ethtool \
+ && dnf clean all
+
+# Pre-create the flex-volume plugin dir. kube-controller-manager mounts this
+# HostPath with DirectoryOrCreate and tries to mkdir at runtime, which fails on
+# bootc's read-only /usr. Creating it at image build avoids the mkdir entirely.
+RUN mkdir -p /usr/libexec/kubernetes/kubelet-plugins/volume/exec
+
+# Kernel modules + sysctls required by kubeadm
+RUN printf 'overlay\nbr_netfilter\n' > /etc/modules-load.d/k8s.conf \
+ && printf 'net.bridge.bridge-nf-call-iptables  = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward                 = 1\n' \
+      > /etc/sysctl.d/k8s.conf
+
+# Bake build-time config into an env file the first-boot script sources.
+RUN mkdir -p /etc/hummingbird \
+ && printf 'POD_CIDR=%s\nAPISERVER_EXTRA_SANS=%s\n' "$POD_CIDR" "$APISERVER_EXTRA_SANS" \
+      > /etc/hummingbird/k8s-init.env
+
+# First-boot script: kubeadm init + flannel + untaint, then mark complete.
+COPY k8s-init.sh /usr/libexec/k8s-init.sh
+RUN chmod +x /usr/libexec/k8s-init.sh
+
+COPY k8s-init.service /etc/systemd/system/k8s-init.service
+
+# Hummingbird ships a 99-default-disable.preset that strips unenabled symlinks
+# during image build. Override with a low-numbered preset that wins.
+COPY 10-k8s.preset /usr/lib/systemd/system-preset/10-k8s.preset
+RUN systemctl preset crio.service kubelet.service k8s-init.service || true
+
+LABEL containers.bootc=1
