@@ -106,7 +106,7 @@ EOF
 chmod 0600 /etc/kubernetes/kubeadm-init.yaml
 chown root:root /etc/kubernetes/kubeadm-init.yaml
 
-kubeadm init --config=/etc/kubernetes/kubeadm-init.yaml --cri-socket=unix:///var/run/crio/crio.sock
+kubeadm init --config=/etc/kubernetes/kubeadm-init.yaml
 
 # Single-node: let workloads schedule on the control-plane
 KUBECONFIG=/etc/kubernetes/admin.conf kubectl taint nodes --all \
