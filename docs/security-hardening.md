@@ -32,7 +32,9 @@ etc.) are exempted explicitly in `admission-control-config.yaml`:
 - `kube-system`
 - `kube-public`
 - `kube-node-lease`
-- `kube-flannel` (until #6 swaps flannel for Cilium — see Caveats)
+
+The CNI (Cilium) runs in `kube-system`, which is already exempt — see
+[`docs/cilium-migration.md`](cilium-migration.md).
 
 [pss]: https://kubernetes.io/docs/concepts/security/pod-security-standards/
 
@@ -222,13 +224,12 @@ but it's not invisible to operators.
 upper bound. On a busy cluster you may want to either reduce the
 policy's coverage further or ship logs off-node.
 
-### CNI namespace exemption is flannel-specific
+### CNI namespace exemption
 
-`kube-flannel` is on the namespace exemption list because flannel's
-daemonset needs host networking + `NET_ADMIN` and would otherwise be
-blocked. When #6 lands and swaps flannel for Cilium, that exemption
-needs to swap to the Cilium namespace (typically `kube-system`, which
-is already exempt, so the line can simply be removed).
+The CNI (Cilium) runs in `kube-system`, which is already on the
+exemption list — no CNI-specific exemption is required. See
+[`docs/cilium-migration.md`](cilium-migration.md) for details on the
+CNI swap.
 
 ### Cluster recovery from a half-init
 

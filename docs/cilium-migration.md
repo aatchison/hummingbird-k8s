@@ -171,6 +171,37 @@ currently ships these. If a future minimal base drops them, Cilium
 won't start — the `cilium` daemonset will go CrashLoopBackOff with
 "BPF filesystem not mounted" or similar in the logs.
 
+### Rollback limitations
+
+`bootc rollback` restores the previous filesystem deployment (the prior
+image's `/usr`, `/etc` baseline, baked-in binaries, etc.) and reboots
+into it. It does **not** roll back cluster state stored in etcd. After
+a rollback from a Cilium-enabled image to a flannel-era image:
+
+- Cilium CRDs installed at first boot (e.g. `CiliumNetworkPolicy`,
+  `CiliumEndpoint`, `CiliumIdentity`, …) remain registered with the
+  apiserver.
+- Cilium IP allocations and endpoint records persist in etcd.
+- The Cilium agent/operator workloads will be gone from the image, but
+  their Deployment / DaemonSet specs in etcd will remain until
+  manually deleted.
+
+The result is a cluster with a flannel-era binary surface but Cilium
+detritus in etcd — both CNIs nominally trying to manage the same
+podCIDR. This is not a clean state.
+
+Recommended approach if a rollback across the CNI swap is needed:
+
+1. Before upgrading, take an etcd snapshot of the pre-Cilium cluster
+   (`etcdctl snapshot save`) and stash it off the VM.
+2. If a rollback becomes necessary, `bootc rollback` + reboot, then
+   restore the snapshot into the rolled-back image's etcd before any
+   workloads come up.
+
+Automating snapshot-and-restore is out of scope for this image. In
+practice, the simpler path for a lab cluster is to rebuild from the
+old image rather than attempt a CNI-crossing rollback.
+
 ### Version pinning is explicit
 
 Two versions are pinned independently:

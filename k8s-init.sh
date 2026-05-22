@@ -5,11 +5,16 @@ MARKER=/var/lib/k8s-init.done
 [[ -f "$MARKER" ]] && { echo "k8s-init already ran"; exit 0; }
 
 # Recover from a half-finished previous init.
-# If admin.conf is missing but our generated kubeadm config is present,
-# a previous kubeadm init died partway. Reset so we can retry cleanly.
-if [[ ! -f /etc/kubernetes/admin.conf && -f /etc/kubernetes/kubeadm-init.yaml ]]; then
+# If a previous run produced the kubeadm config but didn't set the done
+# marker, something failed mid-init (kubeadm init crashed, or kubeadm init
+# finished but `cilium install` later failed and we exited non-zero before
+# touching $MARKER). Either way, reset so the next attempt is clean. The
+# pki / manifests / *.conf cleanup is needed because kubeadm refuses to
+# re-init if those exist.
+if [[ ! -f "$MARKER" && -f /etc/kubernetes/kubeadm-init.yaml ]]; then
   kubeadm reset --force --cri-socket=unix:///var/run/crio/crio.sock || true
   rm -f /etc/kubernetes/kubeadm-init.yaml /etc/kubernetes/encryption-config.yaml
+  rm -rf /etc/kubernetes/pki /etc/kubernetes/manifests /etc/kubernetes/*.conf || true
 fi
 
 # Build-time configuration: APISERVER_EXTRA_SANS is baked into /etc/hummingbird/k8s-init.env
