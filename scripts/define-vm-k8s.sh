@@ -14,6 +14,12 @@ fi
 NAME=hummingbird-k8s
 QCOW=${POOL_DIR}/${NAME}.qcow2
 
+# Resource knobs (override via config.local.sh or environment). Sizes match
+# the pre-knob hardcoded defaults so behavior is unchanged when unset.
+# See config.example.sh for the full list.
+: "${CP_MEMORY:=8192}"
+: "${CP_VCPUS:=4}"
+
 [[ -r "$QCOW" ]] || { echo "Missing/unreadable: $QCOW" >&2; exit 1; }
 
 virsh -c qemu:///system pool-refresh mass2 >/dev/null || true
@@ -26,7 +32,7 @@ fi
 
 virt-install --connect qemu:///system \
   --name "$NAME" \
-  --memory 8192 --vcpus 4 \
+  --memory "$CP_MEMORY" --vcpus "$CP_VCPUS" \
   --disk "$QCOW",format=qcow2,bus=virtio \
   --import \
   --os-variant fedora-unknown \

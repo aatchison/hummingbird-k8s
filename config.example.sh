@@ -24,6 +24,31 @@ export ENABLE_ROOT_SSH=1                # 1 = bake same pubkeys into root@ (defa
 # libvirt storage pool target directory on this host.
 # export POOL_DIR=/var/lib/libvirt/images
 
+# ---- VM resource knobs (#91) --------------------------------------------------
+# Per-flavor virt-install --memory / --vcpus values. Defaults match the
+# pre-knob hardcoded sizes, so unset = unchanged behavior. Override here
+# for resource-constrained labs or larger node sizing.
+#
+# Control plane (scripts/define-vm-k8s.sh):
+# export CP_MEMORY=8192          # MiB
+# export CP_VCPUS=4
+#
+# k3s single-node (scripts/define-vm.sh):
+# export K3S_MEMORY=6144
+# export K3S_VCPUS=4
+#
+# Workers (scripts/spawn-workers.sh, per worker):
+# export WORKER_MEMORY=4096
+# export WORKER_VCPUS=2
+
+# ---- spawn-workers retry tuning (#90) ----------------------------------------
+# When chaining redo-k8s.sh -> redo-workers.sh, the CP may still be coming
+# up the first time spawn-workers.sh SSHes in to mint a join token. The
+# script retries CP_SSH_RETRIES times, sleeping CP_SSH_RETRY_SLEEP seconds
+# between attempts (each attempt has ConnectTimeout=10s).
+# export CP_SSH_RETRIES=5
+# export CP_SSH_RETRY_SLEEP=10
+
 # For the upstream-k8s flavor: extra SANs to bake into the apiserver cert.
 # Add the hostname/IP of any client that will hit the cluster via SSH tunnel.
 # export APISERVER_EXTRA_SANS=127.0.0.1,localhost
