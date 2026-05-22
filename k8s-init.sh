@@ -4,6 +4,12 @@ set -euo pipefail
 MARKER=/var/lib/k8s-init.done
 [[ -f "$MARKER" ]] && { echo "k8s-init already ran"; exit 0; }
 
+# cilium install (cilium-cli) needs a writable cache dir; systemd services
+# have no $HOME by default. Set both XDG_CACHE_HOME and HOME so cilium-cli's
+# helm cache + kubeconfig path resolution work.
+export HOME=/root
+export XDG_CACHE_HOME=/var/cache
+
 # Recover from a half-finished previous init.
 # If a previous run produced the kubeadm config but didn't set the done
 # marker, something failed mid-init (kubeadm init crashed, or kubeadm init
