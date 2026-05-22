@@ -2,3 +2,4 @@ enable crio.service
 enable kubelet.service
 enable worker-init.service
 enable bootc-fetch-apply-updates.timer
+enable health-check-rollback.timer

@@ -43,8 +43,20 @@ RUN install -d /etc/rancher/k3s \
 
 # Hummingbird ships a 99-default-disable.preset that strips unenabled symlinks
 # during bib's qcow2 generation. Override with a low-numbered preset that wins.
+# Post-upgrade health-check + auto-rollback (#104). The timer fires 3 min
+# after every boot; the script only takes action when the marker file
+# /var/lib/bootc-just-upgraded is present (set by an ExecStartPost drop-in
+# on bootc-fetch-apply-updates.service). See docs/rollback.md.
+COPY containers/shared/health-check-rollback.sh /usr/libexec/health-check-rollback.sh
+COPY containers/shared/health-check-rollback.service /etc/systemd/system/health-check-rollback.service
+COPY containers/shared/health-check-rollback.timer /etc/systemd/system/health-check-rollback.timer
+COPY containers/shared/bootc-fetch-apply-updates.service.d/10-mark-upgrade.conf \
+     /etc/systemd/system/bootc-fetch-apply-updates.service.d/10-mark-upgrade.conf
+RUN chmod +x /usr/libexec/health-check-rollback.sh
+
 COPY containers/k3s/10-k3s.preset /usr/lib/systemd/system-preset/10-k3s.preset
-RUN systemctl preset bootc-fetch-apply-updates.timer ssh-hostkey-regen.service || true
+RUN systemctl preset bootc-fetch-apply-updates.timer ssh-hostkey-regen.service \
+      health-check-rollback.timer || true
 
 RUN install -d /etc/systemd/system/multi-user.target.wants \
  && ln -sf /etc/systemd/system/k3s.service \
