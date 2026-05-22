@@ -238,14 +238,51 @@ bib_build() {
 log "building CP qcow2 from ${CP_IMAGE}"
 bib_build "${CP_IMAGE}" "${CP_BIB_CFG}" "${CP_POOL_QCOW}"
 
+# Attach a `<serial type='file'>` device that writes the guest's secondary
+# serial port to a host file. We do this as a post-virt-install XML patch
+# because the inline `--serial file,...` / `--console pty,log.file=...`
+# forms produced an unstartable domain on the runner (the previous re-test
+# of #165 ended with State=shut off and no console log). Best-effort: if
+# the patch fails, dump_failure_context handles an empty console log
+# gracefully.
+attach_serial_file_to_domain() {
+  local dom="$1" log_path="$2"
+  : >"${log_path}"
+  chown qemu:qemu "${log_path}" 2>/dev/null || true
+  chmod 0660 "${log_path}"
+  if ! virsh -c qemu:///system dumpxml "${dom}" >/dev/null 2>&1; then
+    return 0
+  fi
+  local tmp_xml="${WORK}/${dom}.xml"
+  if ! virsh -c qemu:///system dumpxml "${dom}" >"${tmp_xml}"; then
+    return 0
+  fi
+  if grep -q "serial type='file'" "${tmp_xml}"; then
+    return 0
+  fi
+  if ! python3 - "${tmp_xml}" "${log_path}" <<'PY'
+import sys, xml.etree.ElementTree as ET
+xml_path, log_path = sys.argv[1], sys.argv[2]
+tree = ET.parse(xml_path)
+root = tree.getroot()
+devices = root.find('devices')
+if devices is None:
+    sys.exit(2)
+ser = ET.SubElement(devices, 'serial', {'type': 'file'})
+ET.SubElement(ser, 'source', {'path': log_path, 'append': 'on'})
+ET.SubElement(ser, 'target', {'port': '1'})
+tree.write(xml_path, encoding='unicode')
+PY
+  then
+    log "(python XML patch failed for ${dom}; continuing without console log)"
+    return 0
+  fi
+  virsh -c qemu:///system define "${tmp_xml}" >/dev/null 2>&1 \
+    || log "(virsh define after serial-file patch failed for ${dom})"
+}
+
 log "virt-installing CP ${CP_VM}"
-# Console-to-file so we can post-mortem when sshd never comes up (#165/#166
-# share the same opaque-boot failure mode). Place the log file under
-# LIBVIRT_POOL_DIR so it's host-visible from the runner.
 CP_CONSOLE_LOG="${LIBVIRT_POOL_DIR}/${CP_VM}-console.log"
-: >"${CP_CONSOLE_LOG}"
-chown qemu:qemu "${CP_CONSOLE_LOG}" 2>/dev/null || true
-chmod 0660 "${CP_CONSOLE_LOG}"
 virt-install --connect qemu:///system \
   --name "${CP_VM}" \
   --memory 4096 --vcpus 2 \
@@ -254,10 +291,13 @@ virt-install --connect qemu:///system \
   --os-variant fedora-unknown \
   --network network=default,model=virtio \
   --graphics none \
-  --console "pty,log.file=${CP_CONSOLE_LOG}" \
   --noautoconsole \
   --noreboot
-virsh -c qemu:///system start "${CP_VM}" >/dev/null 2>&1 || true
+attach_serial_file_to_domain "${CP_VM}" "${CP_CONSOLE_LOG}"
+log "starting CP ${CP_VM}"
+if ! virsh -c qemu:///system start "${CP_VM}" 2>&1; then
+  log "WARN: virsh start CP exited non-zero — domain may not be running"
+fi
 
 # Resolve CP IP.
 log "waiting for CP DHCP lease (up to 3 min)"
@@ -379,9 +419,6 @@ spawn_worker() {
   # Per-worker console log so we can post-mortem first-boot failures (#166).
   # Under LIBVIRT_POOL_DIR so it's host-visible from the runner.
   local console_log="${LIBVIRT_POOL_DIR}/${name}-console.log"
-  : >"${console_log}"
-  chown qemu:qemu "${console_log}" 2>/dev/null || true
-  chmod 0660 "${console_log}"
 
   # NB: send EVERY noisy subcommand's stdout to stderr so the function's
   # own stdout is reserved exclusively for the `echo "${name}"` at the end.
@@ -408,10 +445,15 @@ spawn_worker() {
     --os-variant fedora-unknown \
     --network network=default,model=virtio \
     --graphics none \
-    --console "pty,log.file=${console_log}" \
     --noautoconsole \
     --noreboot >&2
-  virsh -c qemu:///system start "${name}" >/dev/null 2>&1 || true
+  attach_serial_file_to_domain "${name}" "${console_log}" >&2
+  # Surface virsh start errors to stderr — the prior `>/dev/null 2>&1 || true`
+  # silently masked unstartable-domain failures, leaving cleanup confused
+  # about whether the worker had actually been launched (#166).
+  if ! virsh -c qemu:///system start "${name}" >&2; then
+    echo "WARN: virsh start ${name} exited non-zero" >&2
+  fi
   echo "${name}"
 }
 

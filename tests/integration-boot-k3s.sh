@@ -202,13 +202,6 @@ log "virt-installing ${VM_NAME}"
 # coredns, metrics-server all come up in a single process). The
 # scripts/define-vm.sh production default is 6144M/4vCPUs; match that here
 # so the integration VM doesn't OOM-stall before sshd is reachable.
-#
-# --console pty,log.file=…  wires the guest's primary console to a host
-# file (via libvirt's char-dev `<log file=…/>`) so we can tail boot/console
-# output when sshd never comes up. Without this, an early-boot failure
-# (OOM, sshd-disabled, dependency cycle, …) is completely opaque (#165).
-# Place the log under LIBVIRT_POOL_DIR (host-visible from the runner) and
-# pre-create so SELinux file_type matches libvirt's expectations.
 SERIAL_LOG="${LIBVIRT_POOL_DIR}/${VM_NAME}-console.log"
 : >"${SERIAL_LOG}"
 chown qemu:qemu "${SERIAL_LOG}" 2>/dev/null || true
@@ -221,11 +214,53 @@ virt-install --connect qemu:///system \
   --os-variant fedora-unknown \
   --network network=default,model=virtio \
   --graphics none \
-  --console "pty,log.file=${SERIAL_LOG}" \
   --noautoconsole \
   --noreboot
 
-virsh -c qemu:///system start "${VM_NAME}" >/dev/null 2>&1 || true
+# Bolt a `<serial type='file'>` device onto the domain BEFORE first boot.
+# We do this as a post-virt-install XML patch (rather than `--serial
+# file,...`) because the runner's virt-install/libvirt combination silently
+# produces an unstartable domain when the inline forms are used (the
+# previous re-test ended with State=shut off and `virsh start` failed
+# without diagnostic; #165). Patching the XML directly is the most
+# portable form: target port='1' so it adds a second serial port rather
+# than fighting whatever device virt-install put on port=0. Best-effort —
+# if anything in this block fails, we just won't have a console log;
+# dump_failure_context already gracefully handles an empty SERIAL_LOG.
+if virsh -c qemu:///system dumpxml "${VM_NAME}" >/dev/null 2>&1; then
+  tmp_xml="${WORK}/domain.xml"
+  if virsh -c qemu:///system dumpxml "${VM_NAME}" >"${tmp_xml}"; then
+    if ! grep -q "serial type='file'" "${tmp_xml}"; then
+      if python3 - "${tmp_xml}" "${SERIAL_LOG}" <<'PY'
+import sys, xml.etree.ElementTree as ET
+xml_path, log_path = sys.argv[1], sys.argv[2]
+tree = ET.parse(xml_path)
+root = tree.getroot()
+devices = root.find('devices')
+if devices is None:
+    sys.exit(2)
+ser = ET.SubElement(devices, 'serial', {'type': 'file'})
+ET.SubElement(ser, 'source', {'path': log_path, 'append': 'on'})
+ET.SubElement(ser, 'target', {'port': '1'})
+tree.write(xml_path, encoding='unicode')
+PY
+      then
+        virsh -c qemu:///system define "${tmp_xml}" >/dev/null 2>&1 \
+          || log "(virsh define after serial-file patch failed; continuing without console log)"
+      else
+        log "(python XML patch failed; continuing without console log)"
+      fi
+    fi
+  fi
+fi
+
+# Capture stderr from `virsh start` so a real start failure (the previous
+# re-test left the domain in State=shut off without telling us why; #165)
+# surfaces in the test log.
+log "starting VM ${VM_NAME}"
+if ! virsh -c qemu:///system start "${VM_NAME}" 2>&1; then
+  log "WARN: virsh start exited non-zero — domain may not be running"
+fi
 
 log "waiting for DHCP lease (up to 3 min)"
 VM_IP=""
