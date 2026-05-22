@@ -1,0 +1,187 @@
+name: Agent review
+
+# 10-lens parallel PR review powered by Claude Code subagents.
+#
+# This workflow is a SCAFFOLD. It is wired up to trigger on PR events but
+# short-circuits cleanly when ANTHROPIC_API_KEY is not set as a repo secret.
+# To enable, see docs/agent-review.md.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    branches: [main]
+
+# Cancel any in-flight review for the same PR when a new commit lands.
+concurrency:
+  group: agent-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # post the aggregated findings comment
+  issues: write          # PR comments use the issues API
+
+jobs:
+  gate:
+    name: Check API key gate
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        name: Determine whether ANTHROPIC_API_KEY is configured
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "enabled=true"  >> "$GITHUB_OUTPUT"
+            echo "ANTHROPIC_API_KEY is set; agent review will run."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Agent review skipped::ANTHROPIC_API_KEY is not configured for this repo. See docs/agent-review.md to enable."
+          fi
+
+  review:
+    name: Lens — ${{ matrix.lens }}
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        lens:
+          - security
+          - correctness
+          - shell-hygiene
+          - containerfile
+          - workflow-yaml
+          - docs-accuracy
+          - backwards-compat
+          - defaults-ux
+          - test-plan
+          - supply-chain
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Load lens prompt
+        id: prompt
+        run: |
+          set -euo pipefail
+          prompt_path=".github/agent-review-prompts/${{ matrix.lens }}.md"
+          if [ ! -f "$prompt_path" ]; then
+            echo "::error title=Missing prompt::No prompt file at $prompt_path"
+            exit 1
+          fi
+          # Stash the prompt body for downstream steps via a workspace file.
+          cp "$prompt_path" "$RUNNER_TEMP/lens-prompt.md"
+          echo "path=$RUNNER_TEMP/lens-prompt.md" >> "$GITHUB_OUTPUT"
+
+      # === STUB: Claude Code action invocation ===
+      #
+      # Replace this block with the official anthropics/claude-code-action once
+      # it is published and the prompt file API stabilizes. Example shape:
+      #
+      #   - uses: anthropics/claude-code-action@v1
+      #     with:
+      #       anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+      #       prompt_file: ${{ steps.prompt.outputs.path }}
+      #       github_token: ${{ secrets.GITHUB_TOKEN }}
+      #       pr_number: ${{ github.event.pull_request.number }}
+      #       output_file: ${{ runner.temp }}/findings-${{ matrix.lens }}.md
+      #
+      # Until then, the step below writes a placeholder finding so the
+      # aggregation job has something deterministic to consume during
+      # workflow-structure testing.
+      - name: Run lens review (stub — replace with claude-code-action)
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LENS: ${{ matrix.lens }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/findings-${LENS}.md"
+          {
+            echo "## Lens: ${LENS}"
+            echo
+            echo "_Stub output. Wire up anthropics/claude-code-action to populate this._"
+            echo
+            echo "- **Severity:** info"
+            echo "- **Finding:** lens scaffold executed against PR #${PR_NUMBER}"
+          } > "$out"
+          echo "findings=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload lens findings artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: findings-${{ matrix.lens }}
+          path: ${{ steps.review.outputs.findings }}
+          if-no-files-found: error
+          retention-days: 7
+
+  aggregate:
+    name: Aggregate findings
+    needs: [gate, review]
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all lens findings
+        uses: actions/download-artifact@v4
+        with:
+          path: findings
+          pattern: findings-*
+          merge-multiple: true
+
+      - name: Assemble PR comment
+        id: assemble
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/agent-review-comment.md"
+          {
+            echo "<!-- agent-review:aggregated -->"
+            echo "# Agent review (10 lenses)"
+            echo
+            echo "Each section below is the output of one parallel lens. See"
+            echo "\`docs/agent-review.md\` for the lens design."
+            echo
+            for f in findings/findings-*.md; do
+              [ -f "$f" ] || continue
+              cat "$f"
+              echo
+              echo "---"
+              echo
+            done
+          } > "$body"
+          echo "body=$body" >> "$GITHUB_OUTPUT"
+
+      - name: Post or update aggregated PR comment
+        uses: actions/github-script@v7
+        env:
+          BODY_PATH: ${{ steps.assemble.outputs.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync(process.env.BODY_PATH, 'utf8');
+            const prNumber = Number(process.env.PR_NUMBER);
+            const { owner, repo } = context.repo;
+            const marker = '<!-- agent-review:aggregated -->';
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body,
+              });
+            }
