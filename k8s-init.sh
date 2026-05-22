@@ -4,6 +4,14 @@ set -euo pipefail
 MARKER=/var/lib/k8s-init.done
 [[ -f "$MARKER" ]] && { echo "k8s-init already ran"; exit 0; }
 
+# Recover from a half-finished previous init.
+# If admin.conf is missing but our generated kubeadm config is present,
+# a previous kubeadm init died partway. Reset so we can retry cleanly.
+if [[ ! -f /etc/kubernetes/admin.conf && -f /etc/kubernetes/kubeadm-init.yaml ]]; then
+  kubeadm reset --force --cri-socket=unix:///var/run/crio/crio.sock || true
+  rm -f /etc/kubernetes/kubeadm-init.yaml /etc/kubernetes/encryption-config.yaml
+fi
+
 # Build-time configuration: APISERVER_EXTRA_SANS is baked into /etc/hummingbird/k8s-init.env
 # at image build time (Containerfile.k8s ARG → write env file).
 if [[ -r /etc/hummingbird/k8s-init.env ]]; then
@@ -32,6 +40,8 @@ ENC_KEY="$(head -c 32 /dev/urandom | base64 -w0)"
 
 install -d -m 0700 -o root -g root /etc/kubernetes
 umask 077
+# NOTE: this heredoc is unquoted on purpose so ${ENC_KEY} expands.
+# ENC_KEY is base64 (no YAML metacharacters) — safe.
 cat >/etc/kubernetes/encryption-config.yaml <<EOF
 apiVersion: apiserver.config.k8s.io/v1
 kind: EncryptionConfiguration
@@ -40,7 +50,7 @@ resources:
       - secrets
       - configmaps
     providers:
-      - aescbc:
+      - aesgcm:
           keys:
             - name: bootstrap
               secret: ${ENC_KEY}
@@ -51,6 +61,8 @@ chown root:root /etc/kubernetes/encryption-config.yaml
 unset ENC_KEY
 
 # Build certSANs YAML list from comma-separated APISERVER_EXTRA_SANS.
+# Caller is responsible for ensuring SANs are plain DNS/IP tokens
+# (no YAML metacharacters). Defaults are safe.
 CERT_SANS_YAML=""
 IFS=',' read -r -a _sans <<<"$APISERVER_EXTRA_SANS"
 for s in "${_sans[@]}"; do
@@ -60,24 +72,28 @@ for s in "${_sans[@]}"; do
   CERT_SANS_YAML+="    - ${s}"$'\n'
 done
 
+# Build controlPlaneEndpoint line (with its own trailing newline) when set,
+# so the next key (`networking:`) always lands on a fresh line whether or
+# not CONTROL_PLANE_ENDPOINT is empty.
 CONTROL_PLANE_ENDPOINT_YAML=""
 if [[ -n "$CONTROL_PLANE_ENDPOINT" ]]; then
   CONTROL_PLANE_ENDPOINT_YAML="controlPlaneEndpoint: ${CONTROL_PLANE_ENDPOINT}"$'\n'
 fi
 
 cat >/etc/kubernetes/kubeadm-init.yaml <<EOF
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 nodeRegistration:
   criSocket: unix:///var/run/crio/crio.sock
 ---
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 ${CONTROL_PLANE_ENDPOINT_YAML}networking:
   podSubnet: ${POD_CIDR}
 apiServer:
   extraArgs:
-    encryption-provider-config: /etc/kubernetes/encryption-config.yaml
+    - name: encryption-provider-config
+      value: /etc/kubernetes/encryption-config.yaml
   extraVolumes:
     - name: encryption-config
       hostPath: /etc/kubernetes/encryption-config.yaml
