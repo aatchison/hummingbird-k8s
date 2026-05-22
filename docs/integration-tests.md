@@ -1,4 +1,41 @@
-# Integration tests
+# Tests
+
+Two layers of automated tests cover the project:
+
+1. **Unit tests** for `lib/build-common.sh` helpers (bats-core, fast, run on
+   every PR on the standard `ubuntu-latest` runner — see "Unit tests" below).
+2. **Integration tests** that boot real VMs from published images on a
+   self-hosted KVM host (see "Integration tests" below).
+
+## Unit tests
+
+`tests/lib/build-common.bats` covers the pure-Bash helpers in
+`lib/build-common.sh`:
+
+- `ssh_pubkey_blob` — file-only / GitHub-only / empty / unreadable / dedup.
+- `ssh_pubkeys_from_github` — empty input, comma-separated parsing, trailing
+  whitespace/comma tolerance. `curl` is stubbed as a shell function so the
+  tests never reach github.com.
+- `_render_user_block` — TOML field rendering, multi-group arrays, the
+  `name=root` branch that suppresses `groups`.
+- `render_bib_config` — orchestration only (one vs. two `[[customizations.user]]`
+  blocks). The full TOML snapshot is handled by `render-bib-config-snapshot`
+  in `pr-validate.yml`, so these tests deliberately don't duplicate it.
+
+`require_root` and `build_qcow2` are intentionally not unit-tested — they
+require root + podman + libvirt, which is the integration suite's job.
+
+Run locally:
+
+```bash
+make test-lib
+```
+
+The same invocation runs in CI as the `unit-tests-lib` job in
+`.github/workflows/pr-validate.yml`. The bats container is pinned by digest so
+upstream tag movement can't silently change the test runtime.
+
+## Integration tests
 
 Two integration workflows exercise the published `hummingbird-k8s` image on a
 real KVM host. Both run on the self-hosted runner gated by the `kvm,libvirt`

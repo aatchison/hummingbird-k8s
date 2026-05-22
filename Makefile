@@ -58,6 +58,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         backup-etcd restore-etcd \
         ci-build-k3s ci-build-k8s ci-build-worker \
         print-containerfile-k3s print-containerfile-k8s print-containerfile-worker \
+        test-lib \
         clean-vms clean-images clean
 
 # ---- help ---------------------------------------------------------------
@@ -170,6 +171,16 @@ print-containerfile-k8s: ## Print Containerfile path for the k8s flavor
 
 print-containerfile-worker: ## Print Containerfile path for the k8s-worker flavor
 	@echo $(CONTAINERFILE_WORKER)
+
+# ---- unit tests --------------------------------------------------------
+# bats unit tests for lib/build-common.sh helper functions (issue #106).
+# Runs in a pinned bats container so the host doesn't need bats installed.
+# The same invocation is mirrored by pr-validate.yml's unit-tests-lib job.
+
+BATS_IMAGE := docker.io/bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300
+
+test-lib: ## Run bats unit tests for lib/build-common.sh
+	podman run --rm -v "$(CURDIR):/repo:Z" -w /repo $(BATS_IMAGE) tests/lib/
 
 # ---- cleanup -----------------------------------------------------------
 
