@@ -24,8 +24,12 @@ systemctl list-timers 'bootc-*'                        # shows next + last run
 ```
 
 The unit ships in the base `quay.io/hummingbird-community/bootc-os` image; our
-Containerfiles only add the `timers.target.wants/` symlink that enables it at
-boot.
+Containerfiles enable it by dropping a low-numbered systemd preset file
+(`/usr/lib/systemd/system-preset/10-*.preset` containing
+`enable bootc-fetch-apply-updates.timer`) and running `systemctl preset` at
+build time. A plain `ln -sf … timers.target.wants/` doesn't survive: Hummingbird
+also ships `99-default-disable.preset`, which strips unenabled symlinks during
+bib's qcow2 generation. Lower-numbered preset files win.
 
 ## Disabling on a single host
 
@@ -43,9 +47,10 @@ sudo systemctl enable --now bootc-fetch-apply-updates.timer
 
 ## Disabling fleet-wide
 
-If you want the entire flavor to ship with the timer off, remove the
-`ln -sf … timers.target.wants/bootc-fetch-apply-updates.timer` block from the
-corresponding Containerfile and rebuild.
+If you want the entire flavor to ship with the timer off, drop
+`enable bootc-fetch-apply-updates.timer` from the corresponding `10-*.preset`
+file (and the matching token from the `systemctl preset` line) in that
+flavor's Containerfile and rebuild.
 
 ## Operational caveats
 

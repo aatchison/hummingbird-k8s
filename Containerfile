@@ -21,15 +21,14 @@ RUN curl -fsSL https://get.k3s.io | \
 RUN install -d /etc/rancher/k3s \
  && printf 'write-kubeconfig-mode: "0644"\n' > /etc/rancher/k3s/config.yaml
 
+# Hummingbird ships a 99-default-disable.preset that strips unenabled symlinks
+# during bib's qcow2 generation. Override with a low-numbered preset that wins.
+COPY 10-k3s.preset /usr/lib/systemd/system-preset/10-k3s.preset
+RUN systemctl preset bootc-fetch-apply-updates.timer || true
+
 RUN install -d /etc/systemd/system/multi-user.target.wants \
  && ln -sf /etc/systemd/system/k3s.service \
        /etc/systemd/system/multi-user.target.wants/k3s.service
-
-# Enable bootc auto-update timer (daily, applies + reboots automatically).
-# Operators who want manual control should override via systemctl disable.
-RUN install -d /etc/systemd/system/timers.target.wants \
- && ln -sf /usr/lib/systemd/system/bootc-fetch-apply-updates.timer \
-       /etc/systemd/system/timers.target.wants/bootc-fetch-apply-updates.timer
 
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s
