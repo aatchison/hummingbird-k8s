@@ -62,6 +62,12 @@ posture is healthy.
   (nginx Deployment + Service + PSA-restricted probe).
 - **Driver:** `tests/integration-boot.sh <tag>`.
 
+Manual run:
+
+```bash
+gh workflow run integration-boot.yml -f tag=v0.1.33
+```
+
 ### `integration-boot-k3s.yml` (boot-time CP, k3s flavor)
 
 Same shape as the k8s boot test but for the k3s flavor.
@@ -106,12 +112,6 @@ Manual run:
 ```bash
 gh workflow run integration-workers-join.yml \
   -f cp_tag=v0.1.33 -f worker_tag=v0.1.9 -f worker_count=2
-```
-
-Manual run:
-
-```bash
-gh workflow run integration-boot.yml -f tag=v0.1.10
 ```
 
 ### `integration-bootc-upgrade.yml` (#12 — end-to-end bootc upgrade)
