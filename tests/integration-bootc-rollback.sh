@@ -121,7 +121,7 @@ rm -rf "${LIBVIRT_POOL_DIR}/qcow2"
 podman pull "${FROM_IMAGE}"
 
 podman run --rm --privileged --pull=newer \
-  --net=host \
+  --net=host --cgroupns=host \
   --security-opt label=type:unconfined_t \
   -v "${BIB_CFG}:/config.toml:ro" \
   -v "${LIBVIRT_POOL_DIR}:/output" \
