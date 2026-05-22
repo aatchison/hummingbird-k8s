@@ -204,8 +204,12 @@ log "VM_IP=${VM_IP}"
 ssh_opts=(-i "${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no
           -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
 
-log "waiting for sshd to answer (up to 2 min)"
-for _ in $(seq 1 60); do
+log "waiting for sshd to answer (up to 5 min — k3s boot can be slow)"
+# k3s does a lot on first boot (container runtime, embedded etcd/sqlite,
+# traefik+coredns manifests, ssh-hostkey-regen) and the libvirt DHCP lease
+# can appear well before sshd is actually accepting connections. Give it
+# more headroom than the k8s flavor needs.
+for _ in $(seq 1 150); do
   if ssh "${ssh_opts[@]}" "root@${VM_IP}" true >/dev/null 2>&1; then
     break
   fi
