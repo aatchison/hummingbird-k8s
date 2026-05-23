@@ -245,18 +245,19 @@ if ! virsh -c qemu:///system start "${VM_NAME}" 2>&1; then
   log "WARN: virsh start exited non-zero — domain may not be running"
 fi
 
-# Tee the VM's primary console to a host-side log so we can post-mortem
-# first-boot failures even when sshd never comes up (#165). `virsh
-# ttyconsole` returns the PTY libvirt allocated for the guest's primary
-# serial port; piping `cat <pty>` into a file in the background captures
-# every kernel/systemd message the guest writes to ttyS0. The earlier
-# attempts (--console pty,log.file=, post-XML `<serial type='file'>`)
-# both ended in unstartable domains or empty logs.
-#
-# Best-effort: a few retries to give libvirt a moment to wire the PTY
-# after `virsh start` returns. The background reader gets cleaned up by
-# the EXIT trap (the cat exits naturally when libvirt tears down the
-# domain on cleanup).
+# Try to tee the VM's primary console PTY into ${SERIAL_LOG} so we can
+# post-mortem first-boot failures (#165). NOTE: this is best-effort and
+# routinely no-ops in the geary-docker runner — `virsh ttyconsole`
+# returns a path like `/dev/pts/18`, but `/dev/pts/` lives in qemu's
+# mount namespace on the HOST, not in the runner container's
+# `/dev/pts/`. The runner sees the literal string but `[[ -c $path ]]`
+# returns false because the device node doesn't exist in its filesystem
+# view. A full fix would require either: (a) running the test on a
+# bare-metal runner where qemu and the test driver share /dev/pts/, or
+# (b) running a tiny helper on the host (via the docker socket) that
+# cats the PTY. Tracked as a runner-side limitation; the SSH-based
+# diagnostics in dump_failure_context remain useful when the VM at
+# least reaches DHCP/userspace.
 SERIAL_READER_PID=""
 ttyc_err=""
 for _ in 1 2 3 4 5; do
@@ -271,7 +272,7 @@ for _ in 1 2 3 4 5; do
   sleep 1
 done
 if [[ -z "$SERIAL_READER_PID" ]]; then
-  log "(could not resolve ttyconsole PTY; last err: ${ttyc_err:-<empty>}; console log will be empty)"
+  log "(no PTY tee — virsh returned '${ttyc_err:-<empty>}' but it lives in the host's mount namespace, not the runner's. SSH-based diagnostics only.)"
 fi
 
 log "waiting for DHCP lease (up to 3 min)"
