@@ -7,7 +7,7 @@ _ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Run with sudo. This defines the VM under qemu:///system." >&2
+  echo "${0##*/}: must be run as root — defines the VM under libvirt qemu:///system. Try: sudo bash $0" >&2
   exit 1
 fi
 
@@ -20,7 +20,11 @@ QCOW=${POOL_DIR}/${NAME}.qcow2
 : "${K3S_MEMORY:=6144}"
 : "${K3S_VCPUS:=4}"
 
-[[ -r "$QCOW" ]] || { echo "Missing/unreadable: $QCOW" >&2; exit 1; }
+[[ -r "$QCOW" ]] || {
+  echo "${0##*/}: qcow2 missing or unreadable: $QCOW" >&2
+  echo "${0##*/}: build the image first ('sudo make k3s' or 'sudo bash scripts/build-k3s.sh'), or override POOL_DIR if your pool lives elsewhere." >&2
+  exit 1
+}
 
 virsh -c qemu:///system pool-refresh mass2 >/dev/null || true
 

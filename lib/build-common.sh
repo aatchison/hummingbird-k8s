@@ -52,7 +52,7 @@ fi
 # Require root for the build (bootc-image-builder needs --privileged + loopback mounts).
 require_root() {
   if [[ $EUID -ne 0 ]]; then
-    echo "Run with sudo." >&2
+    echo "${0##*/}: must be run as root (bootc-image-builder needs --privileged + loopback mounts; libvirt qemu:///system needs root). Try: sudo bash $0" >&2
     exit 1
   fi
   : "${SUDO_USER:?must be invoked via sudo so the qcow2 can be chowned to the calling user}"
@@ -94,7 +94,7 @@ ssh_pubkey_blob() {
   {
     local f
     while read -r f; do
-      [[ -r "$f" ]] || { echo "Pubkey file not readable: $f" >&2; exit 1; }
+      [[ -r "$f" ]] || { echo "ssh_pubkey_blob: pubkey file not readable: $f (set SSH_PUBKEY_FILES, or place ~/.ssh/id_ed25519.pub for SUDO_USER='${SUDO_USER:-<unset>}')" >&2; exit 1; }
       cat "$f"
     done < <(ssh_pubkey_files)
     ssh_pubkeys_from_github
@@ -142,10 +142,22 @@ build_qcow2() {
   local stage="${POOL_DIR}/qcow2"
   local disk="${stage}/disk.qcow2"
 
+  # Validate inputs up front so failures point at the real cause (issue #98 / #115).
+  if [[ -z "$local_image" || -z "$name" || -z "$cfg" ]]; then
+    echo "build_qcow2: usage: build_qcow2 <local-image-ref> <qcow2-name> <path-to-bib-config.toml>" >&2
+    echo "build_qcow2: got local_image='${local_image}' name='${name}' cfg='${cfg}'" >&2
+    return 2
+  fi
+  if [[ ! -r "$cfg" ]]; then
+    echo "build_qcow2: bib config not readable: ${cfg}" >&2
+    echo "build_qcow2: render one first via 'render_bib_config > bib-config.toml' (see lib/build-common.sh)." >&2
+    return 2
+  fi
+
   rm -rf "$stage"
   mkdir -p "$POOL_DIR"
 
-  podman run --rm --privileged --pull=newer \
+  if ! podman run --rm --privileged --pull=newer \
     --security-opt label=type:unconfined_t \
     -v "${cfg}:/config.toml:ro" \
     -v "${POOL_DIR}:/output" \
@@ -153,21 +165,26 @@ build_qcow2() {
     "$BIB" \
     --type qcow2 --rootfs ext4 \
     --local \
-    "$local_image"
+    "$local_image"; then
+    echo "build_qcow2: bootc-image-builder (${BIB}) failed for image '${local_image}'." >&2
+    echo "build_qcow2: common causes: missing --privileged, loopback mounts blocked, or the local image ref does not exist in podman storage. Re-run 'podman images' to confirm." >&2
+    return 1
+  fi
 
   # Promote the staged disk to its final path. Each step is explicitly checked so
   # that a failure cannot silently leave stale state in $stage that would poison
   # subsequent builds (issue #103).
   if [[ ! -f "$disk" ]]; then
-    echo "build_qcow2: expected $disk to exist after bib run" >&2
+    echo "build_qcow2: expected $disk to exist after bib run (image='${local_image}', stage='${stage}')" >&2
+    echo "build_qcow2: bib appears to have exited 0 but produced no disk — inspect '${stage}' for partial output." >&2
     return 1
   fi
   if ! mv -f "$disk" "$qcow"; then
-    echo "build_qcow2: failed to move $disk to $qcow" >&2
+    echo "build_qcow2: failed to move $disk to $qcow (check ${POOL_DIR} permissions and free space: $(df -h "$POOL_DIR" 2>/dev/null | tail -1))" >&2
     return 1
   fi
   if ! rmdir "$stage"; then
-    echo "build_qcow2: failed to remove staging dir $stage" >&2
+    echo "build_qcow2: failed to remove staging dir $stage (non-empty? ls: $(ls -A "$stage" 2>/dev/null | head -5 | tr '\n' ' '))" >&2
     return 1
   fi
   chown root:root "$qcow"

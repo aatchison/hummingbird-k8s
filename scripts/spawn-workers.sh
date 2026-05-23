@@ -10,7 +10,7 @@
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Run with sudo." >&2
+  echo "${0##*/}: must be run as root — clones the worker qcow2 + virt-installs under qemu:///system. Try: sudo bash $0 [count]" >&2
   exit 1
 fi
 
@@ -39,14 +39,19 @@ COUNT="${1:-2}"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
 TEMPLATE="${POOL_DIR}/hummingbird-k8s-worker.qcow2"
 
-[[ -r "$TEMPLATE" ]] || { echo "Missing template $TEMPLATE — run build-worker.sh first." >&2; exit 1; }
+[[ -r "$TEMPLATE" ]] || {
+  echo "${0##*/}: worker template qcow2 missing or unreadable: $TEMPLATE" >&2
+  echo "${0##*/}: build it first: 'sudo bash scripts/build-worker.sh' (or 'sudo make workers' to do both)." >&2
+  exit 1
+}
 
 # Resolve the control plane IP so we can ask it for fresh join tokens.
 CP_IP=$(virsh -c qemu:///system domifaddr "$CP_VM_NAME" 2>/dev/null \
           | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}' || true)
 if [[ -z "$CP_IP" ]]; then
-  echo "Could not resolve IP of CP VM '$CP_VM_NAME' via virsh domifaddr." >&2
-  echo "Is the control plane running? Set CP_VM_NAME=... if you renamed it." >&2
+  echo "${0##*/}: could not resolve IP of CP VM '$CP_VM_NAME' via 'virsh -c qemu:///system domifaddr'." >&2
+  echo "${0##*/}: verify the CP is running ('virsh -c qemu:///system list'), or override the VM name with CP_VM_NAME=<name>." >&2
+  echo "${0##*/}: known domains: $(virsh -c qemu:///system list --all --name 2>/dev/null | tr '\n' ' ')" >&2
   exit 1
 fi
 
@@ -71,8 +76,9 @@ else
   elif command -v virt-customize >/dev/null 2>&1; then
     INJECTOR=virt-customize
   else
-    echo "ERROR: guestfish/virt-customize unavailable and could not be installed." >&2
-    echo "Install libguestfs-tools-c (or libguestfs-tools) on this KVM host and retry." >&2
+    echo "${0##*/}: guestfish/virt-customize unavailable and auto-install failed." >&2
+    echo "${0##*/}: install libguestfs-tools-c (Fedora/RHEL) or libguestfs-tools (Debian/Ubuntu) on this KVM host and retry." >&2
+    echo "${0##*/}: an injector is required to write /etc/hummingbird/worker-join.env into each worker qcow2 before boot." >&2
     exit 1
   fi
 fi
@@ -156,7 +162,7 @@ GF
         # which is the live /etc on traditional (non-ostree) images.
         etc_path="/etc/hummingbird"
       fi
-      guestfish --rw -a "$qcow" <<EOF
+      if ! guestfish --rw -a "$qcow" <<EOF
 run
 mount /dev/sda4 /
 mkdir-p ${etc_path}
@@ -164,14 +170,25 @@ upload ${tmpfile} ${etc_path}/worker-join.env
 chmod 0600 ${etc_path}/worker-join.env
 chown 0 0 ${etc_path}/worker-join.env
 EOF
+      then
+        echo "${0##*/}: inject_join_env: guestfish failed to write ${etc_path}/worker-join.env into $qcow" >&2
+        echo "${0##*/}: hints: (a) /dev/sda4 is the expected bootc 'root' partition — confirm with 'virt-filesystems --partitions -a $qcow'; (b) stateroot='${stateroot:-<unresolved>}' deploy='${deploy_basename:-<unresolved>}'; (c) ensure no other process has $qcow open." >&2
+        rm -f "$tmpfile"
+        return 1
+      fi
       ;;
     virt-customize)
-      virt-customize -a "$qcow" \
+      if ! virt-customize -a "$qcow" \
         --mkdir /etc/hummingbird \
         --upload "${tmpfile}:/etc/hummingbird/worker-join.env" \
         --run-command 'chmod 0600 /etc/hummingbird/worker-join.env' \
         --run-command 'chown root:root /etc/hummingbird/worker-join.env' \
-        >/dev/null
+        >/dev/null; then
+        echo "${0##*/}: inject_join_env: virt-customize failed to write /etc/hummingbird/worker-join.env into $qcow" >&2
+        echo "${0##*/}: hint: virt-customize uses libguestfs OS-introspection ('-i'), which fails on bootc/ostree images. Install guestfish on this host to use the bootc-aware code path." >&2
+        rm -f "$tmpfile"
+        return 1
+      fi
       ;;
   esac
   rm -f "$tmpfile"
@@ -206,7 +223,11 @@ for i in $(seq 1 "$COUNT"); do
     exit 1
   fi
 
-  inject_join_env "$QCOW" "$JOIN_CMD"
+  if ! inject_join_env "$QCOW" "$JOIN_CMD"; then
+    echo "${0##*/}: ERROR: inject_join_env failed for $NAME; removing staged $QCOW so a retry starts clean." >&2
+    rm -f "$QCOW"
+    exit 1
+  fi
 
   virt-install --connect qemu:///system \
     --name "$NAME" \

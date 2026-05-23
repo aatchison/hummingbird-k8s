@@ -1,0 +1,228 @@
+#!/usr/bin/env bats
+#
+# Unit tests for the build_qcow2() helper in lib/build-common.sh (issue #115).
+#
+# build_qcow2 is the heart of build-k3s.sh / build-k8s.sh / build-worker.sh: it
+# shells out to bootc-image-builder via podman, promotes the staged disk to its
+# final qcow2 path under $POOL_DIR, and refreshes any known libvirt pools. The
+# function is too thin to be worth e2e-mocking the bib image, but the bits we
+# DO want to test are exactly the bits an operator hits when something is off:
+#
+#   1. Default args -> the right podman invocation (image, bib, mounts).
+#   2. POOL_DIR override -> qcow2 lands in the custom path.
+#   3. BIB override -> the right bib image is used.
+#   4. Failure path -> missing bib-config emits a clear error before podman.
+#
+# We never actually call podman (the bats container has no podman, and we don't
+# want a 2 GB pull in tests anyway). Instead, every test stubs `podman` as a
+# shell function that captures argv to a file, then writes the staged
+# `disk.qcow2` so the post-podman promotion logic can run. `virsh` is also
+# stubbed to a no-op so the best-effort pool-refresh calls don't pollute test
+# output or fail in containers without libvirt-clients.
+#
+# Run via:
+#   make test-lib                          # all bats tests
+#   podman run --rm -v "$PWD:/repo:Z" -w /repo \
+#     docker.io/bats/bats:latest tests/lib/build_qcow2.bats
+
+setup() {
+  REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
+  LIB="${REPO_ROOT}/lib/build-common.sh"
+  FIX="${BATS_TEST_DIRNAME}/fixtures"
+
+  # Isolate HOME so the library never reads developer state.
+  export HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$HOME"
+
+  # Wipe library inputs.
+  unset SSH_PUBKEY_FILES SSH_PUBKEY_GH_USERS VM_USER VM_USER_GROUPS \
+        VM_PASSWORD ENABLE_ROOT_SSH SUDO_USER POOL_DIR BIB BASE_IMAGE
+
+  # Default sandbox locations for every test.
+  export POOL_DIR="${BATS_TEST_TMPDIR}/pool"
+  export SSH_PUBKEY_FILES="${FIX}/keys/a.pub"
+  mkdir -p "$POOL_DIR"
+
+  # Capture file for stubbed-podman argv.
+  PODMAN_ARGS="${BATS_TEST_TMPDIR}/podman-args.txt"
+  export PODMAN_ARGS
+}
+
+# Common stub harness:
+#   - podman() writes its argv (one per line) to $PODMAN_ARGS, then drops a
+#     fake disk.qcow2 in the staging dir so the promotion logic can succeed.
+#     It also accepts an optional `_PODMAN_RC` env var so tests can simulate
+#     a bib failure.
+#   - virsh() no-ops (build_qcow2's pool-refresh is best-effort).
+#   - chown/chmod no-op so we don't need root.
+install_stubs() {
+  podman() {
+    printf '%s\n' "$@" > "$PODMAN_ARGS"
+    # bib stages the output disk at $POOL_DIR/qcow2/disk.qcow2 — fabricate it
+    # so the post-bib mv+rmdir can run. Skip this side effect if the test
+    # wants to simulate a missing-disk failure mode.
+    if [[ "${_BIB_PRODUCE_DISK:-1}" = 1 ]]; then
+      mkdir -p "${POOL_DIR}/qcow2"
+      : > "${POOL_DIR}/qcow2/disk.qcow2"
+    fi
+    return "${_PODMAN_RC:-0}"
+  }
+  export -f podman
+  virsh() { :; }
+  export -f virsh
+  chown() { :; }
+  export -f chown
+  chmod() { :; }
+  export -f chmod
+}
+
+source_lib() {
+  # shellcheck disable=SC1090
+  source "$LIB"
+}
+
+# A throwaway bib-config — the contents don't matter because podman is stubbed.
+make_cfg() {
+  local p="${BATS_TEST_TMPDIR}/bib-config.toml"
+  printf '[[customizations.user]]\nname = "test"\n' > "$p"
+  echo "$p"
+}
+
+# ---------------------------------------------------------------------------
+# Snapshot: podman argv shape (default args)
+# ---------------------------------------------------------------------------
+
+@test "build_qcow2: default args invoke podman with bib image + expected mounts + qcow2 type" {
+  install_stubs
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  run build_qcow2 localhost/hummingbird-k3s:latest hummingbird-k3s "$cfg"
+  [ "$status" -eq 0 ]
+
+  # The captured argv must include the bib image, the config + output mounts,
+  # the qcow2 type, --local, and the local image ref. Each as its own line in
+  # $PODMAN_ARGS.
+  grep -qx 'run' "$PODMAN_ARGS"
+  grep -qx -- '--rm' "$PODMAN_ARGS"
+  grep -qx -- '--privileged' "$PODMAN_ARGS"
+  grep -qx -- '--pull=newer' "$PODMAN_ARGS"
+  # Default BIB (from build-common.sh defaults).
+  grep -qx 'quay.io/centos-bootc/bootc-image-builder:latest' "$PODMAN_ARGS"
+  # The config mount uses the cfg path we passed in.
+  grep -qFx -- "${cfg}:/config.toml:ro" "$PODMAN_ARGS"
+  # The output mount uses POOL_DIR.
+  grep -qFx -- "${POOL_DIR}:/output" "$PODMAN_ARGS"
+  # bib args.
+  grep -qx -- '--type' "$PODMAN_ARGS"
+  grep -qx 'qcow2' "$PODMAN_ARGS"
+  grep -qx -- '--rootfs' "$PODMAN_ARGS"
+  grep -qx 'ext4' "$PODMAN_ARGS"
+  grep -qx -- '--local' "$PODMAN_ARGS"
+  grep -qx 'localhost/hummingbird-k3s:latest' "$PODMAN_ARGS"
+
+  # The promoted qcow2 ends up at ${POOL_DIR}/<name>.qcow2 and the staging dir
+  # is gone.
+  [ -f "${POOL_DIR}/hummingbird-k3s.qcow2" ]
+  [ ! -d "${POOL_DIR}/qcow2" ]
+  # Stdout should announce the path so operators can grep for it.
+  [[ "$output" == *"Built: ${POOL_DIR}/hummingbird-k3s.qcow2"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Snapshot: POOL_DIR override
+# ---------------------------------------------------------------------------
+
+@test "build_qcow2: POOL_DIR=<custom> places the qcow2 in that directory" {
+  install_stubs
+  export POOL_DIR="${BATS_TEST_TMPDIR}/custom-pool"
+  mkdir -p "$POOL_DIR"
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  run build_qcow2 localhost/hummingbird-k8s:latest hummingbird-k8s "$cfg"
+  [ "$status" -eq 0 ]
+
+  # The output mount must point at the custom pool.
+  grep -qFx -- "${POOL_DIR}:/output" "$PODMAN_ARGS"
+  # The promoted qcow2 lives in the custom pool, not the default one.
+  [ -f "${POOL_DIR}/hummingbird-k8s.qcow2" ]
+  [ ! -f "/var/lib/libvirt/images/hummingbird-k8s.qcow2" ]
+  [[ "$output" == *"Built: ${POOL_DIR}/hummingbird-k8s.qcow2"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Snapshot: BIB override
+# ---------------------------------------------------------------------------
+
+@test "build_qcow2: BIB=<custom-image> passes that image to podman run" {
+  install_stubs
+  export BIB="quay.io/example/bib-fork:dev"
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  run build_qcow2 localhost/hummingbird-worker:latest hummingbird-worker "$cfg"
+  [ "$status" -eq 0 ]
+
+  # The custom BIB image appears in the captured argv; the default does not.
+  grep -qx 'quay.io/example/bib-fork:dev' "$PODMAN_ARGS"
+  ! grep -qx 'quay.io/centos-bootc/bootc-image-builder:latest' "$PODMAN_ARGS"
+}
+
+# ---------------------------------------------------------------------------
+# Failure modes
+# ---------------------------------------------------------------------------
+
+@test "build_qcow2: missing bib-config file fails with a clear error before podman" {
+  install_stubs
+  source_lib
+
+  run build_qcow2 localhost/whatever:latest whatever "${BATS_TEST_TMPDIR}/does-not-exist.toml"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"bib config not readable"* ]]
+  [[ "$output" == *"render_bib_config"* ]]
+  # podman must NOT have been called — the precheck must happen first.
+  [ ! -f "$PODMAN_ARGS" ]
+}
+
+@test "build_qcow2: missing required args fails with a usage hint" {
+  install_stubs
+  source_lib
+
+  run build_qcow2 "" "" ""
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"usage:"* ]]
+  [ ! -f "$PODMAN_ARGS" ]
+}
+
+@test "build_qcow2: bib exit non-zero surfaces a contextual error (not silent)" {
+  install_stubs
+  export _PODMAN_RC=42
+  export _BIB_PRODUCE_DISK=0
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  run build_qcow2 localhost/img:latest whatever "$cfg"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"bootc-image-builder"* ]]
+  [[ "$output" == *"failed"* ]]
+  # No qcow2 should have been promoted into the pool.
+  [ ! -f "${POOL_DIR}/whatever.qcow2" ]
+}
+
+@test "build_qcow2: bib exits 0 but produces no disk -> clear error, no stale state" {
+  install_stubs
+  export _BIB_PRODUCE_DISK=0
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  run build_qcow2 localhost/img:latest whatever "$cfg"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"expected"* ]]
+  [[ "$output" == *"disk.qcow2"* ]]
+}

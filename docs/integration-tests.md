@@ -194,6 +194,16 @@ On failure the trap also prints the VM name, last-known IP, and the last 30
 lines of `journalctl -u k8s-init` from the VM before tearing down — these
 land in the GitHub Actions log for the run.
 
+The in-script trap is best-effort: when GitHub cancels a runner or the
+runner container is OOM-killed, the bash process is terminated before
+the EXIT trap can run, leaving the VM + qcow2 on the host (issue #162).
+Each integration workflow therefore also has an `if: always()`
+**Force-clean integration VMs** step that runs after the test step on
+every outcome (success, failure, cancel). It greps `virsh list --all`
+for the `hummingbird-it-` prefix only — production cluster VMs are
+never matched — and is fully defensive (`|| true` on every command), so
+it can never itself fail the job.
+
 ## Security note — fork PRs
 
 None of these workflows run on `pull_request`, so fork PRs can't reach the

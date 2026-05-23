@@ -10,7 +10,7 @@
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Run with sudo." >&2
+  echo "${0##*/}: must be run as root — wipes + respawns hummingbird-k8s-worker-* VMs under libvirt qemu:///system. Try: sudo bash $0 [count]" >&2
   exit 1
 fi
 

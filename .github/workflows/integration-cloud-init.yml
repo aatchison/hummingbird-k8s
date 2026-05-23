@@ -77,6 +77,24 @@ jobs:
           sudo --preserve-env=FLAVOR,GITHUB_RUN_ID,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
             tests/integration-cloud-init.sh "${FLAVOR}"
 
+      - name: Force-clean integration VMs (always)
+        # Belt-and-suspenders to the in-script `trap cleanup EXIT` in
+        # tests/integration-cloud-init.sh — that trap is killed when a
+        # runner is cancelled or OOM'd, leaving hummingbird-it-* VMs +
+        # qcow2s behind (issue #162). Match only the `it-` prefix so we
+        # never touch production hummingbird-* VMs. Defensive throughout:
+        # MUST NEVER fail the job.
+        if: always()
+        run: |
+          for vm in $(sudo virsh -c qemu:///system list --all --name 2>/dev/null | grep '^hummingbird-it-' || true); do
+            echo "force-cleaning $vm"
+            sudo virsh -c qemu:///system destroy "$vm" >/dev/null 2>&1 || true
+            sudo virsh -c qemu:///system undefine --nvram "$vm" >/dev/null 2>&1 || true
+          done
+          sudo rm -f /var/lib/libvirt/images/hummingbird-it-*.qcow2 \
+                     /var/lib/libvirt/images/hummingbird-it-*-seed.iso 2>/dev/null || true
+          sudo rm -rf /var/lib/libvirt/images/integration-runs/* 2>/dev/null || true
+
       - name: Clean up isolated podman storage
         if: always()
         run: |
