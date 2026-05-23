@@ -214,6 +214,8 @@ hatch for a stuck drain.
 Exercised end-to-end by `integration-update-cluster.yml` (see
 [docs/integration-tests.md](docs/integration-tests.md)).
 
+Full reference: [docs/update-cluster.md](docs/update-cluster.md).
+
 ### etcd backup + key rotation
 
 ```bash

@@ -34,6 +34,23 @@ Tear it all down:
 sudo make clean               # destroys + undefines VMs and removes local images
 ```
 
+Rolling update of an existing deploy-cluster cluster (CP first, no
+drain; each worker drained → `bootc upgrade --apply` → uncordoned):
+
+```bash
+# Whole cluster:
+sudo make update-cluster  CONFIG=cluster.local.conf
+
+# Workers only (skip the CP — useful if CP already on latest):
+sudo make update-workers  CONFIG=cluster.local.conf
+
+# One specific node (CP_NAME or a WORKER_NAMES entry):
+sudo make update-node     CONFIG=cluster.local.conf NODE=hbird-w1
+```
+
+Full flag reference, lock-file behavior, recovery procedure, and time
+estimates per cluster size: [`update-cluster.md`](update-cluster.md).
+
 Unit tests for `lib/build-common.sh` (no sudo, runs in a pinned bats
 container — same job CI runs as `unit-tests-lib`):
 
