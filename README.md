@@ -220,6 +220,31 @@ sudo make restore-etcd SNAP=./backups/<file>.db    # destructive; prompts
 sudo make rotate-etcd-key                          # walks 4-stage key rotation
 ```
 
+### Fetch a working kubeconfig
+
+`make get-kubeconfig` is the daily-use sibling of `make export-argocd` — same
+SSH-and-rewrite primitive (`scripts/export-argocd.sh`), but with
+operator-facing defaults: writes to `./kubeconfig.yaml` and names the
+cluster/context/user after `CP_NAME` (no `hummingbird-` prefix) so
+`kubectl --context=<CP_NAME>` matches the libvirt domain name you already
+think in.
+
+```bash
+make get-kubeconfig CONFIG=cluster.local.conf
+KUBECONFIG=./kubeconfig.yaml kubectl get nodes
+
+# Override the apiserver URL / context name / output / overwrite-if-present:
+make get-kubeconfig CONFIG=cluster.local.conf \
+    SERVER=https://cluster.example.com:6443 \
+    CONTEXT=prod-cp \
+    OUTPUT=~/.kube/hummingbird.yaml \
+    FORCE=1
+```
+
+For ArgoCD registration use `make export-argocd` instead — same fetch+rewrite
+logic, but it names the context `hummingbird-<CP_NAME>` to avoid colliding
+with whatever the operator already has in `~/.kube/config`.
+
 ### Register the cluster with ArgoCD
 
 `make export-argocd` SSHes to the CP, pulls `/etc/kubernetes/admin.conf`, and

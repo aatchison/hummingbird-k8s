@@ -8,6 +8,16 @@ scoped ServiceAccount in the target cluster and then authenticates with
 that SA's token. So we don't need an ArgoCD-specific credential. We just
 need a valid, usable-once kubeconfig pointed at a reachable apiserver.
 
+`make get-kubeconfig` (issue #195) wraps the same primitive for daily
+operator use — both targets call `scripts/export-argocd.sh`; the only
+differences are the defaults. `export-argocd` writes
+`argocd-kubeconfig.yaml` and prefixes the context with `hummingbird-` so
+it can sit alongside a regular kubeconfig without name collisions on
+`argocd cluster add`. `get-kubeconfig` writes `kubeconfig.yaml` and uses
+`CP_NAME` directly (no prefix), so `kubectl --context=<CP_NAME>` matches
+the libvirt domain name the operator already uses. The fetch+rewrite
+logic lives in one script — there is no separate `scripts/get-kubeconfig.sh`.
+
 ## What the export contains
 
 The output file is a verbatim copy of `/etc/kubernetes/admin.conf` from

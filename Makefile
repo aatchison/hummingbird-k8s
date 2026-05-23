@@ -56,6 +56,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         destroy-cluster \
         update-cluster update-workers update-node \
         export-argocd \
+        get-kubeconfig \
         switch-to-ghcr \
         nodes kubectl \
         verify-encryption verify-hardening verify-app-deploy verify-all \
@@ -161,6 +162,26 @@ export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CO
 		$(if $(SERVER),--server "$(SERVER)",) \
 		$(if $(CONTEXT),--context-name "$(CONTEXT)",) \
 		$(if $(FORCE),--force,)
+
+# Daily-use sibling of export-argocd (issue #195). Same fetch+rewrite
+# primitive in scripts/export-argocd.sh, but with operator-facing
+# defaults:
+#   - OUTPUT=kubeconfig.yaml (not argocd-kubeconfig.yaml)
+#   - --context-name=$CP_NAME (no "hummingbird-" prefix — operators
+#     expect `kubectl --context=<CP_NAME>` to match the libvirt domain
+#     name, while export-argocd uses the prefixed form to avoid
+#     colliding with whatever ArgoCD already has registered).
+# CONTEXT=/SERVER=/FORCE= still pass through.
+get-kubeconfig: ## Fetch a working kubeconfig from CONFIG=<path> (OUTPUT=, SERVER=, CONTEXT=, FORCE=1)
+	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
+	@set -e; \
+	  source "$(CONFIG)"; \
+	  CONTEXT_FROM_CONF="$(if $(CONTEXT),$(CONTEXT),$${CP_NAME})"; \
+	  CONFIG="$(CONFIG)" bash scripts/export-argocd.sh \
+	    --output "$(if $(OUTPUT),$(OUTPUT),kubeconfig.yaml)" \
+	    --context-name "$$CONTEXT_FROM_CONF" \
+	    $(if $(SERVER),--server "$(SERVER)",) \
+	    $(if $(FORCE),--force,)
 
 switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
 	bash scripts/switch-to-ghcr.sh
