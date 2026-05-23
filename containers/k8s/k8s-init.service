@@ -5,7 +5,7 @@ Description=Initialize single-node kubeadm cluster on first boot
 # After= ensures user-data-injected SSH keys / runcmd / package-installs
 # land before kubeadm init runs, so any operator-supplied prerequisites
 # (extra packages, files written by write_files, etc.) are in place.
-After=crio.service network-online.target cloud-init.target
+After=crio.service network-online.target cloud-final.service
 Wants=crio.service network-online.target
 ConditionPathExists=!/var/lib/k8s-init.done
 

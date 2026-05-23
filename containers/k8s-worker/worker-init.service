@@ -4,7 +4,7 @@ Description=Join the Hummingbird Kubernetes cluster as a worker
 # default build). When ENABLE_CLOUD_INIT=1 was passed at image build, this
 # After= ensures user-data-injected SSH keys / runcmd / package-installs
 # land before kubeadm join runs.
-After=crio.service network-online.target cloud-init.target
+After=crio.service network-online.target cloud-final.service
 Wants=crio.service network-online.target
 ConditionPathExists=!/var/lib/worker-init.done
 # Skip cleanly when an operator boots the bare template qcow2 (no token
