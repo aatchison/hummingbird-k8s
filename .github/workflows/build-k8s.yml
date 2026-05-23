@@ -9,6 +9,11 @@ on:
         description: 'Semver tag (vX.Y.Z)'
         required: true
         type: string
+      force-publish-on-vulns:
+        description: 'Publish even if Trivy finds HIGH/CRITICAL vulns (emergency override, e.g. upstream zero-day with no fix yet). Set TRIVY exit-code to 0 for this run only.'
+        required: false
+        default: false
+        type: boolean
 
 # Serialize tag-driven publishes on the same ref. cancel-in-progress is
 # deliberately false: a real tag push that is mid-publish must finish
@@ -90,8 +95,36 @@ jobs:
           extra-args: |
             --cache-from ghcr.io/${{ github.repository_owner }}/hummingbird-k8s
 
-      # Vulnerability scan the locally-built image before push. exit-code=0
-      # keeps this report-only for now (future PR can ratchet to fail-on-HIGH).
+      # Pre-publish vulnerability gate. buildah-build leaves the image in
+      # podman's local storage (not docker's); TRIVY_IMAGE_SRC=podman pins
+      # the lookup path so a future default-list change can't silently regress
+      # to "image not found, scan skipped".
+      #
+      # exit-code:'1' on HIGH/CRITICAL REFUSES to publish — that's the whole
+      # point of moving this step earlier. The workflow_dispatch input
+      # `force-publish-on-vulns` downgrades exit-code to '0' for a single run
+      # so operators can ship a release during an upstream zero-day window.
+      - name: Trivy vulnerability scan (gate publish on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_IMAGE_SRC: podman
+        with:
+          image-ref: localhost/hummingbird-k8s:${{ steps.v.outputs.version }}
+          severity: HIGH,CRITICAL
+          exit-code: ${{ inputs.force-publish-on-vulns && '0' || '1' }}
+          format: sarif
+          output: trivy-results.sarif
+
+      # SARIF upload runs whether the scan passed or failed, so the security
+      # tab always has the latest findings even on a refused publish.
+      - name: Upload Trivy SARIF
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57 # v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-hummingbird-k8s
+
       - name: Push to GHCR
         id: push
         uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2.8
@@ -124,28 +157,10 @@ jobs:
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
-      # Signing is by digest with --recursive, which walks the multi-arch
-      # manifest index and signs both the index itself AND each per-arch
-      # child manifest. See the cosign sign step below.
-      - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s@${{ steps.digest.outputs.digest }}
-          severity: HIGH,CRITICAL
-          exit-code: '0'
-          format: sarif
-          output: trivy-results.sarif
-
-      - name: Upload Trivy SARIF
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@03e4368ac7daa2bd82b3e85262f3bf87ee112f57 # v3
-        if: always()
-        with:
-          sarif_file: trivy-results.sarif
-          category: trivy-hummingbird-k8s
-
-      # Generate an SPDX SBOM of the locally-built image. Uploaded as a
-      # workflow artifact and later cosign-attested against the pushed digest.
+      # Generate an SPDX SBOM of the published image and cosign-attest it
+      # against the pushed digest so consumers can verify provenance. The
+      # SBOM intentionally references the GHCR digest (provenance of the
+      # published artifact), not the local podman tag.
       - name: Generate SBOM with syft
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
