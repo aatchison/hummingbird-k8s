@@ -118,7 +118,9 @@ jobs:
       - name: Deploy 1-CP + 2-worker cluster
         run: |
           set -euo pipefail
-          sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+          # HOME is preserved so cluster.ci.conf's SSH_PUBKEY_FILE=$HOME/.ssh/...
+          # resolves to the runner user's key (generated above), not /root.
+          sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
             make deploy-cluster CONFIG="${CONFIG}"
 
       - name: Verify CP + workers Ready by name
@@ -258,7 +260,10 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          sudo make destroy-cluster CONFIG="${CONFIG}" || true
+          # HOME preserved so destroy-cluster.sh's source of cluster.ci.conf
+          # resolves $HOME/.ssh/integration_test_key.pub to the runner user's
+          # key path (same reason as the deploy step above).
+          sudo --preserve-env=HOME make destroy-cluster CONFIG="${CONFIG}" || true
 
       - name: Force-clean integration VMs (always)
         # Belt-and-suspenders teardown. Match only the per-run suffix so
