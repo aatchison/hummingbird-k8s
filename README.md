@@ -192,6 +192,31 @@ sudo make restore-etcd SNAP=./backups/<file>.db    # destructive; prompts
 sudo make rotate-etcd-key                          # walks 4-stage key rotation
 ```
 
+### Register the cluster with ArgoCD
+
+`make export-argocd` SSHes to the CP, pulls `/etc/kubernetes/admin.conf`, and
+rewrites it into a kubeconfig you can hand to `argocd cluster add`. ArgoCD
+only needs the file once — it bootstraps its own scoped ServiceAccount in
+the target cluster and stores only that SA's token going forward.
+
+```bash
+# Produce ./argocd-kubeconfig.yaml (mode 0600).
+make export-argocd CONFIG=cluster.local.conf
+
+# Register the cluster (ArgoCD CLI logged in to your ArgoCD server).
+argocd cluster add hummingbird-hbird-cp1 --kubeconfig argocd-kubeconfig.yaml
+
+# Override the apiserver URL if the CP's libvirt IP isn't reachable from
+# the ArgoCD pod (LB, ingress, DNS name, etc.):
+make export-argocd CONFIG=cluster.local.conf SERVER=https://cluster.example.com:6443
+```
+
+The exported file IS `admin.conf` — a full-cluster credential. Delete or
+chmod-0600-store it after ArgoCD has registered the cluster, since ArgoCD
+authenticates with its own SA token from that point on. See
+[docs/argocd.md](docs/argocd.md) for the security model and the leak-recovery
+playbook.
+
 ## Configuration
 
 Per-host overrides live in `config.local.sh` (gitignored). Copy

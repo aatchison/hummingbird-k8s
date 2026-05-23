@@ -54,6 +54,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         k3s k8s workers spawn \
         deploy-cluster \
         destroy-cluster \
+        export-argocd \
         switch-to-ghcr \
         nodes kubectl \
         verify-encryption verify-hardening verify-app-deploy verify-all \
@@ -138,6 +139,13 @@ deploy-cluster: ## Deploy a hybrid bib+cloud-init cluster from CONFIG=<path> (se
 destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs + qcow2s + seed ISOs)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	sudo bash scripts/destroy-cluster.sh "$(CONFIG)"
+
+export-argocd: ## Export an ArgoCD-registerable kubeconfig from CONFIG=<path> (optional OUTPUT=, SERVER=, CONTEXT=)
+	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
+	@CONFIG="$(CONFIG)" bash scripts/export-argocd.sh \
+		$(if $(OUTPUT),--output "$(OUTPUT)",) \
+		$(if $(SERVER),--server "$(SERVER)",) \
+		$(if $(CONTEXT),--context-name "$(CONTEXT)",)
 
 switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
 	bash scripts/switch-to-ghcr.sh
