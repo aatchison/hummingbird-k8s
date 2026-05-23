@@ -251,11 +251,19 @@ done
 [[ -n "$CP_IP" ]] || fail "could not resolve CP IP after ~5 minutes — inspect 'virsh -c qemu:///system console $CP_NAME'"
 log "CP IP: $CP_IP"
 
-# SSH-as-the-sudo-user (root authorized_keys is baked from that user's
-# pubkey by lib/build-common.sh). Matches spawn-workers.sh's pattern.
+# SSH to the CP using the operator's private key explicitly. Nested sudo
+# (sudo make -> sudo bash) resets SUDO_USER to root, breaking the previous
+# `sudo -u $SUDO_USER ssh` approach. Pin the identity to the private key
+# paired with SSH_PUBKEY_FILE — which is the same key bib bakes into root's
+# authorized_keys.
+SSH_PRIVKEY_FILE="${SSH_PUBKEY_FILE%.pub}"
+[[ -r "$SSH_PRIVKEY_FILE" ]] || fail "SSH private key not readable: $SSH_PRIVKEY_FILE (expected next to $SSH_PUBKEY_FILE)"
+
 cp_ssh() {
-  sudo -u "$SUDO_USER" ssh \
-    -o StrictHostKeyChecking=accept-new \
+  ssh -i "$SSH_PRIVKEY_FILE" \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
     -o ConnectTimeout=10 \
     -o BatchMode=yes \
     "root@${CP_IP}" "$@"
