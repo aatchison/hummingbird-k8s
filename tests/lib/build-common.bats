@@ -306,6 +306,19 @@ source_lib() {
   [[ " ${OPTS[*]} " == *" ProxyJump=geary "* ]]
 }
 
+# scripts/export-argocd.sh uses ssh_opts_array (WITH identity) and threads
+# --proxy-jump=$PROXY_JUMP through (issue #194). Lock the option in the
+# identity-flavored array too so a future refactor of the helper can't
+# silently drop the flag on that code path.
+@test "ssh_opts_array --proxy-jump=HOST: appends ProxyJump option (identity flavor)" {
+  export SSH_PRIVKEY_FILE=/tmp/fake-key
+  source_lib
+  ssh_opts_array OPTS --proxy-jump=geary
+  [[ " ${OPTS[*]} " == *" ProxyJump=geary "* ]]
+  # And -i must still be present (the export-argocd CP fetch needs it).
+  [[ " ${OPTS[*]} " == *" -i /tmp/fake-key "* ]]
+}
+
 @test "ssh_opts_array: unknown flag fails with rc!=0" {
   export SSH_PRIVKEY_FILE=/tmp/fake-key
   source_lib

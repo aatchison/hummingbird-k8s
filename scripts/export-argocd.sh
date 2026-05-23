@@ -40,7 +40,14 @@
 #   --output FILE         Output path (default: ./argocd-kubeconfig.yaml)
 #   --server URL          Override apiserver URL (default: https://<CP_IP>:6443)
 #   --context-name NAME   Cluster/context/user name (default: hummingbird-<CP_NAME>)
-#   --force               Overwrite an existing output file
+#   --force               Overwrite an existing output file (creates a
+#                         timestamped .bak-<UTC> copy first, mode 0600)
+#   --proxy-jump=HOST     Tunnel SSH to the CP via HOST (ProxyJump). When
+#                         unset, falls back to the KVM_HOST env var so the
+#                         flag and env paths agree with scripts/kubectl-k8s.sh.
+#                         Use when the operator workstation can't reach the
+#                         CP directly (libvirt NAT subnet not routable) but
+#                         CAN reach the KVM host that runs it.
 
 set -euo pipefail
 
@@ -155,6 +162,7 @@ OUTPUT=""
 SERVER_OVERRIDE=""
 CONTEXT_OVERRIDE=""
 FORCE=0
+PROXY_JUMP=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -164,6 +172,8 @@ while [[ $# -gt 0 ]]; do
     --server=*)      SERVER_OVERRIDE="${1#*=}"; shift ;;
     --context-name)  CONTEXT_OVERRIDE="${2:-}"; shift 2 ;;
     --context-name=*) CONTEXT_OVERRIDE="${1#*=}"; shift ;;
+    --proxy-jump)    PROXY_JUMP="${2:-}";       shift 2 ;;
+    --proxy-jump=*)  PROXY_JUMP="${1#*=}";      shift ;;
     --force)         FORCE=1; shift ;;
     -h|--help)
       sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \{0,1\}//'
@@ -172,6 +182,22 @@ while [[ $# -gt 0 ]]; do
     *) fail "unknown flag: $1" ;;
   esac
 done
+
+# Default the proxy-jump host to KVM_HOST when the flag wasn't given.
+# This mirrors scripts/kubectl-k8s.sh / backup-etcd.sh — operators who
+# already export KVM_HOST=geary for `make kubectl` get the same routing
+# here for free, no script-by-script flag bookkeeping.
+PROXY_JUMP="${PROXY_JUMP:-${KVM_HOST:-}}"
+
+# Validate the proxy-jump host: spliced into an SSH option (-o ProxyJump=<v>)
+# downstream. Allow what ssh_config(5) accepts in a host token —
+# user@host[:port], plus comma-separated chains for multi-hop. Reject shell
+# metacharacters that would break out of the -o value.
+if [[ -n "$PROXY_JUMP" ]]; then
+  if ! [[ "$PROXY_JUMP" =~ ^[A-Za-z0-9._@:,-]+$ ]]; then
+    fail "invalid --proxy-jump host: '$PROXY_JUMP' (expected [user@]host[:port], optionally comma-separated for multi-hop)"
+  fi
+fi
 
 # Validate --server BEFORE any interpolation. The override (if any) gets
 # spliced into a yq expression and/or a sed s|| substitution downstream;
@@ -227,8 +253,15 @@ if [[ -e "$OUTPUT" && "$FORCE" -ne 1 ]]; then
 fi
 
 # ---- SSH helper -------------------------------------------------------------
+# Thread --proxy-jump through to ssh_opts_array when set; the helper appends
+# `-o ProxyJump=<HOST>` to the option list. When unset, plain SSH options.
 
-ssh_opts_array CP_SSH_OPTS
+if [[ -n "$PROXY_JUMP" ]]; then
+  ssh_opts_array CP_SSH_OPTS --proxy-jump="$PROXY_JUMP"
+  log "ssh tunneling via ProxyJump=${PROXY_JUMP}"
+else
+  ssh_opts_array CP_SSH_OPTS
+fi
 cp_ssh() { ssh "${CP_SSH_OPTS[@]}" "root@${CP_IP}" "$@"; }
 
 # ---- pull admin.conf --------------------------------------------------------
@@ -266,6 +299,17 @@ rewrite_kubeconfig "$TMP_KUBECONFIG" "$SERVER_URL" "$CONTEXT_NAME"
 # ---- move into place with 0600 ----------------------------------------------
 # `install -m 0600` is atomic-mode-set: the destination is created at the
 # requested mode in one step, no chmod-after-mv race window.
+
+# Backup-on-overwrite: if --force is moving an existing file out of the way,
+# snapshot it first to ${OUTPUT}.bak-<UTC-timestamp> at mode 0600. The
+# original was 0600 itself (we wrote it that way last time) so the backup
+# inherits the same privacy. Defensive against operator typos that would
+# otherwise silently clobber a working kubeconfig.
+if [[ -e "$OUTPUT" && "$FORCE" -eq 1 ]]; then
+  bak="${OUTPUT}.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+  install -m 0600 "$OUTPUT" "$bak"
+  log "backup: existing $OUTPUT moved to $bak"
+fi
 
 install -m 0600 "$TMP_KUBECONFIG" "$OUTPUT"
 rm -f "$TMP_KUBECONFIG"

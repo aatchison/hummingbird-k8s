@@ -277,8 +277,13 @@ argocd cluster add hummingbird-hbird-cp1 --kubeconfig argocd-kubeconfig.yaml
 # the ArgoCD pod (LB, ingress, DNS name, etc.):
 make export-argocd CONFIG=cluster.local.conf SERVER=https://cluster.example.com:6443
 
+# Tunnel the CP-fetch SSH session through the KVM host when your
+# workstation can't reach the libvirt NAT directly:
+KVM_HOST=geary make export-argocd CONFIG=cluster.local.conf
+
 # Re-export (e.g. after `kubeadm certs renew all`) — refuses by default
-# to overwrite an existing file:
+# to overwrite an existing file. `--force` snapshots the prior file as
+# `argocd-kubeconfig.yaml.bak-<UTC>` before writing the new one:
 make export-argocd CONFIG=cluster.local.conf FORCE=1
 ```
 

@@ -18,6 +18,42 @@ it can sit alongside a regular kubeconfig without name collisions on
 the libvirt domain name the operator already uses. The fetch+rewrite
 logic lives in one script — there is no separate `scripts/get-kubeconfig.sh`.
 
+## Prerequisites
+
+Where to run `argocd cluster add`: on the workstation that has already
+authenticated to your ArgoCD control plane via `argocd login
+<argocd-server>`. The ArgoCD CLI sends the kubeconfig contents to that
+server over the authenticated session — the server uses the file once
+to mint a scoped ServiceAccount in the target cluster, then discards it.
+
+Concretely:
+
+1. On your workstation, log in to ArgoCD (one-time, until the session
+   token expires):
+
+   ```bash
+   argocd login argocd.example.com   # follow the prompt for SSO / token
+   argocd context                    # confirm the active context
+   ```
+
+2. Produce the kubeconfig from this repo:
+
+   ```bash
+   make export-argocd CONFIG=cluster.local.conf
+   ```
+
+3. Hand it to ArgoCD from the same workstation:
+
+   ```bash
+   argocd cluster add hummingbird-<CP_NAME> \
+       --kubeconfig ./argocd-kubeconfig.yaml
+   ```
+
+The exported file does NOT need to be present on the ArgoCD server — the
+ArgoCD CLI uploads it as part of the registration RPC. After
+registration, delete the local file (or store it 0600 offline). See "Why
+this credential is sensitive" below.
+
 ## What the export contains
 
 The output file is a verbatim copy of `/etc/kubernetes/admin.conf` from
@@ -145,3 +181,87 @@ If that returns the nodes list, the file is valid. If it fails with a
 TLS or "connection refused" error, the `--server URL` you passed isn't
 reachable from where you're running `kubectl` — pass a `--server` flag
 that matches the network path ArgoCD itself will take.
+
+## Audit trail: what `argocd cluster add` does in the cluster
+
+The kubeconfig you hand to `argocd cluster add` is used ONCE, by the
+ArgoCD CLI on your workstation, to create three objects in the target
+cluster's `argocd-system`-style namespace (the exact name depends on
+ArgoCD's own deployment; it's the namespace ArgoCD has configured
+itself to register cluster credentials into). The apiserver records
+this as authenticated activity by the `kubernetes-admin` user (kubeadm's
+built-in client cert subject) in the `system:masters` group.
+
+If you have apiserver audit logging enabled per `docs/security-hardening.md`,
+the corresponding entries land in `/var/log/kubernetes/k8s-audit.log` on
+the CP. To find them after a registration:
+
+```bash
+# Run on the CP node:
+sudo grep -E \
+    'kubernetes-admin.*(ServiceAccount|ClusterRoleBinding|Secret).*argocd' \
+    /var/log/kubernetes/k8s-audit.log
+```
+
+You should see three RequestResponse entries with
+`"verb":"create"`:
+
+| Verb | Resource | Purpose |
+| --- | --- | --- |
+| `create` | `serviceaccount` | The SA ArgoCD will authenticate as henceforth. |
+| `create` | `clusterrolebinding` | Binds the SA to the cluster-admin (or scoped) role. |
+| `create` | `secret` | Holds the SA token + CA bundle ArgoCD reads back. |
+
+The User field will be `kubernetes-admin`, the Group will include
+`system:masters`. There is no separate ArgoCD-specific identity at this
+stage — the registration is performed AS admin. After this one
+bootstrap, all subsequent ArgoCD-driven apiserver traffic comes from
+the SA above (its name typically includes `argocd-manager`).
+
+If you see additional `kubernetes-admin` audit entries after the
+registration window closed, treat that as a credential-leak signal
+(the exported file should have been deleted; see the leak playbook).
+
+## HA / load-balanced control planes
+
+In an HA kubeadm cluster, `/etc/kubernetes/admin.conf` on each CP has a
+`server:` URL pointing at the load-balanced apiserver endpoint (the
+`controlPlaneEndpoint` you configured at `kubeadm init` time), NOT at
+the individual CP node's local IP. The export inherits that. Don't
+override it with `--server https://<single-CP-IP>:6443` — that pins
+ArgoCD to one CP node and defeats HA. Pass `--server` only when:
+
+- The cluster is single-CP (this repo's default), AND
+- The libvirt-assigned CP IP isn't reachable from the ArgoCD pod, AND
+- You have a stable address (LB, ingress, DNS name) that IS.
+
+In all other cases, take the default and let the kubeconfig keep the
+URL kubeadm put there.
+
+## ProxyJump via the KVM host
+
+When the operator workstation can't directly reach the CP — most often
+because the CP is on a libvirt NAT subnet that's not routable outside
+the KVM host — `scripts/export-argocd.sh` can tunnel its SSH session
+through the KVM host. Two equivalent ways to enable it:
+
+```bash
+# Env var (matches scripts/kubectl-k8s.sh and backup-etcd.sh):
+KVM_HOST=geary make export-argocd CONFIG=cluster.local.conf
+
+# Explicit flag:
+make export-argocd CONFIG=cluster.local.conf PROXY_JUMP=geary
+```
+
+Under the hood this adds `-o ProxyJump=$HOST` to the SSH option set
+used to pull `admin.conf` from the CP. The flag wins when both are set.
+This affects only the *fetch* — the resulting kubeconfig still embeds
+the `--server` URL ArgoCD itself will use (which has nothing to do
+with how you fetched the file), so you typically also want
+`--server https://<reachable-address>:6443` when the CP isn't directly
+reachable from ArgoCD either.
+
+Same pattern, three different surfaces — `KVM_HOST` is recognized by
+`scripts/kubectl-k8s.sh`, `scripts/backup-etcd.sh`, and
+`scripts/export-argocd.sh`. If your workstation needs the ProxyJump for
+one, it almost certainly needs it for all three.
