@@ -46,7 +46,12 @@ because both edit the same kubeadm `extraVolumes` region of
   ```bash
   KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
     --version 1.16.5 \
-    --set kubeProxyReplacement=false \
+    --set kubeProxyReplacement=true \
+    --set k8sServiceHost=auto \
+    --set k8sServicePort=6443 \
+    --set hubble.enabled=true \
+    --set hubble.relay.enabled=true \
+    --set hubble.ui.enabled=false \
     --wait \
     --wait-duration 5m
   ```
@@ -87,18 +92,20 @@ How it's installed:
   `containers/k8s/Containerfile` build (`curl` + `tar -xzf`) and placed at
   `/usr/bin/cilium`. The version is pinned via the
   `CILIUM_CLI_VERSION` build-arg (default `v0.16.16`).
-- On first boot `k8s-init.sh` calls
-  `cilium install --version 1.16.5 --set kubeProxyReplacement=false
-   --wait --wait-duration 5m`. The `--version` flag pins the Cilium
+- On first boot `k8s-init.sh` calls `cilium install` with
+  `--version 1.16.5`, `--set kubeProxyReplacement=true` (#94),
+  `--set k8sServiceHost=auto --set k8sServicePort=6443` (required
+  companions to kpr=true), `--set hubble.enabled=true --set
+  hubble.relay.enabled=true --set hubble.ui.enabled=false` (#78), and
+  `--wait --wait-duration 5m`. The `--version` flag pins the Cilium
   agent/operator image version (independent of the CLI version).
 - The Cilium CLI internally renders the upstream Helm chart with the
   supplied `--set key=value` values and applies the resulting
   manifests to the cluster. Anything the chart exposes is reachable
   via more `--set` flags — no Helm binary needed in the image.
-- Future PRs can enable Cilium features (`kubeProxyReplacement=true`,
-  Hubble observability, transparent encryption, BPF host routing
-  toggles, …) by adding more `--set` flags to the `cilium install`
-  invocation. No new packages required.
+- Further Cilium features (transparent encryption, BPF host routing
+  toggles, BGP, …) can be enabled by adding more `--set` flags to the
+  `cilium install` invocation. No new packages required.
 
 Why this approach (instead of `kubectl apply -f <quick-install.yaml>`):
 upstream Cilium retired the `install/kubernetes/quick-install.yaml`
@@ -115,15 +122,26 @@ require a Helm install in the image.
   Any external tooling that grepped for `kube-flannel` will need to
   point at `kube-system` (label selector `k8s-app=cilium` for the
   agent).
-- **kube-proxy still present.** This image explicitly passes
-  `--set kubeProxyReplacement=false` to keep kube-proxy as the L4
-  plane (same behavior as flannel). Cilium can replace kube-proxy
-  entirely (`--set kubeProxyReplacement=true`); enabling that is a
-  follow-up PR.
-- **No Hubble by default.** Hubble (observability) and transparent
-  encryption (WireGuard / IPsec) are not enabled. Both can be turned
-  on by adding the corresponding `--set` flags to the `cilium
-  install` invocation in `k8s-init.sh` in a follow-up PR.
+- **kube-proxy is gone.** Cilium runs with
+  `--set kubeProxyReplacement=true` (#94) and the kubeadm
+  `addon/kube-proxy` phase is skipped via
+  `kubeadm init --skip-phases=addon/kube-proxy`. All L4 service
+  routing (ClusterIP, NodePort, ExternalIP, LoadBalancer) runs in
+  Cilium's eBPF datapath. There is no `kube-proxy` DaemonSet in
+  `kube-system` and no `iptables` / `ipvs` rules managed by
+  kube-proxy on the host.
+- **Hubble (flow visibility) is on.** The Cilium agent has Hubble
+  enabled and the `hubble-relay` Deployment is installed so
+  `cilium hubble port-forward` + `hubble observe` work without any
+  extra install step (#78). The Hubble UI is intentionally **off** —
+  port-forwarding the relay from the CLI is the lean path; baking
+  the UI in would add pods (`hubble-ui`, `hubble-ui-backend`) and a
+  Service that aren't needed for a single-node lab image. Flip
+  `--set hubble.ui.enabled=true` in `k8s-init.sh` to enable it.
+- **Transparent encryption still off by default.** WireGuard / IPsec
+  are not enabled. Both can be turned on by adding the corresponding
+  `--set` flags to the `cilium install` invocation in `k8s-init.sh`
+  in a follow-up PR.
 - **NetworkPolicy is now real.** A deny-all policy in any namespace
   will actually drop traffic. Existing workloads that assumed an
   open network (which is most lab workloads) should be unaffected
@@ -132,22 +150,89 @@ require a Helm install in the image.
 
 ## Operational caveats
 
-### cilium-cli defaults only
+### cilium-cli flags this image passes
 
-`cilium install` with the flags this image passes ships with
-**defaults plus one explicit override**:
+`cilium install` is invoked with these explicit overrides:
 
-- kube-proxy replacement is explicitly **off**
-  (`--set kubeProxyReplacement=false`) to match prior flannel
-  behavior.
-- Hubble is **not** enabled.
+- **kube-proxy replacement is on** (`--set kubeProxyReplacement=true`,
+  #94). Cilium handles all L4 service routing in eBPF.
+- **k8sServiceHost=auto, k8sServicePort=6443**. Required companions
+  to `kubeProxyReplacement=true`: with no kube-proxy in the cluster
+  there is no ClusterIP for `kubernetes.default.svc`, so the Cilium
+  agent needs to know where the apiserver lives. `auto` resolves to
+  the kubeadm-published control-plane endpoint.
+- **Hubble + relay on, UI off** (`--set hubble.enabled=true`,
+  `--set hubble.relay.enabled=true`, `--set hubble.ui.enabled=false`,
+  #78). See "Hubble flow visibility" below for the access path.
 - Transparent encryption (WireGuard/IPsec) is **not** enabled.
 - BPF host routing is on by default in current Cilium versions, but
   is **not** explicitly configured here.
 
-If you need any of those, add the appropriate `--set` flag(s) to the
-`cilium install` call in `k8s-init.sh`. That is a follow-up issue and
-out of scope for #6.
+If you need any of the remaining-off features, add the appropriate
+`--set` flag(s) to the `cilium install` call in `k8s-init.sh`.
+
+### kubeProxyReplacement (closes #94)
+
+Setting `kubeProxyReplacement=true` tells the Cilium agent to take
+over all of kube-proxy's responsibilities (ClusterIP, NodePort,
+ExternalIP, LoadBalancer, host-port mapping, session affinity) using
+eBPF programs attached to the socket and tc/XDP hooks. Two things
+have to line up for this to work:
+
+1. **kubeadm must not install the kube-proxy addon.**
+   `k8s-init.sh` passes `--skip-phases=addon/kube-proxy` to
+   `kubeadm init`, so the kube-proxy DaemonSet is never created.
+   This is a CLI flag rather than a `ClusterConfiguration` field in
+   `kubeadm.k8s.io/v1beta4` — there is no YAML equivalent.
+2. **Cilium must know the apiserver address.** Without kube-proxy
+   there is no ClusterIP for `kubernetes.default.svc` that Cilium
+   itself could route to. `k8sServiceHost=auto` lets cilium-cli
+   resolve the kubeadm-published control-plane endpoint;
+   `k8sServicePort=6443` matches kubeadm's default secure port. If
+   you override `controlPlaneEndpoint` to a non-6443 port, override
+   `k8sServicePort` to match.
+
+Verify kube-proxy is gone and Cilium owns the service plane:
+
+```bash
+# No kube-proxy DaemonSet.
+KUBECONFIG=/etc/kubernetes/admin.conf kubectl -n kube-system \
+  get ds kube-proxy 2>&1 | grep -q NotFound && echo "kube-proxy: absent (as expected)"
+
+# Cilium reports kube-proxy-replacement=Strict.
+KUBECONFIG=/etc/kubernetes/admin.conf cilium status --wait | grep -i 'KubeProxyReplacement'
+```
+
+### Hubble flow visibility (closes #78)
+
+Hubble is Cilium's observability layer — it taps the agent's eBPF
+datapath and exposes per-flow records (5-tuple, verdict, L7 metadata
+where Cilium can parse it) via a gRPC API. With
+`--set hubble.enabled=true --set hubble.relay.enabled=true`:
+
+- The `cilium` agent emits flow records into its in-memory ring
+  buffer.
+- The `hubble-relay` Deployment in `kube-system` exposes the
+  aggregated flow stream over gRPC.
+
+Operators reach Hubble from the cilium-cli baked into the image:
+
+```bash
+# Open a local tunnel to the relay (foreground).
+KUBECONFIG=/etc/kubernetes/admin.conf cilium hubble port-forward &
+
+# Stream flows.
+KUBECONFIG=/etc/kubernetes/admin.conf hubble observe --follow
+
+# Drops only (e.g. to confirm a NetworkPolicy is firing).
+KUBECONFIG=/etc/kubernetes/admin.conf hubble observe --verdict DROPPED --follow
+```
+
+The Hubble UI is intentionally **not** installed. The relay +
+`hubble observe` CLI cover the lab use case (debugging a policy,
+watching what a pod sends) without the extra Deployments/Service
+that the UI requires. To enable the UI, flip
+`--set hubble.ui.enabled=true` in `k8s-init.sh` and rebuild.
 
 ### Existing single-node clusters must rebuild
 
