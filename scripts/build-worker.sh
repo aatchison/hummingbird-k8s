@@ -24,8 +24,13 @@ NAME=hummingbird-k8s-worker
 
 render_bib_config > bib-config-worker.toml
 
-podman pull "$BASE_IMAGE"
-podman build \
+# Isolation contract (issue #199): when STORAGE_DRIVER / PODMAN_ROOT /
+# PODMAN_RUNROOT are set, the outer pull/build MUST land in the same
+# isolated graphroot that build_qcow2's `--root` will look in below —
+# otherwise BIB's `--local` lookup fails image-not-found.
+mapfile -t _PODMAN_OPTS < <(podman_storage_opts)
+podman "${_PODMAN_OPTS[@]}" pull "$BASE_IMAGE"
+podman "${_PODMAN_OPTS[@]}" build \
   --build-arg "ENABLE_CLOUD_INIT=${ENABLE_CLOUD_INIT}" \
   -t "$LOCAL_IMAGE" -f containers/k8s-worker/Containerfile .
 

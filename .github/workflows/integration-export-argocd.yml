@@ -34,6 +34,12 @@ permissions:
   contents: read
   packages: read
 
+# Serialize per-workflow against libvirt VM-name + image-pool collisions.
+# Note: as of issue #199 podman container storage IS isolated per-run
+# (the env block below is now actually consumed by build_qcow2 — see
+# lib/build-common.sh and docs/integration-tests.md). The concurrency:
+# block stays as belt-and-suspenders against libvirt domain-name +
+# /var/lib/libvirt/images contention, which are NOT per-run-isolated.
 concurrency:
   group: integration-libvirt-${{ github.workflow }}
   cancel-in-progress: false
@@ -47,10 +53,20 @@ jobs:
        startsWith(github.event.workflow_run.head_branch, 'k8s/v'))
     runs-on: [self-hosted, kvm, libvirt]
     timeout-minutes: 30
+    # Isolated podman storage (issue #199). STORAGE_DRIVER / PODMAN_ROOT /
+    # PODMAN_RUNROOT are consumed by lib/build-common.sh:build_qcow2()
+    # AND by the consumer-side pull/build in scripts/build-*.sh +
+    # scripts/deploy-cluster.sh (via podman_storage_opts). The
+    # bind-mount remap inside build_qcow2 (-v $PODMAN_ROOT:/var/lib/
+    # containers/storage) is what gives the nested podman BIB spawns its
+    # isolated graph view; -e STORAGE_DRIVER tells that nested podman
+    # which driver to use. The `sudo --preserve-env=...` below carries
+    # the vars across the sudo boundary. Path includes run_attempt so
+    # a re-run of the same run_id gets its own graphroot.
     env:
       STORAGE_DRIVER: vfs
-      PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}
-      PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}
+      PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}-${{ github.run_attempt }}
+      PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}-${{ github.run_attempt }}
       CONFIG: tests/fixtures/cluster.ci.conf
       RUN_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:

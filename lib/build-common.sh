@@ -204,8 +204,50 @@ render_bib_config() {
   fi
 }
 
+# podman_storage_opts — emit the top-level podman flags (one per line on
+# stdout) that select an isolated container store. Consumed by
+# build_qcow2() AND by the sibling scripts/build-*.sh + deploy-cluster.sh
+# callers that do their own `podman pull` / `podman build` BEFORE
+# handing the resulting image to build_qcow2. Without that consumer-side
+# threading, the outer podman pull/build would land the image in the
+# default /var/lib/containers/storage while build_qcow2 then runs with
+# `--root $PODMAN_ROOT` against an empty graphroot — BIB's `--local`
+# lookup would FAIL with image-not-found (issue #199 scope completion).
+#
+# Each var is independently optional; when unset, nothing is emitted.
+# Use as:
+#   read -r -a opts < <(podman_storage_opts)
+#   podman "${opts[@]}" pull "$ref"
+# or with split-on-newline word splitting:
+#   podman $(podman_storage_opts) pull "$ref"
+# (the latter is safe because the values we emit — driver name, abs
+# paths — never contain whitespace.)
+podman_storage_opts() {
+  [[ -n "${STORAGE_DRIVER:-}" ]] && printf -- '--storage-driver\n%s\n' "$STORAGE_DRIVER"
+  [[ -n "${PODMAN_ROOT:-}"    ]] && printf -- '--root\n%s\n'           "$PODMAN_ROOT"
+  [[ -n "${PODMAN_RUNROOT:-}" ]] && printf -- '--runroot\n%s\n'        "$PODMAN_RUNROOT"
+  return 0
+}
+
 # Run bib to turn a local OCI image into a qcow2 under $POOL_DIR/$NAME.qcow2
 # Args: 1=local image ref, 2=qcow2 name (without .qcow2), 3=path to bib-config.toml
+#
+# Storage isolation (issue #199): callers that need to point podman + the
+# nested bootc-image-builder at an isolated container store (so two
+# integration runs on the same host don't corrupt each other's overlay
+# graph) can set:
+#
+#   STORAGE_DRIVER  — passed as `podman --storage-driver <v>` (e.g. "vfs")
+#   PODMAN_ROOT     — passed as `podman --root <path>` (graphroot)
+#   PODMAN_RUNROOT  — passed as `podman --runroot <path>` (runroot)
+#
+# All three are optional; when unset, podman uses its default storage
+# location at /var/lib/containers/storage. Isolation for the NESTED
+# podman that BIB spawns comes from the bind-mount remap
+# (`-v ${PODMAN_ROOT}:/var/lib/containers/storage`) — that's the real
+# mechanism; podman does not honor PODMAN_ROOT/PODMAN_RUNROOT as env
+# vars natively. STORAGE_DRIVER alone is forwarded via `-e` to tell the
+# nested podman which driver to use (it IS a podman-recognized env name).
 build_qcow2() {
   local local_image="$1" name="$2" cfg="$3"
   local qcow="${POOL_DIR}/${name}.qcow2"
@@ -224,14 +266,55 @@ build_qcow2() {
     return 2
   fi
 
+  # Pre-flight for isolated storage: PODMAN_ROOT must exist and be
+  # writable before we hand it to `podman --root`. mkdir -p is idempotent
+  # so re-runs against the same root don't trip here.
+  if [[ -n "${PODMAN_ROOT:-}" ]]; then
+    if ! mkdir -p "$PODMAN_ROOT"; then
+      echo "build_qcow2: failed to create PODMAN_ROOT directory: ${PODMAN_ROOT}" >&2
+      return 1
+    fi
+    if [[ ! -w "$PODMAN_ROOT" ]]; then
+      echo "build_qcow2: PODMAN_ROOT is not writable: ${PODMAN_ROOT}" >&2
+      return 1
+    fi
+  fi
+  if [[ -n "${PODMAN_RUNROOT:-}" ]]; then
+    if ! mkdir -p "$PODMAN_RUNROOT"; then
+      echo "build_qcow2: failed to create PODMAN_RUNROOT directory: ${PODMAN_RUNROOT}" >&2
+      return 1
+    fi
+    if [[ ! -w "$PODMAN_RUNROOT" ]]; then
+      echo "build_qcow2: PODMAN_RUNROOT is not writable: ${PODMAN_RUNROOT}" >&2
+      return 1
+    fi
+  fi
+
   rm -rf "$stage"
   mkdir -p "$POOL_DIR"
 
-  if ! podman run --rm --privileged --pull=newer \
+  # Build the top-level podman flag list (before `run`) for isolated
+  # container storage. Each var is independently optional; when unset, we
+  # fall through to podman's compiled-in defaults.
+  local podman_opts=()
+  [[ -n "${STORAGE_DRIVER:-}" ]] && podman_opts+=(--storage-driver "$STORAGE_DRIVER")
+  [[ -n "${PODMAN_ROOT:-}"    ]] && podman_opts+=(--root           "$PODMAN_ROOT")
+  [[ -n "${PODMAN_RUNROOT:-}" ]] && podman_opts+=(--runroot        "$PODMAN_RUNROOT")
+
+  # The BIB container shells out to nested podman to pull/inspect the
+  # local image. Bind-mount the same graphroot the outer podman is using
+  # so the nested podman sees the image we just built. When PODMAN_ROOT
+  # is unset, fall back to the historical /var/lib/containers/storage.
+  # This bind-mount remap is the REAL isolation mechanism for the nested
+  # podman (podman does not honor PODMAN_ROOT/PODMAN_RUNROOT as env vars).
+  local storage_src="${PODMAN_ROOT:-/var/lib/containers/storage}"
+
+  if ! podman "${podman_opts[@]}" run --rm --privileged --pull=newer \
     --security-opt label=type:unconfined_t \
+    -e STORAGE_DRIVER \
     -v "${cfg}:/config.toml:ro" \
     -v "${POOL_DIR}:/output" \
-    -v /var/lib/containers/storage:/var/lib/containers/storage \
+    -v "${storage_src}:/var/lib/containers/storage" \
     "$BIB" \
     --type qcow2 --rootfs ext4 \
     --local \

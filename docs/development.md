@@ -114,6 +114,68 @@ Helpers live in `lib/build-common.sh`. When adding one:
    (`# Shared SSH/virsh/log helpers in lib/build-common.sh; see
    docs/development.md.`).
 
+### Podman storage isolation (issue #199)
+
+`build_qcow2()` reads three optional env vars and threads them through to
+the outer `podman` invocation AND into the `bootc-image-builder` (BIB)
+container that podman launches:
+
+| Var | Maps to |
+|---|---|
+| `STORAGE_DRIVER` | `podman --storage-driver <v>` (e.g. `vfs`) |
+| `PODMAN_ROOT`    | `podman --root <path>` (graphroot) |
+| `PODMAN_RUNROOT` | `podman --runroot <path>` |
+
+How the nested podman that BIB spawns inherits the isolation:
+
+- The `/var/lib/containers/storage` bind-mount is repointed to
+  `$PODMAN_ROOT` when set. **This bind-mount remap is the real
+  isolation mechanism** — podman does not honor `PODMAN_ROOT` /
+  `PODMAN_RUNROOT` as env-var names (only their CLI flag forms). So
+  inside the BIB container the nested podman sees an empty default
+  graphroot UNLESS we shadow it with the outer host's isolated dir.
+- `-e STORAGE_DRIVER` is forwarded so the nested podman picks the
+  same storage driver (vfs in CI). `STORAGE_DRIVER` IS a podman-
+  recognized env var. `PODMAN_ROOT` / `PODMAN_RUNROOT` are NOT
+  forwarded as env vars (they would be inert and misleading) — the
+  bind-mount above is sufficient.
+
+Consumer-side pull/build: the sibling scripts (`scripts/build-k3s.sh`,
+`scripts/build-k8s.sh`, `scripts/build-worker.sh`,
+`scripts/deploy-cluster.sh`) all run their OWN `podman pull` /
+`podman build` BEFORE handing the resulting image to `build_qcow2`.
+Those callers must also thread the isolation flags through, otherwise
+the image lands in the default `/var/lib/containers/storage` while
+`build_qcow2` then runs `podman --root $PODMAN_ROOT` against an empty
+graphroot and BIB's `--local` lookup fails image-not-found. The shared
+helper `podman_storage_opts()` emits the right flag list (one token
+per line); callers read it with `mapfile`:
+
+```bash
+mapfile -t _PODMAN_OPTS < <(podman_storage_opts)
+podman "${_PODMAN_OPTS[@]}" pull "$ref"
+```
+
+Contract: callers that need isolated storage (e.g. two concurrent
+integration runs on the same host) set the env vars before invoking
+`build_qcow2`; the build path threads them everywhere they're needed.
+When the vars are unset, `build_qcow2` falls back to the legacy
+`/var/lib/containers/storage` host path and emits no extra podman flags
+— byte-identical to pre-#199 behavior on developer workstations.
+
+This is the mechanism the integration workflows (`integration-update-
+cluster.yml`, `integration-export-argocd.yml`) use to keep concurrent
+self-hosted runs from corrupting each other's overlay graph.
+
+Known limitation: the operator-only `make image-*` targets (workstation
+fast-iterate; not exercised by any workflow) still call bare
+`podman build` and therefore do NOT participate in storage isolation.
+Threading isolation through those targets would require either an
+intermediate shell wrapper script or reading the env vars inline in
+the recipe; both expand scope and the workflows that actually need
+isolation drive `make deploy-cluster` (which goes via the `scripts/`
+path, which IS threaded). Tracked as a follow-up.
+
 ### Bats tests
 
 Unit tests for `lib/build-common.sh` live in `tests/lib/build-common.bats`.
