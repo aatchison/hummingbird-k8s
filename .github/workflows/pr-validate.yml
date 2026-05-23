@@ -162,3 +162,21 @@ jobs:
           # no --pull-always so a PR build is robust to transient GHCR issues.
           extra-args: |
             --cache-from ghcr.io/${{ github.repository_owner }}/${{ steps.cf.outputs.image }}
+
+      # Vulnerability-gate the PR: buildah-build leaves the image in podman's
+      # local storage (not docker's). Trivy's default --image-src list already
+      # includes podman, but pin it explicitly via TRIVY_IMAGE_SRC so a future
+      # default-list change can't silently regress to "image not found, skipped".
+      # exit-code:1 fails the matrix entry, so the PR check goes red and the
+      # findings appear inline in the failed step's log. No SARIF upload here:
+      # PR-time gating doesn't need security-events:write, and the security tab
+      # is owned by the tag-publish workflow which scans the same image.
+      - name: Trivy vulnerability scan (gate PR on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_IMAGE_SRC: podman
+        with:
+          image-ref: localhost/${{ steps.cf.outputs.image }}:pr-${{ github.event.pull_request.number || github.run_id }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: table
