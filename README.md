@@ -211,6 +211,15 @@ window. Add `--dry-run` (calling the script directly) to preview actions
 without ssh/kubectl, or `--skip-drain` as an emergency-rollback escape
 hatch for a stuck drain.
 
+Readiness gates: between SSH-back and uncordon, the script also requires
+the node's `.status.nodeInfo.bootID` to change (proves a real reboot
+happened — defeats stale apiserver-cache `Ready=True` hits) **and** every
+kube-system DaemonSet pod on the node (Cilium / kube-proxy / coredns) to
+report Ready before proceeding to the next node. Both gates share the
+`READY_TIMEOUT` env knob. Full reference:
+[Reboot detection (bootID)](docs/update-cluster.md#reboot-detection-bootid)
+and [Daemonset readiness gate](docs/update-cluster.md#daemonset-readiness-gate).
+
 Operator-ergonomics flags — pass via `FLAGS=` to the Makefile targets, or
 directly to the script: `--start-from=NAME` (resume after an interrupted
 roll), `--parallel=N` (process workers in batches of N concurrently),

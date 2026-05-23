@@ -11,8 +11,12 @@
 # Per worker the flow is:
 #   systemctl stop bootc-fetch-apply-updates.timer (avoid race with auto-timer)
 #   kubectl drain NODE --ignore-daemonsets --delete-emptydir-data --timeout=5m
+#   capture pre-reboot .status.nodeInfo.bootID (race-free reboot proof)
 #   ssh root@NODE_IP "bootc upgrade --apply"   # --apply auto-reboots
-#   wait until ssh comes back AND kubectl reports the node Ready (5min)
+#   wait until ssh comes back, then wait until bootID changes (post-reboot
+#     proof — defeats stale-apiserver-cache Ready hit), then wait until
+#     kubectl reports the node Ready, then wait until kube-system
+#     DaemonSet pods (Cilium / kube-proxy / coredns) on the node are Ready
 #   kubectl uncordon NODE
 #   systemctl start bootc-fetch-apply-updates.timer (restore auto-update)
 #   sleep 5
@@ -122,7 +126,7 @@ for arg in "$@"; do
     --parallel=*)                PARALLEL="${arg#--parallel=}" ;;
     --parallel)                  fail "--parallel requires a value: --parallel=N" ;;
     -h|--help)
-      sed -n '2,82p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,86p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) fail "unknown argument: $arg (try --help)" ;;
@@ -541,6 +545,124 @@ wait_node_ready() {
   return 1
 }
 
+# capture_node_bootid NODE
+#
+# Returns (on stdout) the node's current .status.nodeInfo.bootID. The bootID
+# is a kernel-supplied UUID that's regenerated on every boot — comparing
+# pre/post values proves a real reboot completed, which is the only reliable
+# way to defeat a stale apiserver cache hit in wait_node_ready (the
+# apiserver may still report Ready=True from the pre-reboot lease before
+# kubelet has actually re-registered).
+#
+# Empty stdout + rc=0 is a valid return (kubectl may have returned no value
+# in race windows); callers MUST treat empty pre-bootid as "couldn't capture,
+# skip the gate" rather than as a comparison sentinel.
+capture_node_bootid() {
+  local node="$1"
+  if (( DRY_RUN == 1 )); then
+    log "DRY-RUN would capture pre-reboot bootID for ${node}"
+    echo "<dry-run-bootid>"
+    return 0
+  fi
+  cp_kubectl "get node ${node} -o jsonpath='{.status.nodeInfo.bootID}'" \
+    2>/dev/null || true
+}
+
+# wait_node_bootid_changed NODE PRE_BOOTID
+#
+# Poll the node's .status.nodeInfo.bootID until it differs from PRE_BOOTID.
+# The bootID is reset only on a real reboot — apiserver state caches a node
+# Ready=True from before the reboot, so wait_node_ready alone can return
+# prematurely on a node that hasn't actually rebooted yet. This gate runs
+# BEFORE wait_node_ready and rejects the stale-cache case.
+#
+# READY_TIMEOUT (existing env knob, validated at startup) bounds the wait.
+# Returns 0 on observed change, 1 on timeout.
+#
+# Special cases:
+#   - PRE_BOOTID empty (capture failed or didn't run) → log + return 0.
+#     Without a baseline we can't compare; skipping is safer than
+#     blocking the update forever on a missing field.
+wait_node_bootid_changed() {
+  local node="$1" pre_bootid="$2" elapsed=0 interval=3 cur_bootid
+  if [[ -z "$pre_bootid" ]]; then
+    log "node ${node}: pre-reboot bootID was empty; skipping bootID-changed gate"
+    return 0
+  fi
+  log "waiting for node ${node} bootID to change from pre-reboot value (timeout ${READY_TIMEOUT}s)"
+  while (( elapsed < READY_TIMEOUT )); do
+    if (( DRY_RUN == 1 )); then
+      log "DRY-RUN would poll bootID for ${node}"
+      return 0
+    fi
+    cur_bootid=$(cp_kubectl "get node ${node} -o jsonpath='{.status.nodeInfo.bootID}'" 2>/dev/null || true)
+    if [[ -n "$cur_bootid" && "$cur_bootid" != "$pre_bootid" ]]; then
+      log "node ${node} bootID changed (pre=${pre_bootid:0:8}… post=${cur_bootid:0:8}…) after ~${elapsed}s"
+      return 0
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+  return 1
+}
+
+# wait_node_daemonsets_ready NODE
+#
+# Poll every pod in kube-system scheduled on NODE until all containers
+# report Ready=true. Node Ready (the kubelet condition) means "kubelet
+# is alive + the CNI binary is present on disk" — it does NOT mean the
+# Cilium agent / kube-proxy / coredns DaemonSet pods on this node are
+# running and forwarding traffic. Without this gate, the script can
+# proceed to drain N+1 while Cilium on N is still CrashLooping, causing
+# a brief networking outage as the next eviction lands on N+1 with no
+# functional CNI on N to talk to.
+#
+# Implementation: --field-selector narrows to this node server-side, then
+# a simple jsonpath emits one "name=ready,ready,..." line per pod. A
+# pod with any "false" is unready. We deliberately don't try to filter
+# DaemonSet-only on the API server side (the ownerReferences jsonpath is
+# noisy across kubectl versions) — kube-system overwhelmingly hosts
+# DaemonSet pods + the CP-only static pods, and the CP-only pods are
+# named with the CP node anyway so they self-select via field-selector
+# on a worker. False positives from a transient kube-system Job are
+# acceptable; better to wait one extra cycle than to miss a real CNI
+# crash loop.
+#
+# READY_TIMEOUT bounds the wait. Returns 0 when all pods report Ready,
+# 1 on timeout.
+wait_node_daemonsets_ready() {
+  local node="$1" elapsed=0 interval=5 line raw unready
+  log "waiting for kube-system DaemonSet pods on ${node} to be Ready (timeout ${READY_TIMEOUT}s)"
+  while (( elapsed < READY_TIMEOUT )); do
+    if (( DRY_RUN == 1 )); then
+      log "DRY-RUN would poll kube-system pods on ${node} for Ready"
+      return 0
+    fi
+    # Emits "podname=true,true\npodname=false,true\n..." (one line per
+    # pod, comma-separated container ready bools). Empty containerStatuses
+    # (e.g. Pending pod) emits "podname=" — also treated as unready.
+    raw=$(cp_kubectl "get pods -n kube-system --field-selector=spec.nodeName=${node} -o jsonpath='{range .items[*]}{.metadata.name}={range .status.containerStatuses[*]}{.ready},{end}{\"\\n\"}{end}'" 2>/dev/null || true)
+    unready=""
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      # Format: "podname=true,true,". Trailing comma is harmless.
+      # Unready if RHS is empty OR contains "false".
+      local rhs="${line#*=}"
+      if [[ -z "$rhs" || "$rhs" == *false* ]]; then
+        unready+="${line%%=*} "
+      fi
+    done <<< "$raw"
+    if [[ -z "$unready" ]]; then
+      log "node ${node} kube-system DaemonSet pods all Ready after ~${elapsed}s"
+      return 0
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+  log "node ${node}: kube-system DaemonSet pods still not Ready after ${READY_TIMEOUT}s: ${unready% }"
+  return 1
+}
+
 wait_apiserver_back() {
   # CP-specific: after the CP reboots, the apiserver itself goes away.
   # Poll `kubectl get nodes` via ssh until it returns 0 again.
@@ -658,6 +780,14 @@ update_cp() {
 
   timer_stop "$CP_IP"
 
+  # Capture the CP's pre-reboot bootID. wait_node_bootid_changed compares
+  # against this after wait_apiserver_back returns to defeat the
+  # stale-apiserver-cache race that wait_node_ready alone can't catch.
+  # See docs/update-cluster.md "Reboot detection (bootID)".
+  local pre_bootid
+  pre_bootid="$(capture_node_bootid "$CP_NAME")"
+  log "  pre-reboot bootID: ${pre_bootid:0:8}…"
+
   log "ssh root@${CP_IP} bootc upgrade --apply  (auto-reboots; digest pre/post compared)"
   set +e
   bootc_upgrade_apply "$CP_IP" "$CP_NAME"
@@ -681,7 +811,18 @@ update_cp() {
 
   wait_ssh_back "$CP_IP" "$SSH_TIMEOUT" || fail "CP ${CP_NAME} did not come back over SSH within ${SSH_TIMEOUT}s"
   wait_apiserver_back "$APISERVER_TIMEOUT"   || fail "CP ${CP_NAME} apiserver did not return within ${APISERVER_TIMEOUT}s"
+  # bootID gate runs BEFORE wait_node_ready to defeat the stale-apiserver-
+  # cache race (apiserver may report Ready=True from the pre-reboot lease
+  # before kubelet has actually re-registered).
+  wait_node_bootid_changed "$CP_NAME" "$pre_bootid" \
+    || fail "CP node ${CP_NAME} bootID did not change after ${READY_TIMEOUT}s (apiserver may be serving stale state)"
   wait_node_ready "$CP_NAME" "$READY_TIMEOUT" || fail "CP node ${CP_NAME} did not reach Ready within ${READY_TIMEOUT}s"
+  # DaemonSet gate: Node Ready means kubelet+CNI binary present, NOT that
+  # the Cilium/kube-proxy/coredns pods are forwarding traffic. Block here
+  # so we don't proceed to workers while the CP's networking is still
+  # CrashLooping. See docs/update-cluster.md "Daemonset readiness gate".
+  wait_node_daemonsets_ready "$CP_NAME" \
+    || fail "CP ${CP_NAME}: kube-system DaemonSet pods not Ready after ${READY_TIMEOUT}s"
 
   timer_start "$CP_IP"
   log "CP ${CP_NAME} updated and Ready."
@@ -728,6 +869,14 @@ update_worker() {
     mark_in_flight
   fi
 
+  # Capture the worker's pre-reboot bootID before kicking off the upgrade.
+  # wait_node_bootid_changed compares against this post-reboot to defeat
+  # the stale-apiserver-cache race that wait_node_ready alone can't catch.
+  # See docs/update-cluster.md "Reboot detection (bootID)".
+  local pre_bootid
+  pre_bootid="$(capture_node_bootid "$name")"
+  log "  pre-reboot bootID: ${pre_bootid:0:8}…"
+
   log "ssh root@${ip} bootc upgrade --apply  (auto-reboots; digest pre/post compared)"
   set +e
   bootc_upgrade_apply "$ip" "$name"
@@ -758,10 +907,22 @@ update_worker() {
   fi
 
   wait_ssh_back "$ip" "$SSH_TIMEOUT"       || { worker_fail "$name" "did not come back over SSH within ${SSH_TIMEOUT}s"; return 1; }
+  # bootID gate runs BEFORE wait_node_ready to defeat the stale-apiserver-
+  # cache race (apiserver may still serve Ready=True from the pre-reboot
+  # lease before kubelet has actually re-registered post-reboot).
+  wait_node_bootid_changed "$name" "$pre_bootid" \
+    || { worker_fail "$name" "node bootID did not change after ${READY_TIMEOUT}s (apiserver may be serving stale state)"; return 1; }
   # wait_node_ready before uncordon: kubelet has to rejoin (which may
   # report Ready,SchedulingDisabled while still cordoned) — the regex
   # in wait_node_ready handles both forms.
   wait_node_ready "$name" "$READY_TIMEOUT" || { worker_fail "$name" "did not reach Ready within ${READY_TIMEOUT}s"; return 1; }
+  # DaemonSet gate: Node Ready means kubelet+CNI binary present, NOT that
+  # the Cilium/kube-proxy/coredns pods are forwarding traffic on this
+  # node. Block here so we don't move to draining N+1 while the CNI on N
+  # is still CrashLooping. See docs/update-cluster.md "Daemonset
+  # readiness gate".
+  wait_node_daemonsets_ready "$name" \
+    || { worker_fail "$name" "kube-system DaemonSet pods not Ready on this node after ${READY_TIMEOUT}s"; return 1; }
 
   log "kubectl uncordon ${name}"
   cp_kubectl "uncordon ${name}" || { worker_fail "$name" "uncordon failed"; return 1; }
