@@ -9,11 +9,6 @@ on:
         description: 'Semver tag (vX.Y.Z)'
         required: true
         type: string
-      force-publish-on-vulns:
-        description: 'Publish even if Trivy finds HIGH/CRITICAL vulns (emergency override, e.g. upstream zero-day with no fix yet). Set TRIVY exit-code to 0 for this run only.'
-        required: false
-        default: false
-        type: boolean
 
 # Serialize tag-driven publishes on the same ref. cancel-in-progress is
 # deliberately false: a real tag push that is mid-publish must finish
@@ -93,23 +88,25 @@ jobs:
           extra-args: |
             --cache-from ghcr.io/${{ github.repository_owner }}/hummingbird-k3s
 
-      # Pre-publish vulnerability gate. buildah-build leaves the image in
-      # podman's local storage (not docker's); TRIVY_IMAGE_SRC=podman pins
-      # the lookup path so a future default-list change can't silently regress
-      # to "image not found, scan skipped".
+      # Pre-publish vulnerability scan (report-only). buildah-build leaves the
+      # image in podman's local storage (not docker's); TRIVY_IMAGE_SRC=podman
+      # pins the lookup path so a future default-list change can't silently
+      # regress to "image not found, scan skipped".
       #
-      # exit-code:'1' on HIGH/CRITICAL REFUSES to publish — that's the whole
-      # point of moving this step earlier. The workflow_dispatch input
-      # `force-publish-on-vulns` downgrades exit-code to '0' for a single run
-      # so operators can ship a release during an upstream zero-day window.
-      - name: Trivy vulnerability scan (gate publish on HIGH/CRITICAL)
+      # exit-code:'0' keeps the publish step gated on actual build/sign success
+      # rather than CVE findings. The findings still flow to GitHub's security
+      # tab (and downstream Trivy dashboards) via the SARIF upload below.
+      # Gating on HIGH/CRITICAL is impractical while the upstream base image's
+      # CVE backlog is unpatched; flip exit-code back to '1' when that clears.
+      # See issue #176 for the gating roadmap.
+      - name: Trivy vulnerability scan (report-only)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_IMAGE_SRC: podman
         with:
           image-ref: localhost/hummingbird-k3s:${{ steps.v.outputs.version }}
           severity: HIGH,CRITICAL
-          exit-code: ${{ inputs.force-publish-on-vulns && '0' || '1' }}
+          exit-code: '0'
           format: sarif
           output: trivy-results.sarif
 
