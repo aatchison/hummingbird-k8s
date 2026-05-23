@@ -16,6 +16,17 @@ fi
 MARKER=/var/lib/k8s-init.done
 [[ -f "$MARKER" ]] && { echo "k8s-init already ran"; exit 0; }
 
+# When cloud-init is installed (ENABLE_CLOUD_INIT=1 build), wait for it to
+# finish so any operator-injected user-data (write_files, runcmd, etc.) is
+# in place before kubeadm init runs. We CAN'T use systemd After= on
+# cloud-final.service or cloud-init.target — both are inside
+# multi-user.target's transaction while this service is WantedBy=multi-user
+# .target, and systemd breaks the resulting ordering cycle by silently
+# dropping k8s-init.service from the boot.
+if command -v cloud-init >/dev/null 2>&1; then
+  cloud-init status --wait >/dev/null 2>&1 || true
+fi
+
 # cilium install (cilium-cli) needs a writable cache dir; systemd services
 # have no $HOME by default. Set both XDG_CACHE_HOME and HOME so cilium-cli's
 # helm cache + kubeconfig path resolution work.

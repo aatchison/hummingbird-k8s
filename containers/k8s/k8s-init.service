@@ -1,11 +1,12 @@
 [Unit]
 Description=Initialize single-node kubeadm cluster on first boot
-# cloud-init.target is a no-op when cloud-init is not installed (the
-# default build). When ENABLE_CLOUD_INIT=1 was passed at image build, this
-# After= ensures user-data-injected SSH keys / runcmd / package-installs
-# land before kubeadm init runs, so any operator-supplied prerequisites
-# (extra packages, files written by write_files, etc.) are in place.
-After=crio.service network-online.target cloud-final.service
+# Note: any After= on cloud-final.service or cloud-init.target creates a
+# systemd ordering cycle (cloud-init's own units are inside multi-user.target's
+# transaction; this service is WantedBy=multi-user.target). The cycle gets
+# broken by systemd dropping k8s-init.service from the boot, so the cluster
+# never initializes. Instead k8s-init.sh blocks on `cloud-init status --wait`
+# at runtime when cloud-init is installed.
+After=crio.service network-online.target
 Wants=crio.service network-online.target
 ConditionPathExists=!/var/lib/k8s-init.done
 

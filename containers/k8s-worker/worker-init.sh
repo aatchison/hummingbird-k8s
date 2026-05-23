@@ -17,6 +17,13 @@ fi
 MARKER=/var/lib/worker-init.done
 [[ -f "$MARKER" ]] && { echo "worker-init already ran"; exit 0; }
 
+# Wait for cloud-init to finish (if installed) so user-data's write_files
+# (specifically /etc/hummingbird/worker-join.env) has landed. systemd After=
+# can't be used; see the matching comment in k8s-init.sh.
+if command -v cloud-init >/dev/null 2>&1; then
+  cloud-init status --wait >/dev/null 2>&1 || true
+fi
+
 JOIN_CMD_FILE=/etc/hummingbird/worker-join.env
 if [[ ! -s "$JOIN_CMD_FILE" ]]; then
   echo "Missing or empty $JOIN_CMD_FILE." >&2

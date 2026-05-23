@@ -1,10 +1,10 @@
 [Unit]
 Description=Join the Hummingbird Kubernetes cluster as a worker
-# cloud-init.target is a no-op when cloud-init is not installed (the
-# default build). When ENABLE_CLOUD_INIT=1 was passed at image build, this
-# After= ensures user-data-injected SSH keys / runcmd / package-installs
-# land before kubeadm join runs.
-After=crio.service network-online.target cloud-final.service
+# Any After= on cloud-final.service or cloud-init.target creates a systemd
+# ordering cycle (those units are inside multi-user.target's transaction and
+# this service is WantedBy=multi-user.target). worker-init.sh blocks on
+# `cloud-init status --wait` at runtime instead.
+After=crio.service network-online.target
 Wants=crio.service network-online.target
 ConditionPathExists=!/var/lib/worker-init.done
 # Skip cleanly when an operator boots the bare template qcow2 (no token
