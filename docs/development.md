@@ -114,6 +114,35 @@ Helpers live in `lib/build-common.sh`. When adding one:
    (`# Shared SSH/virsh/log helpers in lib/build-common.sh; see
    docs/development.md.`).
 
+### Podman storage isolation (issue #199)
+
+`build_qcow2()` reads three optional env vars and threads them through to
+the `podman` invocation AND into the `bootc-image-builder` (BIB) container
+that podman launches:
+
+| Var | Maps to |
+|---|---|
+| `STORAGE_DRIVER` | `podman --storage-driver <v>` (e.g. `vfs`) |
+| `PODMAN_ROOT`    | `podman --root <path>` (graphroot) |
+| `PODMAN_RUNROOT` | `podman --runroot <path>` |
+
+The three vars are also forwarded into the BIB container via `-e` so the
+nested podman that BIB spawns uses the same isolated graphroot. The
+`/var/lib/containers/storage` bind-mount is automatically repointed to
+`$PODMAN_ROOT` when set, so BIB sees the image graph the outer podman
+just populated.
+
+Contract: callers that need isolated storage (e.g. two concurrent
+integration runs on the same host) set the env vars before invoking
+`build_qcow2`; the rest of the build path stays unchanged. When the vars
+are unset, `build_qcow2` falls back to the legacy
+`/var/lib/containers/storage` host path and emits no extra podman flags
+— byte-identical to pre-#199 behavior on developer workstations.
+
+This is the mechanism the integration workflows (`integration-update-
+cluster.yml`, `integration-export-argocd.yml`) use to keep concurrent
+self-hosted runs from corrupting each other's overlay graph.
+
 ### Bats tests
 
 Unit tests for `lib/build-common.sh` live in `tests/lib/build-common.bats`.

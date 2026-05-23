@@ -36,7 +36,8 @@ setup() {
 
   # Wipe library inputs.
   unset SSH_PUBKEY_FILES SSH_PUBKEY_GH_USERS VM_USER VM_USER_GROUPS \
-        VM_PASSWORD ENABLE_ROOT_SSH SUDO_USER POOL_DIR BIB BASE_IMAGE
+        VM_PASSWORD ENABLE_ROOT_SSH SUDO_USER POOL_DIR BIB BASE_IMAGE \
+        STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT
 
   # Default sandbox locations for every test.
   export POOL_DIR="${BATS_TEST_TMPDIR}/pool"
@@ -55,6 +56,12 @@ setup() {
 #     a bib failure.
 #   - virsh() no-ops (build_qcow2's pool-refresh is best-effort).
 #   - chown/chmod no-op so we don't need root.
+#
+# Note: storage-isolation tests (issue #199) wipe STORAGE_DRIVER /
+# PODMAN_ROOT / PODMAN_RUNROOT in setup() and set them only inside the
+# tests that exercise the isolation path; that way the default-args
+# snapshots above keep working even on hosts where an operator happens
+# to have these set in their environment.
 install_stubs() {
   podman() {
     printf '%s\n' "$@" > "$PODMAN_ARGS"
@@ -121,6 +128,15 @@ make_cfg() {
   grep -qx 'ext4' "$PODMAN_ARGS"
   grep -qx -- '--local' "$PODMAN_ARGS"
   grep -qx 'localhost/hummingbird-k3s:latest' "$PODMAN_ARGS"
+
+  # When no isolation env vars are set, the legacy host storage path is
+  # bind-mounted into the BIB container (so the nested podman finds the
+  # image graph the outer podman just populated). And NO top-level
+  # --root / --runroot / --storage-driver flags get prepended.
+  grep -qFx -- '/var/lib/containers/storage:/var/lib/containers/storage' "$PODMAN_ARGS"
+  ! grep -qx -- '--root'           "$PODMAN_ARGS"
+  ! grep -qx -- '--runroot'        "$PODMAN_ARGS"
+  ! grep -qx -- '--storage-driver' "$PODMAN_ARGS"
 
   # The promoted qcow2 ends up at ${POOL_DIR}/<name>.qcow2 and the staging dir
   # is gone.
@@ -225,4 +241,89 @@ make_cfg() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"expected"* ]]
   [[ "$output" == *"disk.qcow2"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Storage isolation (issue #199): STORAGE_DRIVER / PODMAN_ROOT / PODMAN_RUNROOT
+# ---------------------------------------------------------------------------
+
+@test "build_qcow2: STORAGE_DRIVER / PODMAN_ROOT / PODMAN_RUNROOT thread through to podman + BIB" {
+  install_stubs
+  export STORAGE_DRIVER=vfs
+  export PODMAN_ROOT="${BATS_TEST_TMPDIR}/iso-graphroot"
+  export PODMAN_RUNROOT="${BATS_TEST_TMPDIR}/iso-runroot"
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  run build_qcow2 localhost/hummingbird-k3s:latest hummingbird-k3s "$cfg"
+  [ "$status" -eq 0 ]
+
+  # 1) Top-level podman flags (BEFORE `run`) must include --storage-driver,
+  #    --root, --runroot with the values we set.
+  grep -qx -- '--storage-driver' "$PODMAN_ARGS"
+  grep -qx 'vfs'                  "$PODMAN_ARGS"
+  grep -qx -- '--root'            "$PODMAN_ARGS"
+  grep -qFx -- "${PODMAN_ROOT}"   "$PODMAN_ARGS"
+  grep -qx -- '--runroot'         "$PODMAN_ARGS"
+  grep -qFx -- "${PODMAN_RUNROOT}" "$PODMAN_ARGS"
+
+  # 2) Order matters: the flags must appear BEFORE the `run` subcommand
+  #    so podman parses them as global options, not as args to `run`.
+  local first_run_line first_storage_line first_root_line first_runroot_line
+  first_run_line="$(grep -nx 'run' "$PODMAN_ARGS" | head -1 | cut -d: -f1)"
+  first_storage_line="$(grep -nx -- '--storage-driver' "$PODMAN_ARGS" | head -1 | cut -d: -f1)"
+  first_root_line="$(grep -nx -- '--root' "$PODMAN_ARGS" | head -1 | cut -d: -f1)"
+  first_runroot_line="$(grep -nx -- '--runroot' "$PODMAN_ARGS" | head -1 | cut -d: -f1)"
+  [ "$first_storage_line" -lt "$first_run_line" ]
+  [ "$first_root_line"    -lt "$first_run_line" ]
+  [ "$first_runroot_line" -lt "$first_run_line" ]
+
+  # 3) The BIB container itself must inherit the three env vars via -e
+  #    (so the nested podman BIB invokes also uses the isolated store).
+  grep -qx -- '-e' "$PODMAN_ARGS"
+  grep -qx 'STORAGE_DRIVER' "$PODMAN_ARGS"
+  grep -qx 'PODMAN_ROOT'    "$PODMAN_ARGS"
+  grep -qx 'PODMAN_RUNROOT' "$PODMAN_ARGS"
+
+  # 4) The /var/lib/containers/storage bind-mount must point at the
+  #    isolated graphroot, NOT the host default. Otherwise BIB's nested
+  #    podman would still scribble in the shared store.
+  grep -qFx -- "${PODMAN_ROOT}:/var/lib/containers/storage" "$PODMAN_ARGS"
+  ! grep -qFx -- '/var/lib/containers/storage:/var/lib/containers/storage' "$PODMAN_ARGS"
+}
+
+@test "build_qcow2: STORAGE_DRIVER alone (no PODMAN_ROOT/RUNROOT) appends only --storage-driver" {
+  install_stubs
+  export STORAGE_DRIVER=vfs
+  # PODMAN_ROOT / PODMAN_RUNROOT intentionally unset.
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  run build_qcow2 localhost/img:latest name "$cfg"
+  [ "$status" -eq 0 ]
+
+  grep -qx -- '--storage-driver' "$PODMAN_ARGS"
+  grep -qx 'vfs'                  "$PODMAN_ARGS"
+  ! grep -qx -- '--root'    "$PODMAN_ARGS"
+  ! grep -qx -- '--runroot' "$PODMAN_ARGS"
+  # With PODMAN_ROOT unset, the bind-mount falls back to the host default.
+  grep -qFx -- '/var/lib/containers/storage:/var/lib/containers/storage' "$PODMAN_ARGS"
+}
+
+@test "build_qcow2: PODMAN_ROOT alone repoints the BIB storage bind-mount" {
+  install_stubs
+  export PODMAN_ROOT="${BATS_TEST_TMPDIR}/just-graphroot"
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  run build_qcow2 localhost/img:latest name "$cfg"
+  [ "$status" -eq 0 ]
+
+  grep -qx -- '--root' "$PODMAN_ARGS"
+  grep -qFx -- "${PODMAN_ROOT}" "$PODMAN_ARGS"
+  # The bind-mount source must follow PODMAN_ROOT.
+  grep -qFx -- "${PODMAN_ROOT}:/var/lib/containers/storage" "$PODMAN_ARGS"
 }

@@ -206,6 +206,22 @@ render_bib_config() {
 
 # Run bib to turn a local OCI image into a qcow2 under $POOL_DIR/$NAME.qcow2
 # Args: 1=local image ref, 2=qcow2 name (without .qcow2), 3=path to bib-config.toml
+#
+# Storage isolation (issue #199): callers that need to point podman + the
+# nested bootc-image-builder at an isolated container store (so two
+# integration runs on the same host don't corrupt each other's overlay
+# graph) can set:
+#
+#   STORAGE_DRIVER  — passed as `podman --storage-driver <v>` (e.g. "vfs")
+#   PODMAN_ROOT     — passed as `podman --root <path>` (graphroot)
+#   PODMAN_RUNROOT  — passed as `podman --runroot <path>` (runroot)
+#
+# All three are optional; when unset, podman uses its default storage
+# location at /var/lib/containers/storage. The same three vars are also
+# forwarded into the BIB container via `-e` so the nested podman that BIB
+# spawns inherits the isolation. The /var/lib/containers/storage bind mount
+# is conditionally swapped for PODMAN_ROOT when set so BIB can see the
+# same image graph the outer podman just populated.
 build_qcow2() {
   local local_image="$1" name="$2" cfg="$3"
   local qcow="${POOL_DIR}/${name}.qcow2"
@@ -227,11 +243,28 @@ build_qcow2() {
   rm -rf "$stage"
   mkdir -p "$POOL_DIR"
 
-  if ! podman run --rm --privileged --pull=newer \
+  # Build the top-level podman flag list (before `run`) for isolated
+  # container storage. Each var is independently optional; when unset, we
+  # fall through to podman's compiled-in defaults.
+  local podman_opts=()
+  [[ -n "${STORAGE_DRIVER:-}" ]] && podman_opts+=(--storage-driver "$STORAGE_DRIVER")
+  [[ -n "${PODMAN_ROOT:-}"    ]] && podman_opts+=(--root           "$PODMAN_ROOT")
+  [[ -n "${PODMAN_RUNROOT:-}" ]] && podman_opts+=(--runroot        "$PODMAN_RUNROOT")
+
+  # The BIB container shells out to nested podman to pull/inspect the
+  # local image. Bind-mount the same graphroot the outer podman is using
+  # so the nested podman sees the image we just built. When PODMAN_ROOT
+  # is unset, fall back to the historical /var/lib/containers/storage.
+  local storage_src="${PODMAN_ROOT:-/var/lib/containers/storage}"
+
+  if ! podman "${podman_opts[@]}" run --rm --privileged --pull=newer \
     --security-opt label=type:unconfined_t \
+    -e STORAGE_DRIVER \
+    -e PODMAN_ROOT \
+    -e PODMAN_RUNROOT \
     -v "${cfg}:/config.toml:ro" \
     -v "${POOL_DIR}:/output" \
-    -v /var/lib/containers/storage:/var/lib/containers/storage \
+    -v "${storage_src}:/var/lib/containers/storage" \
     "$BIB" \
     --type qcow2 --rootfs ext4 \
     --local \

@@ -35,6 +35,13 @@ permissions:
 # the per-run static VM names (suffixed below) and the shared /var/lib/
 # libvirt/images pool. Serialize per-workflow but DON'T cancel an
 # in-flight run — abandoned VMs are worse than a queued workflow.
+#
+# Note: as of issue #199, podman container storage IS isolated per-run
+# (PODMAN_ROOT/PODMAN_RUNROOT below are now actually consumed by
+# lib/build-common.sh:build_qcow2). The concurrency: block is retained
+# as belt-and-suspenders against libvirt VM-name collisions and pool
+# contention — libvirt domain names + the shared /var/lib/libvirt/
+# images pool are NOT per-run-isolated.
 concurrency:
   group: integration-libvirt-${{ github.workflow }}
   cancel-in-progress: false
@@ -52,6 +59,14 @@ jobs:
        startsWith(github.event.workflow_run.head_branch, 'k8s/v'))
     runs-on: [self-hosted, kvm, libvirt]
     timeout-minutes: 60
+    # Isolated podman storage (issue #199). STORAGE_DRIVER / PODMAN_ROOT /
+    # PODMAN_RUNROOT are consumed by lib/build-common.sh:build_qcow2(),
+    # which threads them through as `podman --root/--runroot/--storage-
+    # driver` args AND propagates them into the BIB container so the
+    # nested podman BIB invokes uses the same isolated graphroot.
+    # Concurrent runs on the same host therefore cannot corrupt each
+    # other's overlay graph; the `sudo --preserve-env=...` below carries
+    # the vars across the sudo boundary into the build path.
     env:
       STORAGE_DRIVER: vfs
       PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}

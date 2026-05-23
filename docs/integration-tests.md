@@ -325,6 +325,36 @@ for the `hummingbird-it-` prefix only — production cluster VMs are
 never matched — and is fully defensive (`|| true` on every command), so
 it can never itself fail the job.
 
+### Podman storage isolation (issue #199)
+
+`integration-update-cluster.yml` and `integration-export-argocd.yml`
+declare a per-run podman graphroot:
+
+```yaml
+env:
+  STORAGE_DRIVER: vfs
+  PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}
+  PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}
+```
+
+These vars are consumed by `lib/build-common.sh:build_qcow2()` (added
+in issue #199) and turn into top-level `podman --root/--runroot/
+--storage-driver` flags PLUS `-e VAR` passthrough into the BIB
+container. That way two concurrent integration runs on the same
+self-hosted host cannot corrupt each other's overlay graph: each lives
+under its own `/var/lib/integration-storage/<run_id>` graphroot.
+
+Before #199 the three env vars were declared in the workflow but never
+consumed by the build path (only `tests/integration-cloud-init.sh` and
+siblings read them), so the "isolated storage" claim was misleading —
+the `concurrency:` block was what actually prevented collisions. After
+#199 the isolation is real, and `concurrency:` stays as belt-and-
+suspenders against libvirt VM-name + `/var/lib/libvirt/images` pool
+collisions, which are still NOT per-run-isolated.
+
+See `docs/development.md` ("Podman storage isolation") for the
+underlying contract.
+
 ## Security note — fork PRs
 
 None of these workflows run on `pull_request`, so fork PRs can't reach the
