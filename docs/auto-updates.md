@@ -166,6 +166,37 @@ Workarounds:
    that flavor's Containerfile. The control-plane image already ships
    this way (see #48).
 
+## Operator-driven rolling upgrades
+
+The per-VM timer is the unattended path: each node wakes up
+independently, fetches whatever its `bootc` image ref points at, and
+reboots without coordinating with the rest of the cluster. That's fine
+for worker fleets but uncomfortable for a single-CP cluster where you
+want drain/uncordon, a defined node ordering, and a clean abort
+surface.
+
+For that, the orchestrated complement is
+[`scripts/update-cluster.sh`](update-cluster.md), surfaced as
+`make update-cluster`:
+
+```bash
+sudo make update-cluster CONFIG=cluster.local.conf
+```
+
+It walks the cluster one node at a time — CP first (no drain, brief
+apiserver outage), then each worker (drained → `bootc upgrade --apply`
+→ uncordon). Per-node it stops the in-image
+`bootc-fetch-apply-updates.timer` for the duration so the two paths
+don't race, then restarts it. See
+[`docs/update-cluster.md`](update-cluster.md) for the full flag and
+config reference (`--workers-only`, `--node=`, `--skip-drain`,
+`--dry-run`, recovery procedure).
+
+The timer described in this document and the `make update-cluster`
+script are not exclusive — most production deploys use both: the timer
+for routine worker rollouts, the script for image bumps where the
+operator wants to be in the loop.
+
 ## Rolling back
 
 If a bad image lands and the VM still boots:

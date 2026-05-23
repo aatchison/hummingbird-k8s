@@ -174,6 +174,16 @@ The seed ISOs live next to the qcow2s in `POOL_DIR`. They're not picked
 up by `make clean-vms` because they're not VMs — clean them by hand if
 you want a fully fresh deploy with no NoCloud datasources lying around.
 
+## Updating a deployed cluster
+
+Once a cluster is up, image bumps don't require tearing it down. The
+coordinated alternative to the per-VM auto-update timer is
+`make update-cluster CONFIG=…`, which walks the cluster one node at a
+time with drain/uncordon and bounded waits. It reads the same config
+file as the deploy. See [`docs/update-cluster.md`](update-cluster.md)
+for the full flag and config reference; the per-VM timer path is
+covered in [`docs/auto-updates.md`](auto-updates.md).
+
 ## Auto-update behavior
 
 When `SWITCH_TO_GHCR=true` (default), every VM gets a first-boot
