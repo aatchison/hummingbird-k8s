@@ -1,0 +1,270 @@
+name: Integration — export-argocd kubeconfig (#196)
+
+# End-to-end exercise of scripts/export-argocd.sh (PR #188) against a
+# real 1-CP + 2-worker cluster on the self-hosted kvm/libvirt runner.
+#
+# Asserts the full feature surface of `make export-argocd`:
+#   - basic export emits a 0600 kubeconfig with rewritten server URL +
+#     hummingbird-<CP_NAME> context.
+#   - the emitted kubeconfig is actually usable: `kubectl get nodes`
+#     via KUBECONFIG=<exported> returns the CP node.
+#   - refuse-to-clobber: a second run without --force exits non-zero.
+#   - --force overwrites cleanly.
+#   - a hostile --server URL is rejected BEFORE any rewrite touches the
+#     filesystem. The hostile test bypasses `make` and calls the script
+#     directly: Make substitutes $(SERVER) literally into the recipe
+#     shell, so a payload containing shell metacharacters runs on the
+#     runner BEFORE the script's regex validator sees it (BLOCKER #1
+#     from the 10-agent review of PR #198).
+#   - (PR #197) a sibling `make get-kubeconfig` produces a kubeconfig
+#     with the CP_NAME context (no hummingbird- prefix). Gated on the
+#     Make target being present.
+#
+# Trigger surface mirrors integration-update-cluster.yml:
+#   workflow_dispatch + workflow_run on Build & publish hummingbird-k8s
+#   (tag refs only).
+
+on:
+  workflow_dispatch: {}
+  workflow_run:
+    workflows: ['Build & publish — hummingbird-k8s']
+    types: [completed]
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: integration-libvirt-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  export-argocd:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'k8s/v'))
+    runs-on: [self-hosted, kvm, libvirt]
+    timeout-minutes: 30
+    env:
+      STORAGE_DRIVER: vfs
+      PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}
+      PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}
+      CONFIG: tests/fixtures/cluster.ci.conf
+      RUN_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Install runner deps (CNI + virtinst + genisoimage + kubectl + yq)
+        # kubectl is added for the "kubeconfig usable" assertion. yq (Go
+        # flavor, mikefarah) is the variant scripts/export-argocd.sh
+        # expects on the canonical path; if absent, the script silently
+        # falls back to its sed path. We install the Go yq explicitly to
+        # exercise the canonical path here. (Note: Debian's `yq` package
+        # ships kislyuk/yq, the Python variant — wrong tool.)
+        run: |
+          set -euo pipefail
+          need=()
+          { ls /usr/lib/cni/bridge >/dev/null 2>&1 \
+              || ls /usr/libexec/cni/bridge >/dev/null 2>&1 \
+              || ls /opt/cni/bin/bridge >/dev/null 2>&1 ; } \
+              || need+=(containernetworking-plugins)
+          command -v virt-install >/dev/null 2>&1 || need+=(virtinst)
+          command -v virsh        >/dev/null 2>&1 || need+=(libvirt-clients)
+          command -v genisoimage  >/dev/null 2>&1 || need+=(genisoimage)
+          command -v kubectl      >/dev/null 2>&1 || need+=(kubectl)
+          if [[ ${#need[@]} -gt 0 ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q "${need[@]}"
+          fi
+          # mikefarah/yq via release binary — not packaged in apt with
+          # the right variant. v4 is the current stable line.
+          if ! { command -v yq >/dev/null 2>&1 \
+                 && yq --version 2>&1 | grep -qiE 'mikefarah|go-yaml'; }; then
+            arch="$(uname -m)"
+            case "$arch" in
+              x86_64) yq_arch=amd64 ;;
+              aarch64|arm64) yq_arch=arm64 ;;
+              *) echo "::error::unsupported arch for yq: $arch"; exit 1 ;;
+            esac
+            sudo curl -fsSL \
+              "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${yq_arch}" \
+              -o /usr/local/bin/yq
+            sudo chmod 0755 /usr/local/bin/yq
+            yq --version
+          fi
+
+      - name: Generate runner SSH key
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          rm -f ~/.ssh/integration_test_key ~/.ssh/integration_test_key.pub
+          ssh-keygen -t ed25519 -N '' -f ~/.ssh/integration_test_key -C "hbird-ci-${{ github.run_id }}"
+
+      - name: Render per-run cluster.ci.conf
+        run: |
+          set -euo pipefail
+          sed -i "s|hbird-ci-cp1|hbird-ci-cp1-${RUN_SUFFIX}|g" "${CONFIG}"
+          sed -i "s|hbird-ci-w1|hbird-ci-w1-${RUN_SUFFIX}|g"   "${CONFIG}"
+          sed -i "s|hbird-ci-w2|hbird-ci-w2-${RUN_SUFFIX}|g"   "${CONFIG}"
+          echo "----- rendered ${CONFIG} -----"
+          cat "${CONFIG}"
+
+      - name: Prepare isolated podman storage
+        run: |
+          set -euo pipefail
+          sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
+          sudo mkdir -p "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
+
+      - name: Deploy 1-CP + 2-worker cluster
+        run: |
+          set -euo pipefail
+          # HOME is preserved so cluster.ci.conf's SSH_PUBKEY_FILE=$HOME/.ssh/...
+          # resolves to the runner user's key (generated above), not /root.
+          sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+            make deploy-cluster CONFIG="${CONFIG}"
+
+      - name: Verify CP + workers Ready by name
+        run: |
+          set -euo pipefail
+          CONFIG="${CONFIG}" bash tests/integration-export-argocd.sh \
+            verify-nodes-by-name
+
+      - name: T1 — basic export
+        run: |
+          set -euo pipefail
+          CONFIG="${CONFIG}" bash tests/integration-export-argocd.sh \
+            test-basic-export
+
+      - name: T2 — exported kubeconfig is usable
+        run: |
+          set -euo pipefail
+          CONFIG="${CONFIG}" bash tests/integration-export-argocd.sh \
+            test-kubeconfig-usable
+
+      - name: T3 — refuse-to-clobber without FORCE=1
+        run: |
+          set -euo pipefail
+          CONFIG="${CONFIG}" bash tests/integration-export-argocd.sh \
+            test-refuse-clobber
+
+      - name: T4 — FORCE=1 overwrites
+        run: |
+          set -euo pipefail
+          CONFIG="${CONFIG}" bash tests/integration-export-argocd.sh \
+            test-force-overwrite
+
+      - name: T5 — hostile --server is rejected
+        # Driven via the helper script (NOT through `make`), since
+        # Make's recipe substitutes $(SERVER) literally into the shell
+        # — the test would run `rm -rf /` on the runner before the
+        # script's regex ever saw the value.
+        run: |
+          set -euo pipefail
+          CONFIG="${CONFIG}" bash tests/integration-export-argocd.sh \
+            test-hostile-server
+
+      - name: T6 — get-kubeconfig sibling (PR #197, gated)
+        run: |
+          set -euo pipefail
+          CONFIG="${CONFIG}" bash tests/integration-export-argocd.sh \
+            test-get-kubeconfig
+
+      - name: Collect failure artifacts
+        if: failure() || cancelled()
+        run: |
+          set +e
+          mkdir -p /tmp/integration-logs
+          # See sibling workflow for why we pipe sudo output through tee
+          # rather than redirecting (SC2024).
+          sudo virsh -c qemu:///system list --all 2>&1 \
+            | tee /tmp/integration-logs/virsh-list-all.txt >/dev/null || true
+          for vm in $(sudo virsh -c qemu:///system list --all --name 2>/dev/null \
+                      | grep -E "^hbird-ci-.*-${RUN_SUFFIX}\$" || true); do
+            sudo virsh -c qemu:///system dumpxml "$vm" 2>&1 \
+              | tee "/tmp/integration-logs/dumpxml-${vm}.xml" >/dev/null || true
+          done
+          sudo journalctl -u libvirtd --no-pager -n 500 2>&1 \
+            | tee /tmp/integration-logs/journalctl-libvirtd.txt >/dev/null || true
+          # shellcheck disable=SC1090
+          source "${CONFIG}" || true
+          if [[ -n "${CP_NAME:-}" ]]; then
+            CP_IP="$(sudo virsh -c qemu:///system domifaddr "${CP_NAME}" 2>/dev/null \
+                     | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')"
+            if [[ -n "${CP_IP}" ]]; then
+              ssh -i ~/.ssh/integration_test_key \
+                  -o StrictHostKeyChecking=no \
+                  -o UserKnownHostsFile=/dev/null \
+                  -o LogLevel=ERROR \
+                  -o ConnectTimeout=10 \
+                  -o BatchMode=yes \
+                  "root@${CP_IP}" \
+                  'kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide; \
+                   echo "---"; \
+                   kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A' \
+                  > /tmp/integration-logs/kubectl-state.txt 2>&1 || true
+            fi
+          fi
+
+      - name: Upload failure artifacts
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-export-argocd-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/integration-logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Destroy cluster
+        if: always()
+        run: |
+          set -euo pipefail
+          # HOME preserved so destroy-cluster.sh's source of cluster.ci.conf
+          # resolves $HOME/.ssh/integration_test_key.pub to the runner user's
+          # key path (same reason as the deploy step above).
+          sudo --preserve-env=HOME make destroy-cluster CONFIG="${CONFIG}" || true
+
+      - name: Force-clean integration VMs (always)
+        if: always()
+        run: |
+          for vm in $(sudo virsh -c qemu:///system list --all --name 2>/dev/null \
+                      | grep -E "^hbird-ci-.*-${RUN_SUFFIX}\$" || true); do
+            echo "force-cleaning $vm"
+            sudo virsh -c qemu:///system destroy "$vm" >/dev/null 2>&1 || true
+            sudo virsh -c qemu:///system undefine --nvram "$vm" >/dev/null 2>&1 || true
+          done
+          sudo rm -f "/var/lib/libvirt/images/hbird-ci-cp1-${RUN_SUFFIX}.qcow2" \
+                     "/var/lib/libvirt/images/hbird-ci-w1-${RUN_SUFFIX}.qcow2" \
+                     "/var/lib/libvirt/images/hbird-ci-w2-${RUN_SUFFIX}.qcow2" \
+                     "/var/lib/libvirt/images/hbird-ci-cp1-${RUN_SUFFIX}-seed.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-w1-${RUN_SUFFIX}-seed.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-w2-${RUN_SUFFIX}-seed.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-cp1-${RUN_SUFFIX}-cloud-init.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-w1-${RUN_SUFFIX}-cloud-init.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-w2-${RUN_SUFFIX}-cloud-init.iso" \
+                     2>/dev/null || true
+          sudo rm -rf /var/lib/libvirt/images/deploy-cluster 2>/dev/null || true
+
+      - name: Clean up isolated podman storage
+        if: always()
+        run: |
+          sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}" || true
+
+      - name: Clean up exported kubeconfigs
+        if: always()
+        run: |
+          rm -f /tmp/ci-kubeconfig.yaml /tmp/ci-bad.yaml /tmp/ci-get.yaml || true
+
+      - name: Remove runner SSH key
+        if: always()
+        run: |
+          rm -f ~/.ssh/integration_test_key ~/.ssh/integration_test_key.pub || true
+
+# TODO(follow-up): install-deps / podman-storage / teardown duplicated
+# with integration-update-cluster.yml. Extract into a composite action
+# once a third workflow joins the family. Follow-up to PR #198.

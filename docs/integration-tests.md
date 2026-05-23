@@ -37,7 +37,7 @@ upstream tag movement can't silently change the test runtime.
 
 ## Integration tests
 
-Five integration workflows exercise the published Hummingbird images on a
+Seven integration workflows exercise the published Hummingbird images on a
 real KVM host. All run on the self-hosted runner gated by the `kvm,libvirt`
 labels (see `docs/self-hosted-runner.md`).
 
@@ -158,6 +158,88 @@ gh workflow run integration-bootc-rollback.yml \
 
 See `docs/rollback.md` for the auto-rollback behaviour built on top of
 this path.
+
+### `integration-update-cluster.yml` (#196 — rolling cluster update)
+
+End-to-end exercise of `scripts/update-cluster.sh` (PR #187) against a real
+1-CP + 2-worker cluster. The headline assertion is that PR #187's
+`wait_node_ready` regex fix (`$2 ~ /^Ready(,|$)/`) actually keeps working:
+the script must successfully wait through a worker rejoining as
+`Ready,SchedulingDisabled` post-reboot and then uncordon it.
+
+- **Triggers:**
+  - `workflow_run` on a successful `Build & publish — hummingbird-k8s`
+    restricted to `k8s/v*` tag refs (auto-runs against each release).
+  - `workflow_dispatch` — for ad-hoc manual replays.
+- **What it exercises:** deploy a CP + 2 workers via `make deploy-cluster`
+  → assert all three are Ready by name (not just by count) → drive
+  `scripts/update-cluster.sh --dry-run` and validate the expected per-target
+  log lines (CP timer-stop, drain, uncordon, etc.) appear with the expected
+  multiplicity → install a `/usr/local/bin/bootc` shim on one worker to
+  force the real reboot codepath (the no-update short-circuit would
+  otherwise bypass `wait_node_ready` entirely) → run
+  `make update-node NODE=<worker>` and assert the worker reached
+  `Ready,SchedulingDisabled` and was uncordoned → SIGINT a second
+  `make update-node` mid-flight (gated on `.spec.unschedulable=true`,
+  proving the drain actually completed) and assert
+  `cleanup_on_exit`'s recovery banner surfaces the manual uncordon
+  command. Failure artifacts (virsh dumpxml, journalctl, kubectl state)
+  are uploaded on failure.
+- **Driver:** `tests/integration-update-cluster.sh` (sub-commands:
+  `assert-dry-run-sequence`, `force-worker-upgrade`,
+  `unforce-worker-upgrade`, `assert-update-node-real`, `assert-exit-trap`).
+- **Fixture:** `tests/fixtures/cluster.ci.conf` (DO NOT copy this for a
+  real cluster — it carries CI-only sizing and skips the verify suite).
+  Names are rewritten per-run with `${run_id}-${run_attempt}` suffixes to
+  avoid libvirt-domain collisions across concurrent runs.
+
+Manual run:
+
+```bash
+gh workflow run integration-update-cluster.yml
+```
+
+### `integration-export-argocd.yml` (#196 — export-argocd kubeconfig)
+
+End-to-end exercise of `scripts/export-argocd.sh` (PR #188) against the
+same 1-CP + 2-worker fixture. Validates the full operator-facing surface
+of `make export-argocd`.
+
+- **Triggers:** identical to `integration-update-cluster.yml` —
+  `workflow_run` on a successful k8s/v* build, or `workflow_dispatch`.
+- **What it exercises (T1–T6):**
+  - **T1 basic export** — `make export-argocd OUTPUT=…` emits a 0600
+    kubeconfig with rewritten `server:` URL and `hummingbird-<CP_NAME>`
+    context.
+  - **T2 usable kubeconfig** — `KUBECONFIG=…  kubectl get nodes` returns
+    `CP_NAME Ready` via the rewritten apiserver URL.
+  - **T3 refuse-to-clobber** — a second invocation without `FORCE=1`
+    exits non-zero and surfaces `already exists` / `--force`.
+  - **T4 force overwrite** — `FORCE=1` advances mtime cleanly.
+  - **T5 hostile --server** — calls `scripts/export-argocd.sh` directly
+    (NOT via `make`, because Make's recipe substitutes `$(SERVER)`
+    literally into the shell — a payload containing `";rm -rf /;\n` would
+    run on the runner BEFORE the script's regex validator saw it). The
+    test asserts the script rejects the payload, never produces the
+    output file, and surfaces `invalid --server`.
+  - **T6 get-kubeconfig sibling** — gated on PR #197's `make
+    get-kubeconfig` target landing. Verifies the sibling target uses
+    the bare `CP_NAME` context (no `hummingbird-` prefix) and is
+    similarly usable.
+- **Driver:** `tests/integration-export-argocd.sh` (sub-commands:
+  `verify-nodes-by-name`, `test-basic-export`, `test-kubeconfig-usable`,
+  `test-refuse-clobber`, `test-force-overwrite`, `test-hostile-server`,
+  `test-get-kubeconfig`).
+- **Fixture:** `tests/fixtures/cluster.ci.conf` (shared with the
+  update-cluster workflow). The mikefarah/yq Go variant is installed by
+  release binary so the canonical yq-driven rewrite path is exercised
+  (the script's sed fallback is exercised in unit tests).
+
+Manual run:
+
+```bash
+gh workflow run integration-export-argocd.yml
+```
 
 ## What the runner needs
 
