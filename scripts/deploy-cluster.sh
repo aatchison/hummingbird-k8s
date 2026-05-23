@@ -44,8 +44,7 @@ source "${REPO_ROOT}/lib/build-common.sh"
 # shellcheck source=lib/cloud-init-seed.sh
 source "${SCRIPT_DIR}/lib/cloud-init-seed.sh"
 
-log()  { printf '[deploy-cluster] %s\n' "$*" >&2; }
-fail() { printf '[deploy-cluster] ERROR: %s\n' "$*" >&2; exit 1; }
+setup_logging "[deploy-cluster]"
 
 # ---- Root + arg parsing -----------------------------------------------------
 
@@ -236,18 +235,8 @@ virt-install --connect qemu:///system \
 
 # ---- Wait for CP Ready ------------------------------------------------------
 
-resolve_cp_ip() {
-  virsh -c qemu:///system domifaddr "$CP_NAME" 2>/dev/null \
-    | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}'
-}
-
 log "waiting for CP IP to appear via DHCP..."
-CP_IP=""
-for _ in $(seq 1 60); do
-  CP_IP="$(resolve_cp_ip || true)"
-  [[ -n "$CP_IP" ]] && break
-  sleep 5
-done
+CP_IP="$(resolve_vm_ip "$CP_NAME" 60 5 || true)"
 [[ -n "$CP_IP" ]] || fail "could not resolve CP IP after ~5 minutes — inspect 'virsh -c qemu:///system console $CP_NAME'"
 log "CP IP: $CP_IP"
 
@@ -256,18 +245,11 @@ log "CP IP: $CP_IP"
 # `sudo -u $SUDO_USER ssh` approach. Pin the identity to the private key
 # paired with SSH_PUBKEY_FILE — which is the same key bib bakes into root's
 # authorized_keys.
-SSH_PRIVKEY_FILE="${SSH_PUBKEY_FILE%.pub}"
-[[ -r "$SSH_PRIVKEY_FILE" ]] || fail "SSH private key not readable: $SSH_PRIVKEY_FILE (expected next to $SSH_PUBKEY_FILE)"
-
-cp_ssh() {
-  ssh -i "$SSH_PRIVKEY_FILE" \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR \
-    -o ConnectTimeout=10 \
-    -o BatchMode=yes \
-    "root@${CP_IP}" "$@"
-}
+# shellcheck disable=SC2034  # SSH_PRIVKEY_FILE is read by ssh_opts_array (lib/build-common.sh)
+SSH_PRIVKEY_FILE="$(derive_ssh_privkey_file "$SSH_PUBKEY_FILE")" \
+  || fail "SSH private key not readable next to $SSH_PUBKEY_FILE"
+ssh_opts_array CP_SSH_OPTS
+cp_ssh() { ssh "${CP_SSH_OPTS[@]}" "root@${CP_IP}" "$@"; }
 
 log "polling 'kubectl get nodes' on CP until it reports Ready (max ~$((CP_READY_RETRIES * CP_READY_SLEEP))s)"
 CP_READY=0

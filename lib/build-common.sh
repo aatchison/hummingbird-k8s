@@ -1,5 +1,51 @@
 #!/usr/bin/env bash
-# Shared helpers for build-*.sh scripts. Source it; don't run it directly.
+# Shared helpers for build-*.sh and scripts/* shell scripts. Source it; don't
+# run it directly.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# Section: build-only helpers (bib + qcow2)            (lines ~35-205)
+# Section: shared SSH / virsh / log helpers (issue #190) (lines ~206-end)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Shared helpers (issue #190) — extracted from five callers
+# (deploy-cluster, destroy-cluster, update-cluster, export-argocd,
+# verify-hardening) that each hand-rolled the same primitives. Contracts:
+#
+#   setup_logging <prefix>
+#       Defines log() and fail() in the caller's scope. log() prints
+#       "<prefix> <msg>" to stderr; fail() prints "<prefix> ERROR: <msg>"
+#       to stderr and exits 1. <prefix> is taken verbatim — pass it with
+#       brackets if you want them, e.g. setup_logging '[deploy-cluster]'.
+#
+#   ssh_opts_array <out_array_name> [--with-controlmaster] [--proxy-jump=HOST]
+#       Populates the caller's array with the canonical SSH option set:
+#         -i $SSH_PRIVKEY_FILE
+#         -o StrictHostKeyChecking=no
+#         -o UserKnownHostsFile=/dev/null
+#         -o LogLevel=ERROR
+#         -o ConnectTimeout=10
+#         -o BatchMode=yes
+#       With --with-controlmaster, appends ControlMaster/ControlPath/
+#       ControlPersist for SSH multiplexing across many invocations
+#       (used by update-cluster.sh which makes ~6-12 ssh calls per node).
+#       With --proxy-jump=HOST, appends `-o ProxyJump=HOST` (used by
+#       verify-hardening.sh tunneling via the KVM host).
+#       Requires SSH_PRIVKEY_FILE to be set in the caller's env.
+#       Variant: ssh_opts_array_no_identity <out_array_name> [flags]
+#       Omits the `-i` line — used by verify-hardening which relies on
+#       agent auth or ~/.ssh/config.
+#
+#   resolve_vm_ip <vm-name> [retries] [interval-seconds]
+#       Echoes the first IPv4 from `virsh -c qemu:///system domifaddr
+#       <vm>` to stdout. Retries on empty result (DHCP lease may not be
+#       ready yet — defaults: 1 attempt, 0s interval — caller can pass
+#       e.g. `resolve_vm_ip $vm 60 5` for the deploy-cluster wait-loop).
+#       Returns non-zero with a diagnostic on stderr if no IP appears.
+#
+#   derive_ssh_privkey_file <pubkey-path>
+#       Echoes "${pubkey%.pub}" — the conventional private-key path next
+#       to the pubkey. Errors with a clear message if the result is not
+#       readable. Centralized for consistency across callers.
 #
 # Environment variables (all optional, sensible defaults):
 #   VM_USER           — Username of the initial account in the guest (default: core)
@@ -201,4 +247,125 @@ build_qcow2() {
   virsh -c qemu:///system pool-refresh mass2   >/dev/null 2>&1 || true
 
   echo "Built: $qcow"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared SSH / virsh / log helpers (issue #190)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# setup_logging <prefix> — define log()/fail() in the caller's scope with the
+# given prefix. <prefix> is emitted verbatim (caller decides whether to wrap it
+# in brackets, colons, etc). Output goes to stderr.
+setup_logging() {
+  local _prefix="${1:?setup_logging requires a prefix (e.g. setup_logging \"[deploy-cluster]\")}"
+  # Stash the prefix in a function-local global so each subsequent call to
+  # setup_logging in the same process redefines log/fail with the new prefix.
+  # We don't try to support "nested" loggers — callers only need one.
+  eval "
+    log()  { printf '${_prefix} %s\\n' \"\$*\" >&2; }
+    fail() { printf '${_prefix} ERROR: %s\\n' \"\$*\" >&2; exit 1; }
+  "
+}
+
+# _ssh_opts_array_impl <out_array_name> <include_identity:0|1> [flags...]
+# Internal helper. Callers should use ssh_opts_array or
+# ssh_opts_array_no_identity. Recognized flags:
+#   --with-controlmaster      Add ControlMaster=auto + ControlPath + ControlPersist
+#   --proxy-jump=HOST         Add -o ProxyJump=HOST
+_ssh_opts_array_impl() {
+  local _out="$1" _with_identity="$2"
+  shift 2
+  local _with_cm=0 _proxy_jump=""
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      --with-controlmaster) _with_cm=1 ;;
+      --proxy-jump=*)       _proxy_jump="${_arg#--proxy-jump=}" ;;
+      *) echo "ssh_opts_array: unknown flag '$_arg'" >&2; return 2 ;;
+    esac
+  done
+
+  # Build the option list, then assign to the caller's array in one shot.
+  local _opts=()
+  if (( _with_identity == 1 )); then
+    : "${SSH_PRIVKEY_FILE:?ssh_opts_array requires SSH_PRIVKEY_FILE to be set}"
+    _opts+=( -i "$SSH_PRIVKEY_FILE" )
+  fi
+  _opts+=(
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o LogLevel=ERROR
+    -o ConnectTimeout=10
+    -o BatchMode=yes
+  )
+  if (( _with_cm == 1 )); then
+    _opts+=(
+      -o ControlMaster=auto
+      -o ControlPath=/tmp/hbird-update-%r@%h:%p
+      -o ControlPersist=60s
+    )
+  fi
+  if [[ -n "$_proxy_jump" ]]; then
+    _opts+=( -o "ProxyJump=${_proxy_jump}" )
+  fi
+
+  # Assign — use eval so the indirection works with arbitrary array names
+  # (printf -v doesn't support arrays in bash <5.1).
+  eval "${_out}=(\"\${_opts[@]}\")"
+}
+
+# ssh_opts_array <out_array_name> [--with-controlmaster] [--proxy-jump=HOST]
+# Build the canonical SSH option array (with -i SSH_PRIVKEY_FILE).
+ssh_opts_array() {
+  local _out="${1:?ssh_opts_array requires an output array name}"
+  shift
+  _ssh_opts_array_impl "$_out" 1 "$@"
+}
+
+# ssh_opts_array_no_identity <out_array_name> [--with-controlmaster] [--proxy-jump=HOST]
+# Same as ssh_opts_array but omits the `-i` line — for callers that
+# rely on agent auth or ~/.ssh/config (e.g. verify-hardening.sh).
+ssh_opts_array_no_identity() {
+  local _out="${1:?ssh_opts_array_no_identity requires an output array name}"
+  shift
+  _ssh_opts_array_impl "$_out" 0 "$@"
+}
+
+# resolve_vm_ip <vm-name> [retries] [interval-seconds]
+# Echo the first IPv4 from `virsh -c qemu:///system domifaddr <vm>`.
+# Defaults: 1 attempt, 0s interval (no retry). Pass higher retries for
+# the deploy-cluster boot-wait scenario (DHCP lease may take ~minutes).
+# Returns non-zero with a diagnostic on stderr if no IP appears.
+resolve_vm_ip() {
+  local vm="${1:?resolve_vm_ip requires a VM name}"
+  local retries="${2:-1}" interval="${3:-0}"
+  local attempt ip=""
+
+  for (( attempt = 1; attempt <= retries; attempt++ )); do
+    ip="$(virsh -c qemu:///system domifaddr "$vm" 2>/dev/null \
+      | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')"
+    if [[ -n "$ip" ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+    if (( attempt < retries )) && (( interval > 0 )); then
+      sleep "$interval"
+    fi
+  done
+
+  echo "resolve_vm_ip: could not resolve IPv4 for domain '${vm}' via 'virsh -c qemu:///system domifaddr' after ${retries} attempt(s). The DHCP lease may not be ready yet, or the domain may be powered off." >&2
+  return 1
+}
+
+# derive_ssh_privkey_file <pubkey-path>
+# Echo the conventional private-key path next to the pubkey. Errors with a
+# clear message if the result is not readable. Empty pubkey path is an error.
+derive_ssh_privkey_file() {
+  local pub="${1:?derive_ssh_privkey_file requires a public key path}"
+  local priv="${pub%.pub}"
+  if [[ ! -r "$priv" ]]; then
+    echo "derive_ssh_privkey_file: SSH private key not readable: ${priv} (expected next to ${pub})" >&2
+    return 1
+  fi
+  printf '%s\n' "$priv"
 }

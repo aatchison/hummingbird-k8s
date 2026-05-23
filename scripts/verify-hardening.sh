@@ -31,12 +31,15 @@
 
 set -euo pipefail
 
-log() { printf '[verify-hardening] %s\n' "$*" >&2; }
+# shellcheck source=../lib/build-common.sh
+source "$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/lib/build-common.sh"
+setup_logging "[verify-hardening]"
 
-# Build SSH option array. When KVM_HOST is set we tunnel through it as a
-# jump host so the libvirt NAT subnet doesn't need to be routable from
-# the dev machine. When KVM_HOST is unset the array stays empty and ssh
-# behaves exactly as before (direct connection to root@$CP_IP).
+# SSH options: KVM_HOST adds ProxyJump so the libvirt NAT subnet doesn't need
+# to be routable from the dev machine. This script keeps a deliberately narrow
+# opt set (no UserKnownHostsFile=/dev/null, no LogLevel=ERROR) so operators
+# running it from their workstation get normal ssh warnings — different needs
+# than the deploy/update/export flows, so it does NOT call ssh_opts_array.
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no)
 if [[ -n "${KVM_HOST:-}" ]]; then
   SSH_OPTS+=(-o "ProxyJump=${KVM_HOST}")

@@ -8,8 +8,11 @@
 
 set -euo pipefail
 
-log() { printf '[destroy-cluster] %s\n' "$*" >&2; }
-fail() { log "ERROR: $*"; exit 1; }
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=../lib/build-common.sh
+source "${REPO_ROOT}/lib/build-common.sh"
+setup_logging "[destroy-cluster]"
 
 CONFIG_PATH="${1:?usage: $0 <cluster.local.conf>}"
 [[ -r "$CONFIG_PATH" ]] || fail "config not readable: $CONFIG_PATH"
