@@ -90,6 +90,9 @@ The full set is in `cluster.example.conf`; the essentials:
 | `POOL_DIR` | no | `/var/lib/libvirt/images` | Where qcow2s + seed ISOs land. |
 | `RUN_VERIFY` | no | `false` | Run `scripts/verify-app-deploy.sh` after Ready. |
 | `KVM_HOST` | no | unset | Recorded in the summary for downstream `scripts/kubectl-k8s.sh` use. |
+| `BOOTC_UPDATE_SCHEDULE` | no | unset (use image default) | Override the `bootc-semver-update.timer` `OnCalendar=` on every node. Any systemd `OnCalendar=` value. See [Customizing auto-update](#customizing-auto-update). |
+| `BOOTC_UPDATE_REPO_K8S` | no | unset (use image-baked default) | OCI ref without tag — overrides the CP's tracked semver-update repo (e.g. point at a fork). |
+| `BOOTC_UPDATE_REPO_WORKER` | no | unset (use image-baked default) | OCI ref without tag — overrides workers' tracked semver-update repo. |
 
 When `AUTO_UPDATE_CP=false`, no `systemctl enable` runcmd is emitted —
 the YAML stays clean rather than relying on a no-op enable. Same logic
@@ -142,6 +145,8 @@ for `SWITCH_TO_GHCR=false`.
 | `/etc/hummingbird/worker-join.env` | **cloud-init** (`write_files`) | Short-TTL token minted from the live CP. NOT baked. |
 | `bootc switch` to GHCR | **cloud-init** (`runcmd`) | So the auto-update timer has a remote ref. |
 | `bootc-fetch-apply-updates.timer` enabled on the CP | **cloud-init** (`runcmd`) | Overrides #48's opt-out per `AUTO_UPDATE_CP`. |
+| `bootc-semver-update.timer` schedule override | **cloud-init** (`write_files` + `runcmd` reload) | Per `BOOTC_UPDATE_SCHEDULE`; only when set. See [Customizing auto-update](#customizing-auto-update). |
+| `/etc/hummingbird/bootc-update.env` (REPO override) | **cloud-init** (`write_files`) | Per `BOOTC_UPDATE_REPO_K8S` / `BOOTC_UPDATE_REPO_WORKER`; only when set. |
 
 ## Verifying the deploy
 
@@ -196,6 +201,81 @@ To disable auto-update entirely after deploy:
 ```bash
 ssh root@<vm-ip> systemctl disable --now bootc-fetch-apply-updates.timer
 ```
+
+## Customizing auto-update
+
+The image ships a `bootc-semver-update.timer` that fires daily with a
+~30-min randomized delay and an upstream-baked registry repo. The deploy
+script exposes three knobs to override those defaults per cluster
+without rebuilding the image — see [docs/auto-updates.md](auto-updates.md)
+for the image-side contract.
+
+### `BOOTC_UPDATE_SCHEDULE` — change when the timer fires
+
+Accepts any [systemd `OnCalendar=`](https://www.freedesktop.org/software/systemd/man/systemd.time.html)
+value. Examples:
+
+```bash
+# Weekly, Monday 3 AM (maintenance window)
+BOOTC_UPDATE_SCHEDULE="Mon *-*-* 03:00:00"
+
+# Every 15 minutes — for testing the update loop
+BOOTC_UPDATE_SCHEDULE="*:0/15"
+
+# Hourly
+BOOTC_UPDATE_SCHEDULE="hourly"
+```
+
+Leave commented to keep the image default (daily with random delay).
+
+When set, the deploy script writes
+`/etc/systemd/system/bootc-semver-update.timer.d/schedule.conf` via
+cloud-init `write_files` on **every** node (CP and workers) — it's a
+cluster-wide knob. The drop-in clears the baked `OnCalendar=` and sets
+the override:
+
+```ini
+[Timer]
+OnCalendar=
+OnCalendar=Mon *-*-* 03:00:00
+```
+
+The deploy script also adds a `runcmd` to `systemctl daemon-reload &&
+systemctl restart bootc-semver-update.timer` so the override **takes
+effect on first boot**, not just on subsequent reboots.
+
+### `BOOTC_UPDATE_REPO_K8S` / `BOOTC_UPDATE_REPO_WORKER` — track a different repo
+
+By default the timer tracks the upstream `ghcr.io/aatchison/hummingbird-k8s`
+and `ghcr.io/aatchison/hummingbird-k8s-worker` repos (baked at image
+build time in `/etc/hummingbird/bootc-update.env`). To track a fork's
+tags instead — e.g. you're running your own builds out of
+`ghcr.io/yourorg/hummingbird-k8s` — set:
+
+```bash
+BOOTC_UPDATE_REPO_K8S=ghcr.io/yourorg/hummingbird-k8s
+BOOTC_UPDATE_REPO_WORKER=ghcr.io/yourorg/hummingbird-k8s-worker
+```
+
+Format is an OCI ref **without** a tag — the semver-update script
+discovers and pins to the latest matching `vX.Y.Z` tag on its own.
+Note: `bootc-semver-update.timer` is separate from the legacy
+`bootc-fetch-apply-updates.timer` toggled by `AUTO_UPDATE_CP` (which
+follows the currently-pinned tag rather than discovering new semver
+tags). The two timers coexist; the semver one is the future-facing path.
+
+The two repo knobs are independent — set one without the other if your
+CP and workers should track different streams (uncommon but supported).
+
+### When overrides take effect
+
+Cloud-init writes the drop-in / env override during **first boot**, then
+the same runcmd block reloads systemd so the change applies immediately.
+A subsequent `bootc switch` + reboot preserves the drop-in (it lives in
+`/etc/`, not in the ostree-managed `/usr/`). Existing clusters won't
+pick up a changed `BOOTC_UPDATE_SCHEDULE` from `cluster.local.conf`
+because cloud-init only runs at first boot — to retune an existing
+cluster, edit the drop-in by hand or re-deploy the affected nodes.
 
 ## Differences from `make k8s && make workers`
 
