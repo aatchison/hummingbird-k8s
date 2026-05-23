@@ -17,12 +17,13 @@ fi
 MARKER=/var/lib/worker-init.done
 [[ -f "$MARKER" ]] && { echo "worker-init already ran"; exit 0; }
 
-# Wait for cloud-init to finish (if installed) so user-data's write_files
-# (specifically /etc/hummingbird/worker-join.env) has landed. systemd After=
-# can't be used; see the matching comment in k8s-init.sh.
-if command -v cloud-init >/dev/null 2>&1; then
-  cloud-init status --wait >/dev/null 2>&1 || true
-fi
+# cloud-init's write_files/network/config stages all run BEFORE
+# multi-user.target — which is when this service starts — so user-data
+# write_files (e.g. worker-join.env) and hostname have already landed.
+# cloud-final.service (runcmd, packages) runs AFTER multi-user.target
+# by design; we do NOT wait for it (waiting deadlocks against
+# multi-user.target itself — see #171, #172).
+
 
 JOIN_CMD_FILE=/etc/hummingbird/worker-join.env
 if [[ ! -s "$JOIN_CMD_FILE" ]]; then
