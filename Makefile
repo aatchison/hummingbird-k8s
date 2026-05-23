@@ -140,12 +140,13 @@ destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs +
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	sudo bash scripts/destroy-cluster.sh "$(CONFIG)"
 
-export-argocd: ## Export an ArgoCD-registerable kubeconfig from CONFIG=<path> (optional OUTPUT=, SERVER=, CONTEXT=)
+export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@CONFIG="$(CONFIG)" bash scripts/export-argocd.sh \
 		$(if $(OUTPUT),--output "$(OUTPUT)",) \
 		$(if $(SERVER),--server "$(SERVER)",) \
-		$(if $(CONTEXT),--context-name "$(CONTEXT)",)
+		$(if $(CONTEXT),--context-name "$(CONTEXT)",) \
+		$(if $(FORCE),--force,)
 
 switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
 	bash scripts/switch-to-ghcr.sh

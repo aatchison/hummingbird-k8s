@@ -43,11 +43,6 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-# REPO_ROOT is not referenced here, but keeping SCRIPT_DIR computed lets
-# future helpers in lib/ sourced from this script find their siblings.
-export SCRIPT_DIR
-
 log()  { printf '[export-argocd] %s\n' "$*" >&2; }
 fail() { printf '[export-argocd] ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -77,6 +72,18 @@ while [[ $# -gt 0 ]]; do
     *) fail "unknown flag: $1" ;;
   esac
 done
+
+# Validate --server BEFORE any interpolation. The override (if any) gets
+# spliced into a yq expression and/or a sed s|| substitution downstream;
+# both are sensitive to embedded quotes / shell metacharacters. Mirror the
+# conservative regex we use for --context-name below — strict enough to
+# rule out injection, permissive enough for ipv4 / hostnames / ports /
+# paths that operators actually use.
+if [[ -n "$SERVER_OVERRIDE" ]]; then
+  if ! [[ "$SERVER_OVERRIDE" =~ ^https?://[A-Za-z0-9._:-]+(/[A-Za-z0-9._/-]*)?$ ]]; then
+    fail "invalid --server URL: '$SERVER_OVERRIDE' (expected https://host[:port][/path])"
+  fi
+fi
 
 # ---- source CONFIG ----------------------------------------------------------
 
@@ -146,8 +153,11 @@ cleanup() { [[ -n "${TMP_KUBECONFIG:-}" && -e "$TMP_KUBECONFIG" ]] && rm -f "$TM
 trap cleanup EXIT
 
 log "fetching /etc/kubernetes/admin.conf from root@${CP_IP}"
-if ! cp_ssh "sudo cat /etc/kubernetes/admin.conf" > "$TMP_KUBECONFIG" 2>/dev/null; then
-  fail "ssh root@${CP_IP} 'sudo cat /etc/kubernetes/admin.conf' failed — is the CP up and reachable on $SSH_PRIVKEY_FILE?"
+# Let ssh's own stderr flow through to the operator — host-key mismatches,
+# Permission denied (publickey), sudo-no-tty, connection-refused all need
+# to be visible. The post-check fail() just appends a reminder.
+if ! cp_ssh "sudo cat /etc/kubernetes/admin.conf" > "$TMP_KUBECONFIG"; then
+  fail "ssh root@${CP_IP} 'sudo cat /etc/kubernetes/admin.conf' failed — see ssh diagnostic above (is the CP up and reachable on $SSH_PRIVKEY_FILE?)"
 fi
 [[ -s "$TMP_KUBECONFIG" ]] || fail "fetched admin.conf is empty"
 
@@ -157,13 +167,29 @@ if ! grep -q '^apiVersion:' "$TMP_KUBECONFIG" \
   fail "fetched file does not look like a kubeconfig (no 'kind: Config'). Refusing to continue."
 fi
 
+# ---- detect yq flavor -------------------------------------------------------
+# There are two unrelated tools that ship as `yq`:
+#   - mikefarah/yq    (Go)     — jq-like expressions, supports `-i` and
+#                                 ".clusters[0].cluster.server = ..." syntax.
+#   - kislyuk/yq      (Python) — wraps jq, different syntax + different
+#                                 flags. Distros sometimes ship this as the
+#                                 default `yq` (Fedora's python3-yq).
+# Only the Go flavor speaks the expressions below. Probe explicitly and
+# fall through to the (now line-anchored) sed path otherwise.
+use_yq=0
+if command -v yq >/dev/null 2>&1; then
+  if yq --version 2>&1 | grep -qiE 'mikefarah|go-yaml'; then
+    use_yq=1
+  fi
+fi
+
 # ---- rewrite server URL -----------------------------------------------------
-# Prefer yq if available — surgical and structure-aware. Fall back to a
+# Prefer Go yq if available — surgical and structure-aware. Fall back to a
 # constrained sed that only touches the `server: https://…` line inside a
 # clusters[].cluster block. kubeadm's admin.conf only has one cluster
 # entry, so the simple substitution is safe.
 
-if command -v yq >/dev/null 2>&1; then
+if [[ "$use_yq" -eq 1 ]]; then
   log "rewriting server URL via yq -> ${SERVER_URL}"
   yq -i ".clusters[0].cluster.server = \"${SERVER_URL}\"" "$TMP_KUBECONFIG"
 else
@@ -179,7 +205,7 @@ fi
 # the file plugs into ArgoCD without colliding with the operator's other
 # kubeconfigs (e.g. another in-tree cluster also named "kubernetes").
 
-if command -v yq >/dev/null 2>&1; then
+if [[ "$use_yq" -eq 1 ]]; then
   log "rewriting cluster/context/user names via yq -> ${CONTEXT_NAME}"
   yq -i "
     .clusters[0].name = \"${CONTEXT_NAME}\" |
@@ -191,25 +217,43 @@ if command -v yq >/dev/null 2>&1; then
   " "$TMP_KUBECONFIG"
 else
   log "rewriting cluster/context/user names via sed -> ${CONTEXT_NAME}"
-  # Drop all kubeadm defaults to CONTEXT_NAME. Order matters: do the
-  # composite context name (kubernetes-admin@kubernetes) BEFORE the
-  # singleton "kubernetes" / "kubernetes-admin" replacements, otherwise
-  # we'd produce ${CONTEXT_NAME}-admin@${CONTEXT_NAME}.
-  esc_ctx="$(printf '%s\n' "$CONTEXT_NAME" | sed -e 's/[\/&]/\\&/g')"
+  # Anchor each substitution to the specific kubeconfig key line. Global
+  # substitution of "kubernetes" → CONTEXT_NAME would also rewrite the
+  # string inside YAML comments (e.g. "# kubernetes-the-platform note") and
+  # — far worse — could collide with base64-encoded cert / key data where
+  # "kubernetes" happens to appear as a literal substring. We target the
+  # four canonical kubeadm-emitted lines and nothing else; this is
+  # structurally equivalent to the yq edits above.
+  # Use '#' as the sed delimiter — our regexes contain literal '|' for
+  # alternation, which would otherwise collide with the default '|' s||
+  # delimiter. Escape '#' in CONTEXT_NAME just in case (though our
+  # context-name validator already forbids it).
+  esc_ctx="$(printf '%s\n' "$CONTEXT_NAME" | sed -e 's/[\/&#]/\\&/g')"
+  # Six anchored substitutions, one per kubeadm-emitted key line. The
+  # leading-context group accepts either leading whitespace (e.g. "  name:")
+  # OR a YAML list-item dash (e.g. "- name:") since kubeadm emits
+  # users[0].name as `- name: kubernetes-admin` with no other leading
+  # whitespace. Order the composite "kubernetes-admin@kubernetes" pattern
+  # BEFORE the "kubernetes-admin" and bare "kubernetes" patterns so we
+  # don't partial-match the composite first.
   sed -i -E \
-    -e "s/kubernetes-admin@kubernetes/${esc_ctx}/g" \
-    -e "s/kubernetes-admin/${esc_ctx}/g" \
-    -e "s/(^|[^A-Za-z0-9_-])kubernetes([^A-Za-z0-9_-]|$)/\1${esc_ctx}\2/g" \
+    -e "s#^(([[:space:]]+|- )name:[[:space:]]+)kubernetes-admin@kubernetes\$#\1${esc_ctx}#" \
+    -e "s#^(current-context:[[:space:]]+)kubernetes-admin@kubernetes\$#\1${esc_ctx}#" \
+    -e "s#^(([[:space:]]+|- )name:[[:space:]]+)kubernetes-admin\$#\1${esc_ctx}#" \
+    -e "s#^([[:space:]]+user:[[:space:]]+)kubernetes-admin\$#\1${esc_ctx}#" \
+    -e "s#^(([[:space:]]+|- )name:[[:space:]]+)kubernetes\$#\1${esc_ctx}#" \
+    -e "s#^([[:space:]]+cluster:[[:space:]]+)kubernetes\$#\1${esc_ctx}#" \
     "$TMP_KUBECONFIG"
 fi
 
 # ---- move into place with 0600 ----------------------------------------------
+# `install -m 0600` is atomic-mode-set: the destination is created at the
+# requested mode in one step, no chmod-after-mv race window.
 
-chmod 0600 "$TMP_KUBECONFIG"
-mv -f "$TMP_KUBECONFIG" "$OUTPUT"
-chmod 0600 "$OUTPUT"
+install -m 0600 "$TMP_KUBECONFIG" "$OUTPUT"
+rm -f "$TMP_KUBECONFIG"
 # Disarm the EXIT trap — TMP_KUBECONFIG no longer exists.
-TMP_KUBECONFIG=""
+trap - EXIT
 
 log "kubeconfig written to ${OUTPUT}"
 log "register with:  argocd cluster add ${CONTEXT_NAME} --kubeconfig ${OUTPUT}"

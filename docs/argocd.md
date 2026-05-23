@@ -54,28 +54,76 @@ cluster is registered. There's no reason to keep it on a workstation.
 
 ## If the exported file leaks
 
-Treat it as a full-cluster credential compromise. The kubeadm-standard
-recovery is to rotate the cluster CA + client certs on the CP. From the
-CP node:
+Treat it as a full-cluster credential compromise — but be honest about
+what recovery actually means.
 
-```bash
-# Rotate every kubeadm-managed cert (apiserver, controller-manager,
-# scheduler, admin.conf, etc.). This re-signs the admin client cert.
-sudo kubeadm certs renew all
+**kubeadm has no CRL.** The Kubernetes apiserver, as kubeadm configures
+it, trusts any unexpired certificate signed by the cluster CA. There is
+no revocation list, no OCSP, no "this serial number is dead now" knob.
+Running `sudo kubeadm certs renew all` re-issues the local admin client
+cert with a new key — but **the leaked cert remains valid until its
+notAfter date** (the default kubeadm client-cert lifetime is 1 year).
+Anyone holding the leaked file can still authenticate against the CP
+until that expiry passes.
 
-# Restart the static-pod control plane to pick up the new certs.
-sudo systemctl restart kubelet
-```
+The only true revocation for a leaked `admin.conf` is to **rebuild the
+cluster** with a fresh CA. Workarounds short of that:
 
-`kubeadm certs renew` re-signs the leaf certs but keeps the existing
-cluster CA. If you suspect the CA private key (in `/etc/kubernetes/pki/`)
-also leaked — the exported `admin.conf` does NOT contain the CA private
-key, only the CA bundle — you have to rebuild the cluster from scratch;
-there is no in-place CA rotation in upstream kubeadm.
+- **Network-block the apiserver from where the attacker can reach it**
+  (firewall the CP, take the cluster off the routable network) until you
+  can rebuild or until the leaked cert expires.
+- **Rotate the cluster CA** — kubeadm has no in-place CA-rotation
+  command, so this is a manual + destructive procedure (regenerate
+  `/etc/kubernetes/pki/ca.*`, re-sign every leaf cert, restart every
+  kubelet with the new CA bundle). In practice this is the same effort
+  as a rebuild.
+- **Run `kubeadm certs renew all`** anyway — it doesn't revoke the
+  leaked cert, but it does give you a fresh local credential to keep
+  using, and it pushes the *next* compromise window forward by another
+  year:
+
+  ```bash
+  # CP node:
+  sudo kubeadm certs renew all
+  sudo systemctl restart kubelet
+  ```
+
+If you suspect the CA private key (in `/etc/kubernetes/pki/ca.key`)
+also leaked — the exported `admin.conf` does NOT contain it, only the CA
+bundle — rebuild is unconditional. There is no in-place CA rotation in
+upstream kubeadm.
 
 For the etcd at-rest encryption key (a separate credential class), see
 [etcd-encryption.md](etcd-encryption.md) and
 `scripts/rotate-etcd-encryption-key.sh`.
+
+## Cert lifecycle and re-exporting
+
+kubeadm issues `/etc/kubernetes/admin.conf`'s client cert with the
+default lifetime of **1 year**. After that, the cert in the exported
+file no longer authenticates — even though the kubeconfig is otherwise
+structurally valid.
+
+ArgoCD itself is unaffected: it discarded the original credential
+immediately after `argocd cluster add` and has been authenticating with
+its own ServiceAccount token ever since. The SA token has no fixed
+expiry tied to admin.conf.
+
+You only need to re-export if you intend to **re-register the cluster**
+with ArgoCD (new ArgoCD instance, restored from backup, etc.):
+
+```bash
+# CP node: refresh every kubeadm-managed cert (issues new 1y leaves).
+sudo kubeadm certs renew all
+sudo systemctl restart kubelet
+
+# Workstation: produce a fresh argocd-kubeconfig.yaml from the new
+# admin.conf.
+make export-argocd CONFIG=cluster.local.conf FORCE=1
+```
+
+If you forget the `FORCE=1`, the script refuses to overwrite the stale
+file — by design.
 
 ## Sanity check before handing the file to ArgoCD
 
