@@ -1,0 +1,12 @@
+[Unit]
+Description=Run bootc-semver-update daily
+Documentation=https://github.com/aatchison/hummingbird-k8s/blob/main/docs/auto-updates.md
+
+[Timer]
+OnBootSec=15min
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
