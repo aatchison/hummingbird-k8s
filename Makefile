@@ -54,6 +54,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         k3s k8s workers spawn \
         deploy-cluster \
         destroy-cluster \
+        update-cluster update-workers update-node \
         export-argocd \
         switch-to-ghcr \
         nodes kubectl \
@@ -139,6 +140,19 @@ deploy-cluster: ## Deploy a hybrid bib+cloud-init cluster from CONFIG=<path> (se
 destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs + qcow2s + seed ISOs)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	sudo bash scripts/destroy-cluster.sh "$(CONFIG)"
+
+update-cluster: ## Rolling bootc upgrade across CP + workers from CONFIG=<path> (CP no-drain reboot; workers drained)
+	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
+	@CONFIG="$(CONFIG)" sudo -E bash scripts/update-cluster.sh
+
+update-workers: ## Rolling bootc upgrade across workers only from CONFIG=<path>
+	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
+	@CONFIG="$(CONFIG)" sudo -E bash scripts/update-cluster.sh --workers-only
+
+update-node: ## Update a single node (NODE=name) from CONFIG=<path>
+	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
+	@[ -n "$(NODE)" ]   || { echo 'NODE=<name> required (CP_NAME or one of WORKER_NAMES)' >&2; exit 2; }
+	@CONFIG="$(CONFIG)" NODE="$(NODE)" sudo -E bash scripts/update-cluster.sh --node="$(NODE)"
 
 export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
