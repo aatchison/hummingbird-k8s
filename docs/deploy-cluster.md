@@ -28,17 +28,30 @@ keeps the same NoCloud datasource.
 
 ## Prerequisites
 
-The KVM host that will run the deploy needs everything from the main
-[Prerequisites](../README.md#prerequisites) section plus:
+The KVM host that will run the deploy needs:
 
+- `libvirt-daemon-system` running + `qemu:///system` reachable as root
+- `libvirt-clients` (`virsh`) + `virt-install` (`virtinst`/`virt-install` package) on `$PATH`
+- `podman` (for image pulls from GHCR or local builds)
+- `bootc-image-builder` accessible (the bib container image is pulled from `quay.io/centos-bootc/bootc-image-builder`)
 - `cloud-localds` (`cloud-utils` package) **or** `genisoimage`/`mkisofs`
-  on `$PATH` — used to build the NoCloud seed ISO.
+  on `$PATH` — used to build the NoCloud seed ISO
 - The published GHCR images for the tag you'll pin to (`IMAGE_SOURCE=ghcr`)
   reachable, **or** the ability to run `make image-k8s-with-cloud-init`
-  locally (`IMAGE_SOURCE=local`).
+  locally (`IMAGE_SOURCE=local`)
 - A clean libvirt: no existing domains with the names you're about to
   use (`virsh -c qemu:///system list --all`). The script refuses to
   overwrite an existing domain.
+- Outbound network to `ghcr.io`, `quay.io`, and (during first boot for cilium-cli)
+  `github.com`
+
+
+> **Warning — `AUTO_UPDATE_CP=true` on a single-CP cluster.** With this on, the
+> CP's `bootc-fetch-apply-updates.timer` will reboot the CP whenever a new
+> image lands at the tracked tag. A single-CP cluster has **no apiserver
+> availability** during the ~1–2 min reboot window. For production use either
+> deploy 3 CPs (see #11) or set `AUTO_UPDATE_CP=false` and run upgrades
+> manually during a maintenance window.
 
 ## Quickstart
 

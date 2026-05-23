@@ -215,7 +215,7 @@ virt-install --connect qemu:///system \
   --name "$CP_NAME" \
   --memory "$CP_MEMORY" --vcpus "$CP_VCPUS" \
   --disk "$CP_QCOW",format=qcow2,bus=virtio \
-  --disk "$CP_SEED",device=cdrom \
+  --disk path="$CP_SEED",device=cdrom,readonly=on \
   --import \
   --os-variant fedora-unknown \
   --network network=default,model=virtio \
@@ -317,7 +317,7 @@ for w in "${WORKER_NAMES[@]}"; do
     --name "$w" \
     --memory "$WORKER_MEMORY" --vcpus "$WORKER_VCPUS" \
     --disk "$w_qcow",format=qcow2,bus=virtio \
-    --disk "$w_seed",device=cdrom \
+    --disk path="$w_seed",device=cdrom,readonly=on \
     --import \
     --os-variant fedora-unknown \
     --network network=default,model=virtio \
