@@ -65,14 +65,18 @@ the log signal-to-noise ratio reasonable on a single-node lab cluster:
 writable HostPath so the apiserver process inside the pod can append
 to the log on the host filesystem.
 
-### 3. Kubelet `--protect-kernel-defaults=true` (kube-bench CIS 4.2.6)
+### 3. Kubelet hardening: `protect-kernel-defaults` + `rotate-certificates`
 
-The kubelet is started with `--protect-kernel-defaults=true` via
-`InitConfiguration.nodeRegistration.kubeletExtraArgs`. With this flag
-set, the kubelet refuses to *modify* kernel parameters at runtime — it
-will only start if the host already has the values it expects.
+The kubelet is started with two hardening flags via
+`InitConfiguration.nodeRegistration.kubeletExtraArgs`:
 
-`containers/k8s/Containerfile` therefore pre-sets the relevant sysctls in
+| Flag | Value | Rationale |
+|------|-------|-----------|
+| `protect-kernel-defaults` | `true` | kube-bench CIS 4.2.6 — kubelet refuses to *modify* kernel parameters at runtime; it will only start if the host already has the values it expects. |
+| `rotate-certificates` | `true` | The kubelet auto-renews its client certificate (used to authenticate to the apiserver as `system:node:<hostname>`) before expiry by issuing a new CSR against the apiserver and consuming the signed cert (#121). |
+
+With `protect-kernel-defaults=true` set,
+`containers/k8s/Containerfile` pre-sets the relevant sysctls in
 `/etc/sysctl.d/k8s.conf`:
 
 ```
@@ -87,6 +91,31 @@ kernel.keys.root_maxbytes = 25000000
 If kubelet refuses to start with a message like
 `kernel parameter "vm.overcommit_memory" doesn't match`, the host
 sysctl values have drifted from these — `sysctl --system` to reapply.
+
+With `rotate-certificates=true`, the kubelet watches its own
+`/var/lib/kubelet/pki/kubelet-client-current.pem`; ~70% through its
+validity window it submits a CSR via the
+`certificates.k8s.io/v1.CertificateSigningRequest` API and the
+controller-manager auto-approves it (the `kubelet-client-auto-approve`
+ClusterRoleBinding shipped by kubeadm covers this). Without this flag
+the kubelet's client cert silently expires after ~1y on a single-node
+lab cluster and the node goes `NotReady` until manually re-bootstrapped.
+
+### 4. Apiserver request timeout (closes #121)
+
+The apiserver `ClusterConfiguration` sets two timeout knobs:
+
+| Knob | Value | Purpose |
+|------|-------|---------|
+| `apiServer.timeoutForControlPlane` | `5m0s` | how long `kubeadm init` waits for the static-pod control-plane to become healthy before declaring init failed |
+| `apiServer.extraArgs[request-timeout]` | `5m` | apiserver flag — upper bound on the duration of any single HTTP request handler |
+
+The default `request-timeout` (1m for most endpoints, longer for
+watch streams) lets a wedged storage path tie up a handler goroutine
+indefinitely. `5m` is a deliberate, finite ceiling: long enough that
+healthy long-poll watches reset cleanly, short enough that a stuck
+handler bounces and surfaces as a 5xx instead of silently consuming
+goroutines forever.
 
 ## Where the configs live
 

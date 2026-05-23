@@ -115,12 +115,15 @@ nodeRegistration:
   kubeletExtraArgs:
     - name: protect-kernel-defaults
       value: "true"
+    - name: rotate-certificates
+      value: "true"
 ---
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 ${CONTROL_PLANE_ENDPOINT_YAML}networking:
   podSubnet: ${POD_CIDR}
 apiServer:
+  timeoutForControlPlane: 5m0s
   extraArgs:
     - name: encryption-provider-config
       value: /etc/kubernetes/encryption-config.yaml
@@ -134,6 +137,8 @@ apiServer:
       value: "100"
     - name: audit-log-maxbackup
       value: "5"
+    - name: request-timeout
+      value: "5m"
   extraVolumes:
     - name: encryption-config
       hostPath: /etc/kubernetes/encryption-config.yaml
@@ -161,7 +166,7 @@ EOF
 chmod 0600 /etc/kubernetes/kubeadm-init.yaml
 chown root:root /etc/kubernetes/kubeadm-init.yaml
 
-kubeadm init --config=/etc/kubernetes/kubeadm-init.yaml
+kubeadm init --config=/etc/kubernetes/kubeadm-init.yaml --skip-phases=addon/kube-proxy
 
 # Single-node: let workloads schedule on the control-plane
 KUBECONFIG=/etc/kubernetes/admin.conf kubectl taint nodes --all \
@@ -177,12 +182,23 @@ ln -sf /etc/kubernetes/admin.conf.world /etc/profile.d/kubeconfig-symlink-target
 chmod 0644 /etc/kubernetes/admin.conf
 
 # CNI: Cilium installed via cilium-cli (baked at image build time).
-# --wait blocks until pods become Ready; --set kubeProxyReplacement=false to
-# keep kube-proxy as the L4 plane (matches what flannel did; Cilium's
-# kube-proxy-replacement is opt-in via a separate PR).
+# --wait blocks until pods become Ready. kubeProxyReplacement=true makes
+# Cilium handle all L4 service routing in eBPF; kube-proxy is therefore
+# skipped at kubeadm init time (--skip-phases=addon/kube-proxy above).
+# k8sServiceHost/Port are required when kpr=true since Cilium can no longer
+# discover the apiserver via the (absent) kube-proxy ClusterIP — "auto"
+# resolves to the kubeadm-published control-plane endpoint.
+# Hubble + relay are enabled for flow visibility (#78); the UI is left off
+# to keep the install lean — operators reach Hubble via
+# `cilium hubble port-forward` + `hubble observe`.
 KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
   --version 1.16.5 \
-  --set kubeProxyReplacement=false \
+  --set kubeProxyReplacement=true \
+  --set k8sServiceHost=auto \
+  --set k8sServicePort=6443 \
+  --set hubble.enabled=true \
+  --set hubble.relay.enabled=true \
+  --set hubble.ui.enabled=false \
   --wait \
   --wait-duration 5m
 

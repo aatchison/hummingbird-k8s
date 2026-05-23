@@ -6,6 +6,7 @@
 #      (defaults to `restricted`, see docs/security-hardening.md #1).
 #   2. apiserver audit log is being written on the CP host.
 #   3. kubelet is running with `--protect-kernel-defaults=true`.
+#   4. kubelet is running with `--rotate-certificates=true` (#121).
 #
 # Run from anywhere with kubectl + SSH access to the CP:
 #
@@ -125,7 +126,7 @@ fi
 
 # --- 3. kubelet --protect-kernel-defaults=true ------------------------------
 
-log "check 3/3: kubelet running with --protect-kernel-defaults=true"
+log "check 3/4: kubelet running with --protect-kernel-defaults=true"
 # `ps -ef | grep | head` lets ssh return the matched argv line, which the
 # local shell then asserts is non-empty.
 kubelet_cmd="ps -ef | grep -- '--protect-kernel-defaults=true' | grep -v grep | head -1"
@@ -137,6 +138,19 @@ else
   log "  FAIL: kubelet is not running with --protect-kernel-defaults=true"
 fi
 
+# --- 4. kubelet --rotate-certificates=true ----------------------------------
+
+log "check 4/4: kubelet running with --rotate-certificates=true (#121)"
+rotate_cmd="ps -ef | grep -- '--rotate-certificates=true' | grep -v grep | head -1"
+rotate_ok=0
+if rotate_line="$(on_cp "$rotate_cmd" 2>/dev/null)" \
+   && [[ -n "$rotate_line" ]]; then
+  log "  PASS: kubelet has --rotate-certificates=true"
+  rotate_ok=1
+else
+  log "  FAIL: kubelet is not running with --rotate-certificates=true"
+fi
+
 # --- summary ----------------------------------------------------------------
 
 pass_label() { [[ "$1" -eq 1 ]] && printf PASS || printf FAIL; }
@@ -145,8 +159,9 @@ printf '\n[verify-hardening] summary\n'
 printf '  PodSecurity restricted    : %s\n' "$(pass_label "$ps_ok")"
 printf '  apiserver audit log       : %s\n' "$(pass_label "$audit_ok")"
 printf '  kubelet protect-kernel    : %s\n' "$(pass_label "$kubelet_ok")"
+printf '  kubelet rotate-certs      : %s\n' "$(pass_label "$rotate_ok")"
 
-if [[ "$ps_ok" -eq 1 && "$audit_ok" -eq 1 && "$kubelet_ok" -eq 1 ]]; then
+if [[ "$ps_ok" -eq 1 && "$audit_ok" -eq 1 && "$kubelet_ok" -eq 1 && "$rotate_ok" -eq 1 ]]; then
   printf '[verify-hardening] all checks PASSED\n'
   exit 0
 fi
