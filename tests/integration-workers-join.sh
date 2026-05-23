@@ -66,6 +66,7 @@ BIB_IMAGE="${BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
 SPAWNED_WORKERS=()
 
 CP_IP=""
+CP_SERIAL_READER_PID=""
 
 log() { printf '[integration-workers-join] %s\n' "$*" >&2; }
 
@@ -142,6 +143,14 @@ dump_failure_context() {
 
 cleanup() {
   local rc=$?
+  # Stop the CP serial reader (cat <pty> >CP_CONSOLE_LOG) BEFORE dumping
+  # failure context so the file has settled. Worker readers were started
+  # inside parallel subshells and are already orphaned to PID 1; they exit
+  # naturally when libvirt destroys their PTYs in the VM-teardown loop
+  # below.
+  if [[ -n "${CP_SERIAL_READER_PID:-}" ]]; then
+    kill "${CP_SERIAL_READER_PID}" 2>/dev/null || true
+  fi
   if [[ $rc -ne 0 ]]; then
     dump_failure_context
   fi
@@ -253,50 +262,29 @@ bib_build() {
 log "building CP qcow2 from ${CP_IMAGE}"
 bib_build "${CP_IMAGE}" "${CP_BIB_CFG}" "${CP_POOL_QCOW}"
 
-# Attach a `<serial type='file'>` device that writes the guest's secondary
-# serial port to a host file. We do this as a post-virt-install XML patch
-# because the inline `--serial file,...` / `--console pty,log.file=...`
-# forms produced an unstartable domain on the runner (the previous re-test
-# of #165 ended with State=shut off and no console log). Best-effort: if
-# the patch fails, dump_failure_context handles an empty console log
-# gracefully.
-attach_serial_file_to_domain() {
+# Tee the named domain's primary serial PTY (port=0) to a host-side file
+# so we can post-mortem first-boot failures even when sshd never comes up.
+# Earlier attempts at `--console pty,log.file=…` or post-XML
+# `<serial type='file'>` either produced unstartable domains or empty
+# logs on the runner — the simplest path that actually works is to ask
+# libvirt for the ttyconsole PTY AFTER `virsh start` returns and `cat` it
+# into a file in the background. Best-effort with a few retries to give
+# libvirt a moment to wire the PTY. Echoes the reader PID on stdout so the
+# caller can kill it during cleanup.
+tee_console_to_file() {
   local dom="$1" log_path="$2"
   : >"${log_path}"
-  # Mode 0666 because we don't try to predict qemu's effective uid/gid on
-  # the runner; SELinux is the other dragon, and we work around it by
-  # writing the file into /var/log/libvirt/qemu/ (handled at the call
-  # sites) rather than LIBVIRT_POOL_DIR where svirt_image_t blocks writes.
   chmod 0666 "${log_path}"
-  if ! virsh -c qemu:///system dumpxml "${dom}" >/dev/null 2>&1; then
-    return 0
-  fi
-  local tmp_xml="${WORK}/${dom}.xml"
-  if ! virsh -c qemu:///system dumpxml "${dom}" >"${tmp_xml}"; then
-    return 0
-  fi
-  if grep -q "serial type='file'" "${tmp_xml}"; then
-    return 0
-  fi
-  if ! python3 - "${tmp_xml}" "${log_path}" <<'PY'
-import sys, xml.etree.ElementTree as ET
-xml_path, log_path = sys.argv[1], sys.argv[2]
-tree = ET.parse(xml_path)
-root = tree.getroot()
-devices = root.find('devices')
-if devices is None:
-    sys.exit(2)
-ser = ET.SubElement(devices, 'serial', {'type': 'file'})
-ET.SubElement(ser, 'source', {'path': log_path, 'append': 'on'})
-ET.SubElement(ser, 'target', {'port': '1'})
-tree.write(xml_path, encoding='unicode')
-PY
-  then
-    log "(python XML patch failed for ${dom}; continuing without console log)"
-    return 0
-  fi
-  virsh -c qemu:///system define "${tmp_xml}" >/dev/null 2>&1 \
-    || log "(virsh define after serial-file patch failed for ${dom})"
+  local pty=""
+  for _ in 1 2 3 4 5; do
+    pty="$(virsh -c qemu:///system ttyconsole "${dom}" 2>/dev/null || true)"
+    if [[ -n "$pty" && -c "$pty" ]]; then
+      ( cat "$pty" >"${log_path}" 2>/dev/null & echo $! )
+      return 0
+    fi
+    sleep 1
+  done
+  log "(could not resolve ttyconsole PTY for ${dom}; console log will be empty)"
 }
 
 log "virt-installing CP ${CP_VM}"
@@ -311,11 +299,11 @@ virt-install --connect qemu:///system \
   --graphics none \
   --noautoconsole \
   --noreboot
-attach_serial_file_to_domain "${CP_VM}" "${CP_CONSOLE_LOG}"
 log "starting CP ${CP_VM}"
 if ! virsh -c qemu:///system start "${CP_VM}" 2>&1; then
   log "WARN: virsh start CP exited non-zero — domain may not be running"
 fi
+CP_SERIAL_READER_PID="$(tee_console_to_file "${CP_VM}" "${CP_CONSOLE_LOG}" || true)"
 
 # Resolve CP IP.
 log "waiting for CP DHCP lease (up to 3 min)"
@@ -465,13 +453,15 @@ spawn_worker() {
     --graphics none \
     --noautoconsole \
     --noreboot >&2
-  attach_serial_file_to_domain "${name}" "${console_log}" >&2
   # Surface virsh start errors to stderr — the prior `>/dev/null 2>&1 || true`
   # silently masked unstartable-domain failures, leaving cleanup confused
   # about whether the worker had actually been launched (#166).
   if ! virsh -c qemu:///system start "${name}" >&2; then
     echo "WARN: virsh start ${name} exited non-zero" >&2
   fi
+  # tee_console_to_file echoes the reader PID to stdout; redirect that so it
+  # doesn't pollute the function's own `echo "${name}"` below.
+  tee_console_to_file "${name}" "${console_log}" >&2 || true
   echo "${name}"
 }
 

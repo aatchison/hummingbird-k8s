@@ -62,6 +62,7 @@ SHARED_DIR=""
 # SERIAL_LOG is computed once we know LIBVIRT_POOL_DIR+VM_NAME and the dir
 # exists; kept as a global so dump_failure_context + cleanup can find it.
 SERIAL_LOG=""
+SERIAL_READER_PID=""
 
 log() { printf '[integration-boot-k3s] %s\n' "$*" >&2; }
 
@@ -107,6 +108,14 @@ dump_failure_context() {
 
 cleanup() {
   local rc=$?
+  # Stop the serial reader (cat <pty> >SERIAL_LOG) BEFORE dumping failure
+  # context so the file has settled. The reader was backgrounded inside a
+  # subshell, so it's not a child of THIS shell — we can kill by PID but
+  # `wait` would error with "not a child"; just SIGTERM and trust the
+  # filesystem write to have flushed.
+  if [[ -n "${SERIAL_READER_PID}" ]]; then
+    kill "${SERIAL_READER_PID}" 2>/dev/null || true
+  fi
   if [[ $rc -ne 0 ]]; then
     dump_failure_context
   fi
@@ -228,49 +237,41 @@ virt-install --connect qemu:///system \
   --noautoconsole \
   --noreboot
 
-# Bolt a `<serial type='file'>` device onto the domain BEFORE first boot.
-# We do this as a post-virt-install XML patch (rather than `--serial
-# file,...`) because the runner's virt-install/libvirt combination silently
-# produces an unstartable domain when the inline forms are used (the
-# previous re-test ended with State=shut off and `virsh start` failed
-# without diagnostic; #165). Patching the XML directly is the most
-# portable form: target port='1' so it adds a second serial port rather
-# than fighting whatever device virt-install put on port=0. Best-effort —
-# if anything in this block fails, we just won't have a console log;
-# dump_failure_context already gracefully handles an empty SERIAL_LOG.
-if virsh -c qemu:///system dumpxml "${VM_NAME}" >/dev/null 2>&1; then
-  tmp_xml="${WORK}/domain.xml"
-  if virsh -c qemu:///system dumpxml "${VM_NAME}" >"${tmp_xml}"; then
-    if ! grep -q "serial type='file'" "${tmp_xml}"; then
-      if python3 - "${tmp_xml}" "${SERIAL_LOG}" <<'PY'
-import sys, xml.etree.ElementTree as ET
-xml_path, log_path = sys.argv[1], sys.argv[2]
-tree = ET.parse(xml_path)
-root = tree.getroot()
-devices = root.find('devices')
-if devices is None:
-    sys.exit(2)
-ser = ET.SubElement(devices, 'serial', {'type': 'file'})
-ET.SubElement(ser, 'source', {'path': log_path, 'append': 'on'})
-ET.SubElement(ser, 'target', {'port': '1'})
-tree.write(xml_path, encoding='unicode')
-PY
-      then
-        virsh -c qemu:///system define "${tmp_xml}" >/dev/null 2>&1 \
-          || log "(virsh define after serial-file patch failed; continuing without console log)"
-      else
-        log "(python XML patch failed; continuing without console log)"
-      fi
-    fi
-  fi
-fi
-
 # Capture stderr from `virsh start` so a real start failure (the previous
 # re-test left the domain in State=shut off without telling us why; #165)
 # surfaces in the test log.
 log "starting VM ${VM_NAME}"
 if ! virsh -c qemu:///system start "${VM_NAME}" 2>&1; then
   log "WARN: virsh start exited non-zero — domain may not be running"
+fi
+
+# Tee the VM's primary console to a host-side log so we can post-mortem
+# first-boot failures even when sshd never comes up (#165). `virsh
+# ttyconsole` returns the PTY libvirt allocated for the guest's primary
+# serial port; piping `cat <pty>` into a file in the background captures
+# every kernel/systemd message the guest writes to ttyS0. The earlier
+# attempts (--console pty,log.file=, post-XML `<serial type='file'>`)
+# both ended in unstartable domains or empty logs.
+#
+# Best-effort: a few retries to give libvirt a moment to wire the PTY
+# after `virsh start` returns. The background reader gets cleaned up by
+# the EXIT trap (the cat exits naturally when libvirt tears down the
+# domain on cleanup).
+SERIAL_READER_PID=""
+for _ in 1 2 3 4 5; do
+  pty="$(virsh -c qemu:///system ttyconsole "${VM_NAME}" 2>/dev/null || true)"
+  if [[ -n "$pty" && -c "$pty" ]]; then
+    # `script` would also work but cat is enough; line-buffered so dumps
+    # in dump_failure_context show whatever has landed so far.
+    ( cat "$pty" >"${SERIAL_LOG}" 2>/dev/null & echo $! ) >"${WORK}/serial.pid"
+    SERIAL_READER_PID="$(cat "${WORK}/serial.pid")"
+    log "tee'ing ${pty} -> ${SERIAL_LOG} (pid=${SERIAL_READER_PID})"
+    break
+  fi
+  sleep 1
+done
+if [[ -z "$SERIAL_READER_PID" ]]; then
+  log "(could not resolve ttyconsole PTY; console log will be empty)"
 fi
 
 log "waiting for DHCP lease (up to 3 min)"
