@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Shared SSH/virsh/log helpers live in lib/build-common.sh; see docs/development.md.
 # scripts/update-cluster.sh — Rolling bootc upgrade across a deployed cluster.
 #
 # Reads the same CONFIG=<cluster.local.conf> as deploy-cluster.sh and walks
@@ -49,8 +50,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-log()  { printf '[update-cluster] %s\n' "$*" >&2; }
-fail() { printf '[update-cluster] ERROR: %s\n' "$*" >&2; exit 1; }
+# shellcheck source=../lib/build-common.sh
+source "${REPO_ROOT}/lib/build-common.sh"
+setup_logging "[update-cluster]"
 
 # ---- Flag parsing -----------------------------------------------------------
 
@@ -102,44 +104,35 @@ if [[ -z "${WORKER_NAMES+x}" ]]; then
   WORKER_NAMES=()
 fi
 
-# ---- SSH identity ----------------------------------------------------------
-# Same pattern as deploy-cluster.sh post-PR #185: pin the identity to the
-# private key paired with SSH_PUBKEY_FILE so nested sudo can't break us.
+# ---- SSH identity + opts ---------------------------------------------------
+# Pin identity to the private key paired with SSH_PUBKEY_FILE so nested sudo
+# can't break us. ssh_opts_array reads SSH_PRIVKEY_FILE; --with-controlmaster
+# adds the multiplex options that amortize ssh handshake cost across the
+# ~6-12 ssh invocations we make per node. The EXIT trap below `ssh -O exit`s
+# the ControlMaster sockets.
+if (( DRY_RUN == 1 )); then
+  # Dry-run never SSHes; explicit placeholder makes the resolved opt
+  # array obviously non-functional if it leaks into a real ssh call.
+  # shellcheck disable=SC2034  # SSH_PRIVKEY_FILE is read by ssh_opts_array
+  SSH_PRIVKEY_FILE="<dry-run-key>"
+else
+  # shellcheck disable=SC2034
+  SSH_PRIVKEY_FILE="$(derive_ssh_privkey_file "$SSH_PUBKEY_FILE")" \
+    || fail "SSH private key not readable next to $SSH_PUBKEY_FILE"
+fi
+ssh_opts_array SSH_OPTS --with-controlmaster
 
-SSH_PRIVKEY_FILE="${SSH_PUBKEY_FILE%.pub}"
+# Clean up any stale ControlMaster sockets from a prior aborted run.
+# Best-effort — won't fail if no stale sockets exist. The path matches
+# the ControlPath template in lib/build-common.sh::_ssh_opts_array_impl.
 if (( DRY_RUN == 0 )); then
-  [[ -r "$SSH_PRIVKEY_FILE" ]] || fail "SSH private key not readable: $SSH_PRIVKEY_FILE (expected next to $SSH_PUBKEY_FILE)"
+  rm -f /tmp/hbird-ssh-"${UID}"-* 2>/dev/null || true
 fi
 
-# ControlMaster/ControlPersist amortize SSH handshake cost across the ~6-12
-# ssh invocations we make per node. ControlPath is keyed per user@host:port
-# so each node gets its own multiplex socket; ControlPersist=60s lets idle
-# masters fall off naturally between iterations. The EXIT trap also tries
-# `ssh -O exit` for cleanliness.
-SSH_OPTS=(
-  -i "$SSH_PRIVKEY_FILE"
-  -o StrictHostKeyChecking=no
-  -o UserKnownHostsFile=/dev/null
-  -o LogLevel=ERROR
-  -o ConnectTimeout=10
-  -o BatchMode=yes
-  -o ControlMaster=auto
-  -o ControlPath=/tmp/hbird-update-%r@%h:%p
-  -o ControlPersist=60s
-)
-
 # ---- IP resolution ---------------------------------------------------------
-# deploy-cluster.sh leaves IPs as DHCP-assigned — re-resolve via virsh
-# domifaddr each run (cluster.local.conf doesn't pin them).
-
-resolve_vm_ip() {
-  local vm="$1"
-  virsh -c qemu:///system domifaddr "$vm" 2>/dev/null \
-    | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}'
-}
-
-# Allow operator override via env (CP_IP / WORKER_IPS-parallel-to-WORKER_NAMES)
-# so this can be driven against clusters with static addressing too.
+# deploy-cluster.sh leaves IPs as DHCP-assigned — re-resolve via resolve_vm_ip
+# each run. Operator can override via CP_IP / WORKER_IPS (parallel to
+# WORKER_NAMES) for clusters with static addressing.
 if [[ -z "${CP_IP:-}" ]]; then
   if (( DRY_RUN == 0 )); then
     CP_IP="$(resolve_vm_ip "$CP_NAME" || true)"

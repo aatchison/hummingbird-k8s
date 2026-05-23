@@ -221,3 +221,273 @@ source_lib() {
   [[ "$output" == *'name = "core"'* ]]
   [[ "$output" == *'name = "root"'* ]]
 }
+
+# ---------------------------------------------------------------------------
+# setup_logging (issue #190)
+# ---------------------------------------------------------------------------
+
+@test "setup_logging: log() prints '<prefix> <msg>' to stderr" {
+  source_lib
+  setup_logging "[unit-test]"
+  run bash -c 'source "'"$LIB"'"; setup_logging "[unit-test]"; log "hello"' 3>&-
+  [ "$status" -eq 0 ]
+  # bats' `run` merges stdout+stderr by default.
+  [[ "$output" == "[unit-test] hello" ]]
+}
+
+@test "setup_logging: fail() prints ERROR and exits 1" {
+  source_lib
+  run bash -c 'source "'"$LIB"'"; setup_logging "[unit-test]"; fail "boom"; echo NOT_REACHED'
+  [ "$status" -eq 1 ]
+  [[ "$output" == "[unit-test] ERROR: boom" ]]
+  [[ "$output" != *"NOT_REACHED"* ]]
+}
+
+@test "setup_logging: re-invocation switches prefix in place" {
+  source_lib
+  setup_logging "[first]"
+  run bash -c 'source "'"$LIB"'"; setup_logging "[first]"; setup_logging "[second]"; log "msg"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == "[second] msg" ]]
+}
+
+# ---------------------------------------------------------------------------
+# ssh_opts_array / ssh_opts_array_no_identity (issue #190)
+# ---------------------------------------------------------------------------
+
+@test "ssh_opts_array: includes -i SSH_PRIVKEY_FILE and the canonical hardened opt set" {
+  export SSH_PRIVKEY_FILE=/tmp/fake-key
+  source_lib
+  ssh_opts_array OPTS
+  # Spot-check the canonical opts. Each -o appears as a separate element so
+  # we can iterate easily.
+  [[ " ${OPTS[*]} " == *" -i /tmp/fake-key "* ]]
+  [[ " ${OPTS[*]} " == *" StrictHostKeyChecking=no "* ]]
+  [[ " ${OPTS[*]} " == *" UserKnownHostsFile=/dev/null "* ]]
+  [[ " ${OPTS[*]} " == *" LogLevel=ERROR "* ]]
+  [[ " ${OPTS[*]} " == *" ConnectTimeout=10 "* ]]
+  [[ " ${OPTS[*]} " == *" BatchMode=yes "* ]]
+  # Without --with-controlmaster, ControlMaster must NOT appear.
+  [[ " ${OPTS[*]} " != *"ControlMaster"* ]]
+}
+
+@test "ssh_opts_array --with-controlmaster: appends ControlMaster/Path/Persist" {
+  export SSH_PRIVKEY_FILE=/tmp/fake-key
+  source_lib
+  ssh_opts_array OPTS --with-controlmaster
+  [[ " ${OPTS[*]} " == *" ControlMaster=auto "* ]]
+  # Path is rekeyed on $UID + renamed to hbird-ssh-* so two operators on
+  # the same host don't collide on the multiplex socket.
+  [[ " ${OPTS[*]} " == *" ControlPath=/tmp/hbird-ssh-${UID}-%r@%h:%p "* ]]
+  [[ " ${OPTS[*]} " == *" ControlPersist=60s "* ]]
+}
+
+@test "ssh_opts_array: missing SSH_PRIVKEY_FILE fails loudly" {
+  unset SSH_PRIVKEY_FILE
+  source_lib
+  run ssh_opts_array OPTS
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"SSH_PRIVKEY_FILE"* ]]
+}
+
+@test "ssh_opts_array_no_identity: omits the -i line" {
+  source_lib
+  ssh_opts_array_no_identity OPTS
+  # No -i flag and no SSH_PRIVKEY_FILE reference at all.
+  [[ " ${OPTS[*]} " != *" -i "* ]]
+  # Still has the canonical hardened opts.
+  [[ " ${OPTS[*]} " == *" BatchMode=yes "* ]]
+  [[ " ${OPTS[*]} " == *" StrictHostKeyChecking=no "* ]]
+}
+
+@test "ssh_opts_array_no_identity --proxy-jump=HOST: appends ProxyJump option" {
+  source_lib
+  ssh_opts_array_no_identity OPTS --proxy-jump=geary
+  [[ " ${OPTS[*]} " == *" ProxyJump=geary "* ]]
+}
+
+@test "ssh_opts_array: unknown flag fails with rc!=0" {
+  export SSH_PRIVKEY_FILE=/tmp/fake-key
+  source_lib
+  run ssh_opts_array OPTS --no-such-flag
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unknown flag"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# resolve_vm_ip (issue #190)
+# ---------------------------------------------------------------------------
+
+@test "resolve_vm_ip: parses the first IPv4 from virsh domifaddr output" {
+  source_lib
+  # Stub virsh so it emits a representative domifaddr line.
+  virsh() {
+    cat <<'EOF'
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ vnet0      52:54:00:aa:bb:cc    ipv4         192.168.122.42/24
+EOF
+  }
+  export -f virsh
+  run resolve_vm_ip my-vm
+  [ "$status" -eq 0 ]
+  [ "$output" = "192.168.122.42" ]
+}
+
+@test "resolve_vm_ip: returns non-zero with diagnostic when no IP appears" {
+  source_lib
+  virsh() { :; }   # emits nothing
+  export -f virsh
+  run resolve_vm_ip ghost-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"could not resolve IPv4"* ]]
+  [[ "$output" == *"ghost-vm"* ]]
+}
+
+@test "resolve_vm_ip: retries until DHCP lease appears" {
+  source_lib
+  # Stub: empty on call 1, IP on call 2. Counter survives across calls via
+  # a file because bash functions can't share state with `run`'s subshell
+  # any other way that's portable.
+  COUNTER="$BATS_TEST_TMPDIR/counter"
+  echo 0 > "$COUNTER"
+  virsh() {
+    local n
+    n=$(cat "$COUNTER")
+    n=$((n + 1))
+    echo "$n" > "$COUNTER"
+    if (( n >= 2 )); then
+      echo " vnet0  52:54:00:aa:bb:cc  ipv4  10.0.0.5/24"
+    fi
+  }
+  export -f virsh
+  # 5 retries, 0s interval (test should run fast).
+  run resolve_vm_ip late-dhcp-vm 5 0
+  [ "$status" -eq 0 ]
+  [ "$output" = "10.0.0.5" ]
+}
+
+# ---------------------------------------------------------------------------
+# derive_ssh_privkey_file (issue #190)
+# ---------------------------------------------------------------------------
+
+@test "derive_ssh_privkey_file: echoes pub minus .pub when the key file is readable" {
+  source_lib
+  priv="$BATS_TEST_TMPDIR/id_test"
+  pub="${priv}.pub"
+  : > "$priv"
+  chmod 0600 "$priv"
+  : > "$pub"
+  run derive_ssh_privkey_file "$pub"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$priv" ]
+}
+
+@test "derive_ssh_privkey_file: errors when the private key is missing" {
+  source_lib
+  pub="$BATS_TEST_TMPDIR/missing.pub"
+  : > "$pub"
+  # Note: do NOT create the matching private key.
+  run derive_ssh_privkey_file "$pub"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"SSH private key not readable"* ]]
+}
+
+@test "derive_ssh_privkey_file: hard-fails when input does not end in .pub" {
+  source_lib
+  # An already-private path (no .pub suffix) — previously this would
+  # silently return the input unchanged, then ssh -i would fail with a
+  # confusing auth error. Now it must reject up front with rc=2.
+  priv="$BATS_TEST_TMPDIR/id_test"
+  : > "$priv"
+  run derive_ssh_privkey_file "$priv"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"must end in .pub"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# resolve_vm_ip — virsh probe + multi-NIC behavior
+# ---------------------------------------------------------------------------
+
+@test "resolve_vm_ip: virsh not on PATH yields a distinct error message" {
+  source_lib
+  # Strip virsh from PATH so command -v fails. Use a temp dir that
+  # contains nothing.
+  empty_path="$BATS_TEST_TMPDIR/emptybin"
+  mkdir -p "$empty_path"
+  # `unset -f virsh` defensively in case a prior test exported one.
+  unset -f virsh 2>/dev/null || true
+  PATH="$empty_path" run resolve_vm_ip my-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"virsh not installed"* ]]
+}
+
+@test "resolve_vm_ip: multi-NIC VM emits a warning to stderr and returns first IP" {
+  source_lib
+  virsh() {
+    cat <<'EOF'
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ vnet0      52:54:00:aa:bb:cc    ipv4         192.168.122.42/24
+ vnet1      52:54:00:dd:ee:ff    ipv4         10.0.0.5/24
+EOF
+  }
+  export -f virsh
+  run resolve_vm_ip multi-nic-vm
+  [ "$status" -eq 0 ]
+  # Stdout (in `run`'s merged $output) carries the first IP; the
+  # warning is emitted to stderr (also merged). Both must appear.
+  [[ "$output" == *"192.168.122.42"* ]]
+  [[ "$output" == *"WARNING"* ]]
+  [[ "$output" == *"2 IPv4 addresses"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# HBIRD_AUTOLOAD_CONFIG_LOCAL gating
+# ---------------------------------------------------------------------------
+
+@test "HBIRD_AUTOLOAD_CONFIG_LOCAL=0 (default): config.local.sh is NOT sourced" {
+  # Create a config.local.sh at the repo root that sets a marker env var.
+  # If the lib autoloads it unconditionally, the marker leaks into the
+  # post-source environment. We sanity-check by sourcing the lib in a
+  # subshell so the marker can't pollute the host bats process.
+  marker_file="$BATS_TEST_TMPDIR/local.sh"
+  cat >"$marker_file" <<'EOF'
+export HBIRD_AUTOLOAD_MARKER=tripped
+EOF
+  # Symlink it into the repo root as config.local.sh — but the repo
+  # already has a real one in development, so we use a sandbox: copy
+  # lib/build-common.sh into a temp tree and point it at our marker.
+  sandbox="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$sandbox/lib"
+  cp "$LIB" "$sandbox/lib/build-common.sh"
+  cp "$marker_file" "$sandbox/config.local.sh"
+
+  # Source in a clean subshell with the flag unset.
+  result="$(unset HBIRD_AUTOLOAD_CONFIG_LOCAL; bash -c "source '$sandbox/lib/build-common.sh' && printf '%s' \"\${HBIRD_AUTOLOAD_MARKER:-<unset>}\"")"
+  [[ "$result" == "<unset>" ]]
+}
+
+@test "verify-hardening.sh wires through ssh_opts_array_no_identity (no dead helper)" {
+  # Static grep — the helper was introduced for verify-hardening and
+  # must remain a live caller to justify its existence. If this fails,
+  # either restore the call site OR drop the helper from the lib +
+  # docs (see PR #202 review HIGH 1).
+  vh="${REPO_ROOT}/scripts/verify-hardening.sh"
+  [ -r "$vh" ]
+  grep -q 'ssh_opts_array_no_identity' "$vh"
+}
+
+@test "HBIRD_AUTOLOAD_CONFIG_LOCAL=1: config.local.sh IS sourced" {
+  marker_file="$BATS_TEST_TMPDIR/local.sh"
+  cat >"$marker_file" <<'EOF'
+export HBIRD_AUTOLOAD_MARKER=tripped
+EOF
+  sandbox="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$sandbox/lib"
+  cp "$LIB" "$sandbox/lib/build-common.sh"
+  cp "$marker_file" "$sandbox/config.local.sh"
+
+  result="$(HBIRD_AUTOLOAD_CONFIG_LOCAL=1 bash -c "source '$sandbox/lib/build-common.sh' && printf '%s' \"\${HBIRD_AUTOLOAD_MARKER:-<unset>}\"")"
+  [[ "$result" == "tripped" ]]
+}

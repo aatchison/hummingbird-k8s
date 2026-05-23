@@ -380,7 +380,8 @@ containers/<flavor>/   per-flavor Containerfile + first-boot scripts
                        under containers/shared/.
 scripts/               every driver script (build, define, redo, spawn,
                        kubectl wrapper, verifiers, kube-bench).
-lib/                   build-common.sh — sourced by scripts/build-*.sh.
+lib/                   build-common.sh — sourced by scripts/build-*.sh;
+                       shared SSH/log helpers documented in docs/development.md.
 docs/                  day-2 docs (image verification, hardening, etc.).
 references/            external materials referenced by docs.
 Makefile               canonical operator entry point; all targets call

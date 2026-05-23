@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Shared SSH/virsh/log helpers live in lib/build-common.sh; see docs/development.md.
 # scripts/export-argocd.sh — produce an ArgoCD-registerable kubeconfig.
 #
 # ArgoCD's `cluster add` command consumes a normal kubeconfig and uses it
@@ -43,8 +44,11 @@
 
 set -euo pipefail
 
-log()  { printf '[export-argocd] %s\n' "$*" >&2; }
-fail() { printf '[export-argocd] ERROR: %s\n' "$*" >&2; exit 1; }
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=../lib/build-common.sh
+source "${REPO_ROOT}/lib/build-common.sh"
+setup_logging "[export-argocd]"
 
 # ---- CONFIG + flag parsing --------------------------------------------------
 
@@ -99,18 +103,15 @@ source "$CONFIG"
 SSH_PUBKEY_FILE="${SSH_PUBKEY_FILE/#\~/$HOME}"
 
 [[ -r "$SSH_PUBKEY_FILE" ]] || fail "SSH_PUBKEY_FILE not readable: $SSH_PUBKEY_FILE"
-SSH_PRIVKEY_FILE="${SSH_PUBKEY_FILE%.pub}"
-[[ -r "$SSH_PRIVKEY_FILE" ]] || fail "SSH private key not readable: $SSH_PRIVKEY_FILE (expected next to $SSH_PUBKEY_FILE)"
+SSH_PRIVKEY_FILE="$(derive_ssh_privkey_file "$SSH_PUBKEY_FILE")" \
+  || fail "SSH private key not readable next to $SSH_PUBKEY_FILE"
 
 # ---- resolve CP_IP ----------------------------------------------------------
 # CP_IP can come from the config directly (operator pinned), or be resolved
-# via libvirt against CP_NAME on the local KVM host. Mirror deploy-cluster.sh.
+# via libvirt against CP_NAME on the local KVM host (resolve_vm_ip helper).
 
-if [[ -z "${CP_IP:-}" ]]; then
-  if command -v virsh >/dev/null 2>&1; then
-    CP_IP="$(virsh -c qemu:///system domifaddr "$CP_NAME" 2>/dev/null \
-              | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}' || true)"
-  fi
+if [[ -z "${CP_IP:-}" ]] && command -v virsh >/dev/null 2>&1; then
+  CP_IP="$(resolve_vm_ip "$CP_NAME" 2>/dev/null || true)"
 fi
 [[ -n "${CP_IP:-}" ]] || fail "could not resolve CP_IP — set CP_IP=<ip> in $CONFIG or run from the KVM host with libvirt access to '$CP_NAME'"
 
@@ -131,15 +132,8 @@ fi
 
 # ---- SSH helper -------------------------------------------------------------
 
-cp_ssh() {
-  ssh -i "$SSH_PRIVKEY_FILE" \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR \
-    -o ConnectTimeout=10 \
-    -o BatchMode=yes \
-    "root@${CP_IP}" "$@"
-}
+ssh_opts_array CP_SSH_OPTS
+cp_ssh() { ssh "${CP_SSH_OPTS[@]}" "root@${CP_IP}" "$@"; }
 
 # ---- pull admin.conf --------------------------------------------------------
 # umask 077 in the subshell so the temp file is mode 0600 from creation —
