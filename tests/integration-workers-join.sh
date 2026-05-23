@@ -275,16 +275,16 @@ tee_console_to_file() {
   local dom="$1" log_path="$2"
   : >"${log_path}"
   chmod 0666 "${log_path}"
-  local pty=""
+  local out=""
   for _ in 1 2 3 4 5; do
-    pty="$(virsh -c qemu:///system ttyconsole "${dom}" 2>/dev/null || true)"
-    if [[ -n "$pty" && -c "$pty" ]]; then
-      ( cat "$pty" >"${log_path}" 2>/dev/null & echo $! )
+    out="$(virsh -c qemu:///system ttyconsole "${dom}" 2>&1 || true)"
+    if [[ -c "${out}" ]]; then
+      ( cat "${out}" >"${log_path}" 2>/dev/null & echo $! )
       return 0
     fi
     sleep 1
   done
-  log "(could not resolve ttyconsole PTY for ${dom}; console log will be empty)"
+  log "(could not resolve ttyconsole PTY for ${dom}; last err: ${out:-<empty>}; console log will be empty)"
 }
 
 log "virt-installing CP ${CP_VM}"

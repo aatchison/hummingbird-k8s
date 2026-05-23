@@ -258,11 +258,11 @@ fi
 # the EXIT trap (the cat exits naturally when libvirt tears down the
 # domain on cleanup).
 SERIAL_READER_PID=""
+ttyc_err=""
 for _ in 1 2 3 4 5; do
-  pty="$(virsh -c qemu:///system ttyconsole "${VM_NAME}" 2>/dev/null || true)"
-  if [[ -n "$pty" && -c "$pty" ]]; then
-    # `script` would also work but cat is enough; line-buffered so dumps
-    # in dump_failure_context show whatever has landed so far.
+  ttyc_err="$(virsh -c qemu:///system ttyconsole "${VM_NAME}" 2>&1 || true)"
+  if [[ -c "${ttyc_err}" ]]; then
+    pty="${ttyc_err}"
     ( cat "$pty" >"${SERIAL_LOG}" 2>/dev/null & echo $! ) >"${WORK}/serial.pid"
     SERIAL_READER_PID="$(cat "${WORK}/serial.pid")"
     log "tee'ing ${pty} -> ${SERIAL_LOG} (pid=${SERIAL_READER_PID})"
@@ -271,7 +271,7 @@ for _ in 1 2 3 4 5; do
   sleep 1
 done
 if [[ -z "$SERIAL_READER_PID" ]]; then
-  log "(could not resolve ttyconsole PTY; console log will be empty)"
+  log "(could not resolve ttyconsole PTY; last err: ${ttyc_err:-<empty>}; console log will be empty)"
 fi
 
 log "waiting for DHCP lease (up to 3 min)"
