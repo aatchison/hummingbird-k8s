@@ -41,8 +41,20 @@ sysctl --system >/dev/null
 
 # Unique-ish hostname so kubelet doesn't claim "localhost.localdomain" on every
 # worker (kubeadm uses the local hostname as the node name).
-SUFFIX=$(cut -c1-8 /etc/machine-id)
-hostnamectl set-hostname "humbird-worker-${SUFFIX}"
+#
+# If cloud-init's hostname module already set a meaningful hostname during the
+# network stage (e.g. from a NoCloud seed's local-hostname / #cloud-config
+# hostname: directive), defer to it — clobbering it here would override the
+# operator's per-VM declaration and surface workers in the cluster under
+# humbird-worker-<machine-id> instead of the names cloud-init was told to use
+# (#186). Only fall back to the machine-id-derived name when the current
+# hostname is the localhost default (the legacy spawn-workers.sh path, which
+# does not seed cloud-init user-data).
+current_hostname="$(hostname)"
+if [[ "$current_hostname" == "localhost" || "$current_hostname" == "localhost."* ]]; then
+  SUFFIX=$(cut -c1-8 /etc/machine-id)
+  hostnamectl set-hostname "humbird-worker-${SUFFIX}"
+fi
 
 # Wait for cri-o socket
 for _ in $(seq 1 30); do
