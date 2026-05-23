@@ -2,9 +2,16 @@
 # see PR description for the procedure (`skopeo inspect docker://...:latest`).
 FROM quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0f22286fb41c9e00b4f3c9a862696e3bfb84
 
-# K8S_VERSION is the pkgs.k8s.io repo channel (major.minor only — the upstream
-# repo URL doesn't accept a patch version). Bump deliberately when promoting to
-# a new minor release; must match the control-plane image's K8S_VERSION.
+# K8S_VERSION pins the major.minor only (e.g. v1.31). pkgs.k8s.io URLs are
+# major.minor-scoped, so dnf installs the latest 1.31.x patch at build time.
+# This means patch-level CVE fixes ride in on every rebuild without manual
+# bumps; the trade-off is determinism — two builds of the same Containerfile
+# at different times can produce different images. Acceptable for a lab.
+#
+# Must match the control-plane image's K8S_VERSION; the k3s flavor pins
+# patch instead because its installer fetches a specific tagged binary. (#82)
+#
+# Bump deliberately (e.g., v1.32) when promoting to a new minor release.
 ARG K8S_VERSION=v1.31
 
 # Optional cloud-init support. Default OFF — the canonical Hummingbird
