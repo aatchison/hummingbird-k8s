@@ -123,6 +123,75 @@ make kubectl ARGS='get pods -A'
 `127.0.0.1:6443` and runs `kubectl` in a container against the fetched
 admin kubeconfig.
 
+## Useful commands
+
+### On the CP node (SSH'd as root)
+
+```bash
+# kubectl with the in-cluster admin kubeconfig
+export KUBECONFIG=/etc/kubernetes/admin.conf
+kubectl get nodes -o wide
+kubectl get pods -A
+kubectl top nodes                  # needs metrics-server (auto-installed)
+
+# Cilium status + Hubble flows (Hubble enabled by default since #168)
+cilium status --wait
+cilium hubble port-forward &       # tunnel to relay
+hubble observe --follow            # stream all flows
+hubble observe --verdict DROPPED   # only policy-dropped traffic
+
+# bootc lifecycle
+bootc status --json | jq '.status.booted.image.image.image'
+bootc upgrade                      # pull + stage the next image
+bootc rollback && systemctl reboot # roll back if a bad upgrade landed
+systemctl status k8s-init.service
+journalctl -fu k8s-init.service
+```
+
+### From a client (laptop / dev box)
+
+```bash
+# Tunnel + run kubectl through the bitnami container or native kubectl
+KVM_HOST=geary make nodes
+KVM_HOST=geary make kubectl ARGS='get pods -A'
+KVM_HOST=geary make kubectl ARGS='-n kube-system logs ds/cilium'
+
+# Verify suite (PSA + audit + kubelet protect-kernel + rotate-certs)
+KVM_HOST=geary make verify-hardening
+KVM_HOST=geary make verify-encryption
+KVM_HOST=geary make verify-app-deploy   # PSA-restricted nginx smoke test
+KVM_HOST=geary make verify-all          # all three in sequence
+
+# kube-bench (CIS benchmark scan)
+KVM_HOST=geary make kube-bench
+```
+
+### Cluster lifecycle
+
+```bash
+# Single-host quickstart (dev iteration)
+sudo make k8s                    # CP
+sudo make workers COUNT=2        # workers
+sudo make clean-vms              # tear down all hummingbird-* VMs
+
+# Production-style deploy (hybrid bib + cloud-init)
+cp cluster.example.conf cluster.local.conf   # edit it
+sudo make deploy-cluster  CONFIG=cluster.local.conf
+sudo make destroy-cluster CONFIG=cluster.local.conf
+
+# Point already-deployed VMs at GHCR so the auto-update timer pulls
+sudo make switch-to-ghcr
+```
+
+### etcd backup + key rotation
+
+```bash
+sudo make backup-etcd                              # ./backups/etcd-snapshot-<ts>.db
+sudo make backup-etcd LABEL=pre-cni-swap           # labeled snapshot
+sudo make restore-etcd SNAP=./backups/<file>.db    # destructive; prompts
+sudo make rotate-etcd-key                          # walks 4-stage key rotation
+```
+
 ## Configuration
 
 Per-host overrides live in `config.local.sh` (gitignored). Copy
