@@ -5,6 +5,10 @@ worker-join.env
 admin.conf
 admin.conf.*
 
+# Operator-fetched kubeconfigs (full-cluster credentials — never commit)
+/kubeconfig.yaml
+/argocd-kubeconfig.yaml
+
 # Logs from build/redo scripts
 *.log
 

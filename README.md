@@ -229,6 +229,15 @@ cluster/context/user after `CP_NAME` (no `hummingbird-` prefix) so
 `kubectl --context=<CP_NAME>` matches the libvirt domain name you already
 think in.
 
+> **Security model**: the file produced is `admin.conf` with the server URL
+> rewritten — full-cluster credentials. The client cert inside has a 1-year
+> default lifetime (kubeadm's default). Treat it like a private key: written
+> with mode 0600, never commit to git (this repo's `.gitignore` excludes
+> `kubeconfig.yaml` + `argocd-kubeconfig.yaml`), delete or move to a secure
+> store after use. To re-fetch after the cert rotates (or expires), pass
+> `FORCE=1`. See [docs/argocd.md](docs/argocd.md) for the leak-recovery
+> playbook (which applies identically to this target).
+
 ```bash
 make get-kubeconfig CONFIG=cluster.local.conf
 KUBECONFIG=./kubeconfig.yaml kubectl get nodes
@@ -237,7 +246,7 @@ KUBECONFIG=./kubeconfig.yaml kubectl get nodes
 make get-kubeconfig CONFIG=cluster.local.conf \
     SERVER=https://cluster.example.com:6443 \
     CONTEXT=prod-cp \
-    OUTPUT=~/.kube/hummingbird.yaml \
+    OUTPUT=$HOME/.kube/hummingbird.yaml \
     FORCE=1
 ```
 

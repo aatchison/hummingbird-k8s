@@ -172,10 +172,14 @@ export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CO
 #     name, while export-argocd uses the prefixed form to avoid
 #     colliding with whatever ArgoCD already has registered).
 # CONTEXT=/SERVER=/FORCE= still pass through.
-get-kubeconfig: ## Fetch a working kubeconfig from CONFIG=<path> (OUTPUT=, SERVER=, CONTEXT=, FORCE=1)
+# Recipe sources CONFIG here to read CP_NAME for the default context name;
+# the script re-sources CONFIG itself, so this is read-only / advisory.
+get-kubeconfig: ## Fetch kubeconfig.yaml from CONFIG=<path> (OUTPUT=, SERVER=, CONTEXT=, FORCE=1)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
+	@[ -r "$(CONFIG)" ] || { echo '[get-kubeconfig] CONFIG not readable: $(CONFIG)' >&2; exit 2; }
 	@set -e; \
 	  source "$(CONFIG)"; \
+	  : "$${CP_NAME:?[get-kubeconfig] CP_NAME required in $(CONFIG)}"; \
 	  CONTEXT_FROM_CONF="$(if $(CONTEXT),$(CONTEXT),$${CP_NAME})"; \
 	  CONFIG="$(CONFIG)" bash scripts/export-argocd.sh \
 	    --output "$(if $(OUTPUT),$(OUTPUT),kubeconfig.yaml)" \
