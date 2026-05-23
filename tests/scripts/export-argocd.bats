@@ -305,3 +305,175 @@ EOF
   [[ "$output" == *"--force"* ]]
   [[ "$output" == *"already exists"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# --help precedence: must succeed even when CONFIG is unset (and must
+# print the usage block including --proxy-jump). Regression catch for the
+# original parse-order bug where `: "${CONFIG:?...}"` ran first and
+# operators discovered the script via --help would see "CONFIG required"
+# and exit 1.
+# ---------------------------------------------------------------------------
+
+@test "--help (no CONFIG): succeeds and prints the usage block including --proxy-jump" {
+  # Deliberately leave CONFIG unset. The early --help pre-pass must
+  # short-circuit before the CONFIG check fires.
+  run env -u CONFIG bash "$SCRIPT" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Usage:"* ]]
+  [[ "$output" == *"--proxy-jump"* ]]
+}
+
+@test "-h (no CONFIG): same precedence as --help" {
+  run env -u CONFIG bash "$SCRIPT" -h
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Usage:"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# --proxy-jump robustness:
+#   1. --proxy-jump (space-form, no value) followed by another flag must
+#      fail loudly instead of silently consuming the next flag as a host.
+#   2. --proxy-jump= (explicit-empty) with KVM_HOST exported must NOT
+#      fall through to KVM_HOST — the operator's explicit "disable"
+#      intent has to win.
+#   3. --proxy-jump rejects values containing shell metacharacters that
+#      escape the -o value (whitespace, semicolon, dollar, etc).
+# ---------------------------------------------------------------------------
+
+@test "--proxy-jump (space-form) without a value rejects '--force' as the host" {
+  local cfg out
+  cfg="$(_make_stub_config)"
+  out="$BATS_TEST_TMPDIR/out.yaml"
+  # `--proxy-jump --force` — without the `--*` check the space-form arm
+  # captures `--force` as PROXY_JUMP, the regex accepts it (`-` is in
+  # the char class), and `-o ProxyJump=--force` lands in argv. The
+  # explicit `--*` check makes that case loud.
+  run env CONFIG="$cfg" bash "$SCRIPT" \
+    --proxy-jump --force --output "$out"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"did you forget the host"* ]]
+  [ ! -e "$out" ]
+}
+
+# Helper: build a stub-bin dir with `ssh` that captures argv and a
+# `mktemp` that works under busybox (the bats container uses busybox
+# coreutils, which doesn't accept GNU's `mktemp -t TEMPLATE` form).
+_make_stub_bin() {
+  local stub_dir="$BATS_TEST_TMPDIR/stub-bin"
+  mkdir -p "$stub_dir"
+  cat > "$stub_dir/ssh" <<'EOF'
+#!/usr/bin/env bash
+# Capture full argv to a known file so the test can grep for ProxyJump=.
+printf '%s\n' "$@" > "${SSH_ARGV_CAPTURE}"
+# Emit a minimal valid-looking admin.conf body so the post-fetch
+# "looks like a kubeconfig" check passes — we want the script to keep
+# going past the SSH step (where the ProxyJump decision has already
+# been made) so any later failures don't mask the argv we care about.
+cat <<'YML'
+apiVersion: v1
+kind: Config
+clusters:
+- name: kubernetes
+  cluster:
+    server: https://1.2.3.4:6443
+contexts:
+- name: kubernetes-admin@kubernetes
+  context:
+    cluster: kubernetes
+    user: kubernetes-admin
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+YML
+EOF
+  chmod +x "$stub_dir/ssh"
+  # Busybox mktemp doesn't grok `mktemp -t TEMPLATE.suffix`. Shim it
+  # to a portable path-only form. The script trusts mktemp's stdout
+  # as the temp path.
+  cat > "$stub_dir/mktemp" <<'EOF'
+#!/usr/bin/env bash
+# Argv comes in as `mktemp -t argocd-kubeconfig-XXXXXX.yaml`. Just
+# emit a unique path in $TMPDIR (or /tmp).
+path="${TMPDIR:-/tmp}/argocd-kubeconfig-$$-$RANDOM.yaml"
+: > "$path"
+chmod 0600 "$path"
+printf '%s\n' "$path"
+EOF
+  chmod +x "$stub_dir/mktemp"
+  echo "$stub_dir"
+}
+
+@test "--proxy-jump= (explicit-empty) with KVM_HOST exported disables ProxyJump" {
+  local cfg out stub_dir argv_capture
+  cfg="$(_make_stub_config)"
+  out="$BATS_TEST_TMPDIR/out.yaml"
+  stub_dir="$(_make_stub_bin)"
+  argv_capture="$BATS_TEST_TMPDIR/ssh-argv"
+
+  # KVM_HOST=geary exported globally — explicit --proxy-jump= must
+  # override it back to empty for this invocation.
+  run env CONFIG="$cfg" \
+    KVM_HOST=geary \
+    SSH_ARGV_CAPTURE="$argv_capture" \
+    PATH="${stub_dir}:${PATH}" \
+    bash "$SCRIPT" --proxy-jump= --output "$out"
+
+  # We don't care about the script's final exit code — the ProxyJump
+  # decision was made before the SSH stub ran, and we only need the
+  # captured argv.
+  [ -f "$argv_capture" ]
+  ! grep -qF 'ProxyJump=' "$argv_capture"
+}
+
+@test "--proxy-jump= (explicit-empty) without KVM_HOST: still no ProxyJump" {
+  local cfg out stub_dir argv_capture
+  cfg="$(_make_stub_config)"
+  out="$BATS_TEST_TMPDIR/out.yaml"
+  stub_dir="$(_make_stub_bin)"
+  argv_capture="$BATS_TEST_TMPDIR/ssh-argv"
+
+  run env -u KVM_HOST \
+    CONFIG="$cfg" \
+    SSH_ARGV_CAPTURE="$argv_capture" \
+    PATH="${stub_dir}:${PATH}" \
+    bash "$SCRIPT" --proxy-jump= --output "$out"
+
+  [ -f "$argv_capture" ]
+  ! grep -qF 'ProxyJump=' "$argv_capture"
+}
+
+@test "--proxy-jump absent + KVM_HOST exported: ProxyJump=KVM_HOST appears in ssh argv" {
+  local cfg out stub_dir argv_capture
+  cfg="$(_make_stub_config)"
+  out="$BATS_TEST_TMPDIR/out.yaml"
+  stub_dir="$(_make_stub_bin)"
+  argv_capture="$BATS_TEST_TMPDIR/ssh-argv"
+
+  run env CONFIG="$cfg" \
+    KVM_HOST=geary \
+    SSH_ARGV_CAPTURE="$argv_capture" \
+    PATH="${stub_dir}:${PATH}" \
+    bash "$SCRIPT" --output "$out"
+
+  [ -f "$argv_capture" ]
+  grep -qF 'ProxyJump=geary' "$argv_capture"
+}
+
+# ---------------------------------------------------------------------------
+# Symlink OUTPUT rejection
+# ---------------------------------------------------------------------------
+
+@test "--output points at a symlink: rejected with readlink-resolved hint" {
+  local cfg
+  cfg="$(_make_stub_config)"
+  local target="$BATS_TEST_TMPDIR/real-kubeconfig.yaml"
+  : > "$target"
+  local link="$BATS_TEST_TMPDIR/link-kubeconfig.yaml"
+  ln -s "$target" "$link"
+
+  # --force so the existing-file refusal doesn't fire first.
+  run env CONFIG="$cfg" bash "$SCRIPT" \
+    --server "https://1.2.3.4:6443" --output "$link" --force
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"symlink"* ]]
+}

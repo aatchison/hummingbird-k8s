@@ -247,6 +247,13 @@ think in.
 make get-kubeconfig CONFIG=cluster.local.conf
 KUBECONFIG=./kubeconfig.yaml kubectl get nodes
 
+# Tunnel the CP-fetch SSH session through the KVM host when your
+# workstation can't reach the libvirt NAT directly. Either form works
+# — KVM_HOST is the env-var path most operators already have set;
+# PROXY_JUMP is the per-invocation override.
+make get-kubeconfig CONFIG=cluster.local.conf KVM_HOST=geary
+make get-kubeconfig CONFIG=cluster.local.conf PROXY_JUMP=geary
+
 # Override the apiserver URL / context name / output / overwrite-if-present:
 make get-kubeconfig CONFIG=cluster.local.conf \
     SERVER=https://cluster.example.com:6443 \
@@ -254,6 +261,12 @@ make get-kubeconfig CONFIG=cluster.local.conf \
     OUTPUT=$HOME/.kube/hummingbird.yaml \
     FORCE=1
 ```
+
+`FORCE=1` snapshots the existing file to `kubeconfig.yaml.bak-<UTC>`
+(mode 0600) before writing. The backups are admin.conf-grade
+credentials; `.gitignore` excludes `*.bak-*`, but on a workstation they
+accumulate over time — periodically prune (`rm -i kubeconfig.yaml.bak-*`)
+once you no longer need a rollback target.
 
 For ArgoCD registration use `make export-argocd` instead — same fetch+rewrite
 logic, but it names the context `hummingbird-<CP_NAME>` to avoid colliding

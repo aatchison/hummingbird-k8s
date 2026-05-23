@@ -11,6 +11,11 @@ admin.conf.*
 # Operator-fetched kubeconfigs (full-cluster credentials — never commit)
 /kubeconfig.yaml
 /argocd-kubeconfig.yaml
+# ArgoCD/get-kubeconfig backup-on-force credentials (admin.conf-grade
+# full-cluster credentials at mode 0600; never commit). Match the
+# timestamped .bak-<UTC> suffix the --force path writes.
+/argocd-kubeconfig.yaml.bak-*
+/kubeconfig.yaml.bak-*
 
 # Logs from build/redo scripts
 *.log
