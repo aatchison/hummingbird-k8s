@@ -63,6 +63,7 @@ RUN curl -fsSL --retry 3 --retry-delay 2 -o /tmp/fedora.gpg \
 # self-contained drop-in keeps the cloud-init block independent of step
 # ordering. gpgcheck=1 against the Fedora keyring imported above (#70).
 COPY containers/shared/cloud-init/10-cloud-init.preset /usr/lib/systemd/system-preset/10-cloud-init.preset
+COPY containers/shared/cloud-init/98-hummingbird-users.cfg /etc/cloud/cloud.cfg.d/98-hummingbird-users.cfg
 COPY containers/shared/cloud-init/99-hummingbird-datasource.cfg /etc/cloud/cloud.cfg.d/99-hummingbird-datasource.cfg
 RUN if [ "${ENABLE_CLOUD_INIT}" = "1" ]; then \
       printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\n' \

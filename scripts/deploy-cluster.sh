@@ -184,8 +184,14 @@ CP_USER_DATA="$(mktemp -t hbird-cp-userdata-XXXXXX.yaml)"
 {
   printf '#cloud-config\n'
   printf 'hostname: %s\n' "$CP_NAME"
-  printf 'ssh_authorized_keys:\n'
-  printf '  - %s\n' "$SSH_PUBKEY_CONTENT"
+  # Set the key on root explicitly. The top-level `ssh_authorized_keys`
+  # defaults to cloud-init's "default user" which on Fedora is `fedora` —
+  # that fights the Hummingbird sudoless-root-only model.
+  printf 'disable_root: false\n'
+  printf 'users:\n'
+  printf '  - name: root\n'
+  printf '    ssh_authorized_keys:\n'
+  printf '      - %s\n' "$SSH_PUBKEY_CONTENT"
   # Only emit the runcmd block when at least one entry is needed — keeps
   # the user-data clean and matches the design constraint ("don't leave
   # runcmd in and rely on systemctl no-op").
@@ -281,8 +287,12 @@ worker_user_data() {
   {
     printf '#cloud-config\n'
     printf 'hostname: %s\n' "$worker_name"
-    printf 'ssh_authorized_keys:\n'
-    printf '  - %s\n' "$SSH_PUBKEY_CONTENT"
+    # See CP user-data for the disable_root / users-as-root rationale.
+    printf 'disable_root: false\n'
+    printf 'users:\n'
+    printf '  - name: root\n'
+    printf '    ssh_authorized_keys:\n'
+    printf '      - %s\n' "$SSH_PUBKEY_CONTENT"
     printf 'write_files:\n'
     printf '  - path: /etc/hummingbird/worker-join.env\n'
     printf '    owner: root:root\n'

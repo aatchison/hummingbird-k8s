@@ -37,6 +37,7 @@ COPY containers/shared/ssh/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-pas
 # default-OFF image is still byte-identical to pre-cloud-init) (#70). The
 # upstream bundle is binary-OpenPGP, so we re-armor via gpg before importing.
 COPY containers/shared/cloud-init/10-cloud-init.preset /usr/lib/systemd/system-preset/10-cloud-init.preset
+COPY containers/shared/cloud-init/98-hummingbird-users.cfg /etc/cloud/cloud.cfg.d/98-hummingbird-users.cfg
 COPY containers/shared/cloud-init/99-hummingbird-datasource.cfg /etc/cloud/cloud.cfg.d/99-hummingbird-datasource.cfg
 RUN if [ "${ENABLE_CLOUD_INIT}" = "1" ]; then \
       curl -fsSL --retry 3 --retry-delay 2 -o /tmp/fedora.gpg \
