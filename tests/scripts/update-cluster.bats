@@ -374,3 +374,184 @@ _load_example_workers() {
   ! echo "$output" | grep -q "WORKER: hbird-w1"
   echo "$output" | grep -q "WORKER: hbird-w2"
 }
+
+# ---------------------------------------------------------------------------
+# bootID + DaemonSet readiness gates (#195).
+#
+# Two new gates run between wait_ssh_back and uncordon:
+#   1. capture_node_bootid before the upgrade + wait_node_bootid_changed
+#      after wait_ssh_back, before wait_node_ready. Defeats the stale
+#      apiserver-cache Ready=True hit (apiserver may still report Ready
+#      from the pre-reboot lease before kubelet has re-registered).
+#   2. wait_node_daemonsets_ready after wait_node_ready, before uncordon.
+#      Node Ready means kubelet+CNI binary present; not that the Cilium /
+#      kube-proxy / coredns DaemonSet pods on this node are actually
+#      forwarding traffic.
+#
+# These tests assert the dry-run log lines for both gates appear in the
+# right order on EVERY node (CP + each worker). The integration test will
+# pick up real-cluster behavior via the self-hosted runner.
+# ---------------------------------------------------------------------------
+
+@test "dry-run emits 'pre-reboot bootID' capture line for the CP and each worker" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  # cluster.example.conf = 1 CP + 2 workers = 3 nodes total.
+  capture_n="$(echo "$output" | grep -cE 'DRY-RUN would capture pre-reboot bootID for ' || true)"
+  [ "$capture_n" -eq 3 ]
+  echo "$output" | grep -q "DRY-RUN would capture pre-reboot bootID for hbird-cp1"
+  echo "$output" | grep -q "DRY-RUN would capture pre-reboot bootID for hbird-w1"
+  echo "$output" | grep -q "DRY-RUN would capture pre-reboot bootID for hbird-w2"
+}
+
+@test "dry-run emits 'waiting for node X bootID to change' for the CP and each worker" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  wait_n="$(echo "$output" | grep -cE 'waiting for node .* bootID to change from pre-reboot value' || true)"
+  [ "$wait_n" -eq 3 ]
+  echo "$output" | grep -q "waiting for node hbird-cp1 bootID to change"
+  echo "$output" | grep -q "waiting for node hbird-w1 bootID to change"
+  echo "$output" | grep -q "waiting for node hbird-w2 bootID to change"
+}
+
+@test "dry-run emits 'waiting for kube-system DaemonSet pods on X' for the CP and each worker" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  ds_n="$(echo "$output" | grep -cE 'waiting for kube-system DaemonSet pods on .* to be Ready' || true)"
+  [ "$ds_n" -eq 3 ]
+  echo "$output" | grep -q "waiting for kube-system DaemonSet pods on hbird-cp1"
+  echo "$output" | grep -q "waiting for kube-system DaemonSet pods on hbird-w1"
+  echo "$output" | grep -q "waiting for kube-system DaemonSet pods on hbird-w2"
+}
+
+@test "dry-run gates appear in the documented order on a worker: bootID-changed BEFORE node Ready BEFORE daemonsets-ready BEFORE uncordon" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  # Extract the per-line "marker => line number" for hbird-w1 (any worker
+  # would do; w1 is the first in WORKER_NAMES). Anchored grep -n picks the
+  # first occurrence.
+  bootid_line="$(  echo "$output" | grep -nE 'waiting for node hbird-w1 bootID to change'                | head -1 | cut -d: -f1)"
+  ready_line="$(   echo "$output" | grep -nE 'waiting for node hbird-w1 to report Ready'                  | head -1 | cut -d: -f1)"
+  ds_line="$(      echo "$output" | grep -nE 'waiting for kube-system DaemonSet pods on hbird-w1'        | head -1 | cut -d: -f1)"
+  uncordon_line="$(echo "$output" | grep -nE 'DRY-RUN cp_kubectl -- uncordon hbird-w1$'                  | head -1 | cut -d: -f1)"
+  # All four must be present.
+  [ -n "$bootid_line"  ]
+  [ -n "$ready_line"   ]
+  [ -n "$ds_line"      ]
+  [ -n "$uncordon_line" ]
+  # Order constraint: bootid < ready < daemonsets < uncordon.
+  [ "$bootid_line" -lt "$ready_line"  ] || { echo "bootid=$bootid_line ready=$ready_line" >&2; false; }
+  [ "$ready_line"  -lt "$ds_line"     ] || { echo "ready=$ready_line ds=$ds_line"         >&2; false; }
+  [ "$ds_line"     -lt "$uncordon_line" ] || { echo "ds=$ds_line uncordon=$uncordon_line" >&2; false; }
+}
+
+@test "dry-run gates do NOT shift drain/uncordon counts (integration-test contract)" {
+  # Belt-and-suspenders: the integration test's assert-dry-run-sequence
+  # counts drains + uncordons by anchored cp_kubectl DRY-RUN echoes. The
+  # bootID + daemonset gate dry-run lines must NEVER match those patterns.
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  drain_n="$(  echo "$output" | grep -cE 'DRY-RUN cp_kubectl -- drain hbird-w[12] --ignore-daemonsets' || true)"
+  uncordon_n="$(echo "$output" | grep -cE 'DRY-RUN cp_kubectl -- uncordon hbird-w[12]$'                 || true)"
+  [ "$drain_n"    -eq 2 ]
+  [ "$uncordon_n" -eq 2 ]
+}
+
+@test "dry-run gates use READY_TIMEOUT, not a hardcoded value" {
+  # No new env knob: the bootID + daemonset gates share READY_TIMEOUT.
+  # An override must thread through both gate log lines.
+  READY_TIMEOUT=600 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "bootID to change from pre-reboot value (timeout 600s)"
+  echo "$output" | grep -q "kube-system DaemonSet pods on hbird-w1 to be Ready (timeout 600s)"
+}
+
+# ---------------------------------------------------------------------------
+# PR #208 round-1 review hardenings — bootID retry, baseline-unready
+# exclusion, phase-1 wait, --skip-gates, DAEMONSET_TIMEOUT validation,
+# READY_TIMEOUT=0 rejection.
+# ---------------------------------------------------------------------------
+
+@test "READY_TIMEOUT=0 is rejected (strict positive)" {
+  # Pre-#208 the regex permitted 0, which would defeat the gates.
+  READY_TIMEOUT=0 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "READY_TIMEOUT"
+}
+
+@test "DAEMONSET_TIMEOUT defaults to READY_TIMEOUT when unset" {
+  # No explicit DAEMONSET_TIMEOUT — should mirror READY_TIMEOUT in the
+  # startup-flags log and in the gate log line.
+  READY_TIMEOUT=450 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "daemonset=450s"
+  echo "$output" | grep -q "kube-system DaemonSet pods on hbird-w1 to be Ready (timeout 450s)"
+}
+
+@test "DAEMONSET_TIMEOUT env override surfaces independent of READY_TIMEOUT" {
+  DAEMONSET_TIMEOUT=900 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "daemonset=900s"
+  echo "$output" | grep -q "kube-system DaemonSet pods on hbird-w1 to be Ready (timeout 900s)"
+  # But the bootID gate must still be bound by READY_TIMEOUT.
+  echo "$output" | grep -q "bootID to change from pre-reboot value (timeout 300s)"
+}
+
+@test "DAEMONSET_TIMEOUT rejects bash-arithmetic injection payload" {
+  DAEMONSET_TIMEOUT='a[0$(reboot)]' run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "DAEMONSET_TIMEOUT"
+}
+
+@test "DAEMONSET_TIMEOUT=0 is rejected (strict positive)" {
+  DAEMONSET_TIMEOUT=0 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "DAEMONSET_TIMEOUT"
+}
+
+@test "--skip-gates skips bootID + DaemonSet gates (dry-run)" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run --skip-gates
+  [ "$status" -eq 0 ]
+  # Flag must surface in the startup summary.
+  echo "$output" | grep -q "skip-gates=1"
+  # In dry-run, gate log lines are emitted before the skip check
+  # short-circuits — but on a REAL run the gates skip-log the early-out.
+  # For the dry-run we assert the skip-log appears at least once per node
+  # (CP + 2 workers = 3 nodes; skip log fires for both gates).
+  # Note: in dry-run we still execute the gate's early `(( DRY_RUN == 1 ))`
+  # branch BEFORE the SKIP_GATES check. To make --skip-gates dry-run
+  # observable we put SKIP_GATES ahead of DRY_RUN in both gates. So:
+  bootid_skip=$(echo "$output" | grep -c "skipping bootID-changed gate" || true)
+  ds_skip=$(echo "$output" | grep -c "skipping DaemonSet readiness gate" || true)
+  [ "$bootid_skip" -ge 3 ]
+  [ "$ds_skip" -ge 3 ]
+}
+
+@test "--skip-gates is documented in --help output" {
+  run bash "$SCRIPT" --help
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q -- "--skip-gates"
+}
+
+@test "DAEMONSET_TIMEOUT is documented in --help output" {
+  run bash "$SCRIPT" --help
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "DAEMONSET_TIMEOUT"
+}
+
+@test "per-node worst-case time budget is announced in the startup banner" {
+  # The pre-announce line gives operators a quick "how long will this
+  # take" ceiling. Must reflect override values.
+  READY_TIMEOUT=400 DAEMONSET_TIMEOUT=500 SSH_TIMEOUT=200 DRAIN_TIMEOUT=10m \
+    run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "per-node worst-case budget: drain 10m + ssh-back 200s + bootID 400s + ready 400s + daemonsets 500s"
+}
+
+@test "bootID truncation log uses ASCII '...' not U+2026 ellipsis" {
+  # grep/copy-paste hygiene — the U+2026 (…) glyph caused trouble in
+  # postmortems where operators were greping for "post=" substrings.
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  ! echo "$output" | grep -qF $'\xe2\x80\xa6'
+}

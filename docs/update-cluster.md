@@ -30,13 +30,19 @@ order — the script:
 3. Snapshots the booted image digest via `bootc status --json` so the
    "no actual update" case can be detected (see
    [bootc no-update detection](#bootc-no-update-detection) below).
-4. `ssh root@NODE_IP bootc upgrade --apply` — `--apply` auto-reboots.
-5. Waits for SSH to come back, then for `kubectl get node NAME` to
-   report `Ready` (the regex covers `Ready,SchedulingDisabled` too —
-   workers come back cordoned-but-Ready until step 6 lands).
-6. For workers: `kubectl uncordon NODE`.
-7. Restarts `bootc-fetch-apply-updates.timer` on the node.
-8. Sleeps 5s before moving on (small breather; not load-bearing).
+4. Captures the node's `.status.nodeInfo.bootID` (see
+   [Reboot detection (bootID)](#reboot-detection-bootid) below).
+5. `ssh root@NODE_IP bootc upgrade --apply` — `--apply` auto-reboots.
+6. Waits for SSH to come back; then waits for `bootID` to differ from
+   the pre-reboot value (proves a real reboot happened — defeats the
+   stale-apiserver-cache hit on Ready); then for `kubectl get node NAME`
+   to report `Ready` (the regex covers `Ready,SchedulingDisabled` too —
+   workers come back cordoned-but-Ready until step 8 lands); then for
+   every kube-system DaemonSet pod on the node to be Ready (see
+   [Daemonset readiness gate](#daemonset-readiness-gate)).
+7. For workers: `kubectl uncordon NODE`.
+8. Restarts `bootc-fetch-apply-updates.timer` on the node.
+9. Sleeps 5s before moving on (small breather; not load-bearing).
 
 The CP is rolled before workers so that any apiserver outage happens
 while workloads are still on their original nodes — workers don't lose
@@ -78,7 +84,8 @@ Environment variables the script honors:
 | `CONFIG` | `./cluster.local.conf` | Path to the cluster config. |
 | `DRY_RUN=1` | unset | Same as `--dry-run` — print actions, don't ssh/kubectl. Useful for unprivileged previews; bypasses the root-required check. |
 | `DRAIN_TIMEOUT` | `5m` | `kubectl drain --timeout=` value (Go duration string). Tune up for workloads with slow graceful-shutdown. |
-| `READY_TIMEOUT` | `300` | Seconds to wait for `kubectl get node` to report `Ready` post-reboot. |
+| `READY_TIMEOUT` | `300` | Seconds to wait for `kubectl get node` to report `Ready` post-reboot. Also bounds the [bootID-changed gate](#reboot-detection-bootid). Must be > 0. |
+| `DAEMONSET_TIMEOUT` | `${READY_TIMEOUT}` | Seconds to wait for the [DaemonSet readiness gate](#daemonset-readiness-gate). Defaults to `READY_TIMEOUT` for compatibility; set independently when the DS gate needs more (or less) headroom than node-Ready. Must be > 0. |
 | `APISERVER_TIMEOUT` | `300` | Seconds to wait for the CP apiserver to answer `/readyz` after the CP reboots. |
 | `SSH_TIMEOUT` | `300` | Seconds to wait for `ssh root@<ip>` to come back post-reboot. |
 | `INTER_NODE_SLEEP` | `5` | Seconds to pause after uncordoning a node before processing the next one (small settle window). |
@@ -98,7 +105,8 @@ startup with strict regexes before any privileged call:
 | Var | Accepted pattern |
 | --- | --- |
 | `DRAIN_TIMEOUT` | `^[0-9]+(s\|m\|h)?$` (bare integer or a kubectl-style duration) |
-| `READY_TIMEOUT` | `^[0-9]+$` |
+| `READY_TIMEOUT` | `^[1-9][0-9]*$` (strictly positive — 0 would short-circuit the gate) |
+| `DAEMONSET_TIMEOUT` | `^[1-9][0-9]*$` (strictly positive) |
 | `APISERVER_TIMEOUT` | `^[0-9]+$` |
 | `SSH_TIMEOUT` | `^[0-9]+$` |
 | `INTER_NODE_SLEEP` | `^[0-9]+$` (0 is allowed; it skips the inter-batch sleep) |
@@ -163,6 +171,30 @@ sudo -E bash scripts/update-cluster.sh --skip-drain
 Use sparingly — `kubectl drain` is the only thing keeping workloads
 from being killed mid-flight. Reserve this for stuck drains where you
 have already accepted the workload disruption.
+
+### `--skip-gates`
+
+Operator escape hatch — skip the bootID-changed and DaemonSet-readiness
+gates added in PR #208. `wait_node_ready` alone is the post-reboot
+signal in this mode, which is what `update-cluster.sh` did pre-#208.
+
+```bash
+sudo -E bash scripts/update-cluster.sh --skip-gates
+```
+
+Use **only** if you've verified the cluster is healthy via other means
+(`kubectl get pods -n kube-system`, manual `bootc status`, etc.). The
+gates exist to prevent dataplane outages during the roll — turning them
+off re-introduces the stale-apiserver-cache and pending-pods-window
+risks described in
+[Reboot detection (bootID)](#reboot-detection-bootid) and the
+[DaemonSet readiness gate](#daemonset-readiness-gate).
+
+Common reason to reach for this: the gates are misfiring on a
+known-healthy cluster (e.g. a non-DaemonSet kube-system pod is
+chronically in CrashLoop and pre-#208 baseline-exclusion didn't pick
+it up). The right fix in that case is to file an issue with the gate
+log line, not to leave `--skip-gates` on permanently.
 
 ### `--dry-run`
 
@@ -363,6 +395,123 @@ Today the script snapshots
 
 Added in commit `9dabcab` from PR #187 round-1 fixes.
 
+## Reboot detection (bootID)
+
+`wait_node_ready` alone is not sufficient to prove a node has actually
+rebooted on the new image — there's a brief window where the apiserver
+still serves a cached `Ready=True` from the **pre-reboot** kubelet
+lease, before the post-reboot kubelet has re-registered. A naive
+`wait_node_ready` returns immediately from that cached state and the
+script moves on to drain N+1 while N is in the middle of rebooting,
+which can cascade into a real outage.
+
+To defeat this, the script captures the node's
+`.status.nodeInfo.bootID` **before** issuing `bootc upgrade --apply`,
+and after `wait_ssh_back` returns it polls until the bootID differs
+from the captured value:
+
+```text
+[update-cluster]   pre-reboot bootID: 7a0e3b8c…
+[update-cluster] waiting for node hbird-w1 bootID to change from pre-reboot value (timeout 300s)
+[update-cluster] node hbird-w1 bootID changed (pre=7a0e3b8c… post=4f1d22a3…) after ~62s
+```
+
+The kernel regenerates `bootID` on every boot, so a changed value
+*proves* the node has actually rebooted (no apiserver-cache window can
+fake it). Only then does `wait_node_ready` run.
+
+Bounded by the existing `READY_TIMEOUT` env knob (no new env var). On
+timeout the gate routes through `worker_fail` for workers (so
+`--continue-on-error` still applies) or `fail` for the CP (CP failures
+remain fatal). The cordoned-node recovery path from
+[Recovery from interruption](#recovery-from-interruption) covers the
+case where a worker times out at this gate — the node stays cordoned
+until the operator restores it.
+
+Implementation: `capture_node_bootid` + `wait_node_bootid_changed` in
+`scripts/update-cluster.sh`. The pre-bootid is captured **before**
+`bootc_upgrade_apply` is called; `capture_node_bootid` retries up to
+3 times with a 2s sleep between attempts so a single transient
+apiserver flake doesn't silently regress the gate. If the capture is
+still empty after retries, both `capture_node_bootid` and
+`wait_node_bootid_changed` log a `WARN:`-prefixed line (greppable in
+postmortems) and the gate skips — there's no useful baseline to
+compare against, and blocking the whole roll on a missing field is
+worse than letting `wait_node_ready` carry the load alone for that
+node.
+
+The polling loop emits a progress heartbeat every ~30s during a slow
+reboot, and on timeout logs the last observed `pre=…/cur=…` digests so
+an operator can tell at a glance whether the apiserver returned
+anything at all.
+
+## Daemonset readiness gate
+
+`wait_node_ready` proves kubelet is alive and the CNI **binary** is
+present on disk — it does **not** prove the per-node DaemonSet pods
+that implement the data plane (Cilium agent, kube-proxy, coredns) are
+running and forwarding traffic. Before this gate, the script could
+proceed to drain N+1 while Cilium on N was still in `CrashLoopBackOff`,
+producing brief networking outages as the next eviction's pods landed
+on N+1 with no functional CNI on N to talk to.
+
+After `wait_node_ready` returns, the script now polls all
+kube-system pods scheduled on the node and blocks until every
+container reports `ready: true`:
+
+```text
+[update-cluster] waiting for kube-system DaemonSet pods on hbird-w1 to be Ready (timeout 300s)
+[update-cluster] node hbird-w1 kube-system DaemonSet pods all Ready after ~18s
+```
+
+The implementation uses a server-side `kubectl get pods
+--field-selector=spec.nodeName=NODE -o jsonpath=…` (no client-side jq
+dependency on the operator host; matches the
+[`bootc_booted_digest`](#bootc-no-update-detection) pattern of running
+jq remotely if at all). The filter narrows to pods on this node and
+emits per-container readiness; any `false` keeps the wait running.
+
+Bounded by the `DAEMONSET_TIMEOUT` env knob (defaults to `READY_TIMEOUT`
+for backward compatibility — see the env-knob table above). On timeout
+the gate routes through `worker_fail` for workers (so
+`--continue-on-error` still applies) or `fail` for the CP. The same
+cordoned-node recovery path from
+[Recovery from interruption](#recovery-from-interruption) applies if a
+worker hits this timeout.
+
+Round-1 review hardenings (PR #208):
+
+- **Baseline-unready exclusion.** Pods that are already unready at gate
+  entry (chronic CrashLoops in kube-system unrelated to this upgrade)
+  are snapshotted and excluded — only **new** unready pods (post-
+  baseline) gate progress. Without this exclusion a long-standing
+  unrelated failure would block every roll forever.
+- **Phase-1 wait for first pod.** After a reboot the DaemonSet controller
+  takes a few seconds to bind pods to the freshly-rejoined node. The
+  gate now first waits up to 60s for at least one kube-system pod to
+  appear on the node, then enters the readiness loop. A genuinely-empty
+  node (fresh cluster, no DaemonSets deployed) logs a WARN and proceeds
+  rather than hanging.
+- **Progress heartbeat** every ~30s during the readiness wait so
+  operators tailing the log can see the gate is still alive on a slow
+  Cilium rollout.
+
+False-positive note: pods in kube-system that are not DaemonSet-managed
+(a transient `Job`, an admission-webhook `Deployment`) will also keep
+the wait running if any of their containers is not Ready. In practice
+the kube-system namespace is overwhelmingly DaemonSets + CP-only
+static pods, and the gate's wall-clock cost is dominated by the
+worst-case container rather than the count of pods evaluated — so we
+accept the over-conservative match in exchange for not introducing a
+fragile owner-reference jsonpath.
+
+For Cilium-specific failure modes that surface at this gate (chronic
+agent crashloop, kube-proxy/iptables conflict, missing CRDs), see
+[`docs/cilium-migration.md`](cilium-migration.md) and the CNI section
+of [`docs/troubleshooting.md`](troubleshooting.md). If
+`--skip-gates` is necessary as a workaround, document the cluster
+state in the issue you file so the gate logic can be tightened.
+
 ## `--apply` fallback for older bootc
 
 `bootc upgrade --apply` is bootc 1.1+. The script probes for support
@@ -442,6 +591,17 @@ sudo make update-node CONFIG=cluster.local.conf NODE=<node>
 If the script aborted before drain, no recovery is needed beyond
 re-running the upgrade.
 
+If the abort came from the
+[bootID-changed gate](#reboot-detection-bootid) or the
+[DaemonSet readiness gate](#daemonset-readiness-gate) — both bounded
+by `READY_TIMEOUT` and routed through `worker_fail` / `fail` — the
+node is left cordoned and the runbook above applies as-is. Common
+root causes: the bootc reboot stalled at first boot (check
+`virsh console <name>` or `journalctl -u systemd-journald`); Cilium
+agent on the node is in `CrashLoopBackOff` (check `kubectl logs
+-n kube-system <cilium-pod>` from the CP); a network policy is
+blocking the new node from reaching the CP.
+
 ## Resume after interruption
 
 If a roll dies partway — operator Ctrl-C, host crash, a drain failure
@@ -509,7 +669,15 @@ small homelab cluster with fast SSDs, the actual times are typically:
 | drain | 5-30s | `DRAIN_TIMEOUT=5m` |
 | SSH back post-reboot | 30-60s | `SSH_TIMEOUT=300` |
 | apiserver back (CP only) | 60-120s | `APISERVER_TIMEOUT=300` |
+| bootID changed | 30-90s | `READY_TIMEOUT=300` |
 | node Ready | 30-90s | `READY_TIMEOUT=300` |
+| DaemonSet pods Ready | 10-60s | `DAEMONSET_TIMEOUT=${READY_TIMEOUT}` |
+
+The script's startup banner pre-announces the per-node worst-case time
+budget (`drain ${DRAIN_TIMEOUT} + ssh-back ${SSH_TIMEOUT} + bootID
+${READY_TIMEOUT} + ready ${READY_TIMEOUT} + daemonsets
+${DAEMONSET_TIMEOUT}`) so an operator can compute "when will this
+finish?" off the cluster size before hitting Enter.
 
 Tightening these makes a stuck node fail faster instead of waiting the
 full 5 minutes:
@@ -606,6 +774,20 @@ the CP causes it, and it happens exactly once per run.
 - **`worker … did not reach Ready within 5min`.** SSH is back but
   kubelet hasn't rejoined. `ssh root@<worker-ip> journalctl -u
   kubelet.service` — usually a Cilium / CNI issue or a stale CA cert.
+
+- **`node … bootID did not change after 5min`.** The node came back
+  on SSH but its `.status.nodeInfo.bootID` is still the pre-reboot
+  value — either kubelet hasn't re-registered yet, or the node was
+  somehow returned to SSH without an actual reboot (very rare; check
+  `uptime` on the node). See
+  [Reboot detection (bootID)](#reboot-detection-bootid).
+
+- **`kube-system DaemonSet pods not Ready on this node after 5min`.**
+  Node Ready but Cilium / kube-proxy / coredns on this node is still
+  CrashLooping. From the CP: `kubectl get pods -n kube-system
+  --field-selector=spec.nodeName=<node>` + `kubectl logs -n kube-system
+  <unready-pod>`. See
+  [Daemonset readiness gate](#daemonset-readiness-gate).
 
 - **`CP apiserver did not return within 5min`.** The CP reboot
   succeeded but the apiserver isn't responding. `ssh root@<cp-ip>
