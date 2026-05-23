@@ -93,7 +93,7 @@ jobs:
           context: .
           # Multi-arch: emit a manifest index containing both linux/amd64
           # and linux/arm64 child manifests. Closes #107.
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           # Reuse layers from the previously published :latest when available.
           # buildah tolerates a missing remote (first-time cache miss); no
           # --pull-always so a registry hiccup doesn't break a real publish.
