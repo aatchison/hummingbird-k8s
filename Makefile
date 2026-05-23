@@ -134,26 +134,37 @@ workers: ## Rebuild worker template and spawn $(COUNT) workers (sudo)
 spawn: ## Spawn $(COUNT) more workers without rebuilding the template (sudo)
 	bash scripts/spawn-workers.sh $(COUNT)
 
+# --preserve-env passes HOME (used by cluster config templates), plus the
+# podman storage isolation vars (issue #199) so the inner sudo'd
+# deploy-cluster.sh + lib/build-common.sh:build_qcow2 see them. Outer
+# sudo --preserve-env already carries them in from CI; the Makefile recipe
+# re-launches sudo a second time and would otherwise strip the vars at the
+# inner sudo's env_reset.
 deploy-cluster: ## Deploy a hybrid bib+cloud-init cluster from CONFIG=<path> (see cluster.example.conf)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required (start from cluster.example.conf)' >&2; exit 2; }
-	sudo bash scripts/deploy-cluster.sh "$(CONFIG)"
+	sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+	  bash scripts/deploy-cluster.sh "$(CONFIG)"
 
 destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs + qcow2s + seed ISOs)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	sudo bash scripts/destroy-cluster.sh "$(CONFIG)"
+	sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
+	  bash scripts/destroy-cluster.sh "$(CONFIG)"
 
 update-cluster: ## Rolling bootc upgrade across CP + workers from CONFIG=<path> (CP no-drain reboot; workers drained)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" sudo -E bash scripts/update-cluster.sh
+	@CONFIG="$(CONFIG)" sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,CONFIG \
+	  bash scripts/update-cluster.sh
 
 update-workers: ## Rolling bootc upgrade across workers only from CONFIG=<path>
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" sudo -E bash scripts/update-cluster.sh --workers-only
+	@CONFIG="$(CONFIG)" sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,CONFIG \
+	  bash scripts/update-cluster.sh --workers-only
 
 update-node: ## Update a single node (NODE=name) from CONFIG=<path>
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@[ -n "$(NODE)" ]   || { echo 'NODE=<name> required (CP_NAME or one of WORKER_NAMES)' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" NODE="$(NODE)" sudo -E bash scripts/update-cluster.sh --node="$(NODE)"
+	@CONFIG="$(CONFIG)" NODE="$(NODE)" sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,CONFIG,NODE \
+	  bash scripts/update-cluster.sh --node="$(NODE)"
 
 export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }

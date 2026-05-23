@@ -135,10 +135,16 @@ case "$IMAGE_SOURCE" in
   ghcr)
     CP_IMAGE_REF="ghcr.io/aatchison/hummingbird-k8s:${GHCR_TAG}"
     WORKER_IMAGE_REF="ghcr.io/aatchison/hummingbird-k8s-worker:${GHCR_TAG}"
+    # Isolation contract (issue #199): the outer `podman pull` MUST
+    # land in the same graphroot build_qcow2 will look in below; bare
+    # `podman pull` would land in /var/lib/containers/storage while
+    # build_qcow2 uses --root $PODMAN_ROOT and BIB's --local lookup
+    # would then fail image-not-found.
+    mapfile -t _PODMAN_OPTS < <(podman_storage_opts)
     log "pulling ${CP_IMAGE_REF}"
-    podman pull "$CP_IMAGE_REF"
+    podman "${_PODMAN_OPTS[@]}" pull "$CP_IMAGE_REF"
     log "pulling ${WORKER_IMAGE_REF}"
-    podman pull "$WORKER_IMAGE_REF"
+    podman "${_PODMAN_OPTS[@]}" pull "$WORKER_IMAGE_REF"
     ;;
   local)
     CP_IMAGE_REF="localhost/hummingbird-k8s:latest"

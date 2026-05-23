@@ -333,16 +333,33 @@ declare a per-run podman graphroot:
 ```yaml
 env:
   STORAGE_DRIVER: vfs
-  PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}
-  PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}
+  PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}-${{ github.run_attempt }}
+  PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}-${{ github.run_attempt }}
 ```
 
-These vars are consumed by `lib/build-common.sh:build_qcow2()` (added
-in issue #199) and turn into top-level `podman --root/--runroot/
---storage-driver` flags PLUS `-e VAR` passthrough into the BIB
-container. That way two concurrent integration runs on the same
-self-hosted host cannot corrupt each other's overlay graph: each lives
-under its own `/var/lib/integration-storage/<run_id>` graphroot.
+These vars are consumed end-to-end by the build path
+(`lib/build-common.sh:build_qcow2()` plus the consumer-side
+`podman pull` / `podman build` in `scripts/build-*.sh` and
+`scripts/deploy-cluster.sh`, all via the shared `podman_storage_opts`
+helper). They translate to top-level `podman --root / --runroot /
+--storage-driver` flags on every podman invocation in the build path.
+Inside `build_qcow2`, the
+`-v $PODMAN_ROOT:/var/lib/containers/storage` bind-mount is what
+gives the nested podman that BIB spawns its isolated graph view —
+podman does not honor `PODMAN_ROOT` / `PODMAN_RUNROOT` as env-var
+names natively, so the bind-mount remap is the real mechanism for
+the nested podman; `-e STORAGE_DRIVER` is forwarded so the nested
+podman picks the same driver.
+
+The path includes `run_attempt` (not just `run_id`) because re-runs
+of a workflow share `run_id` but get distinct `run_attempt` values —
+without that suffix a re-run would collide with the prior attempt's
+graphroot on the runner.
+
+Two concurrent integration runs on the same self-hosted host
+therefore cannot corrupt each other's overlay graph: each lives
+under its own `/var/lib/integration-storage/<run_id>-<run_attempt>`
+graphroot.
 
 Before #199 the three env vars were declared in the workflow but never
 consumed by the build path (only `tests/integration-cloud-init.sh` and
@@ -351,6 +368,18 @@ the `concurrency:` block was what actually prevented collisions. After
 #199 the isolation is real, and `concurrency:` stays as belt-and-
 suspenders against libvirt VM-name + `/var/lib/libvirt/images` pool
 collisions, which are still NOT per-run-isolated.
+
+Disk-usage note: the vfs storage driver does not deduplicate layers
+across images (each layer is a full copy under `$PODMAN_ROOT`), so an
+isolated CI graphroot for one run is roughly `N × image_size` where N
+is the layer count of the bootc base + flavor images. Expect ~5-10 GB
+per run on the self-hosted runner. Old graphroots are removed at the
+end of each job by the "Clean up isolated podman storage" step; on a
+runner crash that step may not execute and `/var/lib/integration-
+storage/` can accumulate stale dirs — manual `find /var/lib/
+integration-storage -maxdepth 1 -mtime +1 -exec rm -rf {} \;` is the
+maintenance command. (A scheduled cleanup workflow is tracked as a
+follow-up.)
 
 See `docs/development.md` ("Podman storage isolation") for the
 underlying contract.
