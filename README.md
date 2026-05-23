@@ -183,6 +183,34 @@ sudo make destroy-cluster CONFIG=cluster.local.conf
 sudo make switch-to-ghcr
 ```
 
+### Rolling cluster updates
+
+`make update-cluster` walks the cluster one node at a time, pulls the latest
+bootc image with `bootc upgrade --apply`, and reboots into it. Workers are
+`kubectl drain`-ed before reboot and `kubectl uncordon`-ed after they rejoin
+Ready; the CP is rebooted in place (single-CP topology, no peers to drain
+to). The same `cluster.local.conf` that drives `make deploy-cluster` drives
+the update.
+
+```bash
+# Full rolling update: CP first (no drain — brief apiserver outage), then
+# each worker drained -> upgraded -> uncordoned in WORKER_NAMES order.
+sudo make update-cluster  CONFIG=cluster.local.conf
+
+# Skip the CP; only roll the workers (useful if CP is already on latest).
+sudo make update-workers  CONFIG=cluster.local.conf
+
+# Touch exactly one node — useful for spot-fixing a stuck worker or for
+# canarying a new image against a single node before rolling the rest.
+sudo make update-node     CONFIG=cluster.local.conf NODE=hbird-w1
+```
+
+Heads-up: single-CP means the apiserver is unavailable for ~60-120s while
+the CP reboots. `scripts/update-cluster.sh` prints a warning before that
+window. Add `--dry-run` (calling the script directly) to preview actions
+without ssh/kubectl, or `--skip-drain` as an emergency-rollback escape
+hatch for a stuck drain.
+
 ### etcd backup + key rotation
 
 ```bash
