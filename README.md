@@ -211,6 +211,14 @@ window. Add `--dry-run` (calling the script directly) to preview actions
 without ssh/kubectl, or `--skip-drain` as an emergency-rollback escape
 hatch for a stuck drain.
 
+Operator-ergonomics flags — pass via `FLAGS=` to the Makefile targets, or
+directly to the script: `--start-from=NAME` (resume after an interrupted
+roll), `--parallel=N` (process workers in batches of N concurrently),
+`--continue-on-error` (record per-node failures, summarize at the end),
+`--no-delete-emptydir-data` (preserve emptyDir caches during drain).
+Per-step timeouts are tunable via `DRAIN_TIMEOUT`, `READY_TIMEOUT`,
+`APISERVER_TIMEOUT`, `SSH_TIMEOUT`, and `INTER_NODE_SLEEP` env vars.
+
 Exercised end-to-end by `integration-update-cluster.yml` (see
 [docs/integration-tests.md](docs/integration-tests.md)).
 

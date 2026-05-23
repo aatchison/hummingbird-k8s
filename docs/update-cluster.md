@@ -73,14 +73,38 @@ deploy surface.
 
 Environment variables the script honors:
 
-| Var | Effect |
-| --- | --- |
-| `CONFIG` | Path to the cluster config (defaults to `./cluster.local.conf`). |
-| `DRY_RUN=1` | Same as `--dry-run` — print actions, don't ssh/kubectl. Useful for unprivileged previews; bypasses the root-required check. |
+| Var | Default | Effect |
+| --- | --- | --- |
+| `CONFIG` | `./cluster.local.conf` | Path to the cluster config. |
+| `DRY_RUN=1` | unset | Same as `--dry-run` — print actions, don't ssh/kubectl. Useful for unprivileged previews; bypasses the root-required check. |
+| `DRAIN_TIMEOUT` | `5m` | `kubectl drain --timeout=` value (Go duration string). Tune up for workloads with slow graceful-shutdown. |
+| `READY_TIMEOUT` | `300` | Seconds to wait for `kubectl get node` to report `Ready` post-reboot. |
+| `APISERVER_TIMEOUT` | `300` | Seconds to wait for the CP apiserver to answer `/readyz` after the CP reboots. |
+| `SSH_TIMEOUT` | `300` | Seconds to wait for `ssh root@<ip>` to come back post-reboot. |
+| `INTER_NODE_SLEEP` | `5` | Seconds to pause after uncordoning a node before processing the next one (small settle window). |
 
-No other public env knobs exist today. Anything else the script needs
-(SSH timeouts, ControlPersist window, per-step waits) is hard-coded;
-file an issue if you need to tune one.
+All knobs honor the standard `VAR=value make …` pattern; the Makefile
+targets pass them through via `sudo -E`. See
+[Performance tuning](#performance-tuning) for guidance.
+
+### Env-var validation (security)
+
+Because `make update-cluster` invokes the script via `sudo -E`,
+operator-shell env vars survive the privilege boundary and reach the
+script as root. To prevent shell-injection and bash-arithmetic
+side-effects from hostile values, every env knob above is validated at
+startup with strict regexes before any privileged call:
+
+| Var | Accepted pattern |
+| --- | --- |
+| `DRAIN_TIMEOUT` | `^[0-9]+(s\|m\|h)?$` (bare integer or a kubectl-style duration) |
+| `READY_TIMEOUT` | `^[0-9]+$` |
+| `APISERVER_TIMEOUT` | `^[0-9]+$` |
+| `SSH_TIMEOUT` | `^[0-9]+$` |
+| `INTER_NODE_SLEEP` | `^[0-9]+$` (0 is allowed; it skips the inter-batch sleep) |
+
+Anything else exits the script with `rc=1` and a clear diagnostic
+before reaching `ssh` / `kubectl`.
 
 ## Full flag reference
 
@@ -155,6 +179,128 @@ bash scripts/update-cluster.sh --dry-run
 
 Useful for code review, CI smoke tests, and previewing a `--node=` /
 `--workers-only` selection.
+
+### `--start-from=NAME`
+
+Resume an interrupted roll. The script walks `WORKER_NAMES` in order
+and skips every entry before `NAME`; once `NAME` is encountered it is
+processed and the loop continues from there.
+
+```bash
+# Original run aborted after hbird-w1; pick up at hbird-w2:
+sudo -E bash scripts/update-cluster.sh --start-from=hbird-w2
+```
+
+Semantics:
+
+- The CP is **also skipped** when `--start-from=` is set — the resume
+  point is implicitly past the CP (which is always rolled first).
+- Combines with `--workers-only` (both skip the CP); the two have
+  overlapping effects, no conflict.
+- **Mutually exclusive with `--node=`** (single-node mode). `--node=` is
+  "exactly this one node"; `--start-from=` is "this node onward".
+- The value must match one of `WORKER_NAMES`; mismatches fail loudly.
+
+See [Resume after interruption](#resume-after-interruption) for the
+recommended workflow.
+
+### `--continue-on-error`
+
+Record per-node failures and proceed instead of aborting. A summary is
+printed at the end listing succeeded vs failed nodes. The default
+remains **fail-fast** — a single drain failure or stuck `bootc upgrade`
+will abort the rest of the cluster's rollout.
+
+```bash
+sudo -E bash scripts/update-cluster.sh --continue-on-error
+```
+
+Exit codes:
+
+| rc | Meaning |
+| --- | --- |
+| 0 | Every targeted node succeeded. |
+| 1 | Fail-fast abort (the default mode's behavior). |
+| 3 | One or more workers failed, but `--continue-on-error` was set. |
+
+Note: failed nodes are left **cordoned** — `--continue-on-error` does
+not auto-uncordon. The end-of-run summary lists which nodes need
+operator attention.
+
+**Scope**: `--continue-on-error` applies to **worker** failures only.
+Control-plane failures (drain, bootc upgrade, wait-for-Ready on the CP)
+remain fail-fast — a broken CP is not a state the script can safely
+roll past.
+
+### `--no-delete-emptydir-data`
+
+By default the script passes `--delete-emptydir-data` to
+`kubectl drain`. That's the right call for ephemeral cache pods
+(scratch volumes, build artifacts) but is destructive for workloads
+that use `emptyDir` as persistent-ish state — Prometheus' WAL, for
+instance, is on `emptyDir` in many Helm charts and will lose pending
+samples on every roll.
+
+```bash
+sudo -E bash scripts/update-cluster.sh --no-delete-emptydir-data
+```
+
+Trade-off: drain will now **block** on any pod that has `emptyDir`
+volumes (no `--delete-emptydir-data` and no eviction grace from
+kubectl). For affected workloads, manually evict / scale down /
+checkpoint before running the upgrade. Combine with
+`--continue-on-error` to roll past unevictable workers without
+aborting.
+
+### `--parallel=N`
+
+Process workers in batches of N concurrently — each batch fans out to
+`update_worker` in background subshells, the script `wait`s for the
+batch, replays each subshell's log in deterministic order, then moves
+to the next batch.
+
+```bash
+sudo -E bash scripts/update-cluster.sh --parallel=2
+```
+
+Defaults to `N=1` (serial; the historical behavior). The **CP is still
+updated serially** before any worker batch — the CP reboot is too
+disruptive to overlap with anything else.
+
+Safety considerations before raising N:
+
+- All workloads must have PodDisruptionBudgets that allow at least N
+  concurrent pod evictions. A PDB with `maxUnavailable: 1` will
+  deadlock at `N=2`.
+- The cluster must have enough headroom to run all replicas of every
+  workload on `(workers - N)` nodes during a batch.
+- Storage backends (local-path, OpenEBS LocalPV) on N nodes go away
+  simultaneously — make sure replicated storage / off-node persistence
+  is in place for stateful workloads.
+- Network policies that filter on node IP will see N nodes restarting
+  at once.
+
+When in doubt, leave at `N=1` and accept the longer wall-clock.
+
+#### Trade-offs and known limitations
+
+- **Output is captured per-worker and replayed after the batch
+  completes** so the log sequence is deterministic (rather than two
+  workers interleaving log lines at the byte level). The practical
+  consequence: during a long batch — say a 5-minute `kubectl drain` on
+  both workers — the operator will see **no output at all** until the
+  batch finishes. This is intentional but jarring; if you want live
+  progress, run with `--parallel=1`.
+- **Fail-fast within a batch is best-effort.** When one worker in a
+  parallel batch fails (without `--continue-on-error`), siblings
+  finish their current step before the script aborts. The script does
+  not actively kill in-flight `bootc upgrade --apply` calls on
+  siblings — and even if it did, see the next bullet.
+- **Ctrl-C does NOT abort an in-flight `bootc upgrade --apply` on a
+  worker.** Once the remote `bootc` has started staging the new
+  deployment, the reboot will happen even if you Ctrl-C the script
+  locally. After interrupting, check `bootc status` on the affected
+  node before retrying.
 
 ## Apiserver downtime window
 
@@ -295,6 +441,118 @@ sudo make update-node CONFIG=cluster.local.conf NODE=<node>
 
 If the script aborted before drain, no recovery is needed beyond
 re-running the upgrade.
+
+## Resume after interruption
+
+If a roll dies partway — operator Ctrl-C, host crash, a drain failure
+the operator hand-fixed — restart it without re-rolling already-updated
+nodes via `--start-from=NAME`:
+
+```bash
+# Original run made it through hbird-cp1 + hbird-w1, then failed on
+# hbird-w2 mid-drain. Operator hand-fixes hbird-w2's stuck pod, then:
+sudo -E bash scripts/update-cluster.sh \
+  --start-from=hbird-w2 \
+  CONFIG=cluster.local.conf
+```
+
+What `--start-from` does:
+
+1. Walks `WORKER_NAMES` in order, skipping every entry that comes
+   *before* the named worker.
+2. Skips the CP (the CP is always first in the original ordering, so
+   a resume point past the first worker is implicitly past the CP).
+3. Processes the named worker and every worker after it, in
+   `WORKER_NAMES` order.
+
+Compose with `--continue-on-error` if you want a "best-effort resume"
+that doesn't re-abort on a different worker:
+
+```bash
+sudo -E bash scripts/update-cluster.sh \
+  --start-from=hbird-w2 \
+  --continue-on-error
+```
+
+If you only need to fix **one** node (and don't want to walk subsequent
+workers), use `--node=NAME` instead — `--node=` and `--start-from=` are
+mutually exclusive on purpose.
+
+## Performance tuning
+
+The default config trades wall-clock for safety: one worker at a time,
+generous per-step timeouts. For larger clusters or known-fast workloads
+it's worth tuning:
+
+### Parallelism (`--parallel=N`)
+
+```bash
+# 5-worker cluster, PDBs allow 2 concurrent evictions:
+sudo -E bash scripts/update-cluster.sh --parallel=2
+```
+
+The roughly-linear `5 × 5min ≈ 25min` worker time drops to
+`ceil(5/2) × 5min ≈ 15min`. The CP still adds its serial `~5min` on
+top regardless.
+
+Review the safety considerations in the
+[`--parallel=N` flag reference](#-paralleln) before raising N — a
+mis-tuned `--parallel=` can stall the whole roll on a PDB deadlock.
+
+### Timeouts (env vars)
+
+The per-step waits default to 5 minutes each, which is generous. On a
+small homelab cluster with fast SSDs, the actual times are typically:
+
+| Step | Typical | Default timeout |
+| --- | --- | --- |
+| drain | 5-30s | `DRAIN_TIMEOUT=5m` |
+| SSH back post-reboot | 30-60s | `SSH_TIMEOUT=300` |
+| apiserver back (CP only) | 60-120s | `APISERVER_TIMEOUT=300` |
+| node Ready | 30-90s | `READY_TIMEOUT=300` |
+
+Tightening these makes a stuck node fail faster instead of waiting the
+full 5 minutes:
+
+```bash
+DRAIN_TIMEOUT=2m \
+SSH_TIMEOUT=120 \
+READY_TIMEOUT=180 \
+sudo -E make update-cluster CONFIG=cluster.local.conf
+```
+
+Conversely, loosen them on slow / busy clusters with heavy graceful
+shutdowns or large image pulls on first boot:
+
+```bash
+DRAIN_TIMEOUT=15m \
+READY_TIMEOUT=600 \
+sudo -E make update-cluster CONFIG=cluster.local.conf
+```
+
+`INTER_NODE_SLEEP` (default 5s) is the post-uncordon settle window
+before moving to the next node. Drop to `0` if you want maximum
+throughput; raise to `30` if you want each node's pods to fully
+re-spread before the next eviction starts.
+
+### `make` `FLAGS=` passthrough
+
+The Makefile targets honor a `FLAGS=` variable that's appended to the
+underlying `scripts/update-cluster.sh` invocation. This means you can
+stay in the `make` UX even for the operator-ergonomics flags:
+
+```bash
+# Dry-run preview with the resume + parallel + emptydir-preserve combo:
+make update-cluster CONFIG=cluster.local.conf \
+  FLAGS='--dry-run --start-from=hbird-w2 --parallel=2 --no-delete-emptydir-data'
+
+# Resume an aborted roll, best-effort across remaining workers:
+sudo make update-cluster CONFIG=cluster.local.conf \
+  FLAGS='--start-from=hbird-w2 --continue-on-error'
+```
+
+Combine with the env-tunable timeouts as needed; both `FLAGS=` and the
+env vars are propagated to the script.
 
 ## Rolling time estimates
 

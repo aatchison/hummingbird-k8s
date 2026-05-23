@@ -150,21 +150,27 @@ destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs +
 	sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
 	  bash scripts/destroy-cluster.sh "$(CONFIG)"
 
-update-cluster: ## Rolling bootc upgrade across CP + workers from CONFIG=<path> (CP no-drain reboot; workers drained)
+# update-cluster delegates to scripts/update-cluster.sh. FLAGS= is a
+# passthrough for extra flags so operators don't have to drop down to the
+# raw script invocation for things like --dry-run, --parallel=N,
+# --start-from=NAME, --continue-on-error, --no-delete-emptydir-data, or
+# --skip-drain. Example:
+#   make update-cluster CONFIG=cluster.local.conf FLAGS='--dry-run --parallel=2'
+update-cluster: ## Rolling bootc upgrade across CP + workers from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@CONFIG="$(CONFIG)" sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,CONFIG \
-	  bash scripts/update-cluster.sh
+	  bash scripts/update-cluster.sh $(FLAGS)
 
-update-workers: ## Rolling bootc upgrade across workers only from CONFIG=<path>
+update-workers: ## Rolling bootc upgrade across workers only from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@CONFIG="$(CONFIG)" sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,CONFIG \
-	  bash scripts/update-cluster.sh --workers-only
+	  bash scripts/update-cluster.sh --workers-only $(FLAGS)
 
-update-node: ## Update a single node (NODE=name) from CONFIG=<path>
+update-node: ## Update a single node (NODE=name) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@[ -n "$(NODE)" ]   || { echo 'NODE=<name> required (CP_NAME or one of WORKER_NAMES)' >&2; exit 2; }
 	@CONFIG="$(CONFIG)" NODE="$(NODE)" sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,CONFIG,NODE \
-	  bash scripts/update-cluster.sh --node="$(NODE)"
+	  bash scripts/update-cluster.sh --node="$(NODE)" $(FLAGS)
 
 export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1, PROXY_JUMP=)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
