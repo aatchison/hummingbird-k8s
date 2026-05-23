@@ -40,7 +40,14 @@
 #   --output FILE         Output path (default: ./argocd-kubeconfig.yaml)
 #   --server URL          Override apiserver URL (default: https://<CP_IP>:6443)
 #   --context-name NAME   Cluster/context/user name (default: hummingbird-<CP_NAME>)
-#   --force               Overwrite an existing output file
+#   --force               Overwrite an existing output file (creates a
+#                         timestamped .bak-<UTC> copy first, mode 0600)
+#   --proxy-jump=HOST     Tunnel SSH to the CP via HOST (ProxyJump). When
+#                         unset, falls back to the KVM_HOST env var so the
+#                         flag and env paths agree with scripts/kubectl-k8s.sh.
+#                         Use when the operator workstation can't reach the
+#                         CP directly (libvirt NAT subnet not routable) but
+#                         CAN reach the KVM host that runs it.
 
 set -euo pipefail
 
@@ -148,6 +155,20 @@ fi
 
 # ---- CONFIG + flag parsing --------------------------------------------------
 
+# Handle --help before any other validation so `bash scripts/export-argocd.sh
+# --help` (the natural discovery command) succeeds even without CONFIG set.
+# Without this early branch, the `: "${CONFIG:?...}"` check below fires
+# first and the operator sees `CONFIG required` instead of the usage block,
+# unable to discover flags like --proxy-jump.
+for _arg in "$@"; do
+  case "$_arg" in
+    -h|--help)
+      sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+  esac
+done
+
 : "${CONFIG:?CONFIG=<path-to-cluster.local.conf> is required}"
 [[ -r "$CONFIG" ]] || fail "config not readable: $CONFIG"
 
@@ -155,6 +176,12 @@ OUTPUT=""
 SERVER_OVERRIDE=""
 CONTEXT_OVERRIDE=""
 FORCE=0
+PROXY_JUMP=""
+# Track whether --proxy-jump was passed at all (with any value, including
+# empty) so we can distinguish `--proxy-jump=` (explicit-empty: disable
+# ProxyJump on this invocation) from the flag being absent (fall through
+# to KVM_HOST). bash's :- operator can't tell those two cases apart.
+PROXY_JUMP_SET=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -164,14 +191,54 @@ while [[ $# -gt 0 ]]; do
     --server=*)      SERVER_OVERRIDE="${1#*=}"; shift ;;
     --context-name)  CONTEXT_OVERRIDE="${2:-}"; shift 2 ;;
     --context-name=*) CONTEXT_OVERRIDE="${1#*=}"; shift ;;
+    --proxy-jump)    PROXY_JUMP="${2:-}";       PROXY_JUMP_SET=1; shift 2 ;;
+    --proxy-jump=*)  PROXY_JUMP="${1#*=}";      PROXY_JUMP_SET=1; shift ;;
     --force)         FORCE=1; shift ;;
     -h|--help)
+      # Reachable only when --help appears after other flags; the early
+      # pre-pass above already handled the common "bare --help" case.
       sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) fail "unknown flag: $1" ;;
   esac
 done
+
+# If --proxy-jump was passed without an argument (e.g. `--proxy-jump --force`),
+# the space-form arm above captured the NEXT flag as the value because
+# the regex below would otherwise accept `--force` as a "valid host"
+# (the `-` is in our char class). Reject any value that starts with `--`
+# BEFORE regex validation so the next-flag-swallow is loud, not silent.
+if (( PROXY_JUMP_SET == 1 )) && [[ "$PROXY_JUMP" == --* ]]; then
+  fail "--proxy-jump requires a value (got: '$PROXY_JUMP'); did you forget the host?"
+fi
+
+# Default the proxy-jump host to KVM_HOST when the flag wasn't given AT
+# ALL. An explicit `--proxy-jump=` (set-but-empty) means "disable
+# ProxyJump on this invocation, even if KVM_HOST is exported" — without
+# the sentinel, a globally-exported KVM_HOST would silently re-engage.
+# This mirrors scripts/kubectl-k8s.sh / backup-etcd.sh — operators who
+# already export KVM_HOST=geary for `make kubectl` get the same routing
+# here for free, no script-by-script flag bookkeeping.
+if (( PROXY_JUMP_SET == 0 )); then
+  PROXY_JUMP="${KVM_HOST:-}"
+fi
+
+# Validate the proxy-jump host: spliced into an SSH option (-o ProxyJump=<v>)
+# downstream. Allow what ssh_config(5) accepts in a host token —
+# user@host[:port], plus comma-separated chains for multi-hop, and the
+# bracketed IPv6 form `[::1]:2222`. Reject shell metacharacters that
+# would break out of the -o value.
+if [[ -n "$PROXY_JUMP" ]]; then
+  # Bracket-class quirk: to include literal `[` and `]` in a bash regex
+  # character class, place `]` FIRST (right after the opening `[`) and
+  # `[` anywhere after — escaping with `\[`/`\]` does not work
+  # consistently across bash versions. The placement below matches both
+  # `geary` and `[::1]:2222`.
+  if ! [[ "$PROXY_JUMP" =~ ^[][A-Za-z0-9._@:,-]+$ ]]; then
+    fail "invalid --proxy-jump host: '$PROXY_JUMP' (expected [user@]host[:port], optionally comma-separated for multi-hop; IPv6 in [brackets])"
+  fi
+fi
 
 # Validate --server BEFORE any interpolation. The override (if any) gets
 # spliced into a yq expression and/or a sed s|| substitution downstream;
@@ -226,9 +293,24 @@ if [[ -e "$OUTPUT" && "$FORCE" -ne 1 ]]; then
   fail "output file already exists: $OUTPUT (re-run with --force to overwrite)"
 fi
 
-# ---- SSH helper -------------------------------------------------------------
+# Refuse a symlinked OUTPUT: `install -m 0600` would replace the symlink
+# with a regular file, leaving the original target stale. Operators who
+# want to write through a symlink should resolve it themselves so the
+# behavior is explicit.
+if [[ -L "$OUTPUT" ]]; then
+  fail "OUTPUT is a symlink ($OUTPUT -> $(readlink "$OUTPUT")); re-run with --output=$(readlink -f "$OUTPUT") or remove the symlink first"
+fi
 
-ssh_opts_array CP_SSH_OPTS
+# ---- SSH helper -------------------------------------------------------------
+# Thread --proxy-jump through to ssh_opts_array when set; the helper appends
+# `-o ProxyJump=<HOST>` to the option list. When unset, plain SSH options.
+
+if [[ -n "$PROXY_JUMP" ]]; then
+  ssh_opts_array CP_SSH_OPTS --proxy-jump="$PROXY_JUMP"
+  log "ssh tunneling via ProxyJump=${PROXY_JUMP}"
+else
+  ssh_opts_array CP_SSH_OPTS
+fi
 cp_ssh() { ssh "${CP_SSH_OPTS[@]}" "root@${CP_IP}" "$@"; }
 
 # ---- pull admin.conf --------------------------------------------------------
@@ -267,6 +349,26 @@ rewrite_kubeconfig "$TMP_KUBECONFIG" "$SERVER_URL" "$CONTEXT_NAME"
 # `install -m 0600` is atomic-mode-set: the destination is created at the
 # requested mode in one step, no chmod-after-mv race window.
 
+# Backup-on-overwrite: if --force is moving an existing file out of the way,
+# snapshot it first to ${OUTPUT}.bak-<UTC-timestamp> at mode 0600. The
+# original was 0600 itself (we wrote it that way last time) so the backup
+# inherits the same privacy. Defensive against operator typos that would
+# otherwise silently clobber a working kubeconfig.
+if [[ -e "$OUTPUT" && "$FORCE" -eq 1 ]]; then
+  # Nanosecond precision avoids same-second collisions across two rapid
+  # --force runs (operator typo + retry). %N is a GNU date extension —
+  # fine here because the entire build flow already assumes GNU coreutils.
+  bak="${OUTPUT}.bak-$(date -u +%Y%m%dT%H%M%S%N%Z)"
+  if [[ -e "$bak" ]]; then
+    fail "backup target already exists: $bak (refusing to clobber; wait 1ns and retry)"
+  fi
+  install -m 0600 "$OUTPUT" "$bak"
+  # `install` copies, it doesn't move — the original file is about to be
+  # overwritten in the next step, but for the duration between this log
+  # and the install below it still exists at $OUTPUT.
+  log "backup: copied $OUTPUT to $bak (will be overwritten next)"
+fi
+
 install -m 0600 "$TMP_KUBECONFIG" "$OUTPUT"
 rm -f "$TMP_KUBECONFIG"
 # Disarm the EXIT trap — TMP_KUBECONFIG no longer exists.
@@ -275,3 +377,14 @@ trap - EXIT
 log "kubeconfig written to ${OUTPUT}"
 log "register with:  argocd cluster add ${CONTEXT_NAME} --kubeconfig ${OUTPUT}"
 log "sanity check:   KUBECONFIG=${OUTPUT} kubectl get nodes"
+if [[ -n "$PROXY_JUMP" ]]; then
+  # When ProxyJump was used to FETCH admin.conf, the workstation almost
+  # certainly cannot reach the embedded server URL directly either —
+  # the sanity-check `kubectl get nodes` above will fail with a TLS or
+  # "connection refused" error from the workstation. That's expected;
+  # the kubeconfig is destined for ArgoCD (or another consumer on the
+  # same network as the CP), not for direct use here.
+  log "note: ProxyJump used for fetch — direct 'kubectl get nodes' from"
+  log "      this workstation may fail (apiserver isn't reachable here);"
+  log "      that is expected and does not invalidate the kubeconfig."
+fi

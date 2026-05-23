@@ -155,12 +155,13 @@ update-node: ## Update a single node (NODE=name) from CONFIG=<path>
 	@[ -n "$(NODE)" ]   || { echo 'NODE=<name> required (CP_NAME or one of WORKER_NAMES)' >&2; exit 2; }
 	@CONFIG="$(CONFIG)" NODE="$(NODE)" sudo -E bash scripts/update-cluster.sh --node="$(NODE)"
 
-export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1)
+export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1, PROXY_JUMP=)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@CONFIG="$(CONFIG)" bash scripts/export-argocd.sh \
 		$(if $(OUTPUT),--output "$(OUTPUT)",) \
 		$(if $(SERVER),--server "$(SERVER)",) \
 		$(if $(CONTEXT),--context-name "$(CONTEXT)",) \
+		$(if $(PROXY_JUMP),--proxy-jump="$(PROXY_JUMP)",) \
 		$(if $(FORCE),--force,)
 
 # Daily-use sibling of export-argocd (issue #195). Same fetch+rewrite
@@ -174,7 +175,7 @@ export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CO
 # CONTEXT=/SERVER=/FORCE= still pass through.
 # Recipe sources CONFIG here to read CP_NAME for the default context name;
 # the script re-sources CONFIG itself, so this is read-only / advisory.
-get-kubeconfig: ## Fetch kubeconfig.yaml from CONFIG=<path> (OUTPUT=, SERVER=, CONTEXT=, FORCE=1)
+get-kubeconfig: ## Fetch kubeconfig.yaml from CONFIG=<path> (OUTPUT=, SERVER=, CONTEXT=, FORCE=1, PROXY_JUMP=)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@[ -r "$(CONFIG)" ] || { echo '[get-kubeconfig] CONFIG not readable: $(CONFIG)' >&2; exit 2; }
 	@set -e; \
@@ -185,6 +186,7 @@ get-kubeconfig: ## Fetch kubeconfig.yaml from CONFIG=<path> (OUTPUT=, SERVER=, C
 	    --output "$(if $(OUTPUT),$(OUTPUT),kubeconfig.yaml)" \
 	    --context-name "$$CONTEXT_FROM_CONF" \
 	    $(if $(SERVER),--server "$(SERVER)",) \
+	    $(if $(PROXY_JUMP),--proxy-jump="$(PROXY_JUMP)",) \
 	    $(if $(FORCE),--force,)
 
 switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
