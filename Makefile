@@ -55,6 +55,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         deploy-cluster \
         destroy-cluster \
         update-cluster update-workers update-node \
+        export-argocd \
         switch-to-ghcr \
         nodes kubectl \
         verify-encryption verify-hardening verify-app-deploy verify-all \
@@ -152,6 +153,14 @@ update-node: ## Update a single node (NODE=name) from CONFIG=<path>
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@[ -n "$(NODE)" ]   || { echo 'NODE=<name> required (CP_NAME or one of WORKER_NAMES)' >&2; exit 2; }
 	@CONFIG="$(CONFIG)" NODE="$(NODE)" sudo -E bash scripts/update-cluster.sh --node="$(NODE)"
+
+export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1)
+	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
+	@CONFIG="$(CONFIG)" bash scripts/export-argocd.sh \
+		$(if $(OUTPUT),--output "$(OUTPUT)",) \
+		$(if $(SERVER),--server "$(SERVER)",) \
+		$(if $(CONTEXT),--context-name "$(CONTEXT)",) \
+		$(if $(FORCE),--force,)
 
 switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
 	bash scripts/switch-to-ghcr.sh
