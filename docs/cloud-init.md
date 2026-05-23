@@ -140,6 +140,32 @@ If your user-data does something that affects kubelet / cri-o (e.g.,
 writes a `/etc/crio/crio.conf.d/` drop-in), the ordering guarantees
 that drop-in is in place before `kubeadm init` reads it.
 
+### Hostname authority
+
+cloud-init's hostname module is **authoritative** for worker nodes. If
+your NoCloud seed declares a `local-hostname` in `meta-data` (or a
+`hostname:` directive in `#cloud-config` user-data), cloud-init sets
+it during the network stage — well before `worker-init.service`
+fires. `worker-init.sh` then inspects the current hostname and only
+falls back to its machine-id-derived `humbird-worker-<suffix>` name
+when the existing hostname matches `localhost` / `localhost.*` (the
+unseeded default). This means:
+
+- `make deploy-cluster` (which seeds per-VM cloud-init with the
+  `WORKER_NAMES` from your cluster config) ends up with workers
+  joined to the cluster under exactly those names — `kubectl get
+  nodes` shows `hbird-w1`, `hbird-w2`, etc., not the
+  `humbird-worker-<machine-id>` pattern.
+- `scripts/spawn-workers.sh` (legacy no-cloud-init path — only
+  injects `worker-join.env`, never touches hostname) still produces
+  unique node names via the `localhost*` fallback. The behavior for
+  that flow is unchanged.
+
+To override cloud-init's hostname from your own user-data, set it
+through standard cloud-init mechanisms (`local-hostname` in
+meta-data, or `hostname:` / `fqdn:` in `#cloud-config`); do not
+expect `worker-init.sh` to do it for you.
+
 ## Caveats
 
 - **ostree / bootc and /etc.** cloud-init writes to `/etc`, which on
