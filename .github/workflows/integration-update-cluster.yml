@@ -3,18 +3,20 @@ name: Integration — update-cluster rolling upgrade (#196)
 # End-to-end exercise of scripts/update-cluster.sh (PR #187) against a real
 # 1-CP + 2-worker cluster on the self-hosted kvm/libvirt runner.
 #
-# The most important assertion: `make update-workers` against an
-# already-current image (no actual update is available, since
-# workflow_run fires after the very build we'd be pulling) must complete
-# fast — that proves the wait_node_ready `$2 ~ /^Ready/` regex fix from
-# PR #187 is correct. Without that fix the script would time out at 5
-# minutes per worker.
+# The most important assertion: `make update-node` against a worker that
+# we've coerced into actually rebooting must exercise wait_node_ready —
+# THAT is the regression guard for PR #187's `$2 ~ /^Ready(,|$)/` fix.
+# The naive "make update-workers against an already-current image"
+# variant short-circuits at update-cluster.sh:526-537 BEFORE wait_node_ready
+# runs, defeating the purpose; we therefore install a bootc shim on one
+# worker to force the upgrade-applied codepath (see tests/integration-
+# update-cluster.sh::cmd_force_worker_upgrade).
 #
 # Trigger surface:
 #   workflow_dispatch — for manual replay against the geary runner.
 #   workflow_run     — after Build & publish hummingbird-k8s completes
-#                      successfully on a tag push, auto-fire so the
-#                      latest published image is exercised.
+#                      successfully on a tag push (k8s/v*), auto-fire so
+#                      the latest published image is exercised.
 #
 # This workflow is NOT meant to gate PRs; pr-validate stays on
 # ubuntu-latest and only smoke-builds the Containerfile.
@@ -29,25 +31,41 @@ permissions:
   contents: read
   packages: read
 
+# Two integration workflows fighting over the same libvirt host trip
+# the per-run static VM names (suffixed below) and the shared /var/lib/
+# libvirt/images pool. Serialize per-workflow but DON'T cancel an
+# in-flight run — abandoned VMs are worse than a queued workflow.
+concurrency:
+  group: integration-libvirt-${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   update-cluster:
-    # Skip auto-fires from a failed Build & publish run — there's nothing
-    # to validate if the publish itself failed.
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # Restrict workflow_run auto-fires to tag-driven publishes (k8s/v*).
+    # The Build & publish workflow also runs on PR validate paths in
+    # some configurations; without this gate we'd integrate against
+    # whatever the head_branch happened to be.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'k8s/v'))
     runs-on: [self-hosted, kvm, libvirt]
     timeout-minutes: 60
-    # Same isolated podman storage trick as integration-cloud-init.yml —
-    # the runner container's rootfs is overlayfs so we force vfs into a
-    # per-run graph root (#124, #139). deploy-cluster.sh runs podman
-    # under sudo, so the env vars get preserved via --preserve-env.
     env:
       STORAGE_DRIVER: vfs
       PODMAN_ROOT: /var/lib/integration-storage/${{ github.run_id }}
       PODMAN_RUNROOT: /run/integration-storage/${{ github.run_id }}
       CONFIG: tests/fixtures/cluster.ci.conf
+      RUN_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # workflow_run defaults to the default branch, NOT the head_sha
+          # of the build that just published. Pin to head_sha so the test
+          # validates the same code that produced the image under test.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install runner deps (CNI + virtinst + genisoimage + jq)
         # Mirrors integration-cloud-init.yml's deps list. jq is added
@@ -70,16 +88,26 @@ jobs:
           fi
 
       - name: Generate runner SSH key
-        # Throwaway per-run identity. The path matches SSH_PUBKEY_FILE in
-        # tests/fixtures/cluster.ci.conf. We pre-clean any stale key
-        # from a previous run so ssh-keygen -N '' doesn't prompt about
-        # overwriting.
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           rm -f ~/.ssh/integration_test_key ~/.ssh/integration_test_key.pub
           ssh-keygen -t ed25519 -N '' -f ~/.ssh/integration_test_key -C "hbird-ci-${{ github.run_id }}"
+
+      - name: Render per-run cluster.ci.conf
+        # cluster.ci.conf ships CP_NAME / WORKER_NAMES values without a
+        # per-run suffix. Two concurrent runs (or a retried run colliding
+        # with leftover VMs) would step on each other in libvirt. Suffix
+        # them with run_id-run_attempt before deploy-cluster reads the
+        # file. Teardown grep is updated accordingly.
+        run: |
+          set -euo pipefail
+          sed -i "s|hbird-ci-cp1|hbird-ci-cp1-${RUN_SUFFIX}|g" "${CONFIG}"
+          sed -i "s|hbird-ci-w1|hbird-ci-w1-${RUN_SUFFIX}|g"   "${CONFIG}"
+          sed -i "s|hbird-ci-w2|hbird-ci-w2-${RUN_SUFFIX}|g"   "${CONFIG}"
+          echo "----- rendered ${CONFIG} -----"
+          cat "${CONFIG}"
 
       - name: Prepare isolated podman storage
         run: |
@@ -93,235 +121,138 @@ jobs:
           sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
             make deploy-cluster CONFIG="${CONFIG}"
 
-      - name: Verify 3 nodes Ready
+      - name: Verify CP + workers Ready by name
         # deploy-cluster.sh already gates on EXPECTED_NODES Ready before
-        # returning, but re-check from outside the script to make the
-        # assertion explicit in the workflow log.
+        # returning, but re-check by name from outside the script to
+        # catch a "3 random nodes Ready" false-positive (older versions
+        # of this workflow only asserted a count).
+        run: |
+          set -euo pipefail
+          CONFIG="${CONFIG}" bash tests/integration-update-cluster.sh \
+            assert-dry-run-sequence
+          # Re-use the export-argocd helper for the by-name node check;
+          # it's defined there because both workflows need it.
+          CONFIG="${CONFIG}" bash tests/integration-export-argocd.sh \
+            verify-nodes-by-name
+
+      - name: Force a real upgrade codepath on hbird-ci-w1
+        # The naive `make update-workers` against an already-current
+        # image triggers the no-update short-circuit in
+        # update-cluster.sh:526-537, BEFORE wait_node_ready runs. Install
+        # a /usr/local/bin/bootc shim on the first worker so the digest
+        # compare sees a delta AND the worker actually reboots — that
+        # forces bootc_upgrade_apply down the rc=0/rc=255 success branch
+        # and exercises wait_ssh_back + wait_node_ready (the regex from
+        # PR #187). Tearing the shim back down in the always-block keeps
+        # the destroy step happy.
         run: |
           set -euo pipefail
           # shellcheck disable=SC1090
           source "${CONFIG}"
-          CP_IP="$(sudo virsh -c qemu:///system domifaddr "${CP_NAME}" \
-                   | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')"
-          if [[ -z "${CP_IP}" ]]; then
-            echo "::error::could not resolve CP_IP for ${CP_NAME}"
-            exit 1
-          fi
-          ready="$(ssh -i ~/.ssh/integration_test_key \
-                    -o StrictHostKeyChecking=no \
-                    -o UserKnownHostsFile=/dev/null \
-                    -o LogLevel=ERROR \
-                    "root@${CP_IP}" \
-                    'kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers 2>/dev/null | awk "\$2 ~ /^Ready/" | wc -l')"
-          ready="${ready//[^0-9]/}"
-          if [[ "${ready:-0}" -lt 3 ]]; then
-            echo "::error::expected 3 Ready nodes, got ${ready:-0}"
-            exit 1
-          fi
-          echo "ok: ${ready} nodes Ready"
+          CONFIG="${CONFIG}" bash tests/integration-update-cluster.sh \
+            force-worker-upgrade "${WORKER_NAMES[0]}"
 
-      - name: Assert update-cluster --dry-run sequence
-        # --dry-run runs without sudo (the script's own guard allows
-        # non-root in DRY_RUN mode). We capture the log and grep for
-        # the expected per-node action sequence: timer-stop, the
-        # bootc-upgrade-apply log line, wait Ready, uncordon — exactly
-        # once each for the CP + each worker.
-        run: |
-          set -euo pipefail
-          out="$(mktemp)"
-          CONFIG="${CONFIG}" bash scripts/update-cluster.sh --dry-run | tee "${out}"
-
-          # shellcheck disable=SC1090
-          source "${CONFIG}"
-
-          fail=0
-          assert_once() {
-            local pattern="$1" label="$2"
-            local n
-            n="$(grep -cE "${pattern}" "${out}" || true)"
-            if [[ "${n}" -ne 1 ]]; then
-              echo "::error::expected exactly 1 match for [${label}] (${pattern}), got ${n}"
-              fail=1
-            fi
-          }
-
-          # CP: skips drain, runs timer-stop + bootc-upgrade-apply line.
-          assert_once "DRY-RUN ssh root@.* systemctl stop bootc-fetch-apply-updates.timer" "CP timer-stop"
-          assert_once "bootc upgrade --apply.*${CP_NAME}|CP: ${CP_NAME}" "CP upgrade header"
-
-          # Each worker: drain + bootc-upgrade-apply + uncordon, exactly once.
-          for w in "${WORKER_NAMES[@]}"; do
-            assert_once "WORKER: ${w}" "worker header ${w}"
-            assert_once "drain ${w}" "worker drain ${w}"
-            assert_once "uncordon ${w}" "worker uncordon ${w}"
-          done
-
-          if [[ "${fail}" -ne 0 ]]; then
-            exit 1
-          fi
-          echo "ok: dry-run sequence verified for CP + ${#WORKER_NAMES[@]} workers"
-
-      - name: Run update-workers (digest short-circuit assertion)
-        # This is the BLOCKER-fix regression guard. The image we just
-        # pulled IS what the cluster is running; bootc_upgrade_apply()
-        # MUST report rc=2 ("no update available") via the pre/post
-        # digest compare and short-circuit. Total runtime should be
-        # well under the 5-min-per-worker timeout the wait_node_ready
-        # regex bug would trigger.
-        id: update_workers
-        run: |
-          set -euo pipefail
-          out="$(mktemp)"
-          # shellcheck disable=SC1090
-          source "${CONFIG}"
-
-          start="$(date +%s)"
-          sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
-            make update-workers CONFIG="${CONFIG}" 2>&1 | tee "${out}"
-          end="$(date +%s)"
-          elapsed=$((end - start))
-          echo "update-workers elapsed: ${elapsed}s"
-
-          # 1. No worker should have been left cordoned.
-          CP_IP="$(sudo virsh -c qemu:///system domifaddr "${CP_NAME}" \
-                   | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')"
-          json="$(ssh -i ~/.ssh/integration_test_key \
-                    -o StrictHostKeyChecking=no \
-                    -o UserKnownHostsFile=/dev/null \
-                    -o LogLevel=ERROR \
-                    "root@${CP_IP}" \
-                    'kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o json')"
-          unsched="$(echo "${json}" | jq -r '
-            .items[]
-            | select(.spec.unschedulable == true)
-            | .metadata.name
-          ')"
-          if [[ -n "${unsched}" ]]; then
-            echo "::error::workers left cordoned after update-workers:"
-            echo "${unsched}"
-            exit 1
-          fi
-
-          # 2. Every worker should have logged "no update available" exactly
-          #    once. The log line lives in update-cluster.sh:
-          #    "  no update available on ${name}; skipping wait loops"
-          fail=0
-          for w in "${WORKER_NAMES[@]}"; do
-            n="$(grep -cE "no update available on ${w}" "${out}" || true)"
-            if [[ "${n}" -ne 1 ]]; then
-              echo "::error::expected 1 'no update available' line for ${w}, got ${n}"
-              fail=1
-            fi
-          done
-
-          # 3. Runtime sanity: 2 workers, each <60s of no-update overhead.
-          #    The wait_node_ready regex bug would push us past 300s/worker.
-          if [[ "${elapsed}" -gt 240 ]]; then
-            echo "::error::update-workers took ${elapsed}s (>240s) — the digest short-circuit may be broken (suspect: wait_node_ready regex)"
-            fail=1
-          fi
-
-          if [[ "${fail}" -ne 0 ]]; then
-            exit 1
-          fi
-          echo "ok: workers ran the no-update short-circuit path in ${elapsed}s"
-
-      - name: Assert EXIT-trap recovery message on Ctrl-C
-        # Kick off `make update-node NODE=hbird-ci-w1` in the background.
-        # Wait until the drain log line appears (proving we're past the
-        # drain step but before uncordon), then SIGINT the make process
-        # group. Assert:
-        #   - update-cluster's EXIT-trap recovery banner mentions the
-        #     kubectl uncordon command for the in-flight node.
-        #   - the node IS still cordoned (script must NOT auto-uncordon).
-        # Then manually uncordon to leave the cluster healthy for the
-        # destroy step. Defensive: this assertion is wrapped to never
-        # leave the cluster in a half-cordoned state.
+      - name: Run update-node against the forced worker
+        # This is the BLOCKER-fix regression guard from PR #187. With
+        # the shim above, the script MUST hit wait_node_ready and see
+        # the worker rejoin as "Ready,SchedulingDisabled" — exactly the
+        # case the original `$2 ~ /^Ready$/` regex missed.
         run: |
           set -euo pipefail
           # shellcheck disable=SC1090
           source "${CONFIG}"
+          CONFIG="${CONFIG}" bash tests/integration-update-cluster.sh \
+            assert-update-node-real "${WORKER_NAMES[0]}"
 
-          out="$(mktemp)"
-          target="${WORKER_NAMES[0]}"
-
-          # Launch in the background. setsid → its own pgid so we can
-          # SIGINT the whole tree (sudo + make + bash + ssh).
-          setsid -- bash -c "
-            sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
-              make update-node CONFIG='${CONFIG}' NODE='${target}'
-          " >"${out}" 2>&1 &
-          mk_pid=$!
-
-          # Wait up to 60s for the drain line to appear in the log.
-          deadline=$((SECONDS + 60))
-          drained=0
-          while (( SECONDS < deadline )); do
-            if grep -qE "drain ${target}" "${out}"; then
-              drained=1
-              break
-            fi
-            sleep 2
-          done
-
-          if [[ "${drained}" -ne 1 ]]; then
-            echo "::error::update-node never reached the drain step within 60s"
-            sudo kill -TERM "-${mk_pid}" 2>/dev/null || true
-            cat "${out}" || true
-            exit 1
+      - name: Remove bootc shim from forced worker
+        if: always()
+        run: |
+          set +e
+          # shellcheck disable=SC1090
+          source "${CONFIG}" || true
+          if [[ -n "${WORKER_NAMES[0]:-}" ]]; then
+            CONFIG="${CONFIG}" bash tests/integration-update-cluster.sh \
+              unforce-worker-upgrade "${WORKER_NAMES[0]}" || true
           fi
 
-          # SIGINT the process group. update-cluster.sh's EXIT trap fires.
-          sudo kill -INT "-${mk_pid}" 2>/dev/null || true
+      - name: Assert EXIT-trap recovery on mid-flight SIGINT
+        # Drives the second worker through update-node and SIGINTs the
+        # process group once the node has actually reached
+        # `.spec.unschedulable=true` (drain complete). That gate replaces
+        # the original "wait for the drain LOG LINE" trigger which fired
+        # BEFORE cp_kubectl drain ran, leaving IN_FLIGHT_DRAINED=0 and
+        # the cleanup_on_exit banner silently skipped.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1090
+          source "${CONFIG}"
+          # Force this worker into a real-reboot path too — otherwise the
+          # no-update short-circuit completes before the drain even
+          # starts and we have nothing to SIGINT.
+          CONFIG="${CONFIG}" bash tests/integration-update-cluster.sh \
+            force-worker-upgrade "${WORKER_NAMES[1]}"
+          CONFIG="${CONFIG}" bash tests/integration-update-cluster.sh \
+            assert-exit-trap "${WORKER_NAMES[1]}"
 
-          # Give the script up to 30s to print its recovery banner and exit.
-          wait "${mk_pid}" 2>/dev/null || true
-          deadline=$((SECONDS + 30))
-          banner=0
-          while (( SECONDS < deadline )); do
-            if grep -qE "kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon ${target}" "${out}"; then
-              banner=1
-              break
-            fi
-            sleep 2
+      - name: Remove bootc shim from second worker
+        if: always()
+        run: |
+          set +e
+          # shellcheck disable=SC1090
+          source "${CONFIG}" || true
+          if [[ -n "${WORKER_NAMES[1]:-}" ]]; then
+            CONFIG="${CONFIG}" bash tests/integration-update-cluster.sh \
+              unforce-worker-upgrade "${WORKER_NAMES[1]}" || true
+          fi
+
+      - name: Collect failure artifacts
+        if: failure() || cancelled()
+        run: |
+          set +e
+          mkdir -p /tmp/integration-logs
+          # Use `sudo … | tee` rather than `sudo … > file`: the redirect
+          # is opened by the unprivileged shell BEFORE sudo elevates, so
+          # only `tee` actually inherits root's privilege for the write.
+          # /tmp/integration-logs is unprivileged-writable anyway, so
+          # plain tee suffices.
+          sudo virsh -c qemu:///system list --all 2>&1 \
+            | tee /tmp/integration-logs/virsh-list-all.txt >/dev/null || true
+          for vm in $(sudo virsh -c qemu:///system list --all --name 2>/dev/null \
+                      | grep -E "^hbird-ci-.*-${RUN_SUFFIX}\$" || true); do
+            sudo virsh -c qemu:///system dumpxml "$vm" 2>&1 \
+              | tee "/tmp/integration-logs/dumpxml-${vm}.xml" >/dev/null || true
           done
-
-          if [[ "${banner}" -ne 1 ]]; then
-            echo "::error::EXIT-trap recovery banner did not surface the uncordon command for ${target}"
-            cat "${out}" || true
-            # Belt-and-suspenders: try to uncordon anyway so destroy stays happy.
-            CP_IP="$(sudo virsh -c qemu:///system domifaddr "${CP_NAME}" \
+          sudo journalctl -u libvirtd --no-pager -n 500 2>&1 \
+            | tee /tmp/integration-logs/journalctl-libvirtd.txt >/dev/null || true
+          # If the cluster is still reachable, capture nodes/pods.
+          # shellcheck disable=SC1090
+          source "${CONFIG}" || true
+          if [[ -n "${CP_NAME:-}" ]]; then
+            CP_IP="$(sudo virsh -c qemu:///system domifaddr "${CP_NAME}" 2>/dev/null \
                      | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')"
-            ssh -i ~/.ssh/integration_test_key \
-                -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null \
-                "root@${CP_IP}" \
-                "kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon ${target}" || true
-            exit 1
+            if [[ -n "${CP_IP}" ]]; then
+              ssh -i ~/.ssh/integration_test_key \
+                  -o StrictHostKeyChecking=no \
+                  -o UserKnownHostsFile=/dev/null \
+                  -o LogLevel=ERROR \
+                  -o ConnectTimeout=10 \
+                  -o BatchMode=yes \
+                  "root@${CP_IP}" \
+                  'kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide; \
+                   echo "---"; \
+                   kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A' \
+                  > /tmp/integration-logs/kubectl-state.txt 2>&1 || true
+            fi
           fi
 
-          # Confirm the node IS still cordoned (script must not have
-          # auto-uncordoned). Then manually restore.
-          CP_IP="$(sudo virsh -c qemu:///system domifaddr "${CP_NAME}" \
-                   | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')"
-          unsched="$(ssh -i ~/.ssh/integration_test_key \
-                       -o StrictHostKeyChecking=no \
-                       -o UserKnownHostsFile=/dev/null \
-                       -o LogLevel=ERROR \
-                       "root@${CP_IP}" \
-                       "kubectl --kubeconfig=/etc/kubernetes/admin.conf get node ${target} -o jsonpath='{.spec.unschedulable}'")"
-          if [[ "${unsched}" != "true" ]]; then
-            echo "::error::node ${target} was NOT cordoned after SIGINT (script auto-uncordoned?)"
-            exit 1
-          fi
-
-          ssh -i ~/.ssh/integration_test_key \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              -o LogLevel=ERROR \
-              "root@${CP_IP}" \
-              "kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon ${target}"
-          echo "ok: EXIT-trap recovery banner surfaced + node correctly left cordoned"
+      - name: Upload failure artifacts
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-update-cluster-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/integration-logs/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Destroy cluster
         if: always()
@@ -330,19 +261,26 @@ jobs:
           sudo make destroy-cluster CONFIG="${CONFIG}" || true
 
       - name: Force-clean integration VMs (always)
-        # Belt-and-suspenders teardown, copy of integration-cloud-init.yml's
-        # force-cleanup adapted to the hbird-ci-* libvirt-domain prefix.
-        # Defensive throughout: MUST NEVER fail the job.
+        # Belt-and-suspenders teardown. Match only the per-run suffix so
+        # we never touch another run's VMs.
         if: always()
         run: |
-          for vm in $(sudo virsh -c qemu:///system list --all --name 2>/dev/null | grep -E '^hbird-ci-' || true); do
+          for vm in $(sudo virsh -c qemu:///system list --all --name 2>/dev/null \
+                      | grep -E "^hbird-ci-.*-${RUN_SUFFIX}\$" || true); do
             echo "force-cleaning $vm"
             sudo virsh -c qemu:///system destroy "$vm" >/dev/null 2>&1 || true
             sudo virsh -c qemu:///system undefine --nvram "$vm" >/dev/null 2>&1 || true
           done
-          sudo rm -f /var/lib/libvirt/images/hbird-ci-*.qcow2 \
-                     /var/lib/libvirt/images/hbird-ci-*-seed.iso \
-                     /var/lib/libvirt/images/hbird-ci-*-cloud-init.iso 2>/dev/null || true
+          sudo rm -f "/var/lib/libvirt/images/hbird-ci-cp1-${RUN_SUFFIX}.qcow2" \
+                     "/var/lib/libvirt/images/hbird-ci-w1-${RUN_SUFFIX}.qcow2" \
+                     "/var/lib/libvirt/images/hbird-ci-w2-${RUN_SUFFIX}.qcow2" \
+                     "/var/lib/libvirt/images/hbird-ci-cp1-${RUN_SUFFIX}-seed.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-w1-${RUN_SUFFIX}-seed.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-w2-${RUN_SUFFIX}-seed.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-cp1-${RUN_SUFFIX}-cloud-init.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-w1-${RUN_SUFFIX}-cloud-init.iso" \
+                     "/var/lib/libvirt/images/hbird-ci-w2-${RUN_SUFFIX}-cloud-init.iso" \
+                     2>/dev/null || true
           sudo rm -rf /var/lib/libvirt/images/deploy-cluster 2>/dev/null || true
 
       - name: Clean up isolated podman storage
@@ -354,3 +292,9 @@ jobs:
         if: always()
         run: |
           rm -f ~/.ssh/integration_test_key ~/.ssh/integration_test_key.pub || true
+
+# TODO(follow-up): the install-deps / podman-storage / teardown blocks are
+# duplicated with integration-export-argocd.yml. Extract into a composite
+# action under .github/actions/setup-integration/ once a second integration
+# workflow lands that would benefit from the shared surface. Tracked as a
+# follow-up to PR #198.

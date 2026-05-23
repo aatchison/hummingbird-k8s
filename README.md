@@ -211,6 +211,9 @@ window. Add `--dry-run` (calling the script directly) to preview actions
 without ssh/kubectl, or `--skip-drain` as an emergency-rollback escape
 hatch for a stuck drain.
 
+Exercised end-to-end by `integration-update-cluster.yml` (see
+[docs/integration-tests.md](docs/integration-tests.md)).
+
 ### etcd backup + key rotation
 
 ```bash
@@ -249,6 +252,9 @@ it after ArgoCD has registered the cluster, since ArgoCD authenticates
 with its own SA token from that point on. See
 [docs/argocd.md](docs/argocd.md) for the security model, the (honest)
 leak-recovery playbook, and the cert-lifecycle / re-export procedure.
+
+Exercised end-to-end by `integration-export-argocd.yml` (see
+[docs/integration-tests.md](docs/integration-tests.md)).
 
 ## Configuration
 
