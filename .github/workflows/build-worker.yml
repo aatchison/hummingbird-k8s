@@ -78,11 +78,6 @@ jobs:
       # buildah can execute foreign-arch binaries during RUN steps. The
       # GitHub-hosted ubuntu-latest runner ships binfmt_misc handlers but
       # not the static interpreters; this action installs them.
-      - name: Set up QEMU for cross-arch builds
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
-        with:
-          platforms: arm64
-
       - name: Build
         id: build
         uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
