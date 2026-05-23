@@ -12,7 +12,7 @@ orchestrator scripts under `scripts/`. It exposes two families of helpers:
 1. **Build-only helpers** — `ssh_pubkey_blob`, `render_bib_config`,
    `build_qcow2`, etc. Used by `containers/*/build-*.sh`. Originated in
    issue #98 / #106 / #115.
-2. **Shared SSH / virsh / log helpers** — extracted in PR #200 (issue #190)
+2. **Shared SSH / virsh / log helpers** — extracted in PR #202 (issue #190)
    so the cluster-orchestration scripts under `scripts/` don't have to
    reimplement the same primitives five times.
 
@@ -29,8 +29,8 @@ hand-rolled the same SSH option array, `virsh domifaddr` IP resolution, and
 | `setup_logging "<prefix>"`   | Define `log()` / `fail()` in the caller's scope. `log` prints `<prefix> <msg>` to stderr; `fail` adds `ERROR:` and exits 1. |
 | `ssh_opts_array OUT [--with-controlmaster] [--proxy-jump=HOST]` | Populate `OUT` with the canonical hardened SSH option set. Requires `SSH_PRIVKEY_FILE` to be set. |
 | `ssh_opts_array_no_identity OUT [flags]` | Same as above but omits `-i SSH_PRIVKEY_FILE`. Used by callers that rely on agent auth or `~/.ssh/config`. |
-| `resolve_vm_ip <vm> [retries] [interval]` | Echo first IPv4 from `virsh -c qemu:///system domifaddr <vm>`. Retries on empty result for the DHCP-not-yet-ready case. |
-| `derive_ssh_privkey_file <pub>` | Echo `${pub%.pub}` and verify it's readable. Errors loudly if not. |
+| `resolve_vm_ip <vm> [attempts] [interval]` | Echo first IPv4 from `virsh -c qemu:///system domifaddr <vm>`. Defaults to 1 attempt, 0s interval — pass larger values for the DHCP-not-yet-ready boot-wait case. Probes virsh up front; warns when the VM exposes multiple IPv4 addresses (first is returned). |
+| `derive_ssh_privkey_file <pub>` | Echo `${pub%.pub}` and verify it's readable. Hard-fails (rc=2) if `<pub>` does not end in `.pub` (so typos / already-private paths are rejected loudly instead of silently feeding ssh a wrong identity). |
 
 #### Adding a new SSH-driven script
 
@@ -79,6 +79,40 @@ cp_ssh "uname -a"
   ~6-12 ssh calls per node; the multiplex socket amortizes handshake
   cost from ~200ms to ~5ms after the first connection. `update-cluster`
   also calls `ssh -O exit` on EXIT to close the sockets cleanly.
+
+### `HBIRD_AUTOLOAD_CONFIG_LOCAL`
+
+`lib/build-common.sh` can optionally source a repo-local `config.local.sh`
+(image-build inputs — `SSH_PUBKEY_FILES`, `POOL_DIR`, resource knobs,
+etc.). The autoload is gated behind `HBIRD_AUTOLOAD_CONFIG_LOCAL=1`,
+which the calling script must `export` **before** sourcing the lib:
+
+```bash
+export HBIRD_AUTOLOAD_CONFIG_LOCAL=1
+source lib/build-common.sh
+```
+
+The build paths (`scripts/build-k3s.sh`, `scripts/build-k8s.sh`,
+`scripts/build-worker.sh`, `scripts/spawn-workers.sh`) opt in. The
+cluster-orchestrator scripts (`deploy-cluster.sh`, `destroy-cluster.sh`,
+`update-cluster.sh`, `export-argocd.sh`, `verify-hardening.sh`) do
+NOT — they take their config from an explicit `CONFIG=<path>` argument
+and have no reason to inherit arbitrary side-effects from
+`config.local.sh`.
+
+### Adding a new shared helper
+
+Helpers live in `lib/build-common.sh`. When adding one:
+
+1. Define the function with a short docstring above it (contract,
+   inputs, outputs, error modes).
+2. Add at least two bats cases in `tests/lib/build-common.bats` — one
+   happy-path and one error-path — per the two-test rule below.
+3. If multiple existing scripts can now use it, wire them through in
+   the same PR (dead helpers tend to drift out of sync with callers).
+4. Cross-reference back from the consumer script's header
+   (`# Shared SSH/virsh/log helpers in lib/build-common.sh; see
+   docs/development.md.`).
 
 ### Bats tests
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Shared SSH/virsh/log helpers live in lib/build-common.sh; see docs/development.md.
 # scripts/deploy-cluster.sh — Hybrid bib + cloud-init cluster orchestrator.
 #
 # Deploys 1 control plane + N workers on the local KVM host from a single

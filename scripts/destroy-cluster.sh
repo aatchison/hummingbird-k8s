@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Shared SSH/virsh/log helpers live in lib/build-common.sh; see docs/development.md.
 # destroy-cluster.sh — Tear down a cluster that was deployed via
 # deploy-cluster.sh, using the same config file. Destroys + undefines every
 # CP_NAME and WORKER_NAMES domain, removes its qcow2 + seed ISO from the

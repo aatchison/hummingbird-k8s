@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Shared SSH/virsh/log helpers live in lib/build-common.sh; see docs/development.md.
 # scripts/export-argocd.sh — produce an ArgoCD-registerable kubeconfig.
 #
 # ArgoCD's `cluster add` command consumes a normal kubeconfig and uses it

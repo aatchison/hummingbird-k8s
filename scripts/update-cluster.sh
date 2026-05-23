@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Shared SSH/virsh/log helpers live in lib/build-common.sh; see docs/development.md.
 # scripts/update-cluster.sh — Rolling bootc upgrade across a deployed cluster.
 #
 # Reads the same CONFIG=<cluster.local.conf> as deploy-cluster.sh and walks
@@ -109,14 +110,24 @@ fi
 # adds the multiplex options that amortize ssh handshake cost across the
 # ~6-12 ssh invocations we make per node. The EXIT trap below `ssh -O exit`s
 # the ControlMaster sockets.
-# shellcheck disable=SC2034  # SSH_PRIVKEY_FILE is read by ssh_opts_array
-SSH_PRIVKEY_FILE="${SSH_PUBKEY_FILE%.pub}"
-if (( DRY_RUN == 0 )); then
+if (( DRY_RUN == 1 )); then
+  # Dry-run never SSHes; explicit placeholder makes the resolved opt
+  # array obviously non-functional if it leaks into a real ssh call.
+  # shellcheck disable=SC2034  # SSH_PRIVKEY_FILE is read by ssh_opts_array
+  SSH_PRIVKEY_FILE="<dry-run-key>"
+else
   # shellcheck disable=SC2034
   SSH_PRIVKEY_FILE="$(derive_ssh_privkey_file "$SSH_PUBKEY_FILE")" \
     || fail "SSH private key not readable next to $SSH_PUBKEY_FILE"
 fi
 ssh_opts_array SSH_OPTS --with-controlmaster
+
+# Clean up any stale ControlMaster sockets from a prior aborted run.
+# Best-effort — won't fail if no stale sockets exist. The path matches
+# the ControlPath template in lib/build-common.sh::_ssh_opts_array_impl.
+if (( DRY_RUN == 0 )); then
+  rm -f /tmp/hbird-ssh-"${UID}"-* 2>/dev/null || true
+fi
 
 # ---- IP resolution ---------------------------------------------------------
 # deploy-cluster.sh leaves IPs as DHCP-assigned — re-resolve via resolve_vm_ip

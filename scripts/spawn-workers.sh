@@ -17,6 +17,10 @@ fi
 : "${SUDO_USER:?must be invoked via sudo so ssh uses the calling user known_hosts/key}"
 
 cd "$(dirname "$(readlink -f "$0")")/.."
+# Opt into autoloading config.local.sh — spawn-workers has always relied
+# on it for WORKER_MEMORY / WORKER_VCPUS / POOL_DIR overrides. See
+# docs/development.md for the HBIRD_AUTOLOAD_CONFIG_LOCAL flag rationale.
+export HBIRD_AUTOLOAD_CONFIG_LOCAL=1
 # shellcheck source=../lib/build-common.sh
 source lib/build-common.sh
 

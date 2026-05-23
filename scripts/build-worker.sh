@@ -6,10 +6,14 @@
 # it into each cloned qcow2's /etc/hummingbird/worker-join.env just before
 # virt-install. See docs/worker-tokens.md for the rationale (no static
 # long-lived secret embedded in the published image).
+# Shared SSH/virsh/log helpers live in lib/build-common.sh; see docs/development.md.
 set -euo pipefail
 # Run from the repo root so the build context (and `lib/`, `containers/`
 # paths) resolves consistently regardless of where the operator invokes us.
 cd "$(dirname "$(readlink -f "$0")")/.."
+# Opt into autoloading config.local.sh — build-* scripts have always
+# relied on its env-var side-effects (POOL_DIR, SSH_PUBKEY_FILES, etc).
+export HBIRD_AUTOLOAD_CONFIG_LOCAL=1
 # shellcheck source=../lib/build-common.sh
 source lib/build-common.sh
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Shared SSH/virsh/log helpers live in lib/build-common.sh; see docs/development.md.
 # verify-hardening.sh — Verify three control-plane hardening controls on a
 # running hummingbird-k8s cluster:
 #
@@ -35,14 +36,16 @@ set -euo pipefail
 source "$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/lib/build-common.sh"
 setup_logging "[verify-hardening]"
 
-# SSH options: KVM_HOST adds ProxyJump so the libvirt NAT subnet doesn't need
-# to be routable from the dev machine. This script keeps a deliberately narrow
-# opt set (no UserKnownHostsFile=/dev/null, no LogLevel=ERROR) so operators
-# running it from their workstation get normal ssh warnings — different needs
-# than the deploy/update/export flows, so it does NOT call ssh_opts_array.
-SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no)
+# SSH options: this script does not have an SSH_PUBKEY_FILE in scope — it
+# expects the operator's ssh-agent or ~/.ssh/config to surface the right
+# identity. ssh_opts_array_no_identity emits the canonical hardened opt
+# set without `-i SSH_PRIVKEY_FILE`, which is exactly what we want.
+# KVM_HOST (when set) adds ProxyJump so the libvirt NAT subnet doesn't
+# need to be routable from the dev machine.
 if [[ -n "${KVM_HOST:-}" ]]; then
-  SSH_OPTS+=(-o "ProxyJump=${KVM_HOST}")
+  ssh_opts_array_no_identity SSH_OPTS --proxy-jump="${KVM_HOST}"
+else
+  ssh_opts_array_no_identity SSH_OPTS
 fi
 
 # Helper: run a command "on the CP host". If CP_IP looks like localhost (the

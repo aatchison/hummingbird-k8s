@@ -276,7 +276,9 @@ source_lib() {
   source_lib
   ssh_opts_array OPTS --with-controlmaster
   [[ " ${OPTS[*]} " == *" ControlMaster=auto "* ]]
-  [[ " ${OPTS[*]} " == *" ControlPath=/tmp/hbird-update-%r@%h:%p "* ]]
+  # Path is rekeyed on $UID + renamed to hbird-ssh-* so two operators on
+  # the same host don't collide on the multiplex socket.
+  [[ " ${OPTS[*]} " == *" ControlPath=/tmp/hbird-ssh-${UID}-%r@%h:%p "* ]]
   [[ " ${OPTS[*]} " == *" ControlPersist=60s "* ]]
 }
 
@@ -389,4 +391,103 @@ EOF
   run derive_ssh_privkey_file "$pub"
   [ "$status" -ne 0 ]
   [[ "$output" == *"SSH private key not readable"* ]]
+}
+
+@test "derive_ssh_privkey_file: hard-fails when input does not end in .pub" {
+  source_lib
+  # An already-private path (no .pub suffix) — previously this would
+  # silently return the input unchanged, then ssh -i would fail with a
+  # confusing auth error. Now it must reject up front with rc=2.
+  priv="$BATS_TEST_TMPDIR/id_test"
+  : > "$priv"
+  run derive_ssh_privkey_file "$priv"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"must end in .pub"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# resolve_vm_ip — virsh probe + multi-NIC behavior
+# ---------------------------------------------------------------------------
+
+@test "resolve_vm_ip: virsh not on PATH yields a distinct error message" {
+  source_lib
+  # Strip virsh from PATH so command -v fails. Use a temp dir that
+  # contains nothing.
+  empty_path="$BATS_TEST_TMPDIR/emptybin"
+  mkdir -p "$empty_path"
+  # `unset -f virsh` defensively in case a prior test exported one.
+  unset -f virsh 2>/dev/null || true
+  PATH="$empty_path" run resolve_vm_ip my-vm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"virsh not installed"* ]]
+}
+
+@test "resolve_vm_ip: multi-NIC VM emits a warning to stderr and returns first IP" {
+  source_lib
+  virsh() {
+    cat <<'EOF'
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ vnet0      52:54:00:aa:bb:cc    ipv4         192.168.122.42/24
+ vnet1      52:54:00:dd:ee:ff    ipv4         10.0.0.5/24
+EOF
+  }
+  export -f virsh
+  run resolve_vm_ip multi-nic-vm
+  [ "$status" -eq 0 ]
+  # Stdout (in `run`'s merged $output) carries the first IP; the
+  # warning is emitted to stderr (also merged). Both must appear.
+  [[ "$output" == *"192.168.122.42"* ]]
+  [[ "$output" == *"WARNING"* ]]
+  [[ "$output" == *"2 IPv4 addresses"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# HBIRD_AUTOLOAD_CONFIG_LOCAL gating
+# ---------------------------------------------------------------------------
+
+@test "HBIRD_AUTOLOAD_CONFIG_LOCAL=0 (default): config.local.sh is NOT sourced" {
+  # Create a config.local.sh at the repo root that sets a marker env var.
+  # If the lib autoloads it unconditionally, the marker leaks into the
+  # post-source environment. We sanity-check by sourcing the lib in a
+  # subshell so the marker can't pollute the host bats process.
+  marker_file="$BATS_TEST_TMPDIR/local.sh"
+  cat >"$marker_file" <<'EOF'
+export HBIRD_AUTOLOAD_MARKER=tripped
+EOF
+  # Symlink it into the repo root as config.local.sh — but the repo
+  # already has a real one in development, so we use a sandbox: copy
+  # lib/build-common.sh into a temp tree and point it at our marker.
+  sandbox="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$sandbox/lib"
+  cp "$LIB" "$sandbox/lib/build-common.sh"
+  cp "$marker_file" "$sandbox/config.local.sh"
+
+  # Source in a clean subshell with the flag unset.
+  result="$(unset HBIRD_AUTOLOAD_CONFIG_LOCAL; bash -c "source '$sandbox/lib/build-common.sh' && printf '%s' \"\${HBIRD_AUTOLOAD_MARKER:-<unset>}\"")"
+  [[ "$result" == "<unset>" ]]
+}
+
+@test "verify-hardening.sh wires through ssh_opts_array_no_identity (no dead helper)" {
+  # Static grep — the helper was introduced for verify-hardening and
+  # must remain a live caller to justify its existence. If this fails,
+  # either restore the call site OR drop the helper from the lib +
+  # docs (see PR #202 review HIGH 1).
+  vh="${REPO_ROOT}/scripts/verify-hardening.sh"
+  [ -r "$vh" ]
+  grep -q 'ssh_opts_array_no_identity' "$vh"
+}
+
+@test "HBIRD_AUTOLOAD_CONFIG_LOCAL=1: config.local.sh IS sourced" {
+  marker_file="$BATS_TEST_TMPDIR/local.sh"
+  cat >"$marker_file" <<'EOF'
+export HBIRD_AUTOLOAD_MARKER=tripped
+EOF
+  sandbox="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$sandbox/lib"
+  cp "$LIB" "$sandbox/lib/build-common.sh"
+  cp "$marker_file" "$sandbox/config.local.sh"
+
+  result="$(HBIRD_AUTOLOAD_CONFIG_LOCAL=1 bash -c "source '$sandbox/lib/build-common.sh' && printf '%s' \"\${HBIRD_AUTOLOAD_MARKER:-<unset>}\"")"
+  [[ "$result" == "tripped" ]]
 }
