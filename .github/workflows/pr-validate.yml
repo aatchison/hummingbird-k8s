@@ -65,6 +65,21 @@ jobs:
             docker.io/bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300 \
             tests/lib/
 
+  unit-tests-scripts:
+    # bats-core unit tests for scripts/update-cluster.sh + scripts/export-argocd.sh
+    # (issue #189). Codifies the assertion patterns integration-update-cluster
+    # .yml::assert-dry-run-sequence keys on — regression protection at
+    # pr-validate time, not just on the self-hosted runner. Same pinned bats
+    # container as unit-tests-lib.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bats unit tests for scripts/
+        run: |
+          podman run --rm -v "${{ github.workspace }}:/repo:Z" -w /repo \
+            docker.io/bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300 \
+            tests/scripts/
+
   render-bib-config-snapshot:
     runs-on: ubuntu-latest
     steps:

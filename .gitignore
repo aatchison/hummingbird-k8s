@@ -4,6 +4,9 @@ bib-config-*.toml
 worker-join.env
 admin.conf
 admin.conf.*
+# Exception: the tests/fixtures admin.conf is a deliberately-inert
+# kubeadm-shaped fixture used by tests/scripts/export-argocd.bats (issue #189).
+!tests/fixtures/admin.conf
 
 # Operator-fetched kubeconfigs (full-cluster credentials — never commit)
 /kubeconfig.yaml
