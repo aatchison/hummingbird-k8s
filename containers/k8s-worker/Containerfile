@@ -21,7 +21,7 @@ ARG K8S_VERSION=v1.31
 # datasource, which lets operators inject per-VM user-data (SSH keys,
 # runcmd, package installs) via `virt-install --cloud-init` or a libvirt
 # seed ISO. See docs/cloud-init.md.
-ARG ENABLE_CLOUD_INIT=0
+ARG ENABLE_CLOUD_INIT=1
 
 # Drop in the sshd config early so changes here don't bust the (much bigger)
 # package-install layer cache below.
