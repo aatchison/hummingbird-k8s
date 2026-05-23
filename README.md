@@ -214,9 +214,12 @@ hatch for a stuck drain.
 Readiness gates: between SSH-back and uncordon, the script also requires
 the node's `.status.nodeInfo.bootID` to change (proves a real reboot
 happened — defeats stale apiserver-cache `Ready=True` hits) **and** every
-kube-system DaemonSet pod on the node (Cilium / kube-proxy / coredns) to
-report Ready before proceeding to the next node. Both gates share the
-`READY_TIMEOUT` env knob. Full reference:
+NEW kube-system DaemonSet pod on the node (Cilium / kube-proxy / coredns)
+to report Ready before proceeding. Pre-existing CrashLoops are
+snapshotted at gate entry and excluded so an unrelated chronic failure
+doesn't halt the whole roll. Both gates are bounded by `READY_TIMEOUT` /
+`DAEMONSET_TIMEOUT` (default-equal), with `--skip-gates` as an operator
+escape hatch. Full reference:
 [Reboot detection (bootID)](docs/update-cluster.md#reboot-detection-bootid)
 and [Daemonset readiness gate](docs/update-cluster.md#daemonset-readiness-gate).
 
@@ -224,9 +227,11 @@ Operator-ergonomics flags — pass via `FLAGS=` to the Makefile targets, or
 directly to the script: `--start-from=NAME` (resume after an interrupted
 roll), `--parallel=N` (process workers in batches of N concurrently),
 `--continue-on-error` (record per-node failures, summarize at the end),
-`--no-delete-emptydir-data` (preserve emptyDir caches during drain).
+`--no-delete-emptydir-data` (preserve emptyDir caches during drain),
+`--skip-gates` (escape hatch for misfiring bootID/DS gates).
 Per-step timeouts are tunable via `DRAIN_TIMEOUT`, `READY_TIMEOUT`,
-`APISERVER_TIMEOUT`, `SSH_TIMEOUT`, and `INTER_NODE_SLEEP` env vars.
+`DAEMONSET_TIMEOUT`, `APISERVER_TIMEOUT`, `SSH_TIMEOUT`, and
+`INTER_NODE_SLEEP` env vars.
 
 Exercised end-to-end by `integration-update-cluster.yml` (see
 [docs/integration-tests.md](docs/integration-tests.md)).

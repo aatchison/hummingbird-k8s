@@ -67,6 +67,12 @@
 #                              drain by design). Also skips the
 #                              bootc-fetch-apply-updates.timer stop/restart
 #                              dance (operator-driven mode).
+#   --skip-gates               Operator escape hatch — skip the bootID-changed
+#                              and DaemonSet-readiness gates. Only use if
+#                              you've verified the cluster is healthy via
+#                              other means; gates exist to prevent dataplane
+#                              outages during the roll. wait_node_ready
+#                              alone will be the post-reboot signal.
 #   --dry-run                  Print the intended actions without
 #                              ssh/kubectl.
 #
@@ -74,6 +80,10 @@
 # use bare seconds or Go-style durations as appropriate):
 #   DRAIN_TIMEOUT       kubectl drain --timeout (default 5m)
 #   READY_TIMEOUT       wait_node_ready seconds (default 300)
+#   DAEMONSET_TIMEOUT   wait_node_daemonsets_ready seconds (defaults to
+#                       READY_TIMEOUT). Set independently when the
+#                       DaemonSet gate needs more (or less) headroom than
+#                       the node-Ready gate.
 #   APISERVER_TIMEOUT   wait_apiserver_back seconds (default 300)
 #   SSH_TIMEOUT         wait_ssh_back seconds (default 300)
 #   INTER_NODE_SLEEP    seconds to pause between nodes (default 5)
@@ -98,6 +108,7 @@ setup_logging "[update-cluster]"
 
 WORKERS_ONLY=0
 SKIP_DRAIN=0
+SKIP_GATES=0
 DRY_RUN=0
 NODE_FILTER=""
 START_FROM=""
@@ -109,6 +120,7 @@ for arg in "$@"; do
   case "$arg" in
     --workers-only)              WORKERS_ONLY=1 ;;
     --skip-drain)                SKIP_DRAIN=1 ;;
+    --skip-gates)                SKIP_GATES=1 ;;
     --dry-run)                   DRY_RUN=1 ;;
     --continue-on-error)         CONTINUE_ON_ERROR=1 ;;
     --no-delete-emptydir-data)   NO_DELETE_EMPTYDIR_DATA=1 ;;
@@ -126,7 +138,7 @@ for arg in "$@"; do
     --parallel=*)                PARALLEL="${arg#--parallel=}" ;;
     --parallel)                  fail "--parallel requires a value: --parallel=N" ;;
     -h|--help)
-      sed -n '2,86p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,95p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) fail "unknown argument: $arg (try --help)" ;;
@@ -153,6 +165,11 @@ fi
 # bare seconds consumed by the wait_* helpers below.
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-5m}"
 READY_TIMEOUT="${READY_TIMEOUT:-300}"
+# DAEMONSET_TIMEOUT defaults to READY_TIMEOUT for backward compatibility —
+# pre-#208 the DaemonSet gate was bounded by READY_TIMEOUT directly. Operators
+# can now tune the gate independently (e.g. a noisy Cilium rollout may want
+# more headroom than the node-Ready check).
+DAEMONSET_TIMEOUT="${DAEMONSET_TIMEOUT:-${READY_TIMEOUT}}"
 APISERVER_TIMEOUT="${APISERVER_TIMEOUT:-300}"
 SSH_TIMEOUT="${SSH_TIMEOUT:-300}"
 INTER_NODE_SLEEP="${INTER_NODE_SLEEP:-5}"
@@ -178,8 +195,12 @@ INTER_NODE_SLEEP="${INTER_NODE_SLEEP:-5}"
 # rejected here, so hostile env vars never reach the sinks.
 [[ "$DRAIN_TIMEOUT" =~ ^[0-9]+(s|m|h)?$ ]] \
   || fail "DRAIN_TIMEOUT must match ^[0-9]+(s|m|h)?\$ (got: ${DRAIN_TIMEOUT})"
-[[ "$READY_TIMEOUT" =~ ^[0-9]+$ ]] \
-  || fail "READY_TIMEOUT must be a positive integer of seconds (got: ${READY_TIMEOUT})"
+# READY_TIMEOUT / DAEMONSET_TIMEOUT must be STRICTLY positive — a value of 0
+# would make the wait loops short-circuit immediately, defeating the gates.
+[[ "$READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
+  || fail "READY_TIMEOUT must be a positive integer of seconds, >0 (got: ${READY_TIMEOUT})"
+[[ "$DAEMONSET_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
+  || fail "DAEMONSET_TIMEOUT must be a positive integer of seconds, >0 (got: ${DAEMONSET_TIMEOUT})"
 [[ "$APISERVER_TIMEOUT" =~ ^[0-9]+$ ]] \
   || fail "APISERVER_TIMEOUT must be a positive integer of seconds (got: ${APISERVER_TIMEOUT})"
 [[ "$SSH_TIMEOUT" =~ ^[0-9]+$ ]] \
@@ -376,6 +397,13 @@ IN_FLIGHT_NODE=""
 IN_FLIGHT_IP=""
 IN_FLIGHT_DRAINED=0
 IN_FLIGHT_UNCORDONED=0
+# IN_FLIGHT_PHASE names the in-progress step so cleanup_on_exit can surface
+# a more specific recovery hint than "cordoned, not uncordoned". Values are
+# advisory (operator-readable strings), e.g.
+#   pre-drain, post-drain, post-bootID-pre-Ready, post-Ready-pre-DaemonSet,
+#   post-DaemonSet-pre-uncordon. Set by update_worker / update_cp at each
+# transition; consumed only by cleanup_on_exit.
+IN_FLIGHT_PHASE=""
 
 # Per-node result tracking for --continue-on-error. FAILED_NODES is a
 # parallel array of "NAME:reason" entries; SUCCEEDED_NODES is just names.
@@ -408,8 +436,8 @@ mark_in_flight() {
   [[ -n "${BATCH_TMPDIR:-}" ]] || return 0
   [[ -d "$BATCH_TMPDIR" ]]     || return 0
   [[ -n "$IN_FLIGHT_NODE" ]]   || return 0
-  printf 'node=%s\nip=%s\ndrained=%d\nuncordoned=%d\n' \
-    "$IN_FLIGHT_NODE" "$IN_FLIGHT_IP" "$IN_FLIGHT_DRAINED" "$IN_FLIGHT_UNCORDONED" \
+  printf 'node=%s\nip=%s\ndrained=%d\nuncordoned=%d\nphase=%s\n' \
+    "$IN_FLIGHT_NODE" "$IN_FLIGHT_IP" "$IN_FLIGHT_DRAINED" "$IN_FLIGHT_UNCORDONED" "$IN_FLIGHT_PHASE" \
     > "${BATCH_TMPDIR}/${IN_FLIGHT_NODE}.in-flight" 2>/dev/null || true
 }
 
@@ -429,6 +457,9 @@ cleanup_on_exit() {
     printf '\n' >&2
     printf '[update-cluster] ============================================================\n' >&2
     printf '[update-cluster] WARNING: node %s is cordoned and was not uncordoned.\n' "$IN_FLIGHT_NODE" >&2
+    if [[ -n "$IN_FLIGHT_PHASE" ]]; then
+      printf '[update-cluster] in-flight phase: %s\n' "$IN_FLIGHT_PHASE" >&2
+    fi
     printf '[update-cluster] Restore it manually once you have verified its state:\n' >&2
     printf '[update-cluster]   ssh root@%s "kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon %s"\n' \
       "$CP_IP" "$IN_FLIGHT_NODE" >&2
@@ -443,18 +474,22 @@ cleanup_on_exit() {
     for _inflight in "${BATCH_TMPDIR}"/*.in-flight; do
       [[ -e "$_inflight" ]] || continue
       # shellcheck disable=SC1090
-      local _node="" _drained=0 _uncordoned=0
+      local _node="" _drained=0 _uncordoned=0 _phase=""
       while IFS='=' read -r _k _v; do
         case "$_k" in
           node)       _node="$_v" ;;
           drained)    _drained="$_v" ;;
           uncordoned) _uncordoned="$_v" ;;
+          phase)      _phase="$_v" ;;
         esac
       done < "$_inflight"
       if [[ -n "$_node" ]] && (( _drained == 1 )) && (( _uncordoned == 0 )); then
         printf '\n' >&2
         printf '[update-cluster] ============================================================\n' >&2
         printf '[update-cluster] WARNING: node %s (parallel batch) is cordoned, not uncordoned.\n' "$_node" >&2
+        if [[ -n "$_phase" ]]; then
+          printf '[update-cluster] in-flight phase: %s\n' "$_phase" >&2
+        fi
         printf '[update-cluster] Restore it manually once you have verified its state:\n' >&2
         printf '[update-cluster]   ssh root@%s "kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon %s"\n' \
           "${CP_IP:-CP_IP}" "$_node" >&2
@@ -557,6 +592,13 @@ wait_node_ready() {
 # Empty stdout + rc=0 is a valid return (kubectl may have returned no value
 # in race windows); callers MUST treat empty pre-bootid as "couldn't capture,
 # skip the gate" rather than as a comparison sentinel.
+#
+# Retry: a single transient apiserver flake (or controlmaster reconnect)
+# can return an empty string even on a healthy cluster. Round-1 review of
+# PR #208 flagged that "empty pre_bootid silently regresses the gate"; we
+# now retry up to 3 times with a 2s sleep before giving up. A persistent
+# failure logs WARN (greppable in postmortems) AND surfaces the same WARN
+# from wait_node_bootid_changed when the empty value is consumed downstream.
 capture_node_bootid() {
   local node="$1"
   if (( DRY_RUN == 1 )); then
@@ -564,8 +606,18 @@ capture_node_bootid() {
     echo "<dry-run-bootid>"
     return 0
   fi
-  cp_kubectl "get node ${node} -o jsonpath='{.status.nodeInfo.bootID}'" \
-    2>/dev/null || true
+  local attempt val
+  for attempt in 1 2 3; do
+    val="$(cp_kubectl "get node ${node} -o jsonpath='{.status.nodeInfo.bootID}'" 2>/dev/null || true)"
+    if [[ -n "$val" ]]; then
+      printf '%s' "$val"
+      return 0
+    fi
+    # Don't sleep after the last attempt — the caller is waiting.
+    (( attempt < 3 )) && sleep 2
+  done
+  log "WARN: failed to capture pre-reboot bootID for ${node} after 3 attempts; bootID-changed gate will be skipped (apiserver flake?)"
+  # Empty stdout. Callers must treat as "skip the gate" per the docstring.
 }
 
 # wait_node_bootid_changed NODE PRE_BOOTID
@@ -584,9 +636,13 @@ capture_node_bootid() {
 #     Without a baseline we can't compare; skipping is safer than
 #     blocking the update forever on a missing field.
 wait_node_bootid_changed() {
-  local node="$1" pre_bootid="$2" elapsed=0 interval=3 cur_bootid
+  local node="$1" pre_bootid="$2" elapsed=0 interval=5 cur_bootid="" last_heartbeat=0
+  if (( SKIP_GATES == 1 )); then
+    log "node ${node}: --skip-gates set, skipping bootID-changed gate"
+    return 0
+  fi
   if [[ -z "$pre_bootid" ]]; then
-    log "node ${node}: pre-reboot bootID was empty; skipping bootID-changed gate"
+    log "WARN: node ${node}: pre-reboot bootID was empty; skipping bootID-changed gate"
     return 0
   fi
   log "waiting for node ${node} bootID to change from pre-reboot value (timeout ${READY_TIMEOUT}s)"
@@ -597,12 +653,22 @@ wait_node_bootid_changed() {
     fi
     cur_bootid=$(cp_kubectl "get node ${node} -o jsonpath='{.status.nodeInfo.bootID}'" 2>/dev/null || true)
     if [[ -n "$cur_bootid" && "$cur_bootid" != "$pre_bootid" ]]; then
-      log "node ${node} bootID changed (pre=${pre_bootid:0:8}… post=${cur_bootid:0:8}…) after ~${elapsed}s"
+      log "node ${node} bootID changed (pre=${pre_bootid:0:8}... post=${cur_bootid:0:8}...) after ~${elapsed}s"
       return 0
     fi
     sleep "$interval"
     elapsed=$((elapsed + interval))
+    # Progress heartbeat every ~30s so an operator watching the log knows
+    # the gate is still alive on a slow reboot. Rounded to the interval
+    # boundary so we don't log every iteration.
+    if (( elapsed - last_heartbeat >= 30 )) && (( elapsed < READY_TIMEOUT )); then
+      log "  still polling node ${node} for bootID-changed gate after ~${elapsed}s (pre=${pre_bootid:0:8}... cur=${cur_bootid:0:8}...)"
+      last_heartbeat=$elapsed
+    fi
   done
+  # Diagnostic on timeout: surface the last observed pre/cur so an operator
+  # can tell at a glance whether the apiserver returned anything at all.
+  log "node ${node}: bootID-changed gate timed out after ${READY_TIMEOUT}s (pre=${pre_bootid:0:8}... cur=${cur_bootid:0:8}...)"
   return 1
 }
 
@@ -628,39 +694,101 @@ wait_node_bootid_changed() {
 # acceptable; better to wait one extra cycle than to miss a real CNI
 # crash loop.
 #
-# READY_TIMEOUT bounds the wait. Returns 0 when all pods report Ready,
+# DAEMONSET_TIMEOUT bounds the wait. Returns 0 when all pods report Ready,
 # 1 on timeout.
+#
+# Round-1 review hardenings (PR #208):
+#   - Phase 1: wait up to 60s for at least one kube-system pod to APPEAR on
+#     the node. After a fresh reboot the DaemonSet controller can take a
+#     few seconds to schedule pods to the node; without phase 1 we'd race
+#     the controller and pass vacuously on the empty result. On phase-1
+#     timeout we emit a WARN and proceed (could be a fresh cluster with no
+#     DS yet; better than hanging forever).
+#   - Baseline-unready exclusion: snapshot the set of pods that are
+#     already unready at gate entry. Pre-existing CrashLoops in kube-system
+#     that have nothing to do with this upgrade no longer block the whole
+#     roll. Only NEW unready pods (post-baseline) gate progress.
+#   - Progress heartbeat every ~30s on a slow rollout.
 wait_node_daemonsets_ready() {
-  local node="$1" elapsed=0 interval=5 line raw unready
-  log "waiting for kube-system DaemonSet pods on ${node} to be Ready (timeout ${READY_TIMEOUT}s)"
-  while (( elapsed < READY_TIMEOUT )); do
-    if (( DRY_RUN == 1 )); then
-      log "DRY-RUN would poll kube-system pods on ${node} for Ready"
-      return 0
+  local node="$1" elapsed=0 interval=5 line raw new_unready
+  local baseline_unready="" pod_count=0 phase1_elapsed=0 last_heartbeat=0
+  if (( SKIP_GATES == 1 )); then
+    log "node ${node}: --skip-gates set, skipping DaemonSet readiness gate"
+    return 0
+  fi
+  if (( DRY_RUN == 1 )); then
+    log "waiting for kube-system DaemonSet pods on ${node} to be Ready (timeout ${DAEMONSET_TIMEOUT}s)"
+    log "DRY-RUN would poll kube-system pods on ${node} for Ready"
+    return 0
+  fi
+  # ---- Phase 1: wait for at least one kube-system pod to appear on the node.
+  # After a reboot the DaemonSet controller may take a few seconds to bind
+  # pods to the freshly-rejoined node; polling Ready before that gives a
+  # vacuous pass. Bounded to 60s — long enough for the DS controller to act,
+  # short enough that a genuinely-no-DS cluster doesn't stall.
+  while (( phase1_elapsed < 60 )); do
+    pod_count=$(cp_kubectl "get pods -n kube-system --field-selector=spec.nodeName=${node} --no-headers 2>/dev/null | wc -l" 2>/dev/null || echo 0)
+    pod_count="${pod_count//[^0-9]/}"  # strip any stray whitespace/CR
+    [[ -z "$pod_count" ]] && pod_count=0
+    if (( pod_count > 0 )); then
+      break
     fi
-    # Emits "podname=true,true\npodname=false,true\n..." (one line per
-    # pod, comma-separated container ready bools). Empty containerStatuses
-    # (e.g. Pending pod) emits "podname=" — also treated as unready.
+    if (( phase1_elapsed == 0 )); then
+      log "WARN: no kube-system pods yet observed on ${node}; waiting up to 60s for DaemonSet controller to schedule"
+    fi
+    sleep 2
+    phase1_elapsed=$((phase1_elapsed + 2))
+  done
+  if (( pod_count == 0 )); then
+    log "WARN: no kube-system pods on ${node} after 60s; proceeding (fresh cluster or no DS deployed yet)"
+    return 0
+  fi
+  # ---- Snapshot baseline-unready: any kube-system pod on this node that
+  # is ALREADY unready right now. Pre-existing CrashLoops unrelated to the
+  # upgrade are excluded from the gate so they don't block the roll.
+  raw=$(cp_kubectl "get pods -n kube-system --field-selector=spec.nodeName=${node} -o jsonpath='{range .items[*]}{.metadata.name}={range .status.containerStatuses[*]}{.ready},{end}{\"\\n\"}{end}'" 2>/dev/null || true)
+  baseline_unready=$(_collect_unready_names "$raw" | sort -u)
+  if [[ -n "$baseline_unready" ]]; then
+    # shellcheck disable=SC2001  # tr is the simpler join here
+    log "  baseline-unready pods on ${node} (excluded from gate): $(echo "$baseline_unready" | tr '\n' ' ')"
+  fi
+  log "waiting for kube-system DaemonSet pods on ${node} to be Ready (timeout ${DAEMONSET_TIMEOUT}s)"
+  # ---- Phase 2: poll until every NEW (post-baseline) unready pod becomes
+  # Ready, bounded by DAEMONSET_TIMEOUT.
+  while (( elapsed < DAEMONSET_TIMEOUT )); do
     raw=$(cp_kubectl "get pods -n kube-system --field-selector=spec.nodeName=${node} -o jsonpath='{range .items[*]}{.metadata.name}={range .status.containerStatuses[*]}{.ready},{end}{\"\\n\"}{end}'" 2>/dev/null || true)
-    unready=""
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      # Format: "podname=true,true,". Trailing comma is harmless.
-      # Unready if RHS is empty OR contains "false".
-      local rhs="${line#*=}"
-      if [[ -z "$rhs" || "$rhs" == *false* ]]; then
-        unready+="${line%%=*} "
-      fi
-    done <<< "$raw"
-    if [[ -z "$unready" ]]; then
-      log "node ${node} kube-system DaemonSet pods all Ready after ~${elapsed}s"
+    # Compute set difference: current unready MINUS baseline unready.
+    new_unready=$(comm -23 <(_collect_unready_names "$raw" | sort -u) <(printf '%s\n' "$baseline_unready" | sort -u) | tr '\n' ' ')
+    new_unready="${new_unready% }"
+    if [[ -z "$new_unready" ]]; then
+      log "node ${node} kube-system DaemonSet pods all Ready after ~${elapsed}s (excluding ${baseline_unready:+pre-existing-unready})"
       return 0
     fi
     sleep "$interval"
     elapsed=$((elapsed + interval))
+    if (( elapsed - last_heartbeat >= 30 )) && (( elapsed < DAEMONSET_TIMEOUT )); then
+      log "  still polling kube-system DaemonSet pods on ${node} after ~${elapsed}s (new-unready: ${new_unready})"
+      last_heartbeat=$elapsed
+    fi
   done
-  log "node ${node}: kube-system DaemonSet pods still not Ready after ${READY_TIMEOUT}s: ${unready% }"
+  log "node ${node}: kube-system DaemonSet pods (new, post-baseline) still not Ready after ${DAEMONSET_TIMEOUT}s: ${new_unready}"
   return 1
+}
+
+# _collect_unready_names — read jsonpath blob on stdin (one
+# "podname=true,false,..." line per pod) and emit, one per line, the names
+# of pods whose ready set contains "false" or is entirely empty (Pending
+# pod with no containerStatuses). Internal helper for
+# wait_node_daemonsets_ready.
+_collect_unready_names() {
+  local raw="$1" line rhs
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    rhs="${line#*=}"
+    if [[ -z "$rhs" || "$rhs" == *false* ]]; then
+      echo "${line%%=*}"
+    fi
+  done <<< "$raw"
 }
 
 wait_apiserver_back() {
@@ -777,6 +905,7 @@ update_cp() {
   IN_FLIGHT_IP="$CP_IP"
   IN_FLIGHT_DRAINED=0
   IN_FLIGHT_UNCORDONED=0
+  IN_FLIGHT_PHASE="pre-upgrade"
 
   timer_stop "$CP_IP"
 
@@ -786,7 +915,7 @@ update_cp() {
   # See docs/update-cluster.md "Reboot detection (bootID)".
   local pre_bootid
   pre_bootid="$(capture_node_bootid "$CP_NAME")"
-  log "  pre-reboot bootID: ${pre_bootid:0:8}…"
+  log "  pre-reboot bootID: ${pre_bootid:0:8}..."
 
   log "ssh root@${CP_IP} bootc upgrade --apply  (auto-reboots; digest pre/post compared)"
   set +e
@@ -810,25 +939,30 @@ update_cp() {
   fi
 
   wait_ssh_back "$CP_IP" "$SSH_TIMEOUT" || fail "CP ${CP_NAME} did not come back over SSH within ${SSH_TIMEOUT}s"
+  IN_FLIGHT_PHASE="post-reboot-pre-apiserver"
   wait_apiserver_back "$APISERVER_TIMEOUT"   || fail "CP ${CP_NAME} apiserver did not return within ${APISERVER_TIMEOUT}s"
   # bootID gate runs BEFORE wait_node_ready to defeat the stale-apiserver-
   # cache race (apiserver may report Ready=True from the pre-reboot lease
   # before kubelet has actually re-registered).
+  IN_FLIGHT_PHASE="post-apiserver-pre-bootID"
   wait_node_bootid_changed "$CP_NAME" "$pre_bootid" \
     || fail "CP node ${CP_NAME} bootID did not change after ${READY_TIMEOUT}s (apiserver may be serving stale state)"
+  IN_FLIGHT_PHASE="post-bootID-pre-Ready"
   wait_node_ready "$CP_NAME" "$READY_TIMEOUT" || fail "CP node ${CP_NAME} did not reach Ready within ${READY_TIMEOUT}s"
   # DaemonSet gate: Node Ready means kubelet+CNI binary present, NOT that
   # the Cilium/kube-proxy/coredns pods are forwarding traffic. Block here
   # so we don't proceed to workers while the CP's networking is still
   # CrashLooping. See docs/update-cluster.md "Daemonset readiness gate".
+  IN_FLIGHT_PHASE="post-Ready-pre-DaemonSet"
   wait_node_daemonsets_ready "$CP_NAME" \
-    || fail "CP ${CP_NAME}: kube-system DaemonSet pods not Ready after ${READY_TIMEOUT}s"
+    || fail "CP ${CP_NAME}: kube-system DaemonSet pods not Ready after ${DAEMONSET_TIMEOUT}s"
 
   timer_start "$CP_IP"
   log "CP ${CP_NAME} updated and Ready."
 
   IN_FLIGHT_NODE=""
   IN_FLIGHT_IP=""
+  IN_FLIGHT_PHASE=""
 }
 
 # update_worker NAME IP
@@ -847,6 +981,7 @@ update_worker() {
   IN_FLIGHT_IP="$ip"
   IN_FLIGHT_DRAINED=0
   IN_FLIGHT_UNCORDONED=0
+  IN_FLIGHT_PHASE="pre-drain"
   mark_in_flight
 
   timer_stop "$ip"
@@ -866,6 +1001,7 @@ update_worker() {
     cp_kubectl "drain ${name} ${drain_flags}" \
       || { worker_fail "$name" "drain failed (use --skip-drain to override)"; return 1; }
     IN_FLIGHT_DRAINED=1
+    IN_FLIGHT_PHASE="post-drain-pre-upgrade"
     mark_in_flight
   fi
 
@@ -875,7 +1011,7 @@ update_worker() {
   # See docs/update-cluster.md "Reboot detection (bootID)".
   local pre_bootid
   pre_bootid="$(capture_node_bootid "$name")"
-  log "  pre-reboot bootID: ${pre_bootid:0:8}…"
+  log "  pre-reboot bootID: ${pre_bootid:0:8}..."
 
   log "ssh root@${ip} bootc upgrade --apply  (auto-reboots; digest pre/post compared)"
   set +e
@@ -906,24 +1042,34 @@ update_worker() {
     return 0
   fi
 
+  IN_FLIGHT_PHASE="post-upgrade-pre-ssh"
+  mark_in_flight
   wait_ssh_back "$ip" "$SSH_TIMEOUT"       || { worker_fail "$name" "did not come back over SSH within ${SSH_TIMEOUT}s"; return 1; }
   # bootID gate runs BEFORE wait_node_ready to defeat the stale-apiserver-
   # cache race (apiserver may still serve Ready=True from the pre-reboot
   # lease before kubelet has actually re-registered post-reboot).
+  IN_FLIGHT_PHASE="post-ssh-pre-bootID"
+  mark_in_flight
   wait_node_bootid_changed "$name" "$pre_bootid" \
     || { worker_fail "$name" "node bootID did not change after ${READY_TIMEOUT}s (apiserver may be serving stale state)"; return 1; }
   # wait_node_ready before uncordon: kubelet has to rejoin (which may
   # report Ready,SchedulingDisabled while still cordoned) — the regex
   # in wait_node_ready handles both forms.
+  IN_FLIGHT_PHASE="post-bootID-pre-Ready"
+  mark_in_flight
   wait_node_ready "$name" "$READY_TIMEOUT" || { worker_fail "$name" "did not reach Ready within ${READY_TIMEOUT}s"; return 1; }
   # DaemonSet gate: Node Ready means kubelet+CNI binary present, NOT that
   # the Cilium/kube-proxy/coredns pods are forwarding traffic on this
   # node. Block here so we don't move to draining N+1 while the CNI on N
   # is still CrashLooping. See docs/update-cluster.md "Daemonset
   # readiness gate".
+  IN_FLIGHT_PHASE="post-Ready-pre-DaemonSet"
+  mark_in_flight
   wait_node_daemonsets_ready "$name" \
-    || { worker_fail "$name" "kube-system DaemonSet pods not Ready on this node after ${READY_TIMEOUT}s"; return 1; }
+    || { worker_fail "$name" "kube-system DaemonSet pods not Ready on this node after ${DAEMONSET_TIMEOUT}s"; return 1; }
 
+  IN_FLIGHT_PHASE="post-DaemonSet-pre-uncordon"
+  mark_in_flight
   log "kubectl uncordon ${name}"
   cp_kubectl "uncordon ${name}" || { worker_fail "$name" "uncordon failed"; return 1; }
   IN_FLIGHT_UNCORDONED=1
@@ -939,6 +1085,7 @@ update_worker() {
 
   IN_FLIGHT_NODE=""
   IN_FLIGHT_IP=""
+  IN_FLIGHT_PHASE=""
   SUCCEEDED_NODES+=("$name")
 }
 
@@ -963,10 +1110,14 @@ worker_fail() {
 
 log "config: $CONFIG_PATH"
 log "CP=${CP_NAME} (${CP_IP}), workers=(${WORKER_NAMES[*]:-})"
-log "flags: workers-only=${WORKERS_ONLY} skip-drain=${SKIP_DRAIN} dry-run=${DRY_RUN}"
+log "flags: workers-only=${WORKERS_ONLY} skip-drain=${SKIP_DRAIN} skip-gates=${SKIP_GATES} dry-run=${DRY_RUN}"
 log "       node-filter=${NODE_FILTER:-<none>} start-from=${START_FROM:-<none>}"
 log "       continue-on-error=${CONTINUE_ON_ERROR} no-delete-emptydir-data=${NO_DELETE_EMPTYDIR_DATA} parallel=${PARALLEL}"
-log "timeouts: drain=${DRAIN_TIMEOUT} ready=${READY_TIMEOUT}s apiserver=${APISERVER_TIMEOUT}s ssh=${SSH_TIMEOUT}s inter-node-sleep=${INTER_NODE_SLEEP}s"
+log "timeouts: drain=${DRAIN_TIMEOUT} ready=${READY_TIMEOUT}s daemonset=${DAEMONSET_TIMEOUT}s apiserver=${APISERVER_TIMEOUT}s ssh=${SSH_TIMEOUT}s inter-node-sleep=${INTER_NODE_SLEEP}s"
+# Per-node time budget pre-announcement: worst-case ceiling for an operator
+# computing "when will this finish?" off the cluster size. Adds the new
+# DaemonSet gate into the published budget (post-#208).
+log "per-node worst-case budget: drain ${DRAIN_TIMEOUT} + ssh-back ${SSH_TIMEOUT}s + bootID ${READY_TIMEOUT}s + ready ${READY_TIMEOUT}s + daemonsets ${DAEMONSET_TIMEOUT}s"
 
 # Build the worker list we'll actually process. --start-from skips entries
 # until START_FROM is encountered (inclusive). Empty WORKER_NAMES → empty

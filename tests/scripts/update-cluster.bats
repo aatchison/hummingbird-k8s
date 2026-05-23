@@ -465,3 +465,93 @@ _load_example_workers() {
   echo "$output" | grep -q "bootID to change from pre-reboot value (timeout 600s)"
   echo "$output" | grep -q "kube-system DaemonSet pods on hbird-w1 to be Ready (timeout 600s)"
 }
+
+# ---------------------------------------------------------------------------
+# PR #208 round-1 review hardenings — bootID retry, baseline-unready
+# exclusion, phase-1 wait, --skip-gates, DAEMONSET_TIMEOUT validation,
+# READY_TIMEOUT=0 rejection.
+# ---------------------------------------------------------------------------
+
+@test "READY_TIMEOUT=0 is rejected (strict positive)" {
+  # Pre-#208 the regex permitted 0, which would defeat the gates.
+  READY_TIMEOUT=0 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "READY_TIMEOUT"
+}
+
+@test "DAEMONSET_TIMEOUT defaults to READY_TIMEOUT when unset" {
+  # No explicit DAEMONSET_TIMEOUT — should mirror READY_TIMEOUT in the
+  # startup-flags log and in the gate log line.
+  READY_TIMEOUT=450 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "daemonset=450s"
+  echo "$output" | grep -q "kube-system DaemonSet pods on hbird-w1 to be Ready (timeout 450s)"
+}
+
+@test "DAEMONSET_TIMEOUT env override surfaces independent of READY_TIMEOUT" {
+  DAEMONSET_TIMEOUT=900 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "daemonset=900s"
+  echo "$output" | grep -q "kube-system DaemonSet pods on hbird-w1 to be Ready (timeout 900s)"
+  # But the bootID gate must still be bound by READY_TIMEOUT.
+  echo "$output" | grep -q "bootID to change from pre-reboot value (timeout 300s)"
+}
+
+@test "DAEMONSET_TIMEOUT rejects bash-arithmetic injection payload" {
+  DAEMONSET_TIMEOUT='a[0$(reboot)]' run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "DAEMONSET_TIMEOUT"
+}
+
+@test "DAEMONSET_TIMEOUT=0 is rejected (strict positive)" {
+  DAEMONSET_TIMEOUT=0 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "DAEMONSET_TIMEOUT"
+}
+
+@test "--skip-gates skips bootID + DaemonSet gates (dry-run)" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run --skip-gates
+  [ "$status" -eq 0 ]
+  # Flag must surface in the startup summary.
+  echo "$output" | grep -q "skip-gates=1"
+  # In dry-run, gate log lines are emitted before the skip check
+  # short-circuits — but on a REAL run the gates skip-log the early-out.
+  # For the dry-run we assert the skip-log appears at least once per node
+  # (CP + 2 workers = 3 nodes; skip log fires for both gates).
+  # Note: in dry-run we still execute the gate's early `(( DRY_RUN == 1 ))`
+  # branch BEFORE the SKIP_GATES check. To make --skip-gates dry-run
+  # observable we put SKIP_GATES ahead of DRY_RUN in both gates. So:
+  bootid_skip=$(echo "$output" | grep -c "skipping bootID-changed gate" || true)
+  ds_skip=$(echo "$output" | grep -c "skipping DaemonSet readiness gate" || true)
+  [ "$bootid_skip" -ge 3 ]
+  [ "$ds_skip" -ge 3 ]
+}
+
+@test "--skip-gates is documented in --help output" {
+  run bash "$SCRIPT" --help
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q -- "--skip-gates"
+}
+
+@test "DAEMONSET_TIMEOUT is documented in --help output" {
+  run bash "$SCRIPT" --help
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "DAEMONSET_TIMEOUT"
+}
+
+@test "per-node worst-case time budget is announced in the startup banner" {
+  # The pre-announce line gives operators a quick "how long will this
+  # take" ceiling. Must reflect override values.
+  READY_TIMEOUT=400 DAEMONSET_TIMEOUT=500 SSH_TIMEOUT=200 DRAIN_TIMEOUT=10m \
+    run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "per-node worst-case budget: drain 10m + ssh-back 200s + bootID 400s + ready 400s + daemonsets 500s"
+}
+
+@test "bootID truncation log uses ASCII '...' not U+2026 ellipsis" {
+  # grep/copy-paste hygiene — the U+2026 (…) glyph caused trouble in
+  # postmortems where operators were greping for "post=" substrings.
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  ! echo "$output" | grep -qF $'\xe2\x80\xa6'
+}
