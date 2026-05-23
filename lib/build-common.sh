@@ -67,7 +67,13 @@ ssh_pubkey_files() {
       tr ':' '\n' <<<"$SSH_PUBKEY_FILES"
     fi
   else
-    echo "/home/${SUDO_USER}/.ssh/id_ed25519.pub"
+    # Resolve the SUDO_USER's actual home dir via getent — root's home is
+    # /root, not /home/root, and operators with non-standard homes shouldn't
+    # have to override SSH_PUBKEY_FILES just to use the default key.
+    local home
+    home="$(getent passwd "${SUDO_USER}" 2>/dev/null | cut -d: -f6)"
+    [[ -n "$home" ]] || home="/home/${SUDO_USER}"
+    echo "${home}/.ssh/id_ed25519.pub"
   fi
 }
 

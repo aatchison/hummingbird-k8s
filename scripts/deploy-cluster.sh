@@ -118,6 +118,12 @@ case "$SWITCH_TO_GHCR" in true|false) ;; *) fail "SWITCH_TO_GHCR must be true or
 SSH_PUBKEY_CONTENT="$(< "$SSH_PUBKEY_FILE")"
 [[ -n "$SSH_PUBKEY_CONTENT" ]] || fail "SSH_PUBKEY_FILE is empty: $SSH_PUBKEY_FILE"
 
+# Thread SSH_PUBKEY_FILE through to lib/build-common.sh, which reads
+# SSH_PUBKEY_FILES (colon-separated). Without this export, build_qcow2 falls
+# back to ~SUDO_USER/.ssh/id_ed25519.pub and gives a confusing error when the
+# operator pointed at a different key.
+export SSH_PUBKEY_FILES="$SSH_PUBKEY_FILE"
+
 log "config OK: CP=${CP_NAME}, workers=(${WORKER_NAMES[*]}), source=${IMAGE_SOURCE}, tag=${GHCR_TAG}"
 
 # ---- Image acquisition ------------------------------------------------------
