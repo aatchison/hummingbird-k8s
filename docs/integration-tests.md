@@ -35,6 +35,45 @@ The same invocation runs in CI as the `unit-tests-lib` job in
 `.github/workflows/pr-validate.yml`. The bats container is pinned by digest so
 upstream tag movement can't silently change the test runtime.
 
+### `tests/scripts/` — script-level bats tests (issue #189)
+
+A second bats suite under `tests/scripts/` covers the operator-facing
+scripts that aren't pure helpers — flag parsing, dry-run sequencing, YAML
+rewrite roundtrips:
+
+- `tests/scripts/update-cluster.bats` — `--workers-only` + `--node=`
+  mutual-exclusion, bare `--node` rejection, unknown-arg handling, `--help`
+  formatting, and `--dry-run` sequencing. The dry-run cases deliberately
+  codify the patterns that `integration-update-cluster.yml`'s
+  `assert-dry-run-sequence` command keys on — so a refactor that subtly
+  changes log lines is caught at pr-validate time, not only on the
+  self-hosted runner.
+- `tests/scripts/export-argocd.bats` — exercises `rewrite_kubeconfig()`
+  (the YAML rewrite primitive shared by `export-argocd` and
+  `get-kubeconfig`) against `tests/fixtures/admin.conf`. Asserts that the
+  kubeadm-default key lines (cluster/context/user/current-context) are
+  rewritten while non-key lines — YAML comments and base64 PEM blobs that
+  happen to contain the literal substring `kubernetes` — survive
+  byte-identical. Both the Go-`yq` path (skipped when `yq` is absent) and
+  the line-anchored `sed` fallback are exercised. Also covers `--server`
+  URL validation (newline / quote / command-substitution rejected) and
+  `--force` refuse-to-clobber.
+
+`scripts/export-argocd.sh` is structured so the rewrite logic is callable
+when the script is sourced (sourced-mode short-circuit near the top
+returns 0 before any SSH activity), which is what lets the bats suite
+unit-test the YAML rewrite without a real cluster.
+
+Run locally:
+
+```bash
+make test-scripts        # scripts/ suite only
+make test-all            # lib/ + scripts/ together
+```
+
+The same invocations run in CI as the `unit-tests-scripts` and (existing)
+`unit-tests-lib` jobs in `.github/workflows/pr-validate.yml`.
+
 ## Integration tests
 
 Seven integration workflows exercise the published Hummingbird images on a

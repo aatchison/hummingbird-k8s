@@ -64,7 +64,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         backup-etcd restore-etcd rotate-etcd-key \
         ci-build-k3s ci-build-k8s ci-build-worker \
         print-containerfile-k3s print-containerfile-k8s print-containerfile-worker \
-        test-lib \
+        test-lib test-scripts test-all \
         clean-vms clean-images clean
 
 # ---- help ---------------------------------------------------------------
@@ -264,6 +264,11 @@ BATS_IMAGE := docker.io/bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556ede
 
 test-lib: ## Run bats unit tests for lib/build-common.sh
 	podman run --rm -v "$(CURDIR):/repo:Z" -w /repo $(BATS_IMAGE) tests/lib/
+
+test-scripts: ## Run bats unit tests for scripts/ (update-cluster.sh, export-argocd.sh)
+	podman run --rm -v "$(CURDIR):/repo:Z" -w /repo $(BATS_IMAGE) tests/scripts/
+
+test-all: test-lib test-scripts ## Run all bats unit suites (lib + scripts)
 
 # ---- cleanup -----------------------------------------------------------
 

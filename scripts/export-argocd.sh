@@ -44,11 +44,107 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# Resolve via BASH_SOURCE so we work both when executed and when sourced
+# (tests source this script to call rewrite_kubeconfig directly).
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # shellcheck source=../lib/build-common.sh
 source "${REPO_ROOT}/lib/build-common.sh"
 setup_logging "[export-argocd]"
+
+# ---- detect yq flavor (callable from tests via sourced-mode) ----------------
+# There are two unrelated tools that ship as `yq`:
+#   - mikefarah/yq    (Go)     — jq-like expressions, supports `-i` and
+#                                 ".clusters[0].cluster.server = ..." syntax.
+#   - kislyuk/yq      (Python) — wraps jq, different syntax + different flags.
+# Only the Go flavor speaks the expressions below. Probe explicitly and
+# fall through to the (line-anchored) sed path otherwise.
+#
+# Exits 0 with stdout set to "1" if Go yq is present; "0" otherwise.
+detect_yq_flavor() {
+  if command -v yq >/dev/null 2>&1; then
+    if yq --version 2>&1 | grep -qiE 'mikefarah|go-yaml'; then
+      echo 1
+      return 0
+    fi
+  fi
+  echo 0
+}
+
+# ---- rewrite_kubeconfig <admin_conf_path> <server_url> <context_name> ------
+# In-place rewrite of a kubeadm-shaped admin.conf:
+#   1. Rewrites the `server:` URL to <server_url>.
+#   2. Rewrites the kubeadm-default cluster=kubernetes / user=kubernetes-admin
+#      / context=kubernetes-admin@kubernetes names to <context_name>.
+#
+# Prefers Go yq when present (structure-aware); falls back to a constrained
+# sed that only touches the canonical kubeadm-emitted key lines. The sed
+# path is deliberately line-anchored so it does NOT rewrite the substring
+# "kubernetes" inside comments or base64 cert / key blobs.
+#
+# Exposed as a function so tests/scripts/export-argocd.bats can source this
+# script and call rewrite_kubeconfig directly without triggering the SSH
+# fetch + write flow at the bottom of the file.
+rewrite_kubeconfig() {
+  local kc="$1" server_url="$2" context_name="$3"
+  local use_yq
+  use_yq="$(detect_yq_flavor)"
+
+  if [[ "$use_yq" -eq 1 ]]; then
+    log "rewriting server URL via yq -> ${server_url}"
+    yq -i ".clusters[0].cluster.server = \"${server_url}\"" "$kc"
+  else
+    log "rewriting server URL via sed -> ${server_url}"
+    local esc_url
+    esc_url="$(printf '%s\n' "$server_url" | sed -e 's/[\/&]/\\&/g')"
+    sed -i -E "s|^([[:space:]]+server:[[:space:]]+).*$|\1${esc_url}|" "$kc"
+  fi
+
+  if [[ "$use_yq" -eq 1 ]]; then
+    log "rewriting cluster/context/user names via yq -> ${context_name}"
+    yq -i "
+      .clusters[0].name = \"${context_name}\" |
+      .users[0].name = \"${context_name}\" |
+      .contexts[0].name = \"${context_name}\" |
+      .contexts[0].context.cluster = \"${context_name}\" |
+      .contexts[0].context.user = \"${context_name}\" |
+      .current-context = \"${context_name}\"
+    " "$kc"
+  else
+    log "rewriting cluster/context/user names via sed -> ${context_name}"
+    # Anchor each substitution to the specific kubeconfig key line. Global
+    # substitution of "kubernetes" → context_name would also rewrite the
+    # string inside YAML comments (e.g. "# kubernetes-the-platform note")
+    # and — far worse — could collide with base64-encoded cert / key data
+    # where "kubernetes" happens to appear as a literal substring. We
+    # target the canonical kubeadm-emitted lines and nothing else; this
+    # is structurally equivalent to the yq edits above.
+    # Use '#' as the sed delimiter — our regexes contain literal '|' for
+    # alternation, which would otherwise collide with the default '|' s||
+    # delimiter. Escape '#' in context_name just in case (though our
+    # context-name validator already forbids it).
+    local esc_ctx
+    esc_ctx="$(printf '%s\n' "$context_name" | sed -e 's/[\/&#]/\\&/g')"
+    # Six anchored substitutions, one per kubeadm-emitted key line. Order
+    # the composite "kubernetes-admin@kubernetes" pattern BEFORE the
+    # "kubernetes-admin" and bare "kubernetes" patterns so we don't
+    # partial-match the composite first.
+    sed -i -E \
+      -e "s#^(([[:space:]]+|- )name:[[:space:]]+)kubernetes-admin@kubernetes\$#\1${esc_ctx}#" \
+      -e "s#^(current-context:[[:space:]]+)kubernetes-admin@kubernetes\$#\1${esc_ctx}#" \
+      -e "s#^(([[:space:]]+|- )name:[[:space:]]+)kubernetes-admin\$#\1${esc_ctx}#" \
+      -e "s#^([[:space:]]+user:[[:space:]]+)kubernetes-admin\$#\1${esc_ctx}#" \
+      -e "s#^(([[:space:]]+|- )name:[[:space:]]+)kubernetes\$#\1${esc_ctx}#" \
+      -e "s#^([[:space:]]+cluster:[[:space:]]+)kubernetes\$#\1${esc_ctx}#" \
+      "$kc"
+  fi
+}
+
+# Sourced for testing? Short-circuit before the main flow so bats can call
+# the helper functions above without triggering ssh / config-source / write.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 # ---- CONFIG + flag parsing --------------------------------------------------
 
@@ -161,84 +257,11 @@ if ! grep -q '^apiVersion:' "$TMP_KUBECONFIG" \
   fail "fetched file does not look like a kubeconfig (no 'kind: Config'). Refusing to continue."
 fi
 
-# ---- detect yq flavor -------------------------------------------------------
-# There are two unrelated tools that ship as `yq`:
-#   - mikefarah/yq    (Go)     — jq-like expressions, supports `-i` and
-#                                 ".clusters[0].cluster.server = ..." syntax.
-#   - kislyuk/yq      (Python) — wraps jq, different syntax + different
-#                                 flags. Distros sometimes ship this as the
-#                                 default `yq` (Fedora's python3-yq).
-# Only the Go flavor speaks the expressions below. Probe explicitly and
-# fall through to the (now line-anchored) sed path otherwise.
-use_yq=0
-if command -v yq >/dev/null 2>&1; then
-  if yq --version 2>&1 | grep -qiE 'mikefarah|go-yaml'; then
-    use_yq=1
-  fi
-fi
+# ---- rewrite server URL + cluster/context/user names -----------------------
+# Delegated to rewrite_kubeconfig() (defined at top of file) so the same
+# routine is callable from tests/scripts/export-argocd.bats via sourced-mode.
 
-# ---- rewrite server URL -----------------------------------------------------
-# Prefer Go yq if available — surgical and structure-aware. Fall back to a
-# constrained sed that only touches the `server: https://…` line inside a
-# clusters[].cluster block. kubeadm's admin.conf only has one cluster
-# entry, so the simple substitution is safe.
-
-if [[ "$use_yq" -eq 1 ]]; then
-  log "rewriting server URL via yq -> ${SERVER_URL}"
-  yq -i ".clusters[0].cluster.server = \"${SERVER_URL}\"" "$TMP_KUBECONFIG"
-else
-  log "rewriting server URL via sed -> ${SERVER_URL}"
-  # Escape any sed-meaningful characters in the URL before substitution.
-  esc_url="$(printf '%s\n' "$SERVER_URL" | sed -e 's/[\/&]/\\&/g')"
-  sed -i -E "s|^([[:space:]]+server:[[:space:]]+).*$|\1${esc_url}|" "$TMP_KUBECONFIG"
-fi
-
-# ---- rewrite cluster/context/user names from kubeadm default ----------------
-# kubeadm emits cluster=kubernetes, user=kubernetes-admin, context=
-# kubernetes-admin@kubernetes. We rename ALL of these to CONTEXT_NAME so
-# the file plugs into ArgoCD without colliding with the operator's other
-# kubeconfigs (e.g. another in-tree cluster also named "kubernetes").
-
-if [[ "$use_yq" -eq 1 ]]; then
-  log "rewriting cluster/context/user names via yq -> ${CONTEXT_NAME}"
-  yq -i "
-    .clusters[0].name = \"${CONTEXT_NAME}\" |
-    .users[0].name = \"${CONTEXT_NAME}\" |
-    .contexts[0].name = \"${CONTEXT_NAME}\" |
-    .contexts[0].context.cluster = \"${CONTEXT_NAME}\" |
-    .contexts[0].context.user = \"${CONTEXT_NAME}\" |
-    .current-context = \"${CONTEXT_NAME}\"
-  " "$TMP_KUBECONFIG"
-else
-  log "rewriting cluster/context/user names via sed -> ${CONTEXT_NAME}"
-  # Anchor each substitution to the specific kubeconfig key line. Global
-  # substitution of "kubernetes" → CONTEXT_NAME would also rewrite the
-  # string inside YAML comments (e.g. "# kubernetes-the-platform note") and
-  # — far worse — could collide with base64-encoded cert / key data where
-  # "kubernetes" happens to appear as a literal substring. We target the
-  # four canonical kubeadm-emitted lines and nothing else; this is
-  # structurally equivalent to the yq edits above.
-  # Use '#' as the sed delimiter — our regexes contain literal '|' for
-  # alternation, which would otherwise collide with the default '|' s||
-  # delimiter. Escape '#' in CONTEXT_NAME just in case (though our
-  # context-name validator already forbids it).
-  esc_ctx="$(printf '%s\n' "$CONTEXT_NAME" | sed -e 's/[\/&#]/\\&/g')"
-  # Six anchored substitutions, one per kubeadm-emitted key line. The
-  # leading-context group accepts either leading whitespace (e.g. "  name:")
-  # OR a YAML list-item dash (e.g. "- name:") since kubeadm emits
-  # users[0].name as `- name: kubernetes-admin` with no other leading
-  # whitespace. Order the composite "kubernetes-admin@kubernetes" pattern
-  # BEFORE the "kubernetes-admin" and bare "kubernetes" patterns so we
-  # don't partial-match the composite first.
-  sed -i -E \
-    -e "s#^(([[:space:]]+|- )name:[[:space:]]+)kubernetes-admin@kubernetes\$#\1${esc_ctx}#" \
-    -e "s#^(current-context:[[:space:]]+)kubernetes-admin@kubernetes\$#\1${esc_ctx}#" \
-    -e "s#^(([[:space:]]+|- )name:[[:space:]]+)kubernetes-admin\$#\1${esc_ctx}#" \
-    -e "s#^([[:space:]]+user:[[:space:]]+)kubernetes-admin\$#\1${esc_ctx}#" \
-    -e "s#^(([[:space:]]+|- )name:[[:space:]]+)kubernetes\$#\1${esc_ctx}#" \
-    -e "s#^([[:space:]]+cluster:[[:space:]]+)kubernetes\$#\1${esc_ctx}#" \
-    "$TMP_KUBECONFIG"
-fi
+rewrite_kubeconfig "$TMP_KUBECONFIG" "$SERVER_URL" "$CONTEXT_NAME"
 
 # ---- move into place with 0600 ----------------------------------------------
 # `install -m 0600` is atomic-mode-set: the destination is created at the
