@@ -255,7 +255,7 @@ log "CP IP: $CP_IP"
 # pubkey by lib/build-common.sh). Matches spawn-workers.sh's pattern.
 cp_ssh() {
   sudo -u "$SUDO_USER" ssh \
-    -o StrictHostKeyChecking=accept-new \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
     -o ConnectTimeout=10 \
     -o BatchMode=yes \
     "root@${CP_IP}" "$@"
