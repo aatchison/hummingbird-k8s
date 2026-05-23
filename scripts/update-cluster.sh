@@ -31,19 +31,55 @@
 # when the script exits (normally or via the EXIT trap).
 #
 # Flags:
-#   --workers-only       Skip the CP, only roll the workers.
-#   --node=NAME          Update exactly one node (CP or a worker). Mutually
-#                        exclusive with --workers-only.
-#   --skip-drain         Emergency rollback escape hatch — skip kubectl drain
-#                        for workers (CP already skips drain by design).
-#                        Also skips the bootc-fetch-apply-updates.timer
-#                        stop/restart dance (operator-driven mode).
-#   --dry-run            Print the intended actions without ssh/kubectl.
+#   --workers-only             Skip the CP, only roll the workers.
+#   --node=NAME                Update exactly one node (CP or a worker).
+#                              Mutually exclusive with --workers-only and
+#                              --start-from.
+#   --start-from=NAME          Resume an interrupted roll. Skip WORKER_NAMES
+#                              entries until NAME is encountered, then
+#                              process from that point onward. Combines
+#                              with --workers-only (which already skips the
+#                              CP) but is mutually exclusive with --node=.
+#   --continue-on-error        Record per-node failures and proceed instead
+#                              of aborting. A summary is printed at the
+#                              end; if any node failed the script exits
+#                              with rc=3 (distinct from rc=1 fail-fast).
+#                              Default behavior remains fail-fast.
+#                              NOTE: applies to WORKER failures only; CP
+#                              failures still abort the whole run.
+#   --no-delete-emptydir-data  Drop --delete-emptydir-data from kubectl
+#                              drain. Use for workloads with emptyDir
+#                              caches (Prometheus WAL, etc.) the operator
+#                              wants preserved. Drain will then block on
+#                              such pods; manual eviction may be required.
+#   --parallel=N               Process workers in batches of N concurrently
+#                              (drain + reboot + wait). Default N=1
+#                              (serial; current behavior). The CP is still
+#                              updated serially first. Requires that any
+#                              workloads with PodDisruptionBudgets can
+#                              tolerate N concurrent evictions.
+#   --skip-drain               Emergency rollback escape hatch — skip
+#                              kubectl drain for workers (CP already skips
+#                              drain by design). Also skips the
+#                              bootc-fetch-apply-updates.timer stop/restart
+#                              dance (operator-driven mode).
+#   --dry-run                  Print the intended actions without
+#                              ssh/kubectl.
+#
+# Environment overrides (all values are durations parsed by sleep / kubectl;
+# use bare seconds or Go-style durations as appropriate):
+#   DRAIN_TIMEOUT       kubectl drain --timeout (default 5m)
+#   READY_TIMEOUT       wait_node_ready seconds (default 300)
+#   APISERVER_TIMEOUT   wait_apiserver_back seconds (default 300)
+#   SSH_TIMEOUT         wait_ssh_back seconds (default 300)
+#   INTER_NODE_SLEEP    seconds to pause between nodes (default 5)
 #
 # Usage:
 #   CONFIG=cluster.local.conf sudo -E bash scripts/update-cluster.sh
 #   CONFIG=cluster.local.conf sudo -E bash scripts/update-cluster.sh --workers-only
 #   CONFIG=cluster.local.conf sudo -E bash scripts/update-cluster.sh --node=hbird-w1
+#   CONFIG=cluster.local.conf sudo -E bash scripts/update-cluster.sh --start-from=hbird-w2
+#   CONFIG=cluster.local.conf sudo -E bash scripts/update-cluster.sh --parallel=2 --continue-on-error
 
 set -euo pipefail
 
@@ -60,16 +96,33 @@ WORKERS_ONLY=0
 SKIP_DRAIN=0
 DRY_RUN=0
 NODE_FILTER=""
+START_FROM=""
+CONTINUE_ON_ERROR=0
+NO_DELETE_EMPTYDIR_DATA=0
+PARALLEL=1
 
 for arg in "$@"; do
   case "$arg" in
-    --workers-only)   WORKERS_ONLY=1 ;;
-    --skip-drain)     SKIP_DRAIN=1 ;;
-    --dry-run)        DRY_RUN=1 ;;
-    --node=*)         NODE_FILTER="${arg#--node=}" ;;
-    --node)           fail "--node requires a value: --node=NAME" ;;
+    --workers-only)              WORKERS_ONLY=1 ;;
+    --skip-drain)                SKIP_DRAIN=1 ;;
+    --dry-run)                   DRY_RUN=1 ;;
+    --continue-on-error)         CONTINUE_ON_ERROR=1 ;;
+    --no-delete-emptydir-data)   NO_DELETE_EMPTYDIR_DATA=1 ;;
+    --node=*)                    NODE_FILTER="${arg#--node=}" ;;
+    --node)                      fail "--node requires a value: --node=NAME" ;;
+    --start-from=*)
+      START_FROM="${arg#--start-from=}"
+      # `--start-from=` (empty RHS) matched here previously and was silently
+      # accepted, then the `[[ -n "$START_FROM" ]]` guard downstream made
+      # the script proceed as if the flag had not been passed at all.
+      # Reject empty values explicitly so operators get a clear diagnostic.
+      [[ -n "$START_FROM" ]] || fail "--start-from= requires a non-empty value: --start-from=NAME"
+      ;;
+    --start-from)                fail "--start-from requires a value: --start-from=NAME" ;;
+    --parallel=*)                PARALLEL="${arg#--parallel=}" ;;
+    --parallel)                  fail "--parallel requires a value: --parallel=N" ;;
     -h|--help)
-      sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,82p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) fail "unknown argument: $arg (try --help)" ;;
@@ -79,6 +132,56 @@ done
 if (( WORKERS_ONLY == 1 )) && [[ -n "$NODE_FILTER" ]]; then
   fail "--workers-only and --node= are mutually exclusive"
 fi
+
+if [[ -n "$NODE_FILTER" ]] && [[ -n "$START_FROM" ]]; then
+  fail "--node= and --start-from= are mutually exclusive (--node is single-node mode; --start-from is resume mode)"
+fi
+
+# --parallel must be a positive integer.
+if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]] || (( PARALLEL < 1 )); then
+  fail "--parallel=N requires a positive integer (got: $PARALLEL)"
+fi
+
+# ---- Env-tunable timeouts --------------------------------------------------
+# Operators tune these per-cluster; defaults are deliberately generous so
+# slow networks / heavy workloads don't false-fail. DRAIN_TIMEOUT is passed
+# verbatim to `kubectl drain --timeout=` (Go duration string); the rest are
+# bare seconds consumed by the wait_* helpers below.
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-5m}"
+READY_TIMEOUT="${READY_TIMEOUT:-300}"
+APISERVER_TIMEOUT="${APISERVER_TIMEOUT:-300}"
+SSH_TIMEOUT="${SSH_TIMEOUT:-300}"
+INTER_NODE_SLEEP="${INTER_NODE_SLEEP:-5}"
+
+# ---- Env-knob validation (SECURITY) ----------------------------------------
+# The Makefile invokes this script via `sudo -E`, so operator-shell env vars
+# survive the privilege boundary and reach the script as root. Five of these
+# knobs flow into injection sinks if not validated:
+#
+#   DRAIN_TIMEOUT  → composed into "--timeout=${DRAIN_TIMEOUT}" then passed
+#                    to cp_kubectl, which ssh's the string as a single remote
+#                    shell command. Hostile value:
+#                       DRAIN_TIMEOUT='5m; rm -rf /; #'
+#                    → arbitrary commands executed as root on the CP.
+#
+#   READY_TIMEOUT  → consumed by `while (( elapsed < timeout ))` bash
+#   APISERVER_TIMEOUT  arithmetic context, which command-substitutes.
+#   SSH_TIMEOUT       Hostile value: 'a[0$(reboot)]' triggers side effects.
+#   INTER_NODE_SLEEP
+#
+# Validate every knob at the top of the script BEFORE any use. Anything that
+# isn't a bare integer (or kubectl-duration string for DRAIN_TIMEOUT) is
+# rejected here, so hostile env vars never reach the sinks.
+[[ "$DRAIN_TIMEOUT" =~ ^[0-9]+(s|m|h)?$ ]] \
+  || fail "DRAIN_TIMEOUT must match ^[0-9]+(s|m|h)?\$ (got: ${DRAIN_TIMEOUT})"
+[[ "$READY_TIMEOUT" =~ ^[0-9]+$ ]] \
+  || fail "READY_TIMEOUT must be a positive integer of seconds (got: ${READY_TIMEOUT})"
+[[ "$APISERVER_TIMEOUT" =~ ^[0-9]+$ ]] \
+  || fail "APISERVER_TIMEOUT must be a positive integer of seconds (got: ${APISERVER_TIMEOUT})"
+[[ "$SSH_TIMEOUT" =~ ^[0-9]+$ ]] \
+  || fail "SSH_TIMEOUT must be a positive integer of seconds (got: ${SSH_TIMEOUT})"
+[[ "$INTER_NODE_SLEEP" =~ ^[0-9]+$ ]] \
+  || fail "INTER_NODE_SLEEP must be a non-negative integer of seconds (got: ${INTER_NODE_SLEEP})"
 
 # ---- Root + config ---------------------------------------------------------
 # Dry-run lets us iterate the script without sudo (no ssh/kubectl is ever
@@ -162,6 +265,19 @@ else
       WORKER_IP_MAP["$w"]="$ip"
     fi
   done
+fi
+
+# Validate --start-from references a real worker (else the resume loop
+# would silently skip every node).
+if [[ -n "$START_FROM" ]]; then
+  start_from_found=0
+  for w in "${WORKER_NAMES[@]}"; do
+    if [[ "$w" == "$START_FROM" ]]; then
+      start_from_found=1
+      break
+    fi
+  done
+  (( start_from_found == 1 )) || fail "--start-from=${START_FROM} did not match any WORKER_NAMES entry"
 fi
 
 # ---- runner abstraction (dry-run aware) ------------------------------------
@@ -257,6 +373,50 @@ IN_FLIGHT_IP=""
 IN_FLIGHT_DRAINED=0
 IN_FLIGHT_UNCORDONED=0
 
+# Per-node result tracking for --continue-on-error. FAILED_NODES is a
+# parallel array of "NAME:reason" entries; SUCCEEDED_NODES is just names.
+FAILED_NODES=()
+SUCCEEDED_NODES=()
+
+# Tracks the per-batch tmpdir during parallel mode. Module-scope so
+# cleanup_on_exit can scan it for {node}.in-flight files and remove the
+# whole tree on EXIT (including SIGINT). Empty when not in a parallel
+# batch.
+BATCH_TMPDIR=""
+
+# Prune stale /tmp/hbird-update-batch.* dirs left behind by prior killed
+# runs. Best-effort; we only clean OUR-uid-owned dirs to avoid stepping on
+# other operators. Done early so a stale dir from a kill -9 yesterday
+# doesn't fool today's recovery-hint scan.
+if (( DRY_RUN == 0 )); then
+  find /tmp -maxdepth 1 -name 'hbird-update-batch.*' -user "$UID" \
+    -type d -mmin +5 -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# mark_in_flight — write the current IN_FLIGHT_* state to a per-node file
+# under BATCH_TMPDIR so the parent's cleanup_on_exit can emit recovery
+# hints. Subshells under run_worker_batch get a COPY of the IN_FLIGHT_*
+# globals — so the parent has no direct visibility into their state.
+# Workaround: each subshell writes its in-flight state to disk at the
+# key transitions (post-drain, pre-uncordon); the parent scans those on
+# EXIT. No-op when not in parallel mode (BATCH_TMPDIR empty).
+mark_in_flight() {
+  [[ -n "${BATCH_TMPDIR:-}" ]] || return 0
+  [[ -d "$BATCH_TMPDIR" ]]     || return 0
+  [[ -n "$IN_FLIGHT_NODE" ]]   || return 0
+  printf 'node=%s\nip=%s\ndrained=%d\nuncordoned=%d\n' \
+    "$IN_FLIGHT_NODE" "$IN_FLIGHT_IP" "$IN_FLIGHT_DRAINED" "$IN_FLIGHT_UNCORDONED" \
+    > "${BATCH_TMPDIR}/${IN_FLIGHT_NODE}.in-flight" 2>/dev/null || true
+}
+
+# clear_in_flight — remove the .in-flight file once the node is fully
+# uncordoned. Caller invokes at the success boundary.
+clear_in_flight() {
+  [[ -n "${BATCH_TMPDIR:-}" ]] || return 0
+  [[ -n "$IN_FLIGHT_NODE" ]]   || return 0
+  rm -f "${BATCH_TMPDIR}/${IN_FLIGHT_NODE}.in-flight" 2>/dev/null || true
+}
+
 cleanup_on_exit() {
   local rc=$?
   # If we were mid-flight on a worker (drained but not uncordoned yet),
@@ -269,6 +429,35 @@ cleanup_on_exit() {
     printf '[update-cluster]   ssh root@%s "kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon %s"\n' \
       "$CP_IP" "$IN_FLIGHT_NODE" >&2
     printf '[update-cluster] ============================================================\n' >&2
+  fi
+  # In parallel mode the per-worker IN_FLIGHT_* state lives in the
+  # subshells, not in this parent. Each subshell writes a .in-flight file
+  # at the drain transition; scan them here so a Ctrl-C during a parallel
+  # batch still surfaces recovery hints for every still-cordoned node.
+  if [[ -n "${BATCH_TMPDIR:-}" && -d "$BATCH_TMPDIR" ]]; then
+    local _inflight
+    for _inflight in "${BATCH_TMPDIR}"/*.in-flight; do
+      [[ -e "$_inflight" ]] || continue
+      # shellcheck disable=SC1090
+      local _node="" _drained=0 _uncordoned=0
+      while IFS='=' read -r _k _v; do
+        case "$_k" in
+          node)       _node="$_v" ;;
+          drained)    _drained="$_v" ;;
+          uncordoned) _uncordoned="$_v" ;;
+        esac
+      done < "$_inflight"
+      if [[ -n "$_node" ]] && (( _drained == 1 )) && (( _uncordoned == 0 )); then
+        printf '\n' >&2
+        printf '[update-cluster] ============================================================\n' >&2
+        printf '[update-cluster] WARNING: node %s (parallel batch) is cordoned, not uncordoned.\n' "$_node" >&2
+        printf '[update-cluster] Restore it manually once you have verified its state:\n' >&2
+        printf '[update-cluster]   ssh root@%s "kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon %s"\n' \
+          "${CP_IP:-CP_IP}" "$_node" >&2
+        printf '[update-cluster] ============================================================\n' >&2
+      fi
+    done
+    rm -rf "$BATCH_TMPDIR" 2>/dev/null || true
   fi
   # Try to restart the auto-update timer on the in-flight node so the
   # cluster doesn't permanently lose its auto-update behavior after a
@@ -313,7 +502,7 @@ fi
 
 wait_ssh_back() {
   # wait until `ssh root@<ip> true` works again (post-reboot).
-  local ip="$1" timeout="${2:-300}" elapsed=0 interval=5
+  local ip="$1" timeout="${2:-${SSH_TIMEOUT}}" elapsed=0 interval=5
   log "waiting for SSH to come back on ${ip} (timeout ${timeout}s)"
   while (( elapsed < timeout )); do
     if (( DRY_RUN == 1 )); then
@@ -335,7 +524,7 @@ wait_node_ready() {
   # Workers come back cordoned-but-Ready as "Ready,SchedulingDisabled" —
   # match both forms with $2 ~ /^Ready(,|$)/ so the regex covers cordoned
   # AND fully-ready cases. We uncordon *after* this returns.
-  local node="$1" timeout="${2:-300}" elapsed=0 interval=10
+  local node="$1" timeout="${2:-${READY_TIMEOUT}}" elapsed=0 interval=10
   log "waiting for node ${node} to report Ready (timeout ${timeout}s)"
   while (( elapsed < timeout )); do
     if (( DRY_RUN == 1 )); then
@@ -355,7 +544,7 @@ wait_node_ready() {
 wait_apiserver_back() {
   # CP-specific: after the CP reboots, the apiserver itself goes away.
   # Poll `kubectl get nodes` via ssh until it returns 0 again.
-  local timeout="${1:-300}" elapsed=0 interval=10
+  local timeout="${1:-${APISERVER_TIMEOUT}}" elapsed=0 interval=10
   log "waiting for apiserver on CP (${CP_IP}) to answer (timeout ${timeout}s)"
   while (( elapsed < timeout )); do
     if (( DRY_RUN == 1 )); then
@@ -385,6 +574,9 @@ wait_apiserver_back() {
 #
 # Returns:
 #   0 — upgrade applied (reboot expected; caller polls wait_ssh_back)
+#   1 — unexpected non-zero rc from `bootc upgrade` (caller decides whether
+#       to fail-fast or record-and-continue via worker_fail; we do NOT call
+#       fail() here directly — that would bypass --continue-on-error)
 #   2 — no update available (caller should short-circuit the wait loops)
 bootc_upgrade_apply() {
   local ip="$1" name="$2"
@@ -442,7 +634,11 @@ bootc_upgrade_apply() {
       return 0
       ;;
     *)
-      fail "bootc upgrade on ${name} exited with rc=${rc}"
+      # Surface but DO NOT call fail() — caller (update_worker /
+      # update_cp) decides whether to route through worker_fail (which
+      # respects --continue-on-error) or to abort hard.
+      log "bootc upgrade on ${name} exited unexpectedly (rc=${rc})"
+      return 1
       ;;
   esac
 }
@@ -476,9 +672,16 @@ update_cp() {
     return 0
   fi
 
-  wait_ssh_back "$CP_IP" 300 || fail "CP ${CP_NAME} did not come back over SSH within 5min"
-  wait_apiserver_back 300   || fail "CP ${CP_NAME} apiserver did not return within 5min"
-  wait_node_ready "$CP_NAME" 300 || fail "CP node ${CP_NAME} did not reach Ready within 5min"
+  # rc=1 here means `bootc upgrade` itself failed (not a torn-down ssh —
+  # that's rc=255 mapped to 0 inside bootc_upgrade_apply). CP failures
+  # always fail-fast: --continue-on-error is documented as worker-only.
+  if (( rc == 1 )); then
+    fail "bootc upgrade on CP ${CP_NAME} failed (see log above)"
+  fi
+
+  wait_ssh_back "$CP_IP" "$SSH_TIMEOUT" || fail "CP ${CP_NAME} did not come back over SSH within ${SSH_TIMEOUT}s"
+  wait_apiserver_back "$APISERVER_TIMEOUT"   || fail "CP ${CP_NAME} apiserver did not return within ${APISERVER_TIMEOUT}s"
+  wait_node_ready "$CP_NAME" "$READY_TIMEOUT" || fail "CP node ${CP_NAME} did not reach Ready within ${READY_TIMEOUT}s"
 
   timer_start "$CP_IP"
   log "CP ${CP_NAME} updated and Ready."
@@ -487,6 +690,11 @@ update_cp() {
   IN_FLIGHT_IP=""
 }
 
+# update_worker NAME IP
+#
+# Returns 0 on success, non-zero on failure. With --continue-on-error, the
+# caller catches non-zero and records the failure; without it, the inner
+# `fail` calls terminate the script.
 update_worker() {
   local name="$1" ip="$2"
   local rc=0
@@ -498,16 +706,26 @@ update_worker() {
   IN_FLIGHT_IP="$ip"
   IN_FLIGHT_DRAINED=0
   IN_FLIGHT_UNCORDONED=0
+  mark_in_flight
 
   timer_stop "$ip"
 
   if (( SKIP_DRAIN == 1 )); then
     log "  --skip-drain set: skipping kubectl drain for ${name}"
   else
-    log "kubectl drain ${name} --ignore-daemonsets --delete-emptydir-data --timeout=5m"
-    cp_kubectl "drain ${name} --ignore-daemonsets --delete-emptydir-data --timeout=5m" \
-      || fail "drain failed for ${name}; refusing to continue (use --skip-drain to override)"
+    # Compose the drain flags. --delete-emptydir-data is included by default
+    # so cache-only pods (Prometheus WAL, scratch volumes) don't block
+    # drain; --no-delete-emptydir-data drops it for workloads where those
+    # caches are precious.
+    local drain_flags="--ignore-daemonsets --timeout=${DRAIN_TIMEOUT}"
+    if (( NO_DELETE_EMPTYDIR_DATA == 0 )); then
+      drain_flags+=" --delete-emptydir-data"
+    fi
+    log "kubectl drain ${name} ${drain_flags}"
+    cp_kubectl "drain ${name} ${drain_flags}" \
+      || { worker_fail "$name" "drain failed (use --skip-drain to override)"; return 1; }
     IN_FLIGHT_DRAINED=1
+    mark_in_flight
   fi
 
   log "ssh root@${ip} bootc upgrade --apply  (auto-reboots; digest pre/post compared)"
@@ -516,53 +734,208 @@ update_worker() {
   rc=$?
   set -e
 
+  # rc=1 from bootc_upgrade_apply now means the upgrade itself failed.
+  # Route through worker_fail so --continue-on-error is respected (was
+  # previously a direct fail() inside bootc_upgrade_apply that bypassed it).
+  if (( rc == 1 )); then
+    worker_fail "$name" "bootc upgrade --apply failed (see log above)"
+    return 1
+  fi
+
   if (( rc == 2 )); then
     log "worker ${name}: no update available; uncordoning and continuing."
     if (( SKIP_DRAIN == 0 )); then
       log "kubectl uncordon ${name}"
-      cp_kubectl "uncordon ${name}" || fail "uncordon failed for ${name}"
+      cp_kubectl "uncordon ${name}" || { worker_fail "$name" "uncordon failed after no-op upgrade"; return 1; }
       IN_FLIGHT_UNCORDONED=1
     fi
+    clear_in_flight
     timer_start "$ip"
+    IN_FLIGHT_NODE=""
+    IN_FLIGHT_IP=""
+    SUCCEEDED_NODES+=("$name")
+    return 0
+  fi
+
+  wait_ssh_back "$ip" "$SSH_TIMEOUT"       || { worker_fail "$name" "did not come back over SSH within ${SSH_TIMEOUT}s"; return 1; }
+  # wait_node_ready before uncordon: kubelet has to rejoin (which may
+  # report Ready,SchedulingDisabled while still cordoned) — the regex
+  # in wait_node_ready handles both forms.
+  wait_node_ready "$name" "$READY_TIMEOUT" || { worker_fail "$name" "did not reach Ready within ${READY_TIMEOUT}s"; return 1; }
+
+  log "kubectl uncordon ${name}"
+  cp_kubectl "uncordon ${name}" || { worker_fail "$name" "uncordon failed"; return 1; }
+  IN_FLIGHT_UNCORDONED=1
+  clear_in_flight
+
+  timer_start "$ip"
+
+  log "node ${name} updated"
+  # INTER_NODE_SLEEP is applied per-BATCH (after run_worker_batch returns)
+  # in the main loop below — not here. Per-worker would cumulatively delay
+  # parallel-batch starts by N * INTER_NODE_SLEEP, which contradicts the
+  # documented intent "settle window before the NEXT batch starts."
+
+  IN_FLIGHT_NODE=""
+  IN_FLIGHT_IP=""
+  SUCCEEDED_NODES+=("$name")
+}
+
+# worker_fail NAME REASON — either record + continue (with --continue-on-error)
+# or fail fast (default). Called from update_worker on every per-step failure.
+worker_fail() {
+  local name="$1" reason="$2"
+  if (( CONTINUE_ON_ERROR == 1 )); then
+    log "  ERROR on ${name}: ${reason} — continuing (--continue-on-error)"
+    FAILED_NODES+=("${name}: ${reason}")
+    # Restore the timer best-effort so the cluster doesn't permanently
+    # lose auto-updates on this node.
+    timer_start "${WORKER_IP_MAP[$name]:-}" 2>/dev/null || true
     IN_FLIGHT_NODE=""
     IN_FLIGHT_IP=""
     return 0
   fi
-
-  wait_ssh_back "$ip" 300       || fail "worker ${name} did not come back over SSH within 5min"
-  # wait_node_ready before uncordon: kubelet has to rejoin (which may
-  # report Ready,SchedulingDisabled while still cordoned) — the regex
-  # in wait_node_ready handles both forms.
-  wait_node_ready "$name" 300   || fail "worker ${name} did not reach Ready within 5min"
-
-  log "kubectl uncordon ${name}"
-  cp_kubectl "uncordon ${name}" || fail "uncordon failed for ${name}"
-  IN_FLIGHT_UNCORDONED=1
-
-  timer_start "$ip"
-
-  log "node ${name} updated; pausing 5s before next node"
-  if (( DRY_RUN == 0 )); then sleep 5; fi
-
-  IN_FLIGHT_NODE=""
-  IN_FLIGHT_IP=""
+  fail "${name}: ${reason}"
 }
 
 # ---- main ------------------------------------------------------------------
 
 log "config: $CONFIG_PATH"
 log "CP=${CP_NAME} (${CP_IP}), workers=(${WORKER_NAMES[*]:-})"
-log "flags: workers-only=${WORKERS_ONLY} skip-drain=${SKIP_DRAIN} dry-run=${DRY_RUN} node-filter=${NODE_FILTER:-<none>}"
+log "flags: workers-only=${WORKERS_ONLY} skip-drain=${SKIP_DRAIN} dry-run=${DRY_RUN}"
+log "       node-filter=${NODE_FILTER:-<none>} start-from=${START_FROM:-<none>}"
+log "       continue-on-error=${CONTINUE_ON_ERROR} no-delete-emptydir-data=${NO_DELETE_EMPTYDIR_DATA} parallel=${PARALLEL}"
+log "timeouts: drain=${DRAIN_TIMEOUT} ready=${READY_TIMEOUT}s apiserver=${APISERVER_TIMEOUT}s ssh=${SSH_TIMEOUT}s inter-node-sleep=${INTER_NODE_SLEEP}s"
+
+# Build the worker list we'll actually process. --start-from skips entries
+# until START_FROM is encountered (inclusive). Empty WORKER_NAMES → empty
+# WORKERS_TO_RUN; loops below no-op.
+WORKERS_TO_RUN=()
+if [[ -n "$START_FROM" ]]; then
+  seen=0
+  for w in "${WORKER_NAMES[@]}"; do
+    if [[ "$w" == "$START_FROM" ]]; then
+      seen=1
+    fi
+    if (( seen == 1 )); then
+      WORKERS_TO_RUN+=("$w")
+    fi
+  done
+  log "--start-from=${START_FROM}: resuming with workers=(${WORKERS_TO_RUN[*]:-})"
+else
+  WORKERS_TO_RUN=("${WORKER_NAMES[@]}")
+fi
+
+# run_worker_batch NAMES...
+#
+# Process a batch of workers concurrently. Each name in the batch is
+# update_worker'd in a background subshell; we `wait` on the batch and
+# collect rcs. With --continue-on-error a per-worker failure is recorded
+# and the batch proceeds; without it, any failure causes fail-fast (which
+# in turn kills any still-running siblings via the EXIT trap pipeline).
+#
+# IMPORTANT: subshells get a COPY of FAILED_NODES / SUCCEEDED_NODES, so we
+# round-trip them through a per-worker status file under $tmpdir.
+run_worker_batch() {
+  local batch=("$@")
+  local n=${#batch[@]}
+  if (( n == 0 )); then
+    return 0
+  fi
+  if (( n == 1 )) || (( PARALLEL == 1 )); then
+    # Serial fast path — no need for the tmpdir/subshell dance.
+    local rc=0
+    update_worker "${batch[0]}" "${WORKER_IP_MAP[${batch[0]}]}" || rc=$?
+    return "$rc"
+  fi
+
+  log "PARALLEL batch (${n}): ${batch[*]}"
+  # NOTE: this batch waits for ALL pids before returning, even when the
+  # first worker fails — siblings continue in their subshells. With
+  # --continue-on-error this is expected. WITHOUT --continue-on-error the
+  # docstring above used to claim siblings get killed via the EXIT trap;
+  # that's not what actually happens (the EXIT trap only fires when the
+  # parent exits, which is after `wait`). For round-1 we document the
+  # actual behavior here rather than introducing a watcher that kills
+  # sibling pids — see follow-up issue noted in the commit message.
+  #
+  # Output is captured per-worker and replayed in batch-order after the
+  # batch completes (deterministic logs > live streaming under -parallel).
+  # During a long batch the operator will see NO output for the duration;
+  # docs/update-cluster.md "Parallel mode" calls this out explicitly.
+  # Use the module-scope BATCH_TMPDIR so cleanup_on_exit can rm it on
+  # EXIT (even on Ctrl-C during the wait below).
+  BATCH_TMPDIR="$(mktemp -d -t hbird-update-batch.XXXXXX)"
+  local pids=()
+  local i
+  for i in "${!batch[@]}"; do
+    local w="${batch[$i]}"
+    (
+      # Capture per-worker stdout/stderr to a log file so concurrent logs
+      # don't interleave at the byte level.
+      if update_worker "$w" "${WORKER_IP_MAP[$w]}" \
+            >"${BATCH_TMPDIR}/${w}.log" 2>&1; then
+        echo "0" >"${BATCH_TMPDIR}/${w}.rc"
+      else
+        echo "$?" >"${BATCH_TMPDIR}/${w}.rc"
+      fi
+    ) &
+    pids+=("$!")
+  done
+  wait "${pids[@]}" || true
+
+  # Replay each per-worker log in deterministic batch order so the operator
+  # sees them grouped (not interleaved).
+  local batch_rc=0
+  for w in "${batch[@]}"; do
+    if [[ -s "${BATCH_TMPDIR}/${w}.log" ]]; then
+      sed "s/^/[parallel:${w}] /" "${BATCH_TMPDIR}/${w}.log"
+    fi
+    local wrc
+    wrc="$(cat "${BATCH_TMPDIR}/${w}.rc" 2>/dev/null || echo 1)"
+    if (( wrc != 0 )); then
+      batch_rc=1
+      # The subshell update_worker already populated FAILED_NODES /
+      # SUCCEEDED_NODES in its own process; we have to re-mirror that
+      # here. Re-parse the log for the "ERROR on NAME" line emitted by
+      # worker_fail. (--continue-on-error pre-populates that line.)
+      if (( CONTINUE_ON_ERROR == 1 )); then
+        local reason
+        reason="$(grep -m1 "ERROR on ${w}:" "${BATCH_TMPDIR}/${w}.log" \
+                  | sed -E "s/.*ERROR on ${w}: //; s/ — continuing.*//" \
+                  || true)"
+        FAILED_NODES+=("${w}: ${reason:-unknown failure (see log above)}")
+      fi
+    else
+      SUCCEEDED_NODES+=("$w")
+    fi
+  done
+  # Successful workers had clear_in_flight remove their .in-flight files
+  # already; leftover .in-flight files indicate genuinely-stuck nodes.
+  # cleanup_on_exit will surface them as recovery hints AND rm the dir.
+  # Here we just drop the per-worker log/rc artifacts to keep the tree
+  # tidy in the (common) all-success case.
+  if (( batch_rc == 0 )) && [[ -d "$BATCH_TMPDIR" ]]; then
+    rm -rf "$BATCH_TMPDIR"
+    BATCH_TMPDIR=""
+  fi
+
+  if (( batch_rc != 0 )) && (( CONTINUE_ON_ERROR == 0 )); then
+    fail "one or more workers in parallel batch failed (see [parallel:*] logs above)"
+  fi
+  return "$batch_rc"
+}
 
 if [[ -n "$NODE_FILTER" ]]; then
   # Single-node mode: figure out whether it's the CP or a worker.
   if [[ "$NODE_FILTER" == "$CP_NAME" ]]; then
     update_cp
+    SUCCEEDED_NODES+=("$CP_NAME")
   else
     found=0
     for w in "${WORKER_NAMES[@]}"; do
       if [[ "$w" == "$NODE_FILTER" ]]; then
-        update_worker "$w" "${WORKER_IP_MAP[$w]}"
+        update_worker "$w" "${WORKER_IP_MAP[$w]}" || true
         found=1
         break
       fi
@@ -571,15 +944,50 @@ if [[ -n "$NODE_FILTER" ]]; then
   fi
 else
   if (( WORKERS_ONLY == 0 )); then
-    update_cp
+    if [[ -n "$START_FROM" ]]; then
+      log "--start-from set: skipping CP (resume mode starts at worker '${START_FROM}')"
+    else
+      update_cp
+      SUCCEEDED_NODES+=("$CP_NAME")
+    fi
   else
     log "--workers-only: skipping CP"
   fi
-  for w in "${WORKER_NAMES[@]}"; do
-    update_worker "$w" "${WORKER_IP_MAP[$w]}"
+
+  # Walk WORKERS_TO_RUN in batches of $PARALLEL.
+  total=${#WORKERS_TO_RUN[@]}
+  i=0
+  while (( i < total )); do
+    end=$(( i + PARALLEL ))
+    (( end > total )) && end=$total
+    batch=("${WORKERS_TO_RUN[@]:i:PARALLEL}")
+    run_worker_batch "${batch[@]}" || true
+    i=$end
+    # Settle window between batches (NOT between individual workers; see
+    # the note in update_worker). Zero value skips the sleep entirely.
+    if (( i < total )) && (( INTER_NODE_SLEEP > 0 )); then
+      log "pausing ${INTER_NODE_SLEEP}s before next node"
+      if (( DRY_RUN == 0 )); then sleep "$INTER_NODE_SLEEP"; fi
+    fi
   done
 fi
 
 log "============================================================"
 log "Rolling update complete."
+log "  succeeded (${#SUCCEEDED_NODES[@]}): ${SUCCEEDED_NODES[*]:-<none>}"
+if (( ${#FAILED_NODES[@]} > 0 )); then
+  log "  FAILED (${#FAILED_NODES[@]}):"
+  for entry in "${FAILED_NODES[@]}"; do
+    log "    - ${entry}"
+  done
+fi
 log "============================================================"
+
+# Exit code policy:
+#   0  — every targeted node succeeded
+#   1  — fail-fast abort (lib/build-common.sh::fail() exits 1 before we
+#         reach this point; documented for completeness)
+#   3  — one or more nodes failed AND --continue-on-error was set
+if (( ${#FAILED_NODES[@]} > 0 )); then
+  exit 3
+fi
