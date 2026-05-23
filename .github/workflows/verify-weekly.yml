@@ -1,0 +1,142 @@
+name: Verify weekly (orchestrator)
+
+# Weekly orchestrator that iterates the verify-* scripts under scripts/
+# against the live geary cluster on the self-hosted runner. Closes #15.
+#
+# This is the minimum-viable form of "iterate open verify issues and run
+# each issue's test script": rather than reflecting on issue bodies, we
+# run the canonical verifiers that the verify-labeled issues converge on
+# (encryption + hardening + app-deploy). Adding a new check = drop a
+# script in scripts/ and add a step here.
+#
+# Triggers:
+#   - schedule: Monday 07:00 UTC (weekly cadence; matches the on-call rota)
+#   - workflow_dispatch: manual rerun for ad-hoc verification
+#
+# This workflow runs only on the geary-docker self-hosted runner — it
+# depends on libvirt being reachable to look up the CP VM's IP. If the
+# runner is offline the run will queue.
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify:
+    # Defense-in-depth: no pull_request trigger here, but keep the guard so
+    # future additions of one stay safe against fork-PR exploitation of the
+    # self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, kvm, libvirt]
+    timeout-minutes: 30
+    env:
+      CP_VM: hummingbird-k8s
+      KUBECONFIG: /tmp/verify-weekly-kubeconfig
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install runner deps (kubectl, ssh, libvirt-clients)
+        run: |
+          set -euo pipefail
+          need=()
+          command -v kubectl >/dev/null 2>&1 || need+=(kubectl)
+          command -v ssh     >/dev/null 2>&1 || need+=(openssh-client)
+          command -v virsh   >/dev/null 2>&1 || need+=(libvirt-clients)
+          if [[ ${#need[@]} -gt 0 ]]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q "${need[@]}"
+          fi
+
+      - name: Pull kubeconfig from CP
+        run: |
+          set -euo pipefail
+          CP_IP=$(sudo virsh -c qemu:///system domifaddr "$CP_VM" 2>/dev/null \
+            | awk '/ipv4/ {split($4,a,"/"); print a[1]; exit}')
+          if [[ -z "$CP_IP" ]]; then
+            echo "ERROR: could not resolve $CP_VM IP via virsh domifaddr" >&2
+            sudo virsh -c qemu:///system list --all >&2 || true
+            exit 1
+          fi
+          echo "CP_IP=$CP_IP"
+          echo "CP_IP=$CP_IP" >> "$GITHUB_ENV"
+          ssh -o StrictHostKeyChecking=no -o BatchMode=yes \
+            "root@${CP_IP}" "cat /etc/kubernetes/admin.conf" \
+            | sed "s|server: https://[^:]*:6443|server: https://${CP_IP}:6443|" \
+            > "$KUBECONFIG"
+          chmod 600 "$KUBECONFIG"
+          kubectl --kubeconfig="$KUBECONFIG" get nodes
+
+      - name: verify-encryption.sh
+        id: encryption
+        continue-on-error: true
+        # The encryption verifier needs etcdctl/crictl on the CP itself.
+        # Stream it over SSH so it runs in-cluster against local etcd.
+        run: |
+          set -euo pipefail
+          scp -o StrictHostKeyChecking=no -o BatchMode=yes \
+            scripts/verify-encryption.sh "root@${CP_IP}:/tmp/verify-encryption.sh"
+          ssh -o StrictHostKeyChecking=no -o BatchMode=yes \
+            "root@${CP_IP}" "bash /tmp/verify-encryption.sh"
+
+      - name: verify-hardening.sh
+        id: hardening
+        continue-on-error: true
+        # Hardening verifier knows how to ssh to the CP itself; CP_IP and
+        # KUBECONFIG are already in the job env via $GITHUB_ENV.
+        run: bash scripts/verify-hardening.sh
+
+      - name: verify-app-deploy.sh
+        id: appdeploy
+        continue-on-error: true
+        # App-deploy verifier just needs kubectl with a working KUBECONFIG.
+        run: bash scripts/verify-app-deploy.sh
+
+      - name: Summarize results
+        id: summary
+        run: |
+          set -euo pipefail
+          enc='${{ steps.encryption.outcome }}'
+          hard='${{ steps.hardening.outcome }}'
+          app='${{ steps.appdeploy.outcome }}'
+          echo "encryption: $enc"
+          echo "hardening:  $hard"
+          echo "app-deploy: $app"
+          failed=()
+          [[ "$enc"  == "success" ]] || failed+=("verify-encryption")
+          [[ "$hard" == "success" ]] || failed+=("verify-hardening")
+          [[ "$app"  == "success" ]] || failed+=("verify-app-deploy")
+          if [[ ${#failed[@]} -gt 0 ]]; then
+            printf 'failed=%s\n' "$(IFS=,; echo "${failed[*]}")" >> "$GITHUB_OUTPUT"
+            echo "any_failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any_failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post failure summary to issue #15
+        if: steps.summary.outputs.any_failed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED: ${{ steps.summary.outputs.failed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ts=$(date -u +%FT%TZ)
+          body=$(printf 'Weekly verify orchestrator failed at %s.\nFailed checks: %s\nRun log: %s\n' \
+            "$ts" "$FAILED" "$RUN_URL")
+          gh issue comment 15 --repo "${{ github.repository }}" --body "$body"
+
+      - name: Fail the job if any verifier failed
+        if: steps.summary.outputs.any_failed == 'true'
+        run: |
+          echo "One or more verifiers failed: ${{ steps.summary.outputs.failed }}" >&2
+          exit 1
+
+      - name: Cleanup kubeconfig
+        if: always()
+        run: rm -f "$KUBECONFIG" || true
