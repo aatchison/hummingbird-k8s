@@ -391,3 +391,33 @@ kubectl exec a -- curl -m 2 -sS http://$(kubectl get pod b -o jsonpath='{.status
 
 If the second `curl` succeeds, NetworkPolicy is not being enforced
 and the swap has not delivered its primary value.
+
+## Verifying Hubble flow visibility
+
+After deploy, port-forward to Hubble relay and stream flows from your dev box:
+
+```bash
+ssh root@<cp-ip> cilium hubble port-forward &        # background tunnel to relay
+ssh root@<cp-ip> hubble observe --follow              # stream all flows
+ssh root@<cp-ip> hubble observe --verdict DROPPED     # only dropped by policy
+```
+
+## Upgrading an existing cluster to kubeProxyReplacement=true
+
+`k8s-init.sh` only runs on first boot — existing clusters that came up with `kubeProxyReplacement=false` (anything before k8s/v0.1.36) keep their kube-proxy DaemonSet across a `bootc upgrade`. To switch to KPR on a live cluster:
+
+```bash
+# 1. Remove kube-proxy daemonset (it owns no node state; safe to delete)
+kubectl -n kube-system delete daemonset kube-proxy
+
+# 2. Reconfigure Cilium for KPR mode
+cilium config set kubeProxyReplacement=true
+
+# 3. Restart Cilium pods so the new config picks up
+kubectl -n kube-system rollout restart daemonset cilium
+
+# 4. Verify
+cilium status --wait | grep KubeProxyReplacement   # should show "True (Strict)"
+```
+
+This is destructive in the sense that briefly during the rollout some pods will lose service routing. Schedule the change during low-traffic windows on shared clusters. Fresh deployments from k8s/v0.1.36 onward skip this entirely (kube-proxy never installed).
