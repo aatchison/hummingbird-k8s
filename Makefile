@@ -52,6 +52,7 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         image-k3s image-k8s image-worker image-all \
         image-k3s-with-cloud-init image-k8s-with-cloud-init image-worker-with-cloud-init \
         k3s k8s workers spawn \
+        deploy-cluster \
         switch-to-ghcr \
         nodes kubectl \
         verify-encryption verify-hardening verify-app-deploy verify-all \
@@ -128,6 +129,10 @@ workers: ## Rebuild worker template and spawn $(COUNT) workers (sudo)
 
 spawn: ## Spawn $(COUNT) more workers without rebuilding the template (sudo)
 	bash scripts/spawn-workers.sh $(COUNT)
+
+deploy-cluster: ## Deploy a hybrid bib+cloud-init cluster from CONFIG=<path> (see cluster.example.conf)
+	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required (start from cluster.example.conf)' >&2; exit 2; }
+	sudo bash scripts/deploy-cluster.sh "$(CONFIG)"
 
 switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
 	bash scripts/switch-to-ghcr.sh

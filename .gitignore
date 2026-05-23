@@ -13,6 +13,7 @@ admin.conf.*
 
 # Per-host config overrides
 config.local.sh
+cluster.local.conf
 
 # OS/editor noise
 .DS_Store

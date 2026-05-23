@@ -198,6 +198,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/cloud-init.md`](docs/cloud-init.md) — opt-in cloud-init support (`ENABLE_CLOUD_INIT=1`) for per-VM user-data injection via libvirt seed ISO.
 - [`docs/multi-arch.md`](docs/multi-arch.md) — multi-arch (linux/amd64 + linux/arm64) manifest index, cosign verification, and CI boot-test coverage.
 - [`docs/orchestrator.md`](docs/orchestrator.md) — weekly verify orchestrator (encryption + hardening + app-deploy against the live cluster).
+- [`docs/deploy-cluster.md`](docs/deploy-cluster.md) — `make deploy-cluster` hybrid bib + cloud-init orchestrator for deploying 1 CP + N workers from a single config file.
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.
