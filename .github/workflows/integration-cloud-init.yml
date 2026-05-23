@@ -14,6 +14,11 @@ name: Integration — cloud-init path (#163)
 # genisoimage). The `kvm,libvirt` labels gate selection.
 
 on:
+  # Auto-fire after every successful k8s build so cloud-init/systemd ordering
+  # bugs (#171, #172) get caught before any operator-driven deploy hits them.
+  workflow_run:
+    workflows: ["Build & publish — hummingbird-k8s"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       flavor:
@@ -31,6 +36,8 @@ permissions:
 
 jobs:
   cloud-init:
+    # Only run on a SUCCESSFUL upstream build (workflow_run) OR manual dispatch.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'k8s/v'))
     runs-on: [self-hosted, kvm, libvirt]
     timeout-minutes: 45
     # Same isolated podman storage trick as integration-boot — the runner
@@ -69,9 +76,29 @@ jobs:
           sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
           sudo mkdir -p "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
 
+      - name: Resolve flavor
+        id: flavor
+        env:
+          INPUT_FLAVOR: ${{ inputs.flavor }}
+          UPSTREAM_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # workflow_run from build-k8s.yml fires with head_branch=k8s/v*. We
+          # only test the k8s flavor in this auto-trigger path because the
+          # tag namespace identifies which image was just built. Manual
+          # workflow_dispatch lets the operator pick any flavor.
+          case "$EVENT_NAME" in
+            workflow_run)    flavor=k8s ;;
+            workflow_dispatch) flavor="$INPUT_FLAVOR" ;;
+            *) echo "unhandled event $EVENT_NAME" >&2; exit 1 ;;
+          esac
+          echo "flavor=$flavor" >> "$GITHUB_OUTPUT"
+          echo "Using flavor: $flavor"
+
       - name: Run cloud-init integration test
         env:
-          FLAVOR: ${{ inputs.flavor }}
+          FLAVOR: ${{ steps.flavor.outputs.flavor }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           sudo --preserve-env=FLAVOR,GITHUB_RUN_ID,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
