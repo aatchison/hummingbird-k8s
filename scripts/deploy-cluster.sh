@@ -94,6 +94,13 @@ source "$CONFIG_PATH"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
 : "${RUN_VERIFY:=false}"
 : "${KVM_HOST:=}"
+# Optional bootc-semver-update overrides. Empty = use the image default
+# (timer schedule baked in containers/shared/, repo baked per-flavor at
+# build time). When non-empty, cloud-init emits a write_files entry that
+# overrides the image default on first boot.
+: "${BOOTC_UPDATE_SCHEDULE:=}"
+: "${BOOTC_UPDATE_REPO_K8S:=}"
+: "${BOOTC_UPDATE_REPO_WORKER:=}"
 # Match spawn-workers.sh's retry tuning so CP-readiness waits behave the same.
 : "${CP_READY_RETRIES:=60}"
 : "${CP_READY_SLEEP:=10}"
@@ -198,16 +205,47 @@ CP_USER_DATA="$(mktemp -t hbird-cp-userdata-XXXXXX.yaml)"
   printf '  - name: root\n'
   printf '    ssh_authorized_keys:\n'
   printf '      - %s\n' "$SSH_PUBKEY_CONTENT"
+  # write_files for bootc-semver-update overrides. Only emit the block
+  # when at least one override is set, otherwise the YAML stays clean
+  # (no empty write_files array).
+  if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" || -n "${BOOTC_UPDATE_REPO_K8S:-}" ]]; then
+    printf 'write_files:\n'
+    if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+      # Drop-in to override the image's OnCalendar=. Empty OnCalendar=
+      # first clears the default; the second line sets the override.
+      printf '  - path: /etc/systemd/system/bootc-semver-update.timer.d/schedule.conf\n'
+      printf '    owner: root:root\n'
+      printf "    permissions: '0644'\n"
+      printf '    content: |\n'
+      printf '      [Timer]\n'
+      printf '      OnCalendar=\n'
+      printf '      OnCalendar=%s\n' "$BOOTC_UPDATE_SCHEDULE"
+    fi
+    if [[ -n "${BOOTC_UPDATE_REPO_K8S:-}" ]]; then
+      printf '  - path: /etc/hummingbird/bootc-update.env\n'
+      printf '    owner: root:root\n'
+      printf "    permissions: '0644'\n"
+      printf '    content: |\n'
+      printf '      REPO=%s\n' "$BOOTC_UPDATE_REPO_K8S"
+      printf '      PREFIX=v\n'
+    fi
+  fi
   # Only emit the runcmd block when at least one entry is needed — keeps
   # the user-data clean and matches the design constraint ("don't leave
   # runcmd in and rely on systemctl no-op").
-  if [[ "$SWITCH_TO_GHCR" = "true" || "$AUTO_UPDATE_CP" = "true" ]]; then
+  if [[ "$SWITCH_TO_GHCR" = "true" || "$AUTO_UPDATE_CP" = "true" || -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
     printf 'runcmd:\n'
     if [[ "$SWITCH_TO_GHCR" = "true" ]]; then
       printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s:%s ]\n' "$GHCR_TAG"
     fi
     if [[ "$AUTO_UPDATE_CP" = "true" ]]; then
       printf '  - [ systemctl, enable, --now, bootc-fetch-apply-updates.timer ]\n'
+    fi
+    if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+      # Re-read the drop-in cloud-init just wrote, then restart the timer
+      # so the override takes effect this boot (not just next).
+      printf '  - [ systemctl, daemon-reload ]\n'
+      printf '  - [ systemctl, restart, bootc-semver-update.timer ]\n'
     fi
   fi
 } > "$CP_USER_DATA"
@@ -298,9 +336,36 @@ worker_user_data() {
     # Indent the join command exactly 6 spaces to match YAML block scalar
     # under "content: |" at 4-space indent.
     printf '      %s\n' "$JOIN_CMD"
-    if [[ "$SWITCH_TO_GHCR" = "true" ]]; then
+    # bootc-semver-update overrides. Only emit each entry when the
+    # corresponding operator var is set.
+    if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+      printf '  - path: /etc/systemd/system/bootc-semver-update.timer.d/schedule.conf\n'
+      printf '    owner: root:root\n'
+      printf "    permissions: '0644'\n"
+      printf '    content: |\n'
+      printf '      [Timer]\n'
+      printf '      OnCalendar=\n'
+      printf '      OnCalendar=%s\n' "$BOOTC_UPDATE_SCHEDULE"
+    fi
+    if [[ -n "${BOOTC_UPDATE_REPO_WORKER:-}" ]]; then
+      printf '  - path: /etc/hummingbird/bootc-update.env\n'
+      printf '    owner: root:root\n'
+      printf "    permissions: '0644'\n"
+      printf '    content: |\n'
+      printf '      REPO=%s\n' "$BOOTC_UPDATE_REPO_WORKER"
+      printf '      PREFIX=v\n'
+    fi
+    if [[ "$SWITCH_TO_GHCR" = "true" || -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
       printf 'runcmd:\n'
-      printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s-worker:%s ]\n' "$GHCR_TAG"
+      if [[ "$SWITCH_TO_GHCR" = "true" ]]; then
+        printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s-worker:%s ]\n' "$GHCR_TAG"
+      fi
+      if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+        # Re-read the drop-in cloud-init just wrote, then restart the
+        # timer so the override takes effect this boot.
+        printf '  - [ systemctl, daemon-reload ]\n'
+        printf '  - [ systemctl, restart, bootc-semver-update.timer ]\n'
+      fi
     fi
   } > "$out_file"
 }
