@@ -1,34 +1,36 @@
 # hummingbird-k8s — findings
 
 Notes from setting up Fedora Hummingbird VMs on `<kvm-host>` (KVM host) with
-two flavors of single-node Kubernetes layered into the bootc image.
+upstream `kubeadm` Kubernetes layered into the bootc image.
 
 ## What's here
 
 | File | Role |
 |---|---|
-| `containers/k3s/Containerfile` + `containers/k3s/10-k3s.preset` | `hummingbird-k3s` image inputs (k3s baked in) |
 | `containers/k8s/Containerfile` + `k8s-init.sh` / `k8s-init.service` / `10-k8s.preset` | `hummingbird-k8s` image inputs (upstream kubelet/kubeadm/cri-o, control-plane) |
 | `containers/k8s-worker/Containerfile` + `worker-init.sh` / `worker-init.service` / `10-k8s-worker.preset` | Worker template image inputs |
 | `containers/shared/ssh/99-no-passwords.conf` | sshd drop-in COPYd into every flavor |
 | `containers/shared/kubernetes/{admission-control-config,audit-policy}.yaml` | Apiserver hardening configs COPYd into the k8s image |
-| `scripts/build-k3s.sh` / `scripts/define-vm.sh` / `scripts/redo-k3s.sh` | `hummingbird-k3s` build + define + redo |
-| `scripts/build-k8s.sh` / `scripts/define-vm-k8s.sh` / `scripts/redo-k8s.sh` | `hummingbird-k8s` control plane build + define + redo |
-| `scripts/build-worker.sh` / `scripts/spawn-workers.sh` / `scripts/redo-workers.sh` | Worker build + spawner |
+| `scripts/build-k8s.sh` | `hummingbird-k8s` control plane image build |
+| `scripts/build-worker.sh` | `hummingbird-k8s-worker` template image build |
+| `scripts/deploy-cluster.sh` / `scripts/destroy-cluster.sh` / `scripts/update-cluster.sh` | Cluster lifecycle (1 CP + N workers) driven from `cluster.local.conf` |
+| `scripts/spawn-workers.sh` | Clone worker template qcow2, mint per-VM kubeadm join tokens, virt-install N workers |
 | `scripts/kubectl-k8s.sh` | SSH-tunnel-through-KVM-host kubectl wrapper |
-| `scripts/migrate-to-system.sh` | One-time helper that moved the original VM from `qemu:///session` to system |
 | `Makefile` | Canonical operator entry point — every target wraps a `scripts/` script. `make help` lists them. |
 | `worker-join.env` | Cached kubeadm join command. `spawn-workers.sh` mints one per-VM at qcow2 build time. |
 | `bib-config.toml` | Generated at build time — initial user, SSH keys, hashed sudo password |
+| `cluster.example.conf` | Operator-edited config template: copy to `cluster.local.conf` and edit. Drives `make deploy-cluster` / `make update-cluster`. |
+| `config.example.sh` | Optional per-host build-input overrides (VM_USER, SSH_PUBKEY_FILES, POOL_DIR, etc.). |
 | `references/k8s-bootc-talk.transcript.txt` | KubeCon India 2025 talk transcript (Berkus + Kumar) |
 
 ## Host setup (<kvm-host>)
 
 - Fedora 44 Server, libvirt + cockpit-machines already installed.
-- Two libvirt connections in use:
-  - `qemu:///session` — pools `iso`, `userspace` (rootless; existing `molty` VM lives here)
-  - `qemu:///system` — pools `iso`, `iso-1`, `mass2` (`/var/lib/libvirt/images`), `secondary`; network `default` (NAT 192.168.122.0/24)
-- All our VMs live under **system libvirt** so they get a real bridge with DHCP, libvirt sees the IP, and Cockpit lists them in the host's main VM panel.
+- All VMs live under **system libvirt** (`qemu:///system`) so they get a
+  real bridge with DHCP, libvirt sees the IP, and Cockpit lists them in
+  the host's main VM panel.
+- Pools: `iso`, `iso-1`, `mass2` (`/var/lib/libvirt/images`), `secondary`;
+  network `default` (NAT 192.168.122.0/24).
 
 ## Build pipeline (what actually works)
 
@@ -37,6 +39,11 @@ two flavors of single-node Kubernetes layered into the bootc image.
 3. Output goes to `/var/lib/libvirt/images/<name>.qcow2`. `chown root:root` + `chmod 0644` so system qemu can read it.
 4. `virsh -c qemu:///system pool-refresh mass2` so libvirt picks up the new volume.
 5. `virt-install --connect qemu:///system ... --network network=default --import` defines and starts the VM.
+
+`scripts/deploy-cluster.sh` orchestrates the whole pipeline end-to-end for
+1 CP + N workers, sourcing `cluster.local.conf` for the operator-supplied
+names, IPs (optional), SSH key, image source (`ghcr` vs `local`), and
+behavioral toggles (`AUTO_UPDATE_CP`, `SWITCH_TO_GHCR`).
 
 ## Accessing the cluster from another machine (<kvm-client> → <kvm-host> VM)
 
@@ -65,13 +72,12 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 ## `POOL_DIR` — libvirt storage pool location
 
 - `POOL_DIR` controls where qcow2 disks are written and where `virt-install --disk`
-  expects to find them. It is honored by `lib/build-common.sh` (build phase), by
-  `define-vm.sh` / `define-vm-k8s.sh` (define phase), and — once PR #28 lands — by
-  `spawn-workers.sh`.
+  expects to find them. It is honored by `lib/build-common.sh` (build phase) and by
+  `scripts/deploy-cluster.sh` / `scripts/spawn-workers.sh` (define phase).
 - Default: `/var/lib/libvirt/images` (libvirt's stock pool dir).
-- Override per host by exporting `POOL_DIR=/your/path` in `config.local.sh`. All
-  build + define scripts source that file from the repo root, so a single setting
-  keeps build/define/spawn pointing at the same directory.
+- Override per host by setting `POOL_DIR=/your/path` in `cluster.local.conf` (or
+  `config.local.sh` for build-only flows). All build + define paths source the same
+  setting, so a single override keeps everything pointing at the same directory.
 
 ## How bootc auto-update works
 
@@ -80,16 +86,10 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 - `bootc upgrade --check` queries the registry; `bootc upgrade` stages the new image (chunked, only changed layers); reboot applies.
 - `bootc-fetch-apply-updates.timer` ships with Hummingbird but is **disabled by default**. Enable it (via Containerfile or runtime) for daily auto-update + auto-reboot. Most fleets want to enable the fetch but orchestrate the reboot externally.
 - `bootc rollback` swaps to the prior deployment; reboot finalizes.
-- As of #4 the timer is **ENABLED by default** in all three flavors (k3s, CP, worker). See `docs/auto-updates.md` for caveats — notably that control planes reboot without draining themselves.
+- As of #4 the timer is **ENABLED by default** in the CP and worker flavors. See `docs/auto-updates.md` for caveats — notably that control planes reboot without draining themselves.
 
-## Two install styles
+## Install style: upstream kubeadm (`containers/k8s/Containerfile`)
 
-### k3s (`containers/k3s/Containerfile`)
-- Upstream installer drops single `/usr/bin/k3s` binary + systemd unit.
-- Cluster up in ~10s after boot. CNI = flannel (k3s default), ingress = traefik, storage = local-path — all auto-deployed.
-- Best fit for "single node with containers."
-
-### Upstream kubeadm (`containers/k8s/Containerfile`)
 - Adds Fedora Rawhide as a secondary repo (Hummingbird's curated set lacks `iptables-nft`, `socat`, `conntrack-tools`, `ethtool`). The Fedora GPG keyring bundle is imported at build time and the repo is configured with `gpgcheck=1`, so Rawhide RPMs are signature-verified during install (#70).
 - Adds `pkgs.k8s.io` RPM repos for `core` (kubelet/kubeadm/kubectl) and `addons:cri-o`.
 - Pre-creates `/usr/libexec/kubernetes/kubelet-plugins/volume/exec` so kube-controller-manager doesn't fail on read-only `/usr`.
@@ -120,18 +120,26 @@ Both base on `quay.io/fedora/fedora-bootc:43` rather than Hummingbird, since Hum
 # Find a VM's IP
 sudo virsh -c qemu:///system net-dhcp-leases default | grep <vm-name>
 
-# Force rebuild + redefine (via Makefile)
-sudo make -C ~/hummingbird-k8s k3s                 # k3s
-sudo make -C ~/hummingbird-k8s k8s                 # upstream k8s control-plane
-sudo make -C ~/hummingbird-k8s workers COUNT=2     # wipe + build + spawn N workers
-sudo make -C ~/hummingbird-k8s spawn COUNT=3       # spawn N more workers from the existing template
+# Deploy / re-deploy a cluster (the only supported path)
+sudo make -C ~/hummingbird-k8s deploy-cluster CONFIG=cluster.local.conf
 
-# Direct script invocation still works:
-sudo bash ~/hummingbird-k8s/scripts/redo-k3s.sh
-sudo bash ~/hummingbird-k8s/scripts/redo-k8s.sh
-sudo bash ~/hummingbird-k8s/scripts/redo-workers.sh 2
-sudo bash ~/hummingbird-k8s/scripts/spawn-workers.sh 3
+# Tear it down
+sudo make -C ~/hummingbird-k8s destroy-cluster CONFIG=cluster.local.conf
+
+# Direct script invocation still works (deploy-cluster.sh is the entry point):
+sudo bash ~/hummingbird-k8s/scripts/deploy-cluster.sh ~/hummingbird-k8s/cluster.local.conf
 
 # Enable bootc auto-update timer at runtime
 sudo systemctl enable --now bootc-fetch-apply-updates.timer
 ```
+
+## History
+
+Prior versions of this repo also shipped a single-binary k3s flavor and a
+collection of "single-VM Makefile" targets (`make k3s`, `make k8s`,
+`make workers`, `make spawn`) along with companion `scripts/redo-*.sh`,
+`scripts/define-vm*.sh`, and `containers/k3s/`. These were retired in #216:
+they collided with `deploy-cluster`'s operator-chosen names, hardcoded
+operator-specific qcow2 paths (the geary-host-local pool), and carried CI cost for
+a flavor that was no longer deployed. `make deploy-cluster` is now the
+single supported entry point.

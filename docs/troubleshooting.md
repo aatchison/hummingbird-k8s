@@ -52,8 +52,8 @@ nested overlay mounts fail.
   `Error: kernel does not support overlay fs: overlay is not supported over
   overlayfs` from the bib invocation; the qcow2 conversion step exits
   non-zero before producing any output.
-- Fix: export `STORAGE_DRIVER=vfs` before invoking `make k8s` (or the
-  underlying `scripts/build-*.sh`). `vfs` is slower but always works.
+- Fix: export `STORAGE_DRIVER=vfs` before invoking `make deploy-cluster`
+  (or the underlying `scripts/build-*.sh`). `vfs` is slower but always works.
 - Caveat: setting `STORAGE_DRIVER=vfs` alone is not enough if a previous
   podman run already initialized the libpod database with `overlay`.
   Symptom is the misleading error:
@@ -161,7 +161,7 @@ old endpoint.
 
 - Symptom: `Ncat: TIMEOUT.` from the kubectl container, or `kubectl` itself
   reports `Unable to connect to the server: dial tcp 127.0.0.1:6443:
-  connect: connection refused` after a recent `make k8s`.
+  connect: connection refused` after a recent `make deploy-cluster`.
 - Fix: kill the stale tunnel and start fresh:
 
   ```bash

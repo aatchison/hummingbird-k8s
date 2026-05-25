@@ -9,8 +9,8 @@ $EDITOR cluster.local.conf
 sudo make deploy-cluster CONFIG=cluster.local.conf
 ```
 
-It exists alongside `make k8s && make workers` (the dev-iteration path),
-but they cover different shapes — see [Differences](#differences-from-make-k8s--make-workers).
+This is the only supported way to stand up a cluster after #216 retired
+the legacy single-VM `make k8s` / `make workers` / `make spawn` targets.
 
 ## The hybrid model
 
@@ -69,7 +69,7 @@ sudo bash scripts/deploy-cluster.sh cluster.local.conf
 
 When the script finishes, it prints the CP IP and a one-liner for
 `kubectl` access. `make nodes` (which uses `scripts/kubectl-k8s.sh` to
-SSH-tunnel the apiserver) works as it does for `make k8s`.
+SSH-tunnel the apiserver) works against the deployed CP.
 
 ## Config surface
 
@@ -287,21 +287,26 @@ pick up a changed `BOOTC_UPDATE_SCHEDULE` from `cluster.local.conf`
 because cloud-init only runs at first boot — to retune an existing
 cluster, edit the drop-in by hand or re-deploy the affected nodes.
 
-## Differences from `make k8s && make workers`
+## How deploy-cluster differs from raw image builds
 
-| Concern | `make k8s && make workers` | `make deploy-cluster CONFIG=…` |
-| --- | --- | --- |
-| Entry point | Two separate make targets | One config file, one command |
-| Hostname per VM | All VMs get the bib-baked hostname | Per-VM via cloud-init |
-| Worker join token | Injected into the qcow2 via guestfish (mounts ostree deploy dir directly) | Injected via cloud-init `write_files` — no libguestfs OS-introspection workaround |
-| Cloud-init needed? | No (default image works) | Yes (`ENABLE_CLOUD_INIT=1` required) |
-| `bootc switch` to GHCR | Post-deploy via `scripts/switch-to-ghcr.sh` over SSH | First-boot via cloud-init runcmd |
-| Auto-update timer on CP | Off by default (#48); `make redo-k8s` does not enable | `AUTO_UPDATE_CP=true` (default) enables via cloud-init runcmd |
-| Worker count | `COUNT=N` env var, names `hummingbird-k8s-worker-{1..N}` | `WORKER_NAMES=(…)` array, operator-chosen names |
-| Best for | Dev iteration, single-flavor rebuilds, ad-hoc adds via `make spawn` | Deploying a named cluster to a host that should stay up |
+`make deploy-cluster` is the operator-facing wrapper around the
+`build → qcow2 → cloud-init seed → virt-install → kubeadm join`
+pipeline. The underlying primitives (`scripts/build-k8s.sh`,
+`scripts/build-worker.sh`, `lib/build-common.sh`) are still callable
+directly when you want to iterate on the image layer alone (e.g.
+testing a Containerfile change against an existing cluster). Once
+you're ready to stand up VMs, deploy-cluster is the only supported
+path:
 
-Neither path is going away. `redo-k8s.sh` + `redo-workers.sh` keep
-working unchanged; this is an additional surface, not a replacement.
+- It carries per-VM dynamic state (hostname, worker join token,
+  post-boot runcmd) via cloud-init `write_files` + NoCloud seed ISO —
+  no libguestfs OS-introspection workaround required.
+- It enables `AUTO_UPDATE_CP` (cloud-init runcmd) when the operator
+  opts in via `cluster.local.conf`; the CP image otherwise ships with
+  the timer off (#48).
+- It supports operator-chosen names (`CP_NAME=hbird-cp1`,
+  `WORKER_NAMES=(hbird-w1 hbird-w2)`) rather than the legacy
+  single-VM `hummingbird-k8s-worker-{1..N}` naming.
 
 ## Troubleshooting
 

@@ -1,12 +1,11 @@
 # Automatic bootc updates
 
-`hummingbird-k3s` and `hummingbird-k8s-worker` ship with
-`bootc-fetch-apply-updates.timer` **enabled by default**. The
-`hummingbird-k8s` control-plane image ships with the timer **disabled by
-default** — opt in per host via `systemctl enable --now` (see below). The
-rationale: a single-CP cluster suffers a full apiserver outage during the
-CP reboot, so auto-update on the CP needs to be an explicit operator
-choice (#48).
+`hummingbird-k8s-worker` ships with `bootc-fetch-apply-updates.timer`
+**enabled by default**. The `hummingbird-k8s` control-plane image ships
+with the timer **disabled by default** — opt in per host via
+`systemctl enable --now` (see below). The rationale: a single-CP cluster
+suffers a full apiserver outage during the CP reboot, so auto-update on
+the CP needs to be an explicit operator choice (#48).
 
 ## Tracking GHCR vs localhost
 
@@ -17,9 +16,9 @@ timer fires on schedule but has nothing to pull — every GHCR release sits
 on the registry while the VM stays frozen at whatever was last built
 locally (#138).
 
-To make auto-updates actually work, the VM has to track a remote ref. The
-`redo-*.sh` deploy scripts now run `scripts/switch-to-ghcr.sh` against each
-freshly-installed VM as their last step, which does:
+To make auto-updates actually work, the VM has to track a remote ref.
+`scripts/deploy-cluster.sh` (and the helper `scripts/switch-to-ghcr.sh`)
+runs against each freshly-installed VM and does:
 
 ```bash
 bootc switch ghcr.io/aatchison/hummingbird-<flavor>:latest
@@ -30,8 +29,8 @@ GHCR. To verify on any node:
 
 ```bash
 sudo bootc status --json | jq .status.booted.image.image.image
-# → "ghcr.io/aatchison/hummingbird-k3s:latest"   (good)
-# → "localhost/hummingbird-k3s:latest"           (bad — timer can't pull)
+# → "ghcr.io/aatchison/hummingbird-k8s:latest"   (good)
+# → "localhost/hummingbird-k8s:latest"           (bad — timer can't pull)
 ```
 
 ### Switching an already-deployed cluster

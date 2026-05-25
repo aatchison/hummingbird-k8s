@@ -7,18 +7,23 @@ the Makefile just gives operators a stable, discoverable entrypoint. Run
 
 ## Common flows
 
-Full fresh upstream-k8s deploy on a clean KVM host:
+Fresh cluster deploy on a clean KVM host (1 CP + N workers, the only
+supported path since #216):
 
 ```bash
-sudo make k8s                 # build + define + start the control plane
-sudo make workers COUNT=2     # build worker image and spawn 2 workers
-make verify-all               # verify-encryption + verify-hardening + verify-app-deploy
+cp cluster.example.conf cluster.local.conf
+$EDITOR cluster.local.conf                    # set CP_NAME, WORKER_NAMES, IMAGE_SOURCE, ...
+sudo make deploy-cluster CONFIG=cluster.local.conf
+make verify-all                                # verify-encryption + verify-hardening + verify-app-deploy
 ```
 
-k3s single-node:
+Stand-alone image builds (no qcow2, no VM — fast iteration on Containerfile
+changes, mirrors what `pr-validate.yml` does):
 
 ```bash
-sudo make k3s
+make image-k8s            # control plane OCI image
+make image-worker         # worker template OCI image
+make image-all            # both
 ```
 
 Ad-hoc `kubectl` from the client (needs `KVM_HOST` set, see `config.example.sh`):
@@ -65,13 +70,16 @@ test surface.
 
 | Variable   | Default                       | Used by                       |
 | ---        | ---                           | ---                           |
-| `COUNT`    | `2`                           | `workers`, `spawn`            |
+| `CONFIG`   | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig` |
+| `NODE`     | (required for `update-node`)  | `update-node`                 |
+| `FLAGS`    | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
 | `ARGS`     | empty                         | `kubectl`                     |
 | `POOL_DIR` | `/var/lib/libvirt/images`     | `clean-vms`                   |
 | `KVM_HOST` | unset                         | `kubectl` / `nodes`           |
 
-Any other env vars honored by `config.local.sh` (e.g. `VM_USER`,
-`APISERVER_EXTRA_SANS`) flow through to the underlying scripts unchanged.
+Any other env vars honored by `cluster.local.conf` / `config.local.sh`
+(e.g. `VM_USER`, `APISERVER_EXTRA_SANS`, `STORAGE_DRIVER`, `PODMAN_ROOT`,
+`PODMAN_RUNROOT`) flow through to the underlying scripts unchanged.
 
 ## Version pinning
 

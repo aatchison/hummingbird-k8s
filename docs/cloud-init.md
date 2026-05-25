@@ -43,14 +43,16 @@ Build-time:
 
 ```bash
 # via the Makefile convenience targets
-make image-k3s-with-cloud-init
 make image-k8s-with-cloud-init
 make image-worker-with-cloud-init
 
-# or directly via the env var (also threads through the bib qcow2 path)
-ENABLE_CLOUD_INIT=1 sudo make k8s
+# or directly via the env var
 ENABLE_CLOUD_INIT=1 sudo bash scripts/build-k8s.sh
 ```
+
+The `make deploy-cluster` path requires `ENABLE_CLOUD_INIT=1` in
+`cluster.local.conf` and will set the build-arg automatically when
+`IMAGE_SOURCE=local`.
 
 The build-arg is read by `containers/<flavor>/Containerfile`. When
 `ENABLE_CLOUD_INIT=1`, the build:
@@ -156,10 +158,10 @@ unseeded default). This means:
   joined to the cluster under exactly those names — `kubectl get
   nodes` shows `hbird-w1`, `hbird-w2`, etc., not the
   `humbird-worker-<machine-id>` pattern.
-- `scripts/spawn-workers.sh` (legacy no-cloud-init path — only
+- `scripts/spawn-workers.sh` (the no-cloud-init worker primitive that
+  `deploy-cluster.sh` falls back to when cloud-init is not in play —
   injects `worker-join.env`, never touches hostname) still produces
-  unique node names via the `localhost*` fallback. The behavior for
-  that flow is unchanged.
+  unique node names via the `localhost*` fallback.
 
 To override cloud-init's hostname from your own user-data, set it
 through standard cloud-init mechanisms (`local-hostname` in
@@ -189,16 +191,16 @@ expect `worker-init.sh` to do it for you.
   files are merged, not overwritten.
 - **Image size delta.** Expect roughly +30 MB compressed for the
   cloud-init package set. Not enough to matter for a 600 MB+ k8s
-  image, but visible on the lean k3s flavor.
+  image.
 - **Build dependency.** Hummingbird's curated repo ships
   `cloud-init` itself but not all of its deps (xfsprogs, python3
   modules, dhcpcd, nc). The conditional build block adds a
   one-shot Fedora Rawhide repo just for the cloud-init install,
   then removes the repo file before the layer commits — the
   resulting image does not carry a dangling Rawhide
-  configuration. This works uniformly across k3s, k8s, and
-  k8s-worker (the latter two already have a permanent Rawhide
-  repo for iptables/socat/etc, but the cloud-init block stays
+  configuration. This works uniformly across k8s and k8s-worker
+  (both already have a permanent Rawhide repo for
+  iptables/socat/etc, but the cloud-init block stays
   self-contained so it's resilient to reordering). The Fedora
   GPG keyring is imported and the repo runs with `gpgcheck=1`,
   so cloud-init's RPM dependencies are signature-verified at
