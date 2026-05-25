@@ -9,7 +9,9 @@ the conventions the maintainer follows so contributions land smoothly.
 2. Install the prerequisites listed in the
    [README Prerequisites section](README.md#prerequisites) (Fedora 44 host,
    libvirt, `gh`, `shellcheck`, etc.).
-3. Copy `config.example.sh` to `config.sh` and adjust to your environment.
+3. Copy `config.example.sh` to `config.local.sh` and adjust to your environment
+   (used by the build-time scripts). For the deploy/update orchestration scripts,
+   also copy `cluster.example.conf` to `cluster.local.conf`.
 4. Run `make help` to see the cheatsheet of available targets.
 
 ## Code style
@@ -28,9 +30,13 @@ the conventions the maintainer follows so contributions land smoothly.
   - Indent lists and nested blocks with **2 spaces**.
   - Wrap prose at a comfortable column; long links may exceed.
 
-The `pr-validate` workflow runs these linters in CI; reproduce locally with
-`make verify-all` (or the focused targets `make lint-shell`, `make lint-yaml`,
-etc.).
+The `pr-validate` workflow runs these linters in CI. Reproduce locally with
+`make test-all` (bats unit suites in `tests/lib/` + `tests/scripts/`) plus
+the lint commands directly: `shellcheck --severity=warning scripts/*.sh lib/*.sh`,
+`hadolint containers/*/Containerfile`, `actionlint .github/workflows/*.yml`.
+(`make verify-all` is the **cluster** verifier sequence — runs
+`scripts/verify-{encryption,hardening,app-deploy}.sh` against a live deploy;
+not a local lint target.)
 
 ## PR flow
 

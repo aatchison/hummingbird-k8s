@@ -80,7 +80,7 @@ via `config.local.sh`.
 | --- | --- | --- | --- |
 | `hummingbird-k8s` (control plane) | 8 GB | 4 | 30 GB |
 | `hummingbird-k8s-worker` (each) | 4 GB | 2 | 20 GB |
-| `hummingbird-k3s` (single-node) | 4 GB | 2 | 20 GB |
+| `hummingbird-k3s` (single-node) | 6 GB | 4 | 20 GB |
 
 Sizing guidance:
 
@@ -90,8 +90,9 @@ Sizing guidance:
 - qcow2 files live in `POOL_DIR`. Point `POOL_DIR=/mnt/ssd/libvirt` at an SSD
   for noticeably better etcd write latency; HDDs work but `etcdctl defrag`
   cadence matters more.
-- CP/worker memory and vCPU are tunable via `CP_MEMORY`, `CP_VCPUS`,
-  `WORKER_MEMORY`, `WORKER_VCPUS` (see #91 once configurable sizing lands).
+- CP/worker/k3s memory and vCPU are tunable via `CP_MEMORY`, `CP_VCPUS`,
+  `WORKER_MEMORY`, `WORKER_VCPUS`, `K3S_MEMORY`, `K3S_VCPUS` — see
+  [docs/vm-sizing.md](docs/vm-sizing.md).
 
 ## Quick start (operator)
 
