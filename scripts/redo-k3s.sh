@@ -11,11 +11,16 @@ fi
 # Sit in scripts/ so we can invoke our sibling scripts by relative name.
 cd "$(dirname "$(readlink -f "$0")")"
 
+_ROOT="$(cd .. && pwd)"
+# shellcheck disable=SC1091
+[[ -r "${_ROOT}/config.local.sh" ]] && source "${_ROOT}/config.local.sh"
+: "${POOL_DIR:=/var/lib/libvirt/images}"
+
 for name in hummingbird-k3s hummingbird; do
   virsh -c qemu:///system destroy "$name" 2>/dev/null || true
   virsh -c qemu:///system undefine "$name" 2>/dev/null || true
 done
-rm -f /mnt/mass2/vms/hummingbird-k3s.qcow2 /mnt/mass2/vms/hummingbird.qcow2
+rm -f "${POOL_DIR}/hummingbird-k3s.qcow2" "${POOL_DIR}/hummingbird.qcow2"
 
 bash build-k3s.sh
 bash define-vm.sh

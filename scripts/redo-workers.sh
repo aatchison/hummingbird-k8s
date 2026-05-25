@@ -16,6 +16,11 @@ fi
 
 cd "$(dirname "$(readlink -f "$0")")"
 
+_ROOT="$(cd .. && pwd)"
+# shellcheck disable=SC1091
+[[ -r "${_ROOT}/config.local.sh" ]] && source "${_ROOT}/config.local.sh"
+: "${POOL_DIR:=/var/lib/libvirt/images}"
+
 COUNT="${1:-2}"
 
 # Remove any existing worker VMs and their per-instance qcow2s.
@@ -23,7 +28,7 @@ for d in $(virsh -c qemu:///system list --all --name 2>/dev/null | grep '^hummin
   virsh -c qemu:///system destroy "$d" 2>/dev/null || true
   virsh -c qemu:///system undefine "$d" 2>/dev/null || true
 done
-rm -f /mnt/mass2/vms/hummingbird-k8s-worker-*.qcow2 /mnt/mass2/vms/hummingbird-k8s-worker.qcow2
+rm -f "${POOL_DIR}"/hummingbird-k8s-worker-*.qcow2 "${POOL_DIR}/hummingbird-k8s-worker.qcow2"
 
 bash build-worker.sh
 # spawn-workers.sh runs scripts/switch-to-ghcr.sh per worker once each VM

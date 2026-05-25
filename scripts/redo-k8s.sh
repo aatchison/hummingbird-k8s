@@ -8,9 +8,14 @@ fi
 
 cd "$(dirname "$(readlink -f "$0")")"
 
+_ROOT="$(cd .. && pwd)"
+# shellcheck disable=SC1091
+[[ -r "${_ROOT}/config.local.sh" ]] && source "${_ROOT}/config.local.sh"
+: "${POOL_DIR:=/var/lib/libvirt/images}"
+
 virsh -c qemu:///system destroy hummingbird-k8s 2>/dev/null || true
 virsh -c qemu:///system undefine hummingbird-k8s 2>/dev/null || true
-rm -f /mnt/mass2/vms/hummingbird-k8s.qcow2
+rm -f "${POOL_DIR}/hummingbird-k8s.qcow2"
 
 bash build-k8s.sh
 bash define-vm-k8s.sh
