@@ -22,12 +22,11 @@ on:
   workflow_dispatch:
     inputs:
       flavor:
-        description: 'Image flavor to test (k3s | k8s | k8s-worker)'
+        description: 'Image flavor to test (k8s | k8s-worker)'
         required: true
         type: choice
         default: k8s
         options:
-          - k3s
           - k8s
           - k8s-worker
 

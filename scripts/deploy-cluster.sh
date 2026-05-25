@@ -17,17 +17,11 @@
 #     - First-boot runcmd: `bootc switch` to the GHCR ref; enable the
 #       auto-update timer on the CP (overrides #48's opt-out)
 #
-# Why this is distinct from `make k8s && make workers`:
-#
-#   make k8s + make workers is the "dev iteration" path: build locally,
-#   inject the worker join via guestfish-on-qcow2. That path works but
-#   bypasses cloud-init entirely and relies on libguestfs fishing the
-#   ostree deployment dir out of a bootc image (#libguestfs-ostree note
-#   in the repo).
-#
-#   This script is the "real deploy" path: ENABLE_CLOUD_INIT=1 images,
-#   per-VM NoCloud seed ISOs attached at virt-install, worker join via
-#   cloud-init's write_files (no offline qcow2 mutation).
+# This is the canonical (and, since #216, only) supported way to stand
+# up a Hummingbird cluster: ENABLE_CLOUD_INIT=1 images, per-VM NoCloud
+# seed ISOs attached at virt-install time, worker join via cloud-init's
+# write_files (no offline qcow2 mutation, no libguestfs fishing the
+# ostree deployment dir out of the bootc image).
 #
 # Usage:
 #   sudo bash scripts/deploy-cluster.sh [path/to/cluster.local.conf]

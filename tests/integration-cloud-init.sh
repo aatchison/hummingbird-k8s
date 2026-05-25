@@ -2,7 +2,7 @@
 # integration-cloud-init.sh — End-to-end test of the optional cloud-init path.
 #
 # Usage:  sudo tests/integration-cloud-init.sh <flavor>
-#         where <flavor> is one of: k3s, k8s, k8s-worker
+#         where <flavor> is one of: k8s, k8s-worker
 #
 # Verifies the ENABLE_CLOUD_INIT=1 build arg (PR #164, issue #163) end to
 # end:
@@ -38,11 +38,11 @@ PODMAN_RUNROOT="${PODMAN_RUNROOT:-/run/integration-storage/${RUN_ID_TAG}}"
 export PODMAN_ROOT PODMAN_RUNROOT
 mkdir -p "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
 
-FLAVOR="${1:?flavor required (one of: k3s, k8s, k8s-worker)}"
+FLAVOR="${1:?flavor required (one of: k8s, k8s-worker)}"
 case "${FLAVOR}" in
-  k3s|k8s|k8s-worker) ;;
+  k8s|k8s-worker) ;;
   *)
-    printf '[integration-cloud-init] unknown flavor: %s (want k3s|k8s|k8s-worker)\n' "${FLAVOR}" >&2
+    printf '[integration-cloud-init] unknown flavor: %s (want k8s|k8s-worker)\n' "${FLAVOR}" >&2
     exit 2
     ;;
 esac

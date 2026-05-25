@@ -5,11 +5,12 @@
 # wiring without touching libvirt / podman / sudo. Designed to run in a
 # vanilla Ubuntu/Fedora CI runner — no KVM host required.
 #
-# Coverage matches issue #110:
+# Coverage (post-#216, with the k3s flavor and legacy single-VM targets
+# retired):
 #   1.  `make help` exits 0 and lists at least 10 targets.
-#   2.  `make -n k8s`            -> bash scripts/redo-k8s.sh
-#   3.  `make -n k3s`            -> bash scripts/redo-k3s.sh
-#   4.  `make -n workers COUNT=4`-> bash scripts/redo-workers.sh 4
+#   2.  `make -n deploy-cluster CONFIG=…` -> bash scripts/deploy-cluster.sh
+#   3.  `make -n destroy-cluster CONFIG=…` -> bash scripts/destroy-cluster.sh
+#   4.  `make -n update-cluster CONFIG=…` -> bash scripts/update-cluster.sh
 #   5.  `make -n verify-all`     -> all three verify-* scripts in sequence
 #   6.  `make -n backup-etcd`    -> bash scripts/backup-etcd.sh (no LABEL)
 #   7.  `make -n switch-to-ghcr` -> bash scripts/switch-to-ghcr.sh
@@ -49,19 +50,20 @@ make_dry() {
   [ "$target_count" -ge 10 ]
 }
 
-@test "2. make -n k8s invokes scripts/redo-k8s.sh" {
-  make_dry k8s
-  [[ "$output" == *"bash scripts/redo-k8s.sh"* ]]
+@test "2. make -n deploy-cluster CONFIG=… invokes scripts/deploy-cluster.sh" {
+  make_dry deploy-cluster CONFIG=cluster.example.conf
+  [[ "$output" == *"bash scripts/deploy-cluster.sh"* ]]
+  [[ "$output" == *"cluster.example.conf"* ]]
 }
 
-@test "3. make -n k3s invokes scripts/redo-k3s.sh" {
-  make_dry k3s
-  [[ "$output" == *"bash scripts/redo-k3s.sh"* ]]
+@test "3. make -n destroy-cluster CONFIG=… invokes scripts/destroy-cluster.sh" {
+  make_dry destroy-cluster CONFIG=cluster.example.conf
+  [[ "$output" == *"bash scripts/destroy-cluster.sh"* ]]
 }
 
-@test "4. make -n workers COUNT=4 invokes scripts/redo-workers.sh with 4" {
-  make_dry workers COUNT=4
-  [[ "$output" == *"bash scripts/redo-workers.sh 4"* ]]
+@test "4. make -n update-cluster CONFIG=… invokes scripts/update-cluster.sh" {
+  make_dry update-cluster CONFIG=cluster.example.conf
+  [[ "$output" == *"bash scripts/update-cluster.sh"* ]]
 }
 
 @test "5. make -n verify-all runs verify-encryption, verify-hardening, verify-app-deploy in sequence" {
@@ -95,9 +97,8 @@ make_dry() {
   make_dry clean
   # clean-vms recipe: `virsh ... destroy` loop over hummingbird-* domains.
   [[ "$output" == *"virsh"* ]] && [[ "$output" == *"hummingbird-"* ]]
-  # clean-images recipe: `podman image rm` on the three local images.
+  # clean-images recipe: `podman image rm` on the two local images.
   [[ "$output" == *"podman image rm"* ]]
-  [[ "$output" == *"localhost/hummingbird-k3s:latest"* ]]
   [[ "$output" == *"localhost/hummingbird-k8s:latest"* ]]
   [[ "$output" == *"localhost/hummingbird-k8s-worker:latest"* ]]
 }
@@ -138,14 +139,20 @@ make_dry() {
     | tr ' ' '\n' \
     | grep -v '^$')"
 
-  # restore-etcd has a guard that requires SNAP=…; pass a stub so the
-  # dry-run can expand without the @[ -n "$(SNAP)" ] guard short-circuiting.
+  # Targets that require CONFIG=, SNAP=, NODE=, etc. — pass stub values so
+  # the dry-run can expand without the guard short-circuiting.
   for t in $phony; do
     case "$t" in
-      restore-etcd) run make -n "$t" SNAP=/tmp/stub.db ;;
-      workers|spawn) run make -n "$t" COUNT=1 ;;
-      kubectl)      run make -n "$t" ARGS='get nodes' ;;
-      *)            run make -n "$t" ;;
+      restore-etcd)
+        run make -n "$t" SNAP=/tmp/stub.db ;;
+      deploy-cluster|destroy-cluster|update-cluster|update-workers|export-argocd|get-kubeconfig)
+        run make -n "$t" CONFIG=cluster.example.conf ;;
+      update-node)
+        run make -n "$t" CONFIG=cluster.example.conf NODE=stub-node ;;
+      kubectl)
+        run make -n "$t" ARGS='get nodes' ;;
+      *)
+        run make -n "$t" ;;
     esac
     if [ "$status" -ne 0 ]; then
       echo "make -n $t failed (status=$status):" >&2

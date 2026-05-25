@@ -11,8 +11,9 @@
 #                 qemu:///system and switch each one. Skip VMs that already
 #                 track ghcr.
 #
-#   * "single VM" — for use by `redo-*.sh` immediately after a fresh deploy.
-#                 Invoked as:
+#   * "single VM" — for use by `scripts/deploy-cluster.sh` and
+#                 `scripts/spawn-workers.sh` immediately after a fresh
+#                 deploy. Invoked as:
 #                     scripts/switch-to-ghcr.sh <vm-name> <ghcr-ref>
 #                 No discovery / iteration; switches just that one VM.
 #                 Errors are non-fatal (the caller's deploy succeeded; the
@@ -51,7 +52,6 @@ GHCR_TAG="${GHCR_TAG:-latest}"
 flavor_for_vm() {
   local name="$1"
   case "$name" in
-    hummingbird-k3s)            echo "hummingbird-k3s" ;;
     hummingbird-k8s)            echo "hummingbird-k8s" ;;
     hummingbird-k8s-worker-*)   echo "hummingbird-k8s-worker" ;;
     *)                          return 1 ;;
@@ -148,8 +148,9 @@ switch_one() {
 }
 
 # --- single-VM mode ---------------------------------------------------------
-# Invoked by redo-*.sh immediately after a fresh deploy. Two positional args:
-# the VM name and the exact GHCR ref to switch to.
+# Invoked by scripts/deploy-cluster.sh / scripts/spawn-workers.sh immediately
+# after a fresh deploy. Two positional args: the VM name and the exact GHCR
+# ref to switch to.
 if [[ $# -ge 1 ]]; then
   vm_name="$1"
   ref="${2:-}"

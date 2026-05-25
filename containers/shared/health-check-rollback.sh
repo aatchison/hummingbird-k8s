@@ -38,21 +38,17 @@ rm -f "${MARKER}"
 
 healthy=1
 
-# Always check the kubelet — it's present on every flavor we ship (CP, k3s,
+# Always check the kubelet — it's present on every flavor we ship (CP +
 # worker). Use --quiet on the systemctl side since we already log our own
 # verdict below.
 if ! systemctl is-active --quiet kubelet.service; then
-  # k3s ships kubelet inside the k3s.service unit, so on the k3s flavor the
-  # standalone kubelet.service unit doesn't exist. Check k3s as a fallback.
-  if ! systemctl is-active --quiet k3s.service; then
-    log "kubelet/k3s service is not active"
-    healthy=0
-  fi
+  log "kubelet service is not active"
+  healthy=0
 fi
 
 # On the CP image the static-pod manifest for kube-apiserver lives at
 # /etc/kubernetes/manifests/kube-apiserver.yaml. Use file existence as the
-# CP detector so the worker / k3s flavors skip this branch.
+# CP detector so the worker flavor skips this branch.
 if [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]; then
   if ! curl -fsSk --max-time 5 https://127.0.0.1:6443/livez >/dev/null 2>&1; then
     log "kube-apiserver /livez did not respond OK within 5s"

@@ -8,11 +8,6 @@ FROM quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0
 # bumps; the trade-off is determinism — two builds of the same Containerfile
 # at different times can produce different images. Acceptable for a lab.
 #
-# Note: this is intentionally different from the k3s flavor's K3S_VERSION,
-# which pins patch (e.g. v1.31.4+k3s1) because the k3s installer fetches a
-# specific tagged binary by URL. Both flavors target the same minor channel
-# (currently 1.31); bump them together when promoting to a new minor. (#82)
-#
 # Bump deliberately (e.g., v1.32) when promoting to a new minor release.
 ARG K8S_VERSION=v1.31
 ARG POD_CIDR=10.244.0.0/16

@@ -45,7 +45,7 @@ TEMPLATE="${POOL_DIR}/hummingbird-k8s-worker.qcow2"
 
 [[ -r "$TEMPLATE" ]] || {
   echo "${0##*/}: worker template qcow2 missing or unreadable: $TEMPLATE" >&2
-  echo "${0##*/}: build it first: 'sudo bash scripts/build-worker.sh' (or 'sudo make workers' to do both)." >&2
+  echo "${0##*/}: build it first via 'sudo bash scripts/build-worker.sh' (or run 'sudo make deploy-cluster CONFIG=…' to build + spawn together)." >&2
   exit 1
 }
 
@@ -96,7 +96,7 @@ fi
 # ships with ENABLE_ROOT_SSH=1 by default; see docs/worker-tokens.md.
 #
 # Retries up to CP_SSH_RETRIES times because the CP can still be coming up
-# when redo-workers.sh chains here right after redo-k8s.sh (#90). Each
+# when deploy-cluster.sh chains here right after a fresh CP boot (#90). Each
 # attempt has its own ConnectTimeout=10s; on success we emit the join
 # command on stdout, on persistent failure we exit non-zero so the caller
 # aborts rather than spawning a worker with no join token.

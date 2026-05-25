@@ -7,10 +7,10 @@
 # verifiers, so what works locally is what runs in CI.
 #
 # Targets are grouped:
-#   * image-*       — `podman build` only, no qcow2 (cheap to iterate)
-#   * k3s/k8s/...   — full operator lifecycle (image -> qcow2 -> VM)
-#   * verify-*      — post-deploy verifiers (PSA, audit, encryption, etc.)
-#   * clean-*       — tear down local VMs / images
+#   * image-*         — `podman build` only, no qcow2 (cheap to iterate)
+#   * deploy-cluster  — full operator lifecycle (image -> qcow2 -> VMs)
+#   * verify-*        — post-deploy verifiers (PSA, audit, encryption, etc.)
+#   * clean-*         — tear down local VMs / images
 #
 # Most VM-touching targets require sudo (libvirt qemu:///system, bib
 # loopback mounts). Image-only targets can run as the invoking user as
@@ -20,38 +20,21 @@
 
 SHELL := /usr/bin/env bash
 
-# ---- Worker count knob (#96) -------------------------------------------
-# Number of workers spawn / re-spawn targets should create. Override on
-# the command line: `sudo make workers COUNT=3`. Threads through:
-#   make workers COUNT=N
-#     -> bash scripts/redo-workers.sh N
-#       -> bash scripts/spawn-workers.sh N
-#         -> for i in 1..N: virt-install hummingbird-k8s-worker-${i}
-# Same chain applies to `make spawn COUNT=N`, which skips the template
-# rebuild and only spawns additional workers.
-#
-# Per-worker memory / vCPUs are knobbed separately via WORKER_MEMORY /
-# WORKER_VCPUS env vars — see config.example.sh.
-COUNT ?= 2
-
 # Mirror the LOCAL_IMAGE names build-*.sh use, so image-* targets agree
 # with the rest of the toolchain.
-IMAGE_K3S    := localhost/hummingbird-k3s:latest
 IMAGE_K8S    := localhost/hummingbird-k8s:latest
 IMAGE_WORKER := localhost/hummingbird-k8s-worker:latest
 
 # Repo-root-relative Containerfile paths — referenced by both
 # scripts/build-*.sh AND the CI workflows under .github/workflows/, so
 # they live here as the single source of truth.
-CONTAINERFILE_K3S    := containers/k3s/Containerfile
 CONTAINERFILE_K8S    := containers/k8s/Containerfile
 CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
 
 .DEFAULT_GOAL := help
 .PHONY: help \
-        image-k3s image-k8s image-worker image-all \
-        image-k3s-with-cloud-init image-k8s-with-cloud-init image-worker-with-cloud-init \
-        k3s k8s workers spawn \
+        image-k8s image-worker image-all \
+        image-k8s-with-cloud-init image-worker-with-cloud-init \
         deploy-cluster \
         destroy-cluster \
         update-cluster update-workers update-node \
@@ -62,8 +45,8 @@ CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
         verify-encryption verify-hardening verify-app-deploy verify-all \
         kube-bench \
         backup-etcd restore-etcd rotate-etcd-key \
-        ci-build-k3s ci-build-k8s ci-build-worker \
-        print-containerfile-k3s print-containerfile-k8s print-containerfile-worker \
+        ci-build-k8s ci-build-worker \
+        print-containerfile-k8s print-containerfile-worker \
         test-lib test-scripts test-all \
         clean-vms clean-images clean
 
@@ -79,9 +62,6 @@ help: ## Show this target list
 # without the bib qcow2 step. CI's `containerfile-build` matrix exercises
 # the same path.
 
-image-k3s: ## podman build the k3s OCI image
-	podman build -t $(IMAGE_K3S) -f $(CONTAINERFILE_K3S) .
-
 image-k8s: ## podman build the k8s control-plane OCI image
 	podman build -t $(IMAGE_K8S) -f $(CONTAINERFILE_K8S) .
 
@@ -95,7 +75,7 @@ image-worker: ## podman build the k8s-worker template OCI image
 	fi
 	podman build -t $(IMAGE_WORKER) -f $(CONTAINERFILE_WORKER) .
 
-image-all: image-k3s image-k8s image-worker ## podman build all three OCI images
+image-all: image-k8s image-worker ## podman build both OCI images (CP + worker)
 
 # ---- opt-in cloud-init variants ----------------------------------------
 # Convenience targets that flip ENABLE_CLOUD_INIT=1 for a single podman
@@ -104,9 +84,6 @@ image-all: image-k3s image-k8s image-worker ## podman build all three OCI images
 # packages) via `virt-install --cloud-init` or a libvirt seed ISO. The
 # default image-* targets stay byte-identical to pre-cloud-init builds.
 # See docs/cloud-init.md.
-
-image-k3s-with-cloud-init: ## podman build the k3s image with cloud-init opted in
-	podman build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_K3S) -f $(CONTAINERFILE_K3S) .
 
 image-k8s-with-cloud-init: ## podman build the k8s control-plane image with cloud-init opted in
 	podman build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_K8S) -f $(CONTAINERFILE_K8S) .
@@ -118,22 +95,13 @@ image-worker-with-cloud-init: ## podman build the worker template image with clo
 	fi
 	podman build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_WORKER) -f $(CONTAINERFILE_WORKER) .
 
-# ---- VM lifecycle (sudo) -----------------------------------------------
-# These run the full image -> qcow2 -> virt-install dance via the same
-# scripts an operator would call manually.
-
-k3s: ## Build + define + start the hummingbird-k3s VM (sudo)
-	bash scripts/redo-k3s.sh
-
-k8s: ## Build + define + start the hummingbird-k8s control plane VM (sudo)
-	bash scripts/redo-k8s.sh
-
-workers: ## Rebuild worker template and spawn $(COUNT) workers (sudo)
-	bash scripts/redo-workers.sh $(COUNT)
-
-spawn: ## Spawn $(COUNT) more workers without rebuilding the template (sudo)
-	bash scripts/spawn-workers.sh $(COUNT)
-
+# ---- cluster lifecycle (sudo) ------------------------------------------
+# The canonical operator entry point. `deploy-cluster` builds (or pulls)
+# the CP + worker images, converts them to qcow2 via bib, generates per-VM
+# cloud-init seeds, virt-installs the CP, waits for it Ready, then joins
+# the workers. Tear down with `destroy-cluster`, roll bootc upgrades with
+# `update-cluster`. See docs/deploy-cluster.md for the full flow.
+#
 # --preserve-env passes HOME (used by cluster config templates), plus the
 # podman storage isolation vars (issue #199) so the inner sudo'd
 # deploy-cluster.sh + lib/build-common.sh:build_qcow2 see them. Outer
@@ -255,8 +223,6 @@ rotate-etcd-key: ## Walk the operator through etcd encryption-key rotation (#120
 # without divergence creeping in. See pr-validate.yml's matrix entries
 # which call podman build with the same Containerfile path variables.
 
-ci-build-k3s: image-k3s ## Local-equivalent of build-k3s.yml's buildah step
-
 ci-build-k8s: image-k8s ## Local-equivalent of build-k8s.yml's buildah step
 
 ci-build-worker: image-worker ## Local-equivalent of build-worker.yml's buildah step
@@ -264,9 +230,6 @@ ci-build-worker: image-worker ## Local-equivalent of build-worker.yml's buildah 
 # Path-emitting helpers — used by CI to discover the canonical
 # Containerfile location without grepping the Makefile. Example:
 #   make -s print-containerfile-k8s   →   containers/k8s/Containerfile
-
-print-containerfile-k3s: ## Print Containerfile path for the k3s flavor
-	@echo $(CONTAINERFILE_K3S)
 
 print-containerfile-k8s: ## Print Containerfile path for the k8s flavor
 	@echo $(CONTAINERFILE_K8S)
@@ -300,7 +263,6 @@ clean-vms: ## Destroy + undefine all hummingbird-* VMs (sudo)
 	done
 
 clean-images: ## Remove the local OCI build outputs
-	-podman image rm $(IMAGE_K3S) $(IMAGE_K8S) $(IMAGE_WORKER) 2>/dev/null || true
+	-podman image rm $(IMAGE_K8S) $(IMAGE_WORKER) 2>/dev/null || true
 
 clean: clean-vms clean-images ## Destroy all VMs and remove local images
-

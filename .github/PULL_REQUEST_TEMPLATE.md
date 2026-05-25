@@ -5,7 +5,7 @@
 ## Files touched (declare scope)
 
 <!-- list directories/files this PR modifies. Helps parallel work -->
-<!-- avoid conflicts. e.g. scripts/, lib/, containers/k3s/Containerfile -->
+<!-- avoid conflicts. e.g. scripts/, lib/, containers/k8s/Containerfile -->
 
 ## Test plan
 

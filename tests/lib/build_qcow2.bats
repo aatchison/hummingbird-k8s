@@ -2,7 +2,7 @@
 #
 # Unit tests for the build_qcow2() helper in lib/build-common.sh (issue #115).
 #
-# build_qcow2 is the heart of build-k3s.sh / build-k8s.sh / build-worker.sh: it
+# build_qcow2 is the heart of build-k8s.sh / build-worker.sh: it
 # shells out to bootc-image-builder via podman, promotes the staged disk to its
 # final qcow2 path under $POOL_DIR, and refreshes any known libvirt pools. The
 # function is too thin to be worth e2e-mocking the bib image, but the bits we
@@ -105,7 +105,7 @@ make_cfg() {
 
   local cfg
   cfg="$(make_cfg)"
-  run build_qcow2 localhost/hummingbird-k3s:latest hummingbird-k3s "$cfg"
+  run build_qcow2 localhost/hummingbird-k8s:latest hummingbird-k8s "$cfg"
   [ "$status" -eq 0 ]
 
   # The captured argv must include the bib image, the config + output mounts,
@@ -127,7 +127,7 @@ make_cfg() {
   grep -qx -- '--rootfs' "$PODMAN_ARGS"
   grep -qx 'ext4' "$PODMAN_ARGS"
   grep -qx -- '--local' "$PODMAN_ARGS"
-  grep -qx 'localhost/hummingbird-k3s:latest' "$PODMAN_ARGS"
+  grep -qx 'localhost/hummingbird-k8s:latest' "$PODMAN_ARGS"
 
   # When no isolation env vars are set, the legacy host storage path is
   # bind-mounted into the BIB container (so the nested podman finds the
@@ -148,10 +148,10 @@ make_cfg() {
 
   # The promoted qcow2 ends up at ${POOL_DIR}/<name>.qcow2 and the staging dir
   # is gone.
-  [ -f "${POOL_DIR}/hummingbird-k3s.qcow2" ]
+  [ -f "${POOL_DIR}/hummingbird-k8s.qcow2" ]
   [ ! -d "${POOL_DIR}/qcow2" ]
   # Stdout should announce the path so operators can grep for it.
-  [[ "$output" == *"Built: ${POOL_DIR}/hummingbird-k3s.qcow2"* ]]
+  [[ "$output" == *"Built: ${POOL_DIR}/hummingbird-k8s.qcow2"* ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -264,7 +264,7 @@ make_cfg() {
 
   local cfg
   cfg="$(make_cfg)"
-  run build_qcow2 localhost/hummingbird-k3s:latest hummingbird-k3s "$cfg"
+  run build_qcow2 localhost/hummingbird-k8s:latest hummingbird-k8s "$cfg"
   [ "$status" -eq 0 ]
 
   # 1) Top-level podman flags (BEFORE `run`) must include --storage-driver,
