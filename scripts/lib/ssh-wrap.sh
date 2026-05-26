@@ -72,6 +72,14 @@
 #                               bats so tests don't have to stub a
 #                               working ssh path to otherwise-foreign
 #                               hosts.
+#   HBIRD_SSH_WRAP_DRY_RUN_SCP=1
+#                             — In the CONFIG-scp branch, print
+#                               `SCP_WOULD_RUN: <src> -> <dest>` and use
+#                               a deterministic remote tempdir
+#                               (/tmp/hbird-dryrun) instead of actually
+#                               calling scp. Lets bats exercise the
+#                               CONFIG-rewrite path without a working
+#                               remote.
 
 # Default for the remote checkout path. Operator can override via the
 # environment or cluster.local.conf. The remote MUST have a git clone
@@ -150,9 +158,27 @@ hbird_ssh_wrap_maybe_reexec() {
   # the copied file.
   if [[ -n "${CONFIG:-}" && -f "$CONFIG" ]]; then
     local remote_tmp remote_config_path
-    remote_tmp="$(ssh "$KVM_HOST" 'mktemp -d -t hbird-XXXXXX')"
-    remote_config_path="${remote_tmp}/$(basename "$CONFIG")"
-    scp -q "$CONFIG" "${KVM_HOST}:${remote_config_path}"
+    if [[ "${HBIRD_SSH_WRAP_DRY_RUN_SCP:-0}" = 1 ]]; then
+      remote_tmp="/tmp/hbird-dryrun"
+      remote_config_path="${remote_tmp}/$(basename "$CONFIG")"
+      echo "SCP_WOULD_RUN: ${CONFIG} -> ${KVM_HOST}:${remote_config_path}" >&2
+    else
+      remote_tmp="$(ssh "$KVM_HOST" 'mktemp -d -t hbird-XXXXXX')"
+      # H2: guard against empty remote_tmp from a failed `mktemp -d`.
+      # Without this, an scp to "${KVM_HOST}:/$(basename "$CONFIG")"
+      # would write to the remote filesystem root.
+      if [[ -z "$remote_tmp" ]]; then
+        echo "[${script_basename}] remote mktemp -d failed; refusing to scp CONFIG" >&2
+        exit 1
+      fi
+      remote_config_path="${remote_tmp}/$(basename "$CONFIG")"
+      # M6: drop -q so scp errors surface; wrap in if/then for a
+      # friendly diagnostic on failure.
+      if ! scp "$CONFIG" "${KVM_HOST}:${remote_config_path}"; then
+        echo "[${script_basename}] scp of CONFIG to ${KVM_HOST}:${remote_config_path} failed" >&2
+        exit 1
+      fi
+    fi
     for i in "${!env_args[@]}"; do
       [[ "${env_args[i]}" == CONFIG=* ]] && env_args[i]="CONFIG=${remote_config_path}"
     done
