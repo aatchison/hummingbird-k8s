@@ -24,6 +24,17 @@ The same applies to `destroy-cluster`, `update-cluster`,
 `update-workers`, and `update-node`. See
 [`deploy-cluster.md`](deploy-cluster.md) for the three no-op paths.
 
+> **Local fallback path:** if you're running on the KVM host with
+> custom podman storage (`STORAGE_DRIVER`, `PODMAN_ROOT`,
+> `PODMAN_RUNROOT`), pass them through the outer `sudo` explicitly:
+> `sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,HOME make deploy-cluster CONFIG=…`.
+> Before #233 the Makefile carried these for you via `sudo
+> --preserve-env=…`; with `sudo` removed from the recipe it's now the
+> operator's job to keep them across the privilege boundary. Same
+> applies to `destroy-cluster` / `update-cluster` /
+> `update-workers` / `update-node` when running locally on the KVM
+> host with a non-default podman storage location.
+
 Stand-alone image builds (no qcow2, no VM — fast iteration on Containerfile
 changes, mirrors what `pr-validate.yml` does). These run **rootless** as
 the invoking user; no `sudo` is needed because the recipes only call
