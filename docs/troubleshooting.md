@@ -170,6 +170,30 @@ old endpoint.
   make kubectl ARGS='get nodes'
   ```
 
+### `sudo: a terminal is required to read the password` from day-2 wrappers
+
+`scripts/kubectl-k8s.sh` and `scripts/export-argocd.sh` ssh to
+`$KVM_HOST` / `root@$CP_IP` and run `sudo virsh …` / `sudo cat …` on the
+remote. Without `ssh -t` the remote sudo can't allocate a TTY to prompt
+for the operator's password when the remote sudo cache is cold — the
+call fails with `sudo: a terminal is required to read the password`. The
+fix (issue #247) passes `-t` on every such invocation, and strips the
+`\r` that sshd injects when a remote TTY is allocated.
+
+- Symptom: `sudo: a terminal is required to read the password` from
+  `make nodes`, `make kubectl ARGS='…'`, `make get-kubeconfig`,
+  `make export-argocd` — typically the first day-2 call after a fresh
+  login on the client (judah).
+- Fix (operator workaround if running an unfixed build): cache the
+  remote sudo credential first, then re-run:
+
+  ```bash
+  ssh -t "$KVM_HOST" 'sudo -v'
+  make nodes
+  ```
+- Fix (permanent, landed): the wrappers now pass `ssh -t` directly. See
+  PR #247 fix.
+
 ### Verifier scripts can't reach VMs from a non-KVM host
 
 `scripts/verify-*.sh` originally did `ssh root@192.168.122.x`, which only
