@@ -47,6 +47,12 @@
 # footgun: operator's local exports would silently change remote
 # behavior).
 #
+# Quoting:
+#   Every env value and positional arg is escaped through `printf %q`
+#   before being interpolated into the remote command. That closes the
+#   command-injection surface that pre-round-2 had (FLAGS="--foo; rm -rf"
+#   would have been word-split on the remote shell).
+#
 # Test hooks:
 #   HBIRD_REMOTE_REEXEC=1     — Sentinel set by the SSH'd remote side
 #                               to prevent infinite re-exec. Also used by
@@ -112,6 +118,25 @@ hbird_ssh_wrap_maybe_reexec() {
     done
   fi
 
+  # Properly quote every env-arg and positional arg using printf %q.
+  # This closes the round-1 command-injection HIGH finding: values
+  # containing spaces, quotes, or shell metas now reach the remote
+  # bash unmangled.
+  local quoted_env=""
+  for v in "${env_args[@]}"; do
+    # env_args entries look like NAME=value; split on first '=' so we
+    # can quote NAME and value independently. NAME is allowlisted so
+    # never contains metachars in practice, but quote it anyway.
+    local name="${v%%=*}"
+    local val="${v#*=}"
+    quoted_env+="$(printf '%q=%q ' "$name" "$val")"
+  done
+  local quoted_args=""
+  local a
+  for a in "$@"; do
+    quoted_args+="$(printf '%q ' "$a")"
+  done
+
   local script_basename
   script_basename="$(basename "$self")"
   # Resolve the remote script path against the operator's checkout.
@@ -119,19 +144,14 @@ hbird_ssh_wrap_maybe_reexec() {
   echo "[${script_basename}] re-execing on ${KVM_HOST}:${remote_script} (env: ${env_args[*]:-(empty)})" >&2
 
   # Test hook: print the would-be command and exit. Lets bats assert the
-  # exact env-var allowlist without spawning real ssh.
+  # exact env-var allowlist + quoting behavior without spawning real ssh.
   if [[ "${HBIRD_SSH_WRAP_DRY_RUN:-0}" = 1 ]]; then
-    printf 'SSH_WRAP_CMD: ssh -t %s cd %s && sudo env HBIRD_REMOTE_REEXEC=1' \
-      "$KVM_HOST" "$HBIRD_REMOTE_REPO"
-    local a
-    for a in "${env_args[@]}"; do printf ' %s' "$a"; done
-    printf ' bash %s' "$remote_script"
-    for a in "$@"; do printf ' %s' "$a"; done
-    printf '\n'
+    printf 'SSH_WRAP_CMD: ssh -t %s cd %s && sudo env HBIRD_REMOTE_REEXEC=1 %sbash %s %s\n' \
+      "$KVM_HOST" "$HBIRD_REMOTE_REPO" "$quoted_env" "$remote_script" "$quoted_args"
     exit 0
   fi
 
   # cd into the remote checkout, then sudo env=... bash <script> from
   # disk. HBIRD_REMOTE_REEXEC=1 prevents infinite re-exec.
-  exec ssh -t "$KVM_HOST" "cd ${HBIRD_REMOTE_REPO} && sudo env HBIRD_REMOTE_REEXEC=1 ${env_args[*]} bash ${remote_script} $*"
+  exec ssh -t "$KVM_HOST" "cd ${HBIRD_REMOTE_REPO} && sudo env HBIRD_REMOTE_REEXEC=1 ${quoted_env}bash ${remote_script} ${quoted_args}"
 }

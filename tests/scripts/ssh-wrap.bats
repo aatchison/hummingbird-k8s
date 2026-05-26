@@ -154,16 +154,18 @@ invoke_shim() {
   [[ "$output" != *"likewise-do-not-forward"* ]]
 }
 
-@test "ssh-wrap: empty-but-set var is still forwarded (DRY_RUN= empty -> DRY_RUN=)" {
+@test "ssh-wrap: empty-but-set var is still forwarded (DRY_RUN= empty -> DRY_RUN='')" {
   # Distinguishes "set to empty" from "unset" — bash's [[ -n "${v+x}" ]]
   # treats empty-set as set. Empty SKIP_DRAIN= is a legit operator value
   # ("disable" vs unset = "default"), so it should be forwarded.
+  # printf %q of empty string renders as `''`; printf %q of "1" is `1`.
   KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 \
     DRY_RUN= SKIP_DRAIN=1 \
     run invoke_shim
   [ "$status" -eq 0 ]
-  [[ "$output" == *"DRY_RUN="* ]]
-  [[ "$output" == *"SKIP_DRAIN=1"* ]]
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [[ "$ssh_cmd_line" == *"DRY_RUN=''"* ]]
+  [[ "$ssh_cmd_line" == *"SKIP_DRAIN=1"* ]]
 }
 
 # ---------------------------------------------------------------------------
