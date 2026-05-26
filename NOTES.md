@@ -120,11 +120,14 @@ Both base on `quay.io/fedora/fedora-bootc:43` rather than Hummingbird, since Hum
 # Find a VM's IP
 sudo virsh -c qemu:///system net-dhcp-leases default | grep <vm-name>
 
-# Deploy / re-deploy a cluster (the only supported path)
-sudo make -C ~/hummingbird-k8s deploy-cluster CONFIG=cluster.local.conf
+# Deploy / re-deploy a cluster (the only supported path). No `sudo` —
+# the script handles privilege escalation (issue #233): re-execs on
+# $KVM_HOST via SSH when set, otherwise probes EUID locally and bails
+# with a hint if neither path works.
+make -C ~/hummingbird-k8s deploy-cluster CONFIG=cluster.local.conf
 
 # Tear it down
-sudo make -C ~/hummingbird-k8s destroy-cluster CONFIG=cluster.local.conf
+make -C ~/hummingbird-k8s destroy-cluster CONFIG=cluster.local.conf
 
 # Direct script invocation still works (deploy-cluster.sh is the entry point):
 sudo bash ~/hummingbird-k8s/scripts/deploy-cluster.sh ~/hummingbird-k8s/cluster.local.conf

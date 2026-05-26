@@ -6,7 +6,7 @@ entry point. One config file → one CP + N workers, end-to-end:
 ```bash
 cp cluster.example.conf cluster.local.conf
 $EDITOR cluster.local.conf
-sudo make deploy-cluster CONFIG=cluster.local.conf
+make deploy-cluster CONFIG=cluster.local.conf
 ```
 
 This is the only supported way to stand up a cluster after #216 retired
@@ -61,12 +61,34 @@ The KVM host that will run the deploy needs:
 cp cluster.example.conf cluster.local.conf
 $EDITOR cluster.local.conf
 
-# 2. Deploy. CONFIG= is mandatory.
-sudo make deploy-cluster CONFIG=cluster.local.conf
+# 2. Deploy. CONFIG= is mandatory. No `sudo` required (issue #233);
+#    the script re-execs on $KVM_HOST via SSH when set, or probes for
+#    local root and prints a hint if neither path is available.
+make deploy-cluster CONFIG=cluster.local.conf
 
-# Equivalent direct invocation:
+# Equivalent direct invocation (the script handles privilege escalation
+# itself — see docs/deploy-cluster.md for the three no-op paths):
 sudo bash scripts/deploy-cluster.sh cluster.local.conf
 ```
+
+> **Local fallback path with custom podman storage.** If you're
+> running `make deploy-cluster` directly on the KVM host (not the
+> remote-SSH path) and you've overridden `STORAGE_DRIVER`,
+> `PODMAN_ROOT`, or `PODMAN_RUNROOT`, prefix `sudo --preserve-env`
+> explicitly so those vars survive into the script:
+>
+> ```bash
+> sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,HOME \
+>     make deploy-cluster CONFIG=cluster.local.conf
+> ```
+>
+> Before #233 the Makefile carried these for you (the recipe ran
+> `sudo --preserve-env=…`). Now that `sudo` is out of the recipe, the
+> Makefile can't carry them for you anymore — it's the operator's job
+> at the outer-`sudo` boundary. The remote-SSH path forwards env vars
+> via `scripts/lib/ssh-wrap.sh`'s allowlist and is unaffected. Same
+> applies to `destroy-cluster` / `update-cluster` / `update-workers` /
+> `update-node`.
 
 When the script finishes, it prints the CP IP and a one-liner for
 `kubectl` access. `make nodes` (which uses `scripts/kubectl-k8s.sh` to

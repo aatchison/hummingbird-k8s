@@ -13,9 +13,27 @@ supported path since #216):
 ```bash
 cp cluster.example.conf cluster.local.conf
 $EDITOR cluster.local.conf                    # set CP_NAME, WORKER_NAMES, IMAGE_SOURCE, ...
-sudo make deploy-cluster CONFIG=cluster.local.conf
+make deploy-cluster CONFIG=cluster.local.conf
 make verify-all                                # verify-encryption + verify-hardening + verify-app-deploy
 ```
+
+`make deploy-cluster` no longer requires `sudo` (issue #233). The
+underlying script re-execs over SSH to `$KVM_HOST` when set, or probes
+for local root and prints a one-line hint if neither path is available.
+The same applies to `destroy-cluster`, `update-cluster`,
+`update-workers`, and `update-node`. See
+[`deploy-cluster.md`](deploy-cluster.md) for the three no-op paths.
+
+> **Local fallback path:** if you're running on the KVM host with
+> custom podman storage (`STORAGE_DRIVER`, `PODMAN_ROOT`,
+> `PODMAN_RUNROOT`), pass them through the outer `sudo` explicitly:
+> `sudo --preserve-env=STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,HOME make deploy-cluster CONFIG=…`.
+> Before #233 the Makefile carried these for you via `sudo
+> --preserve-env=…`; with `sudo` removed from the recipe it's now the
+> operator's job to keep them across the privilege boundary. Same
+> applies to `destroy-cluster` / `update-cluster` /
+> `update-workers` / `update-node` when running locally on the KVM
+> host with a non-default podman storage location.
 
 Stand-alone image builds (no qcow2, no VM — fast iteration on Containerfile
 changes, mirrors what `pr-validate.yml` does). These run **rootless** as
@@ -120,13 +138,13 @@ drain; each worker drained → `bootc upgrade --apply` → uncordoned):
 
 ```bash
 # Whole cluster:
-sudo make update-cluster  CONFIG=cluster.local.conf
+make update-cluster       CONFIG=cluster.local.conf
 
 # Workers only (skip the CP — useful if CP already on latest):
-sudo make update-workers  CONFIG=cluster.local.conf
+make update-workers       CONFIG=cluster.local.conf
 
 # One specific node (CP_NAME or a WORKER_NAMES entry):
-sudo make update-node     CONFIG=cluster.local.conf NODE=hbird-w1
+make update-node          CONFIG=cluster.local.conf NODE=hbird-w1
 ```
 
 Full flag reference, lock-file behavior, recovery procedure, and time

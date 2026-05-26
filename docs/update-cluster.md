@@ -6,13 +6,14 @@ forward to a new image" entry point. It reads the same
 cluster one node at a time:
 
 ```bash
-# On the KVM host:
-sudo make update-cluster CONFIG=cluster.local.conf
-
 # From a client laptop (since C3 / #232) — re-execs on the KVM host
 # via SSH; client never needs sudo or libvirt locally. See
 # "Remote KVM-host operation" below for the full picture.
 KVM_HOST=geary make update-cluster CONFIG=cluster.local.conf
+
+# On the KVM host (post-#233: the Makefile recipe no longer prefixes
+# sudo, so on-host operators either run as root or prepend it themselves):
+sudo make update-cluster CONFIG=cluster.local.conf
 ```
 
 It complements — does not replace — the per-VM
@@ -110,8 +111,10 @@ Environment variables the script honors:
 | `SSH_TIMEOUT` | `300` | Seconds to wait for `ssh root@<ip>` to come back post-reboot. |
 | `INTER_NODE_SLEEP` | `5` | Seconds to pause after uncordoning a node before processing the next one (small settle window). |
 
-All knobs honor the standard `VAR=value make …` pattern; the Makefile
-targets pass them through via `sudo -E`. See
+All knobs honor the standard `VAR=value make …` pattern. Env vars set
+on the `make` line survive into the script directly (no `sudo`
+boundary on the client; on the KVM host, the C3 SSH-wrap re-execs over
+SSH which forwards the allowlisted env vars). See
 [Performance tuning](#performance-tuning) for guidance.
 
 ## Remote KVM-host operation (`KVM_HOST=`)
@@ -161,8 +164,9 @@ or missing remote checkout).
 
 ### Env-var validation (security)
 
-Because `make update-cluster` invokes the script via `sudo -E`,
-operator-shell env vars survive the privilege boundary and reach the
+Operator-shell env vars reach `scripts/update-cluster.sh` directly on
+the client and survive the SSH re-exec to the KVM host via the
+allowlist in `scripts/lib/ssh-wrap.sh`; they ultimately reach the
 script as root. To prevent shell-injection and bash-arithmetic
 side-effects from hostile values, every env knob above is validated at
 startup with strict regexes before any privileged call:
@@ -186,7 +190,7 @@ before reaching `ssh` / `kubectl`.
 Skip the CP entirely; only roll workers.
 
 ```bash
-sudo make update-workers CONFIG=cluster.local.conf
+make update-workers CONFIG=cluster.local.conf
 # or directly:
 sudo -E bash scripts/update-cluster.sh --workers-only
 ```
@@ -203,7 +207,7 @@ Update exactly one node — either the CP or a single worker.
 
 ```bash
 # Update one specific worker:
-sudo make update-node CONFIG=cluster.local.conf NODE=hbird-w1
+make update-node CONFIG=cluster.local.conf NODE=hbird-w1
 
 # Or directly:
 sudo -E bash scripts/update-cluster.sh --node=hbird-w1
@@ -678,7 +682,7 @@ ssh root@<cp-ip> 'kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon <node
 
 # 4. Re-run the rolling update from where you left off. --node=NAME
 #    lets you resume on a single node without re-rolling the rest.
-sudo make update-node CONFIG=cluster.local.conf NODE=<node>
+make update-node CONFIG=cluster.local.conf NODE=<node>
 ```
 
 If the script aborted before drain, no recovery is needed beyond
@@ -779,7 +783,7 @@ full 5 minutes:
 DRAIN_TIMEOUT=2m \
 SSH_TIMEOUT=120 \
 READY_TIMEOUT=180 \
-sudo -E make update-cluster CONFIG=cluster.local.conf
+make update-cluster CONFIG=cluster.local.conf
 ```
 
 Conversely, loosen them on slow / busy clusters with heavy graceful
@@ -788,7 +792,7 @@ shutdowns or large image pulls on first boot:
 ```bash
 DRAIN_TIMEOUT=15m \
 READY_TIMEOUT=600 \
-sudo -E make update-cluster CONFIG=cluster.local.conf
+make update-cluster CONFIG=cluster.local.conf
 ```
 
 `INTER_NODE_SLEEP` (default 5s) is the post-uncordon settle window
@@ -808,7 +812,7 @@ make update-cluster CONFIG=cluster.local.conf \
   FLAGS='--dry-run --start-from=hbird-w2 --parallel=2 --no-delete-emptydir-data'
 
 # Resume an aborted roll, best-effort across remaining workers:
-sudo make update-cluster CONFIG=cluster.local.conf \
+make update-cluster CONFIG=cluster.local.conf \
   FLAGS='--start-from=hbird-w2 --continue-on-error'
 ```
 

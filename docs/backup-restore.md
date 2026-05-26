@@ -206,7 +206,7 @@ After restore, expect:
 If the CP VM (or the whole KVM host) is gone:
 
 1. Rebuild the CP + workers from a fresh image:
-   `sudo make deploy-cluster CONFIG=cluster.local.conf`. This
+   `make deploy-cluster CONFIG=cluster.local.conf`. This
    reinitializes etcd to an empty state, which is fine — we are
    about to overwrite it.
 2. Copy the most recent snapshot to the orchestrator (or wherever
@@ -221,7 +221,7 @@ If the CP VM (or the whole KVM host) is gone:
    regenerated (because you didn't preserve `/etc/kubernetes/pki/`),
    the workers won't trust the new apiserver — easiest fix is to
    destroy + re-deploy the cluster
-   (`sudo make destroy-cluster CONFIG=… && sudo make deploy-cluster CONFIG=…`),
+   (`make destroy-cluster CONFIG=… && make deploy-cluster CONFIG=…`),
    which produces a fresh CA, fresh join tokens, and re-joined
    workers. The restored etcd will see them as new node objects
    (the old ones will be there too, in `NotReady`; clean up with
