@@ -111,8 +111,10 @@ Environment variables the script honors:
 | `SSH_TIMEOUT` | `300` | Seconds to wait for `ssh root@<ip>` to come back post-reboot. |
 | `INTER_NODE_SLEEP` | `5` | Seconds to pause after uncordoning a node before processing the next one (small settle window). |
 
-All knobs honor the standard `VAR=value make …` pattern; the Makefile
-targets pass them through via `sudo -E`. See
+All knobs honor the standard `VAR=value make …` pattern. Env vars set
+on the `make` line survive into the script directly (no `sudo`
+boundary on the client; on the KVM host, the C3 SSH-wrap re-execs over
+SSH which forwards the allowlisted env vars). See
 [Performance tuning](#performance-tuning) for guidance.
 
 ## Remote KVM-host operation (`KVM_HOST=`)
@@ -162,8 +164,9 @@ or missing remote checkout).
 
 ### Env-var validation (security)
 
-Because `make update-cluster` invokes the script via `sudo -E`,
-operator-shell env vars survive the privilege boundary and reach the
+Operator-shell env vars reach `scripts/update-cluster.sh` directly on
+the client and survive the SSH re-exec to the KVM host via the
+allowlist in `scripts/lib/ssh-wrap.sh`; they ultimately reach the
 script as root. To prevent shell-injection and bash-arithmetic
 side-effects from hostile values, every env knob above is validated at
 startup with strict regexes before any privileged call:
@@ -780,7 +783,7 @@ full 5 minutes:
 DRAIN_TIMEOUT=2m \
 SSH_TIMEOUT=120 \
 READY_TIMEOUT=180 \
-sudo -E make update-cluster CONFIG=cluster.local.conf
+make update-cluster CONFIG=cluster.local.conf
 ```
 
 Conversely, loosen them on slow / busy clusters with heavy graceful
@@ -789,7 +792,7 @@ shutdowns or large image pulls on first boot:
 ```bash
 DRAIN_TIMEOUT=15m \
 READY_TIMEOUT=600 \
-sudo -E make update-cluster CONFIG=cluster.local.conf
+make update-cluster CONFIG=cluster.local.conf
 ```
 
 `INTER_NODE_SLEEP` (default 5s) is the post-uncordon settle window
