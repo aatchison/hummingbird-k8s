@@ -35,6 +35,12 @@ if [[ -n "${CONFIG:-}" ]]; then
   source "$CONFIG"
 fi
 
+# Operator-visible deprecation signal when only the legacy name is set.
+# The alias below still resolves, but we want a one-line warning so the
+# operator notices to migrate to CP_NAME (cluster.local.conf naming).
+if [[ -n "${CP_VM_NAME:-}" && -z "${CP_NAME:-}" ]]; then
+  echo "${0##*/}: warning: CP_VM_NAME is deprecated; use CP_NAME instead (see PR #219)" >&2
+fi
 # Align on CP_NAME (used by cluster.local.conf, deploy-cluster.sh, et al);
 # preserve CP_VM_NAME as a backward-compat alias so operator shell history
 # from before this rename keeps working. See PR #219 round-1 review (H3).
