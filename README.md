@@ -448,21 +448,30 @@ KVM host that pulls from GHCR rather than building locally). The build
 itself runs **rootless** as the invoking user.
 
 ```bash
-gh auth login                                # one-time, if not already
-podman login ghcr.io                         # GH_TOKEN with write:packages
+gh auth login                                                          # one-time, if not already
+gh auth token | podman login ghcr.io -u <github-user> --password-stdin # GH_TOKEN with write:packages
 
-make image-k8s                               # smoke-build (no push)
-make push-image-k8s    IMAGE_TAG=v0.1.x      # tag + push CP image
-make push-image-worker IMAGE_TAG=v0.1.x      # tag + push worker image
-make push-image-all    IMAGE_TAG=v0.1.x      # both
+make image-k8s                                                         # smoke-build (no push)
+make push-image-k8s    IMAGE_TAG=v0.1.x                                # tag + push CP image
+make push-image-worker IMAGE_TAG=v0.1.x                                # tag + push worker image
+make push-image-all    IMAGE_TAG=v0.1.x                                # both
 ```
+
+The `--password-stdin` form keeps the GH_TOKEN out of shell history /
+`ps aux` snapshots — recommended over the interactive `podman login
+ghcr.io` password prompt. Each `make push-image-*` runs a
+`podman login --get-login` preflight against the registry host so a
+missed login step fails with a clear "ERROR: not logged in to ghcr.io"
+diagnostic naming the exact command to run, rather than a downstream
+`podman push` "unauthorized" surprise.
 
 `IMAGE_TAG` defaults to `latest`; override per release. `GHCR_REGISTRY`
 defaults to `ghcr.io/aatchison` — override for forks/mirrors. The tagged
 release workflow above is still the canonical signed-+-SBOM path; the
 `push-image-*` targets are the unsigned local equivalent for fast
 iteration. See [`docs/makefile.md`](docs/makefile.md) for the full
-variable surface.
+variable surface (including the storage-isolation knobs and how to
+keep `PODMAN_ROOT` consistent across the build+push pair).
 
 ## Operations
 

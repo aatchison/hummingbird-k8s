@@ -34,15 +34,73 @@ workflow under `.github/workflows/build-*.yml`; useful for cutting an
 ad-hoc tag from a workstation without going through a tag push):
 
 ```bash
-gh auth login                                       # if not already
-podman login ghcr.io                                # GH_TOKEN with write:packages
-make push-image-k8s    IMAGE_TAG=v0.1.x             # tag + push CP image
-make push-image-worker IMAGE_TAG=v0.1.x             # tag + push worker image
-make push-image-all    IMAGE_TAG=v0.1.x             # both
+gh auth login                                                          # if not already
+gh auth token | podman login ghcr.io -u <github-user> --password-stdin # GH_TOKEN with write:packages
+make push-image-k8s    IMAGE_TAG=v0.1.x                                # tag + push CP image
+make push-image-worker IMAGE_TAG=v0.1.x                                # tag + push worker image
+make push-image-all    IMAGE_TAG=v0.1.x                                # both
 ```
+
+The `--password-stdin` form keeps your PAT out of shell history /
+`ps aux` snapshots. The older interactive `podman login ghcr.io`
+prompt still works if you'd rather paste, but `--password-stdin` is
+the documented default. Each `make push-image-*` runs a
+`podman login --get-login` preflight against the registry host —
+if you skipped the login step, you get a single-line "ERROR: not
+logged in to ghcr.io" with the exact command to fix it, rather than
+a raw `podman push` "unauthorized" from the registry.
 
 `IMAGE_TAG` defaults to `latest`; override per release. `GHCR_REGISTRY`
 defaults to `ghcr.io/aatchison` — override for forks/mirrors.
+
+Operator-supplied values for `STORAGE_DRIVER`, `PODMAN_ROOT`,
+`PODMAN_RUNROOT`, `IMAGE_TAG`, and `GHCR_REGISTRY` are validated
+against a conservative character allowlist at Makefile parse time
+(see [Variables → validated character set](#variables)). A value
+containing characters outside the allowlist aborts `make` before any
+recipe runs — so a stray space or shell metachar fails fast instead
+of being spliced into a `podman` argv.
+
+### Rebuild-on-push behavior
+
+`push-image-{k8s,worker,all}` depends on the matching `image-*`
+target, so each push **always rebuilds** the local OCI image first.
+This is intentional — it keeps every `IMAGE_TAG=…` cut reproducible
+from a single command and matches the GHA workflow's
+build-then-push contract. The cost is a podman cache hit (seconds)
+on a no-op rebuild; the benefit is that `make push-image-k8s
+IMAGE_TAG=v0.1.5` can never push a stale layer from a previous
+local build. If you specifically want to retag-without-rebuild
+(e.g. cutting a new tag from the exact bits you just pushed),
+either invoke `podman tag … && podman push …` directly, or use
+`make -t push-image-k8s` to treat prereqs as up-to-date.
+
+### Sharing PODMAN_ROOT / PODMAN_RUNROOT between build and push
+
+If you set `STORAGE_DRIVER` / `PODMAN_ROOT` / `PODMAN_RUNROOT` for
+storage isolation (issue #199), set them for the **whole `make`
+invocation**, not just the `push-image-*` half. `podman tag` and
+`podman push` only see the image the build placed in the alternate
+graphroot if they are invoked with the same `--root` / `--runroot`.
+Two common shapes:
+
+```bash
+# One `make` call: build + tag + push share the env.
+PODMAN_ROOT=/tmp/r PODMAN_RUNROOT=/tmp/rr \
+  make push-image-k8s IMAGE_TAG=v0.1.x
+
+# Two `make` calls: export the env so BOTH inherit it.
+export STORAGE_DRIVER=overlay
+export PODMAN_ROOT=/tmp/r
+export PODMAN_RUNROOT=/tmp/rr
+make image-k8s
+make push-image-k8s IMAGE_TAG=v0.1.x
+```
+
+Splitting the env between a `make image-*` and a follow-up
+`make push-image-*` shell silently lets the second `make` invocation
+use the default graphroot — the tag step then fails image-not-found
+because the image lives in `$PODMAN_ROOT` instead.
 
 Ad-hoc `kubectl` from the client (needs `KVM_HOST` set, see `config.example.sh`):
 

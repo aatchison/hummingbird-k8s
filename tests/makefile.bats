@@ -28,6 +28,9 @@
 #   16. Shell-metachar attacks on STORAGE_DRIVER / PODMAN_ROOT /
 #       PODMAN_RUNROOT / IMAGE_TAG / GHCR_REGISTRY are refused at
 #       Makefile parse time, before any recipe runs.
+#   17. push-image-{k8s,worker} runs a `podman login --get-login` preflight
+#       against the registry host extracted from GHCR_REGISTRY, with a
+#       diagnostic that names the host the operator must `podman login` to.
 
 setup() {
   # All recipes are anchored at repo root. tests/ lives one level down, so
@@ -295,6 +298,23 @@ make_dry() {
   [ "$status" -eq 0 ] || { echo "well-formed values rejected: $output" >&2; return 1; }
   run make -n push-image-k8s IMAGE_TAG=v0.1.5 GHCR_REGISTRY=ghcr.io/example
   [ "$status" -eq 0 ] || { echo "well-formed push values rejected: $output" >&2; return 1; }
+}
+
+@test "17. push-image-{k8s,worker} preflights podman-login against the registry HOST" {
+  # Default registry — should preflight against the bare host ghcr.io
+  # (not the full path-prefix ghcr.io/aatchison).
+  run make -n push-image-k8s IMAGE_TAG=v0.0.0
+  [ "$status" -eq 0 ] || { echo "make -n push-image-k8s: $output" >&2; return 1; }
+  [[ "$output" == *"podman login --get-login ghcr.io"* ]]
+  # The error message must name the host the operator should `podman login` to.
+  [[ "$output" == *"podman login ghcr.io"* ]]
+
+  # And on a fork/mirror override — the host extracted from the path-
+  # prefix should change correspondingly.
+  run make -n push-image-worker IMAGE_TAG=v0.0.0 GHCR_REGISTRY=quay.io/example
+  [ "$status" -eq 0 ] || { echo "make -n push-image-worker: $output" >&2; return 1; }
+  [[ "$output" == *"podman login --get-login quay.io"* ]]
+  [[ "$output" == *"podman login quay.io"* ]]
 }
 
 @test "15. push-image-k8s depends on image-k8s (prereq build line present in dry-run)" {

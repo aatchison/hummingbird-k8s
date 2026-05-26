@@ -177,19 +177,54 @@ image-worker-with-cloud-init: ## podman build the worker template image with clo
 # Workstation publish path (companion to the tag-driven GHA workflow under
 # .github/workflows/build-*.yml). Operators run:
 #
-#   gh auth login                                  # if not already
-#   podman login ghcr.io                           # GH_TOKEN with write:packages
-#   make push-image-k8s IMAGE_TAG=v0.1.x           # tag + push CP image
+#   gh auth login                                              # if not already
+#   gh auth token | podman login ghcr.io -u <user> --password-stdin
+#   make push-image-k8s IMAGE_TAG=v0.1.x                       # tag + push CP image
+#
+# The `--password-stdin` form keeps the GH_TOKEN out of shell history and
+# `ps aux` snapshots; the older `podman login ghcr.io` interactive
+# password prompt still works, but `--password-stdin` is the documented
+# default. `GH_TOKEN` (or the gh-managed token) needs the `write:packages`
+# scope.
 #
 # Override GHCR_REGISTRY for forks/mirrors; default is the canonical
 # ghcr.io/aatchison namespace. Tagged-release builds in GHA are unaffected
 # — those still go through redhat-actions/buildah-build.
+#
+# Prereq behavior: `push-image-*` depends on the matching `image-*`
+# target, so a `make push-image-k8s` ALWAYS rebuilds before tag+push,
+# even if the local image is already up to date. This is intentional —
+# it keeps `IMAGE_TAG=…` cuts reproducible from a single command and
+# matches the GHA workflow's build-then-push contract. Operators who
+# want to retag-without-rebuild can run `podman tag … && podman push …`
+# directly, or invoke the target via `make -t push-image-k8s` (treat
+# prereqs as up-to-date). See docs/makefile.md → "Publishing images".
+
+# Pre-flight: extract the bare registry HOST from GHCR_REGISTRY
+# (e.g. "ghcr.io/aatchison" -> "ghcr.io") and require that the operator
+# has a credential for it. Without this guard, `podman push` against an
+# unauthenticated daemon prints a cryptic "unauthorized" with no hint
+# at the fix. The check uses `podman login --get-login <host>` which is
+# a read-only probe (no network round-trip, just reads auth.json).
+_GHCR_HOST := $(firstword $(subst /, ,$(GHCR_REGISTRY)))
 
 push-image-k8s: image-k8s ## podman tag + push the k8s OCI image to $(GHCR_REGISTRY)/hummingbird-k8s:$(IMAGE_TAG)
+	@podman login --get-login $(_GHCR_HOST) >/dev/null 2>&1 || { \
+	  echo "ERROR: not logged in to $(_GHCR_HOST). Run:" >&2; \
+	  echo "  gh auth token | podman login $(_GHCR_HOST) -u <github-user> --password-stdin" >&2; \
+	  echo "(see README -> Publishing images locally)" >&2; \
+	  exit 1; \
+	}
 	podman $(PODMAN_BUILD_OPTS) tag  $(IMAGE_K8S) $(GHCR_REGISTRY)/hummingbird-k8s:$(IMAGE_TAG)
 	podman $(PODMAN_BUILD_OPTS) push $(GHCR_REGISTRY)/hummingbird-k8s:$(IMAGE_TAG)
 
 push-image-worker: image-worker ## podman tag + push the worker OCI image to $(GHCR_REGISTRY)/hummingbird-k8s-worker:$(IMAGE_TAG)
+	@podman login --get-login $(_GHCR_HOST) >/dev/null 2>&1 || { \
+	  echo "ERROR: not logged in to $(_GHCR_HOST). Run:" >&2; \
+	  echo "  gh auth token | podman login $(_GHCR_HOST) -u <github-user> --password-stdin" >&2; \
+	  echo "(see README -> Publishing images locally)" >&2; \
+	  exit 1; \
+	}
 	podman $(PODMAN_BUILD_OPTS) tag  $(IMAGE_WORKER) $(GHCR_REGISTRY)/hummingbird-k8s-worker:$(IMAGE_TAG)
 	podman $(PODMAN_BUILD_OPTS) push $(GHCR_REGISTRY)/hummingbird-k8s-worker:$(IMAGE_TAG)
 
