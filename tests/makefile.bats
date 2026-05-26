@@ -17,6 +17,9 @@
 #   8.  `make -n clean`          -> includes both clean-vms and clean-images
 #   9.  Every `.PHONY:` target is also a defined target (and vice versa).
 #   10. Every target referenced from `make -n <t>` actually exists.
+#   11. `make image-*` recipes contain no `sudo` (rootless contract, #230).
+#   12. `make push-image-k8s` IMAGE_TAG/GHCR_REGISTRY interpolate correctly.
+#   13. `make help` lists push-image-{k8s,worker,all}.
 
 setup() {
   # All recipes are anchored at repo root. tests/ lives one level down, so
@@ -160,4 +163,44 @@ make_dry() {
       return 1
     fi
   done
+}
+
+@test "11. image-* recipes contain no sudo (rootless contract, #230)" {
+  # Dry-run every image-* and push-image-* recipe and assert the rendered
+  # command lines do not contain `sudo`. Workstation operators must be
+  # able to invoke them as a non-root user.
+  for t in image-k8s image-worker image-all \
+           image-k8s-with-cloud-init image-worker-with-cloud-init \
+           push-image-k8s push-image-worker push-image-all; do
+    run make -n "$t"
+    [ "$status" -eq 0 ] || {
+      echo "make -n $t failed (status=$status): $output" >&2
+      return 1
+    }
+    if printf '%s\n' "$output" | grep -qE '(^|[[:space:]])sudo([[:space:]]|$)'; then
+      echo "make -n $t contains sudo (must be rootless):" >&2
+      echo "$output" >&2
+      return 1
+    fi
+  done
+}
+
+@test "12. push-image-k8s interpolates IMAGE_TAG and GHCR_REGISTRY" {
+  run make -n push-image-k8s IMAGE_TAG=v9.9.9 GHCR_REGISTRY=ghcr.io/example
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"podman"* ]]
+  [[ "$output" == *"tag"* ]]
+  [[ "$output" == *"push"* ]]
+  [[ "$output" == *"ghcr.io/example/hummingbird-k8s:v9.9.9"* ]]
+  # Default IMAGE_TAG should NOT leak through when overridden.
+  [[ "$output" != *"hummingbird-k8s:latest "* ]] || \
+    [[ "$output" == *"localhost/hummingbird-k8s:latest"* ]]  # local source tag is fine
+}
+
+@test "13. make help lists push-image-{k8s,worker,all}" {
+  run make -s help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"push-image-k8s"* ]]
+  [[ "$output" == *"push-image-worker"* ]]
+  [[ "$output" == *"push-image-all"* ]]
 }

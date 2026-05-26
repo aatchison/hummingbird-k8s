@@ -13,8 +13,9 @@
 #   * clean-*         — tear down local VMs / images
 #
 # Most VM-touching targets require sudo (libvirt qemu:///system, bib
-# loopback mounts). Image-only targets can run as the invoking user as
-# long as their podman is configured.
+# loopback mounts). The `image-*` and `push-image-*` targets are
+# rootless: they only invoke `podman build` / `podman push` and run
+# entirely as the calling user.
 #
 # Run `make help` to see the discoverable target list.
 
@@ -31,10 +32,30 @@ IMAGE_WORKER := localhost/hummingbird-k8s-worker:latest
 CONTAINERFILE_K8S    := containers/k8s/Containerfile
 CONTAINERFILE_WORKER := containers/k8s-worker/Containerfile
 
+# Registry coordinates for `make push-image-*`. Operators override
+# IMAGE_TAG=vX.Y.Z on the command line; GHCR_REGISTRY is rarely changed
+# but kept as a knob for forks/mirrors. See "Publishing images" in the
+# README for the `gh auth login` + `podman login ghcr.io` prerequisites.
+GHCR_REGISTRY ?= ghcr.io/aatchison
+IMAGE_TAG     ?= latest
+
+# Optional rootless-podman storage isolation knobs (issue #199 / #230).
+# When STORAGE_DRIVER / PODMAN_ROOT / PODMAN_RUNROOT are exported in the
+# environment, image-* targets forward them as top-level `podman` flags
+# so rootless builds land in the operator's chosen graphroot rather than
+# clobbering the system store. Unset = no flag emitted = podman default.
+# Mirrors lib/build-common.sh:podman_storage_opts so workstation builds
+# stay byte-identical to the build_qcow2 path that consumes them.
+PODMAN_BUILD_OPTS := \
+        $(if $(STORAGE_DRIVER),--storage-driver $(STORAGE_DRIVER),) \
+        $(if $(PODMAN_ROOT),--root $(PODMAN_ROOT),) \
+        $(if $(PODMAN_RUNROOT),--runroot $(PODMAN_RUNROOT),)
+
 .DEFAULT_GOAL := help
 .PHONY: help \
         image-k8s image-worker image-all \
         image-k8s-with-cloud-init image-worker-with-cloud-init \
+        push-image-k8s push-image-worker push-image-all \
         deploy-cluster \
         destroy-cluster \
         update-cluster update-workers update-node \
@@ -61,11 +82,23 @@ help: ## Show this target list
 # podman-build only; useful for fast lint/iteration and as a smoke test
 # without the bib qcow2 step. CI's `containerfile-build` matrix exercises
 # the same path.
+#
+# Designed to run ROOTLESS — no `sudo` in the recipe. Workstation
+# operators just run `make image-k8s`; the only state touched is the
+# invoking user's podman graphroot (~/.local/share/containers/storage by
+# default). qcow2 generation (`scripts/build-*.sh` -> bib) DOES still
+# require root for loopback mounts; that path is reached only by
+# `make deploy-cluster`, not by these image-* targets. See #230.
+#
+# $(PODMAN_BUILD_OPTS) threads STORAGE_DRIVER / PODMAN_ROOT /
+# PODMAN_RUNROOT through when the operator wants storage isolation
+# (issue #199 — concurrent integration runs on a shared host). Unset =
+# default podman storage = no extra flags emitted.
 
-image-k8s: ## podman build the k8s control-plane OCI image
-	podman build -t $(IMAGE_K8S) -f $(CONTAINERFILE_K8S) .
+image-k8s: ## podman build the k8s control-plane OCI image (rootless)
+	podman $(PODMAN_BUILD_OPTS) build -t $(IMAGE_K8S) -f $(CONTAINERFILE_K8S) .
 
-image-worker: ## podman build the k8s-worker template OCI image
+image-worker: ## podman build the k8s-worker template OCI image (rootless)
 	# Worker image COPYs worker-join.env via build context. Stub a
 	# placeholder when none exists so `make image-worker` works
 	# stand-alone (mirrors the pr-validate.yml convention).
@@ -73,9 +106,9 @@ image-worker: ## podman build the k8s-worker template OCI image
 	  echo 'kubeadm join 127.0.0.1:6443 --token aaaaaa.bbbbbbbbbbbbbbbb --discovery-token-ca-cert-hash sha256:0000000000000000000000000000000000000000000000000000000000000000' \
 	    > worker-join.env; \
 	fi
-	podman build -t $(IMAGE_WORKER) -f $(CONTAINERFILE_WORKER) .
+	podman $(PODMAN_BUILD_OPTS) build -t $(IMAGE_WORKER) -f $(CONTAINERFILE_WORKER) .
 
-image-all: image-k8s image-worker ## podman build both OCI images (CP + worker)
+image-all: image-k8s image-worker ## podman build both OCI images (CP + worker, rootless)
 
 # ---- opt-in cloud-init variants ----------------------------------------
 # Convenience targets that flip ENABLE_CLOUD_INIT=1 for a single podman
@@ -85,15 +118,37 @@ image-all: image-k8s image-worker ## podman build both OCI images (CP + worker)
 # default image-* targets stay byte-identical to pre-cloud-init builds.
 # See docs/cloud-init.md.
 
-image-k8s-with-cloud-init: ## podman build the k8s control-plane image with cloud-init opted in
-	podman build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_K8S) -f $(CONTAINERFILE_K8S) .
+image-k8s-with-cloud-init: ## podman build the k8s control-plane image with cloud-init opted in (rootless)
+	podman $(PODMAN_BUILD_OPTS) build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_K8S) -f $(CONTAINERFILE_K8S) .
 
-image-worker-with-cloud-init: ## podman build the worker template image with cloud-init opted in
+image-worker-with-cloud-init: ## podman build the worker template image with cloud-init opted in (rootless)
 	@if [ ! -s worker-join.env ]; then \
 	  echo 'kubeadm join 127.0.0.1:6443 --token aaaaaa.bbbbbbbbbbbbbbbb --discovery-token-ca-cert-hash sha256:0000000000000000000000000000000000000000000000000000000000000000' \
 	    > worker-join.env; \
 	fi
-	podman build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_WORKER) -f $(CONTAINERFILE_WORKER) .
+	podman $(PODMAN_BUILD_OPTS) build --build-arg ENABLE_CLOUD_INIT=1 -t $(IMAGE_WORKER) -f $(CONTAINERFILE_WORKER) .
+
+# ---- publish to GHCR ---------------------------------------------------
+# Workstation publish path (companion to the tag-driven GHA workflow under
+# .github/workflows/build-*.yml). Operators run:
+#
+#   gh auth login                                  # if not already
+#   podman login ghcr.io                           # GH_TOKEN with write:packages
+#   make push-image-k8s IMAGE_TAG=v0.1.x           # tag + push CP image
+#
+# Override GHCR_REGISTRY for forks/mirrors; default is the canonical
+# ghcr.io/aatchison namespace. Tagged-release builds in GHA are unaffected
+# — those still go through redhat-actions/buildah-build.
+
+push-image-k8s: image-k8s ## podman tag + push the k8s OCI image to $(GHCR_REGISTRY)/hummingbird-k8s:$(IMAGE_TAG)
+	podman $(PODMAN_BUILD_OPTS) tag  $(IMAGE_K8S) $(GHCR_REGISTRY)/hummingbird-k8s:$(IMAGE_TAG)
+	podman $(PODMAN_BUILD_OPTS) push $(GHCR_REGISTRY)/hummingbird-k8s:$(IMAGE_TAG)
+
+push-image-worker: image-worker ## podman tag + push the worker OCI image to $(GHCR_REGISTRY)/hummingbird-k8s-worker:$(IMAGE_TAG)
+	podman $(PODMAN_BUILD_OPTS) tag  $(IMAGE_WORKER) $(GHCR_REGISTRY)/hummingbird-k8s-worker:$(IMAGE_TAG)
+	podman $(PODMAN_BUILD_OPTS) push $(GHCR_REGISTRY)/hummingbird-k8s-worker:$(IMAGE_TAG)
+
+push-image-all: push-image-k8s push-image-worker ## podman push both OCI images (CP + worker) to $(GHCR_REGISTRY)
 
 # ---- cluster lifecycle (sudo) ------------------------------------------
 # The canonical operator entry point. `deploy-cluster` builds (or pulls)
