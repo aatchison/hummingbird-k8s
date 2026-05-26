@@ -103,6 +103,15 @@ The shipped `cluster.example.conf` is registry-first by default
 out-of-the-box. Building locally instead of pulling? See
 [Fast iteration](#fast-iteration-build-locally-instead-of-pulling-from-ghcr).
 
+The five cluster-lifecycle targets — `deploy-cluster`,
+`destroy-cluster`, `update-cluster`, `update-workers`, `update-node` —
+no longer need `sudo` on the client (issue #233). The scripts handle
+privilege escalation themselves: re-exec over SSH to `$KVM_HOST` when
+set, or probe for local root on the KVM host. On-host operators can
+still prefix `sudo make …` and it'll work; the recipes are plain
+`bash scripts/…sh` invocations now. See
+[`docs/makefile.md`](docs/makefile.md) for the full mechanism.
+
 Coming from `make k3s` / `make k8s` / `make workers`? See
 [Migration from pre-#216](#migration-from-pre-216).
 
@@ -264,6 +273,13 @@ sudo make clean-vms
 # and the timer can't resolve a remote tag list.
 sudo make switch-to-ghcr
 ```
+
+Note: legacy + non-lifecycle targets above (`clean-vms`,
+`switch-to-ghcr`, `backup-etcd`, `restore-etcd`, `rotate-etcd-key`)
+still need `sudo` — only the five cluster-lifecycle targets
+(`deploy-cluster`, `destroy-cluster`, `update-cluster`,
+`update-workers`, `update-node`) dropped client-side `sudo` in PR
+#237.
 
 ### Rolling cluster updates
 
