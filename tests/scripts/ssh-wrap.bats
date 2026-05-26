@@ -21,6 +21,10 @@
 #    more — opaque forwarding is a footgun, so any future widening MUST
 #    update this test in lockstep.
 #
+# 3. The remote-checkout exec model (round-2 architectural pivot): the
+#    shim execs `bash scripts/<name>.sh` from disk on the remote at
+#    $HBIRD_REMOTE_REPO, NOT via `bash -s` stdin streaming.
+#
 # We use a sentinel + dry-run to avoid spawning real ssh:
 #   HBIRD_SSH_WRAP_DRY_RUN=1 makes the shim print the would-be SSH
 #   command (prefixed `SSH_WRAP_CMD: `) and exit 0.
@@ -37,7 +41,7 @@ setup() {
   [ -r "$LIB" ] || { echo "FATAL: $LIB not readable" >&2; return 1; }
 
   # Each test starts from a clean slate — no inherited KVM_HOST / sentinel.
-  unset KVM_HOST HBIRD_REMOTE_REEXEC HBIRD_SSH_WRAP_DRY_RUN
+  unset KVM_HOST HBIRD_REMOTE_REEXEC HBIRD_SSH_WRAP_DRY_RUN HBIRD_REMOTE_REPO
   unset CONFIG FLAGS AUTO_UPDATE_CP SWITCH_TO_GHCR \
         BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER \
         IMAGE_SOURCE GHCR_TAG DRY_RUN SKIP_DRAIN WORKERS_ONLY NODE \
@@ -89,17 +93,38 @@ invoke_shim() {
 # The shim fires — env-allowlist contract
 # ---------------------------------------------------------------------------
 
-@test "ssh-wrap: KVM_HOST=otherhost fires re-exec, prints SSH_WRAP_CMD" {
+@test "ssh-wrap: KVM_HOST=otherhost fires re-exec, prints SSH_WRAP_CMD with remote script path" {
   KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 run invoke_shim
   [ "$status" -eq 0 ]
-  [[ "$output" == *"SSH_WRAP_CMD: ssh -t otherhost sudo env HBIRD_REMOTE_REEXEC=1"* ]]
-  [[ "$output" == *"bash -s --"* ]]
+  # Round-2 shape: ssh -t HOST cd <REPO> && sudo env ... bash <REMOTE_SCRIPT> ARGS
+  [[ "$output" == *"SSH_WRAP_CMD: ssh -t otherhost cd "* ]]
+  [[ "$output" == *"sudo env HBIRD_REMOTE_REEXEC=1"* ]]
+  # Script basename is invoked from disk on the remote, NOT streamed via stdin.
+  [[ "$output" == *"/scripts/foo.sh"* ]]
+  # No more `bash -s --` streaming pattern.
+  [[ "$output" != *"bash -s --"* ]]
 }
 
-@test "ssh-wrap: positional args are forwarded verbatim after 'bash -s --'" {
+@test "ssh-wrap: positional args are forwarded verbatim after the remote script path" {
   KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 run invoke_shim --workers-only --node=hbird-w1
   [ "$status" -eq 0 ]
-  [[ "$output" == *"bash -s -- --workers-only --node=hbird-w1"* ]]
+  [[ "$output" == *"/scripts/foo.sh --workers-only --node=hbird-w1"* ]]
+}
+
+@test "ssh-wrap: default HBIRD_REMOTE_REPO is ~/hummingbird-k8s" {
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cd ~/hummingbird-k8s"* ]]
+  [[ "$output" == *"bash ~/hummingbird-k8s/scripts/foo.sh"* ]]
+}
+
+@test "ssh-wrap: HBIRD_REMOTE_REPO override is honored in the remote command" {
+  KVM_HOST=otherhost HBIRD_REMOTE_REPO=/opt/hummingbird-k8s \
+    HBIRD_SSH_WRAP_DRY_RUN=1 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"cd /opt/hummingbird-k8s"* ]]
+  [[ "$output" == *"bash /opt/hummingbird-k8s/scripts/foo.sh"* ]]
 }
 
 @test "ssh-wrap: only allowlisted env vars are forwarded (CONFIG, IMAGE_SOURCE present; SECRET absent)" {

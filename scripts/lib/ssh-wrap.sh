@@ -10,6 +10,28 @@
 #   via SSH. The client only needs `ssh` + the operator's SSH key —
 #   no `sudo` typed locally, no libvirt installed locally.
 #
+# Execution model (round-2 architectural pivot):
+#   The shim assumes a sibling checkout of hummingbird-k8s already
+#   exists on the remote at $HBIRD_REMOTE_REPO (default ~/hummingbird-k8s).
+#   It `cd`s into that checkout and execs `bash scripts/<name>.sh` FROM
+#   DISK, rather than streaming the script body over stdin. Streaming
+#   was a dead end: every wrapped script does
+#       SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+#       REPO_ROOT="${SCRIPT_DIR}/.."
+#       source "${REPO_ROOT}/lib/build-common.sh"
+#   and under `bash -s` $0 is "bash" / a temp path, so SCRIPT_DIR
+#   resolves wrong and the source fails on first call.
+#
+#   Operator does the one-time setup:
+#       ssh $KVM_HOST 'git clone https://github.com/aatchison/hummingbird-k8s ~/hummingbird-k8s'
+#   We deliberately do NOT auto-clone — the operator decides which
+#   branch/ref the remote checkout tracks.
+#
+# Sudo on the remote:
+#   With the checkout-on-remote model, sudo can prompt normally on the
+#   SSH TTY (no stdin-streaming conflict). NOPASSWD sudo is RECOMMENDED
+#   for unattended runs but no longer mandatory.
+#
 # Contract:
 #   - Sourced after `set -euo pipefail` and any source-only test guards.
 #   - Caller invokes:  hbird_ssh_wrap_maybe_reexec "$0" "$@"
@@ -34,6 +56,11 @@
 #                               instead of actually exec'ing ssh. Used
 #                               by ssh-wrap.bats to pin the env
 #                               allowlist contract.
+
+# Default for the remote checkout path. Operator can override via the
+# environment or cluster.local.conf. The remote MUST have a git clone
+# of hummingbird-k8s at this path; the shim does not auto-clone.
+: "${HBIRD_REMOTE_REPO:=~/hummingbird-k8s}"
 
 # Allowlist of env vars to forward to the remote side. Keep tight.
 # Declared at top-level so tests can introspect it without invoking
@@ -87,21 +114,24 @@ hbird_ssh_wrap_maybe_reexec() {
 
   local script_basename
   script_basename="$(basename "$self")"
-  echo "[${script_basename}] re-execing on ${KVM_HOST} via SSH (env: ${env_args[*]:-(empty)})" >&2
+  # Resolve the remote script path against the operator's checkout.
+  local remote_script="${HBIRD_REMOTE_REPO}/scripts/${script_basename}"
+  echo "[${script_basename}] re-execing on ${KVM_HOST}:${remote_script} (env: ${env_args[*]:-(empty)})" >&2
 
   # Test hook: print the would-be command and exit. Lets bats assert the
   # exact env-var allowlist without spawning real ssh.
   if [[ "${HBIRD_SSH_WRAP_DRY_RUN:-0}" = 1 ]]; then
-    printf 'SSH_WRAP_CMD: ssh -t %s sudo env HBIRD_REMOTE_REEXEC=1' "$KVM_HOST"
+    printf 'SSH_WRAP_CMD: ssh -t %s cd %s && sudo env HBIRD_REMOTE_REEXEC=1' \
+      "$KVM_HOST" "$HBIRD_REMOTE_REPO"
     local a
     for a in "${env_args[@]}"; do printf ' %s' "$a"; done
-    printf ' bash -s --'
+    printf ' bash %s' "$remote_script"
     for a in "$@"; do printf ' %s' "$a"; done
     printf '\n'
     exit 0
   fi
 
-  # Stream the script body via stdin so we don't need it pre-existing
-  # on the remote. HBIRD_REMOTE_REEXEC=1 prevents infinite re-exec.
-  exec ssh -t "$KVM_HOST" "sudo env HBIRD_REMOTE_REEXEC=1 ${env_args[*]} bash -s -- $*" <"$self"
+  # cd into the remote checkout, then sudo env=... bash <script> from
+  # disk. HBIRD_REMOTE_REEXEC=1 prevents infinite re-exec.
+  exec ssh -t "$KVM_HOST" "cd ${HBIRD_REMOTE_REPO} && sudo env HBIRD_REMOTE_REEXEC=1 ${env_args[*]} bash ${remote_script} $*"
 }
