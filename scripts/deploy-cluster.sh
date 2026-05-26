@@ -268,6 +268,24 @@ SSH_PUBKEY_CONTENT="$(< "$SSH_PUBKEY_FILE")"
 # operator pointed at a different key.
 export SSH_PUBKEY_FILES="$SSH_PUBKEY_FILE"
 
+# #248: operator's workstation pubkey forwarded by the C3 SSH-wrap shim
+# (scripts/lib/ssh-wrap.sh). Append it to SSH_PUBKEY_FILES so the CP's
+# authorized_keys ends up with BOTH the KVM-host's key (used by THIS
+# script to SSH to the freshly-booted CP via SSH_PRIVKEY_FILE =
+# ${SSH_PUBKEY_FILE%.pub}) AND the operator's workstation key (so the
+# operator can SSH to the CP directly from their workstation with their
+# normal key). Quietly skipped when the var is unset (on-KVM-host
+# operation, no shim involved) or when it equals SSH_PUBKEY_FILE
+# (workstation and KVM host happen to share a key path AND content —
+# the dedup avoids a redundant entry in authorized_keys).
+if [[ -n "${HBIRD_OPERATOR_PUBKEY_FILE:-}" && -r "$HBIRD_OPERATOR_PUBKEY_FILE" ]]; then
+  if [[ "$HBIRD_OPERATOR_PUBKEY_FILE" != "$SSH_PUBKEY_FILE" ]]; then
+    SSH_PUBKEY_FILES="${SSH_PUBKEY_FILES}:${HBIRD_OPERATOR_PUBKEY_FILE}"
+    export SSH_PUBKEY_FILES
+    log "appending operator workstation pubkey to bake list: $HBIRD_OPERATOR_PUBKEY_FILE"
+  fi
+fi
+
 log "config OK: CP=${CP_NAME}, workers=(${WORKER_NAMES[*]}), source=${IMAGE_SOURCE}, tag=${GHCR_TAG}"
 
 # ---- Image acquisition ------------------------------------------------------
