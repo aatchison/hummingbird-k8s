@@ -133,6 +133,24 @@ Tear it all down:
 sudo make clean               # destroys + undefines VMs and removes local images
 ```
 
+`make clean-vms` (the VM half of `make clean`) does two things in
+sequence:
+
+1. Walks every `hummingbird-*` libvirt domain on the host (regardless
+   of which `cluster.local.conf` it belongs to) and `virsh destroy` +
+   `virsh undefine` each one.
+2. Sweeps pre-#216 straggler artifacts from `$POOL_DIR` (default
+   `/var/lib/libvirt/images`):
+   - `$POOL_DIR/hummingbird-*.qcow2` — leftover qcow2 disks from the
+     deleted `make k3s` / `make k8s` / `make workers` chain that no
+     `cluster.local.conf` references anymore.
+   - `$POOL_DIR/*-seed.iso` and `$POOL_DIR/*-cloud-init.iso` —
+     cloud-init seed ISOs from previous deploys.
+
+The sweep uses `rm -f`, so it's idempotent on a clean host: missing
+files are not an error. Override `POOL_DIR=` if your libvirt storage
+pool is not `/var/lib/libvirt/images`. See issue #221.
+
 Rolling update of an existing deploy-cluster cluster (CP first, no
 drain; each worker drained → `bootc upgrade --apply` → uncordoned):
 

@@ -264,7 +264,10 @@ cp cluster.example.conf cluster.local.conf            # edit it
 make deploy-cluster       CONFIG=cluster.local.conf
 make destroy-cluster      CONFIG=cluster.local.conf
 
-# Tear down stragglers (any hummingbird-* libvirt domain on this host)
+# Tear down stragglers (any hummingbird-* libvirt domain on this host),
+# plus sweep pre-#216 leftovers: $POOL_DIR/hummingbird-*.qcow2 and
+# $POOL_DIR/*-seed.iso. Idempotent on a clean host. Override POOL_DIR=
+# if your libvirt storage pool is not /var/lib/libvirt/images.
 sudo make clean-vms
 
 # Point already-deployed VMs at GHCR so the semver-aware auto-update

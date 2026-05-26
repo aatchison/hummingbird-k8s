@@ -305,9 +305,12 @@ sudo rm -f /var/lib/libvirt/images/hbird-cp1.qcow2\
            /var/lib/libvirt/images/hbird-cp1-seed.iso
 ```
 
-The seed ISOs live next to the qcow2s in `POOL_DIR`. They're not picked
-up by `make clean-vms` because they're not VMs — clean them by hand if
-you want a fully fresh deploy with no NoCloud datasources lying around.
+`make clean-vms` (since issue #221) sweeps both the qcow2 disks
+(`$POOL_DIR/hummingbird-*.qcow2`) and the cloud-init seed ISOs
+(`$POOL_DIR/*-seed.iso`, `$POOL_DIR/*-cloud-init.iso`) in addition to
+the `virsh destroy` / `undefine` loop. The sweep uses `rm -f`, so it's
+idempotent on a clean host. Override `POOL_DIR=` if your libvirt
+storage pool is not `/var/lib/libvirt/images`.
 
 ## Updating a deployed cluster
 

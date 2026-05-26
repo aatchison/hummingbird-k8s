@@ -390,13 +390,30 @@ test-all: test-lib test-scripts ## Run all bats unit suites (lib + scripts)
 
 # ---- cleanup -----------------------------------------------------------
 
-clean-vms: ## Destroy + undefine all hummingbird-* VMs (sudo)
+# clean-vms tears down BOTH:
+#   1. Any `hummingbird-*` libvirt domain on the host (regardless of which
+#      cluster.local.conf it belongs to) — undefine with disks.
+#   2. Pre-#216 straggler artifacts in $(POOL_DIR) that no
+#      cluster.local.conf still references:
+#        - $(POOL_DIR)/hummingbird-*.qcow2          (k3s, legacy single-VM, etc.)
+#        - $(POOL_DIR)/*-seed.iso                   (cloud-init seed ISOs)
+#        - $(POOL_DIR)/*-cloud-init.iso             (alternate seed ISO name)
+# `rm -f` keeps the sweep idempotent on a clean host — missing files are
+# not an error. See issue #221.
+POOL_DIR ?= /var/lib/libvirt/images
+
+clean-vms: ## Destroy + undefine all hummingbird-* VMs and sweep stale qcow2/seed-ISO files from $(POOL_DIR) (sudo)
 	@for d in $$(virsh -c qemu:///system list --all --name 2>/dev/null \
 	             | grep '^hummingbird-'); do \
 	  echo "Destroying $$d"; \
 	  virsh -c qemu:///system destroy "$$d" 2>/dev/null || true; \
 	  virsh -c qemu:///system undefine "$$d" 2>/dev/null || true; \
 	done
+	@echo "Sweeping stale hummingbird-*.qcow2 + *-seed.iso from $(POOL_DIR)"
+	rm -f $(POOL_DIR)/hummingbird-*.qcow2 \
+	      $(POOL_DIR)/*-seed.iso \
+	      $(POOL_DIR)/*-cloud-init.iso
+	@virsh -c qemu:///system pool-refresh default >/dev/null 2>&1 || true
 
 clean-images: ## Remove the local OCI build outputs
 	-podman image rm $(IMAGE_K8S) $(IMAGE_WORKER) 2>/dev/null || true

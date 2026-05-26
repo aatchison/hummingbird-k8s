@@ -38,6 +38,10 @@
 #       `--preserve-env` somewhere (drift fence for the local-fallback
 #       workaround when running on the KVM host with custom podman
 #       storage — issue #233, PR #237 round-2).
+#   20. `make -n clean-vms` sweeps pre-#216 straggler qcow2 + seed-ISO
+#       files from $(POOL_DIR), in addition to the libvirt undefine
+#       loop. Verifies the rm -f line is present, names the qcow2 +
+#       seed-ISO globs, and honors POOL_DIR= overrides (issue #221).
 
 setup() {
   # All recipes are anchored at repo root. tests/ lives one level down, so
@@ -385,4 +389,39 @@ make_dry() {
       return 1
     fi
   done
+}
+
+@test "20. clean-vms sweeps stale qcow2 + seed-ISO files from POOL_DIR (issue #221)" {
+  # Pre-#216 stragglers like `hummingbird-k3s.qcow2`,
+  # `hummingbird-k3s-worker-*.qcow2`, and any `*-seed.iso` (cloud-init
+  # seed ISOs from previous deploys) don't appear in any
+  # cluster.local.conf, so destroy-cluster won't remove them. clean-vms
+  # is the sweep target: in addition to undefine-ing every
+  # `hummingbird-*` libvirt domain, it must `rm -f` the qcow2 + seed
+  # ISO files under $(POOL_DIR).
+  #
+  # Default POOL_DIR — should resolve to /var/lib/libvirt/images
+  # (lib/build-common.sh's default).
+  make_dry clean-vms
+  # The original virsh undefine loop must still be present.
+  [[ "$output" == *"virsh"* ]] && [[ "$output" == *"hummingbird-"* ]]
+  # New: rm -f line covering qcow2 + seed-ISO globs.
+  [[ "$output" == *"rm -f"* ]] || { \
+    echo "clean-vms is missing the rm -f sweep:" >&2; \
+    echo "$output" >&2; return 1; }
+  [[ "$output" == *"/var/lib/libvirt/images/hummingbird-*.qcow2"* ]] || { \
+    echo "clean-vms is missing the hummingbird-*.qcow2 glob:" >&2; \
+    echo "$output" >&2; return 1; }
+  [[ "$output" == *"/var/lib/libvirt/images/*-seed.iso"* ]] || { \
+    echo "clean-vms is missing the *-seed.iso glob:" >&2; \
+    echo "$output" >&2; return 1; }
+
+  # POOL_DIR override — the rm -f line must follow.
+  make_dry clean-vms POOL_DIR=/tmp/custom-pool
+  [[ "$output" == *"/tmp/custom-pool/hummingbird-*.qcow2"* ]] || { \
+    echo "clean-vms did not honor POOL_DIR override on qcow2 glob:" >&2; \
+    echo "$output" >&2; return 1; }
+  [[ "$output" == *"/tmp/custom-pool/*-seed.iso"* ]] || { \
+    echo "clean-vms did not honor POOL_DIR override on seed-ISO glob:" >&2; \
+    echo "$output" >&2; return 1; }
 }
