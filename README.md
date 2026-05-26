@@ -95,6 +95,9 @@ sudo make deploy-cluster  CONFIG=cluster.local.conf        # 1 CP + N workers, e
 make verify-all                                            # encryption + hardening + app-deploy smoke test
 ```
 
+Coming from `make k3s` / `make k8s` / `make workers`? See
+[Migration from pre-#216](#migration-from-pre-216).
+
 `make deploy-cluster` is the only supported way to stand up a cluster. It
 drives the full `image -> qcow2 -> virt-install -> kubeadm join` flow from a
 single config file (`cluster.local.conf`), with cloud-init carrying per-VM
@@ -136,6 +139,7 @@ is the mapping:
 | `make k8s` | `sudo make deploy-cluster CONFIG=cluster.local.conf` (CP-only: set `WORKER_NAMES=()` in the config). |
 | `make workers COUNT=2` | Set `WORKER_NAMES=(worker-1 worker-2)` in `cluster.local.conf`, then `sudo make deploy-cluster CONFIG=cluster.local.conf`. |
 | `make spawn` / `sudo bash scripts/redo-*.sh` | Removed. Use `make deploy-cluster` (initial deploy) and `make update-cluster` (rolling image bump). |
+| `CP_VM_NAME=` / `VM_NAME=` env var | Replaced by `CP_NAME=` (legacy names still honored as deprecated aliases, with a stderr warning — see PR #219). |
 
 `config.local.sh` still tunes **image-build inputs** (default user, SSH
 keys, build-time knobs); **cluster-topology** knobs (`CP_NAME`,

@@ -60,8 +60,12 @@ re-running it is idempotent.
 Override the token TTL or the CP VM name if needed:
 
 ```sh
-sudo TOKEN_TTL=30m CP_VM_NAME=hummingbird-k8s bash scripts/spawn-workers.sh 1
+sudo TOKEN_TTL=30m CP_NAME=hummingbird-k8s bash scripts/spawn-workers.sh 1
 ```
+
+(`CP_VM_NAME=` is also honored as a backward-compat alias, with a
+deprecation warning to stderr — see PR #219. New scripts and docs
+should use `CP_NAME=` to match `cluster.local.conf`.)
 
 ## How injection works
 

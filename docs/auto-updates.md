@@ -55,11 +55,13 @@ the VM intentionally tracks the local build — there are two knobs:
 - `SWITCH_TO_GHCR=false` in `cluster.local.conf` keeps freshly-deployed
   VMs pointed at `localhost/hummingbird-*:latest` (consumed by
   `scripts/deploy-cluster.sh`; default is `true`).
-- `BOOTC_SWITCH_TO_GHCR=0` in the environment short-circuits an
-  individual `scripts/switch-to-ghcr.sh` invocation — useful when
-  running the script directly per-VM rather than via `make
-  switch-to-ghcr` (which walks every `hummingbird-*` domain on the
-  host).
+- `BOOTC_SWITCH_TO_GHCR=0` in the environment short-circuits
+  `scripts/switch-to-ghcr.sh` itself. It applies to either invocation
+  path — `make switch-to-ghcr` (which walks every `hummingbird-*`
+  domain on the host) and direct `scripts/switch-to-ghcr.sh <vm-name>
+  <ref>` calls (used by `deploy-cluster.sh` / `spawn-workers.sh`
+  after a fresh deploy). The check is at the top of the script
+  (line 30), so it triggers regardless of caller.
 
 Each booted VM with the timer enabled will, without operator intervention:
 
