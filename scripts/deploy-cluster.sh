@@ -100,10 +100,21 @@ source "$CONFIG_PATH"
 : "${CP_READY_SLEEP:=10}"
 : "${TOKEN_TTL:=2h}"
 
-# Default WORKER_NAMES to a 2-element array if unset/empty.
-if [[ -z "${WORKER_NAMES+x}" || ${#WORKER_NAMES[@]} -eq 0 ]]; then
+# Default WORKER_NAMES to a 2-element array if completely unset.
+# Distinguish "unset" (legacy configs that never declared WORKER_NAMES —
+# preserve historical 2-worker default) from "explicit empty array"
+# (`WORKER_NAMES=()` — operator's documented way to ask for CP-only;
+# README's Migration table promises this honors CP-only intent).
+#
+# Note: bash's `${arr+x}` parameter expansion returns empty for both
+# unset arrays AND empty-but-declared arrays, so it can't tell those
+# apart. `declare -p` IS reliable: it exits non-zero for unset names
+# and prints `declare -a NAME=()` for explicit empty arrays.
+if ! declare -p WORKER_NAMES >/dev/null 2>&1; then
   log "WORKER_NAMES not set — defaulting to (${CP_NAME}-w1 ${CP_NAME}-w2)"
   WORKER_NAMES=("${CP_NAME}-w1" "${CP_NAME}-w2")
+elif [[ ${#WORKER_NAMES[@]} -eq 0 ]]; then
+  log "WORKER_NAMES=() — CP-only deploy (no workers)"
 fi
 
 # Hard validation.
