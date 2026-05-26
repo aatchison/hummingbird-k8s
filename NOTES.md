@@ -84,9 +84,9 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 - Image lives in any OCI registry (ghcr.io, quay.io, your own). GitHub repos *themselves* aren't pullable — publish to GHCR.
 - VM tracks the image reference set at install time (or via `bootc switch`).
 - `bootc upgrade --check` queries the registry; `bootc upgrade` stages the new image (chunked, only changed layers); reboot applies.
-- `bootc-fetch-apply-updates.timer` ships with Hummingbird but is **disabled by default**. Enable it (via Containerfile or runtime) for daily auto-update + auto-reboot. Most fleets want to enable the fetch but orchestrate the reboot externally.
+- `bootc-fetch-apply-updates.timer` ships with Hummingbird but is **disabled by default** in the new preset (#181).
 - `bootc rollback` swaps to the prior deployment; reboot finalizes.
-- As of #4 the timer is **ENABLED by default** in the CP and worker flavors. See `docs/auto-updates.md` for caveats — notably that control planes reboot without draining themselves.
+- As of #181 the canonical timer is **`bootc-semver-update.timer`** (enabled by default in the `k8s` and `k8s-worker` flavors). It resolves the highest `vMAJOR.MINOR.PATCH` tag at the flavor's GHCR repo via `skopeo list-tags` and `bootc switch`es to it daily — so a bad push to `:latest` no longer rolls the fleet. The stock `bootc-fetch-apply-updates.timer` is still on the image (disabled in the preset) for operators who explicitly want `:latest`-tracking. See `docs/auto-updates.md` for the full mechanism + per-host schedule/REPO overrides.
 
 ## Install style: upstream kubeadm (`containers/k8s/Containerfile`)
 
@@ -129,8 +129,11 @@ sudo make -C ~/hummingbird-k8s destroy-cluster CONFIG=cluster.local.conf
 # Direct script invocation still works (deploy-cluster.sh is the entry point):
 sudo bash ~/hummingbird-k8s/scripts/deploy-cluster.sh ~/hummingbird-k8s/cluster.local.conf
 
-# Enable bootc auto-update timer at runtime
-sudo systemctl enable --now bootc-fetch-apply-updates.timer
+# Enable bootc auto-update timer at runtime. The image preset already
+# enables bootc-semver-update.timer; this line is the runtime equivalent
+# for a host built from a pre-#181 image, or to make the OnBootSec=15min
+# window fire this boot rather than after the next reboot.
+sudo systemctl enable --now bootc-semver-update.timer
 ```
 
 ## History
