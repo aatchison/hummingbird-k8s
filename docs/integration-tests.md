@@ -295,6 +295,17 @@ On failure the trap also prints the VM name, last-known IP, and the last 30
 lines of `journalctl -u k8s-init` from the VM before tearing down — these
 land in the GitHub Actions log for the run.
 
+`tests/integration-boot.sh` additionally captures the VM's serial console
+PTY into `/var/log/libvirt/qemu/<VM_NAME>-console.log` (#224), and prints
+the last 200 lines of it on failure. The same file is uploaded as an
+`integration-boot-serial-<run_id>` workflow artifact by
+`.github/workflows/integration-boot.yml` so an SSH-never-up failure
+(timeout with no journal access) still has a recoverable boot log. The
+PTY tee is best-effort and routinely no-ops on the geary-docker runner
+because `/dev/pts/` lives in qemu's host mount namespace rather than the
+runner container's — when that happens the test log says so and the
+SSH-based diagnostics remain the only window into the VM.
+
 The in-script trap is best-effort: when GitHub cancels a runner or the
 runner container is OOM-killed, the bash process is terminated before
 the EXIT trap can run, leaving the VM + qcow2 on the host (issue #162).

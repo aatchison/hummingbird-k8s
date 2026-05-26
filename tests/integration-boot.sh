@@ -57,6 +57,19 @@ POOL_QCOW="${LIBVIRT_POOL_DIR}/${VM_NAME}.qcow2"
 BIB_IMAGE="${BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
 
 VM_IP=""
+# SERIAL_LOG + SERIAL_READER_PID are populated once the VM is virt-installed.
+# Ported forward from the deleted integration-boot-k3s.sh (#224) so the
+# "VM boots, sshd never comes up, test times out" failure mode produces a
+# diagnostic boot log instead of a bare timeout.
+SERIAL_LOG=""
+SERIAL_READER_PID=""
+# SHARED_DIR is the bib-output staging dir used when bib runs as a sibling
+# docker container. Promoted to a script-global so cleanup() can rm it
+# WITHOUT having to overwrite the EXIT trap — the previous in-place
+# `trap 'rm -rf "$SHARED_DIR"' EXIT` silently disabled the failure-context
+# dump AND the VM teardown (the exact bug called out as #165 in the deleted
+# k3s test). #224.
+SHARED_DIR=""
 
 log() { printf '[integration-boot] %s\n' "$*" >&2; }
 
@@ -68,11 +81,30 @@ dump_failure_context() {
   if virsh -c qemu:///system dominfo "${VM_NAME}" >/dev/null 2>&1; then
     log "--- virsh dominfo ---"
     virsh -c qemu:///system dominfo "${VM_NAME}" >&2 || true
+    log "--- virsh domstate ---"
+    virsh -c qemu:///system domstate "${VM_NAME}" >&2 || true
+  fi
+  # The guest console is logged to ${SERIAL_LOG} via the PTY tee below.
+  # Dump the tail so we can see boot messages even when sshd never came up
+  # (#224, originally #165 in the deleted k3s test). This is the single most
+  # important diagnostic when SSH times out — without it we have zero
+  # visibility into what's happening inside the VM.
+  if [[ -n "${SERIAL_LOG}" ]] && [[ -s "${SERIAL_LOG}" ]]; then
+    log "--- last 200 lines of VM serial console (${SERIAL_LOG}) ---"
+    tail -n 200 "${SERIAL_LOG}" >&2 || true
+  else
+    log "(no serial console log at ${SERIAL_LOG:-<unset>})"
   fi
   if [[ -n "${VM_IP}" ]]; then
+    log "--- attempting ssh root@${VM_IP} 'systemctl --failed' ---"
+    ssh -i "${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+        "root@${VM_IP}" "systemctl --failed --no-pager" >&2 2>/dev/null || \
+        log "(SSH unreachable; nothing more to gather over SSH)"
     log "--- last 30 lines of journalctl k8s-init via SSH ---"
     ssh -i "${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no \
-        -o ConnectTimeout=5 "root@${VM_IP}" \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+        "root@${VM_IP}" \
         "journalctl -u k8s-init --no-pager -n 30" >&2 2>/dev/null || \
         log "(could not pull journal — VM unreachable)"
   fi
@@ -81,6 +113,14 @@ dump_failure_context() {
 
 cleanup() {
   local rc=$?
+  # Stop the serial reader (cat <pty> >SERIAL_LOG) BEFORE dumping failure
+  # context so the file has settled. The reader was backgrounded inside a
+  # subshell, so it's not a child of THIS shell — we can kill by PID but
+  # `wait` would error with "not a child"; just SIGTERM and trust the
+  # filesystem write to have flushed.
+  if [[ -n "${SERIAL_READER_PID}" ]]; then
+    kill "${SERIAL_READER_PID}" 2>/dev/null || true
+  fi
   if [[ $rc -ne 0 ]]; then
     dump_failure_context
   fi
@@ -88,6 +128,14 @@ cleanup() {
   virsh -c qemu:///system destroy "${VM_NAME}" >/dev/null 2>&1 || true
   virsh -c qemu:///system undefine --nvram "${VM_NAME}" >/dev/null 2>&1 || true
   rm -f "${POOL_QCOW}" || true
+  # Preserve ${SERIAL_LOG} on failure for workflow artifact upload (#224);
+  # only remove it on a clean run.
+  if [[ $rc -eq 0 ]] && [[ -n "${SERIAL_LOG}" ]]; then
+    rm -f "${SERIAL_LOG}" || true
+  fi
+  if [[ -n "${SHARED_DIR}" ]] && [[ -d "${SHARED_DIR}" ]]; then
+    rm -rf "${SHARED_DIR}" 2>/dev/null || true
+  fi
   rm -rf "${WORK}" || true
   # Best-effort: drop the per-run isolated podman roots (the workflow also
   # cleans these up in an always() step, but local invocations rely on us).
@@ -133,12 +181,15 @@ if command -v docker >/dev/null && [[ -S /var/run/docker.sock ]]; then
   log "using host docker daemon for bib (sibling-of-runner)"
   # docker socket sees the HOST fs (geary), not the runner container's. Use
   # LIBVIRT_POOL_DIR (mounted into runner from host) for all bib-visible paths.
+  # NB: SHARED_DIR is declared at top-of-script so cleanup() can rm it without
+  # us overwriting the parent's EXIT trap (the previous in-place
+  # `trap 'rm -rf "$SHARED_DIR"' EXIT` silently disabled dump_failure_context
+  # AND the VM teardown — #165, recovered via #224).
   SHARED_DIR="${LIBVIRT_POOL_DIR}/integration-runs/${RUN_ID}"
   mkdir -p "${SHARED_DIR}"
   cp "${BIB_CFG}" "${SHARED_DIR}/config.toml"
   BIB_STORAGE="${SHARED_DIR}/storage"
   mkdir -p "${BIB_STORAGE}"
-  trap 'rm -rf "'"${SHARED_DIR}"'" 2>/dev/null || true' EXIT
   # Pre-pull image into bib storage via a sibling podman container.
   log "pre-pulling ${IMAGE} into bib storage via sibling podman"
   docker run --rm --privileged \
@@ -176,6 +227,21 @@ chmod 0644 "${POOL_QCOW}"
 ln -sf "${POOL_QCOW}" "${QCOW}"
 
 log "virt-installing ${VM_NAME}"
+# Put the console log under /var/log/libvirt/qemu/ (the directory libvirt
+# already uses for per-domain logs — guaranteed to have the right SELinux
+# context + qemu-user write access) rather than LIBVIRT_POOL_DIR (where
+# the file gets svirt_image_t and qemu cannot open it for write).
+# Fall back to /tmp with 0666 if the libvirt log dir doesn't exist.
+# Ported from the deleted integration-boot-k3s.sh (#224).
+if [[ -d /var/log/libvirt/qemu ]]; then
+  SERIAL_LOG="/var/log/libvirt/qemu/${VM_NAME}-console.log"
+else
+  SERIAL_LOG="/tmp/${VM_NAME}-console.log"
+fi
+: >"${SERIAL_LOG}"
+chmod 0666 "${SERIAL_LOG}"
+log "serial console log: ${SERIAL_LOG}"
+
 virt-install --connect qemu:///system \
   --name "${VM_NAME}" \
   --memory 4096 --vcpus 2 \
@@ -189,7 +255,42 @@ virt-install --connect qemu:///system \
 
 # `--noreboot` leaves the domain stopped after install completes; start it
 # explicitly so the boot path is unambiguous.
-virsh -c qemu:///system start "${VM_NAME}" >/dev/null 2>&1 || true
+# Capture stderr from `virsh start` so a real start failure surfaces in the
+# test log instead of being swallowed.
+log "starting VM ${VM_NAME}"
+if ! virsh -c qemu:///system start "${VM_NAME}" 2>&1; then
+  log "WARN: virsh start exited non-zero — domain may not be running"
+fi
+
+# Try to tee the VM's primary console PTY into ${SERIAL_LOG} so we can
+# post-mortem first-boot failures (#224). NOTE: this is best-effort and
+# routinely no-ops in the geary-docker runner — `virsh ttyconsole`
+# returns a path like `/dev/pts/18`, but `/dev/pts/` lives in qemu's
+# mount namespace on the HOST, not in the runner container's
+# `/dev/pts/`. The runner sees the literal string but `[[ -c $path ]]`
+# returns false because the device node doesn't exist in its filesystem
+# view. A full fix would require either: (a) running the test on a
+# bare-metal runner where qemu and the test driver share /dev/pts/, or
+# (b) running a tiny helper on the host (via the docker socket) that
+# cats the PTY. Tracked as a runner-side limitation; the SSH-based
+# diagnostics in dump_failure_context remain useful when the VM at
+# least reaches DHCP/userspace.
+SERIAL_READER_PID=""
+ttyc_err=""
+for _ in 1 2 3 4 5; do
+  ttyc_err="$(virsh -c qemu:///system ttyconsole "${VM_NAME}" 2>&1 || true)"
+  if [[ -c "${ttyc_err}" ]]; then
+    pty="${ttyc_err}"
+    ( cat "$pty" >"${SERIAL_LOG}" 2>/dev/null & echo $! ) >"${WORK}/serial.pid"
+    SERIAL_READER_PID="$(cat "${WORK}/serial.pid")"
+    log "tee'ing ${pty} -> ${SERIAL_LOG} (pid=${SERIAL_READER_PID})"
+    break
+  fi
+  sleep 1
+done
+if [[ -z "$SERIAL_READER_PID" ]]; then
+  log "(no PTY tee — virsh returned '${ttyc_err:-<empty>}' but it lives in the host's mount namespace, not the runner's. SSH-based diagnostics only.)"
+fi
 
 log "waiting for DHCP lease (up to 3 min)"
 VM_IP=""
