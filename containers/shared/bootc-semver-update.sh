@@ -23,10 +23,36 @@ if [[ -r /etc/hummingbird/bootc-update.env ]]; then
   source /etc/hummingbird/bootc-update.env
 fi
 : "${REPO:?REPO not set in /etc/hummingbird/bootc-update.env}"
-PREFIX="${PREFIX:-v}"
+# Honor explicitly-empty PREFIX (operators tagging bare 1.2.3, no leading v).
+# `${PREFIX-v}` defaults only when unset; `${PREFIX:-v}` would replace empty
+# with "v" too, contradicting the documented "set to empty for unprefixed
+# semver" behavior in docs/auto-updates.md. (#181 round-1 review.)
+PREFIX="${PREFIX-v}"
 
 # Resolve the highest semver tag at REPO.
-mapfile -t tags < <(skopeo list-tags "docker://${REPO}" 2>/dev/null \
+#
+# Run skopeo first into a temp file so we can distinguish three failure
+# modes that previously all looked like "no semver tags":
+#
+#   1. skopeo itself fails (network, auth, REPO doesn't exist) — we log
+#      the captured stderr to journal and exit non-zero so the operator
+#      sees a real error in `systemctl status` rather than a silent OK.
+#   2. skopeo succeeds but the repo really has no semver-shaped tags
+#      (e.g. brand-new repo, or only :latest published) — log + exit 0;
+#      that's a legitimate "nothing to do" state.
+#   3. skopeo succeeds and we find a target — proceed.
+#
+# Without this split, a transient network outage would log "no semver
+# tags at ${REPO}; exit 0" and the operator would assume the repo
+# regressed. (#181 round-1 review.)
+skopeo_stderr="$(mktemp)"
+trap 'rm -f "$skopeo_stderr"' EXIT
+if ! skopeo_out="$(skopeo list-tags "docker://${REPO}" 2>"$skopeo_stderr")"; then
+  logger -t bootc-semver-update -p user.err \
+    "skopeo list-tags docker://${REPO} failed: $(tr '\n' ' ' < "$skopeo_stderr")"
+  exit 1
+fi
+mapfile -t tags < <(printf '%s\n' "$skopeo_out" \
   | jq -r '.Tags[]' \
   | grep -E "^${PREFIX}[0-9]+\.[0-9]+\.[0-9]+$" \
   | sort -V)
@@ -39,7 +65,7 @@ target="${REPO}:${tags[-1]}"
 current="$(bootc status --json 2>/dev/null \
   | jq -r '.status.booted.image.image.image // empty')"
 if [[ -z "$current" ]]; then
-  logger -t bootc-semver-update "could not read current bootc image; exit 1"
+  logger -t bootc-semver-update -p user.err "could not read current bootc image; exit 1"
   exit 1
 fi
 if [[ "$current" = "$target" ]]; then
