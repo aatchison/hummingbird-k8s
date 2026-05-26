@@ -259,3 +259,29 @@ EOF
   [ "$status" -eq 0 ]
   grep -qE 'bootc switch ghcr.io/test/x:1.2.4' "$BOOTC_CALLS"
 }
+
+# ---------------------------------------------------------------------------
+# 8. empty bootc status JSON -> exit 1, user.err logged (round-2 coverage)
+# ---------------------------------------------------------------------------
+#
+# `bootc status --json` returning `{}` (or a JSON that lacks
+# .status.booted.image.image.image) was previously a silent successful exit
+# in early drafts. The round-1 fix logs the failure to user.err and exits 1
+# so `systemctl status bootc-semver-update.service` flags the run as failed.
+# This test pins that contract — the empty-current path (script lines 67-69)
+# MUST emit `logger -p user.err` and exit non-zero, never proceeding to
+# `bootc switch`.
+
+@test "bootc-semver-update: empty bootc status JSON logs user.err and exits 1" {
+  echo success >"$SKOPEO_MODE_FILE"
+  write_skopeo_tags "v0.4.2"
+  # Bootc status payload is empty JSON -> jq emits empty string -> the
+  # `if [[ -z "$current" ]]` guard fires.
+  printf '%s' '{}' >"$BOOTC_STATUS_JSON"
+  run env REPO="ghcr.io/test/x" bash "$SCRIPT"
+  [ "$status" -eq 1 ]
+  grep -q 'could not read current bootc image' "$LOGGER_OUT"
+  # Must NOT have called bootc switch — we don't know what we're switching
+  # away from, so silently switching is the wrong call.
+  ! grep -qE 'bootc switch|bootc upgrade' "$BOOTC_CALLS"
+}

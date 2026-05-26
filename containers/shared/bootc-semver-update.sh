@@ -45,13 +45,19 @@ PREFIX="${PREFIX-v}"
 # Without this split, a transient network outage would log "no semver
 # tags at ${REPO}; exit 0" and the operator would assume the repo
 # regressed. (#181 round-1 review.)
+# Don't use `trap 'rm -f "$skopeo_stderr"' EXIT` for cleanup: bash allows
+# only one EXIT handler, so a later contributor adding a second EXIT trap
+# would silently shadow this one and leak the tempfile. The tempfile is
+# only used inside this one block, so do the cleanup explicitly in both
+# branches and skip the trap entirely. (#181 round-2 review.)
 skopeo_stderr="$(mktemp)"
-trap 'rm -f "$skopeo_stderr"' EXIT
 if ! skopeo_out="$(skopeo list-tags "docker://${REPO}" 2>"$skopeo_stderr")"; then
-  logger -t bootc-semver-update -p user.err \
+  logger -t bootc-semver-update -p user.err -- \
     "skopeo list-tags docker://${REPO} failed: $(tr '\n' ' ' < "$skopeo_stderr")"
+  rm -f "$skopeo_stderr"
   exit 1
 fi
+rm -f "$skopeo_stderr"
 mapfile -t tags < <(printf '%s\n' "$skopeo_out" \
   | jq -r '.Tags[]' \
   | grep -E "^${PREFIX}[0-9]+\.[0-9]+\.[0-9]+$" \
@@ -65,7 +71,7 @@ target="${REPO}:${tags[-1]}"
 current="$(bootc status --json 2>/dev/null \
   | jq -r '.status.booted.image.image.image // empty')"
 if [[ -z "$current" ]]; then
-  logger -t bootc-semver-update -p user.err "could not read current bootc image; exit 1"
+  logger -t bootc-semver-update -p user.err -- "could not read current bootc image; exit 1"
   exit 1
 fi
 if [[ "$current" = "$target" ]]; then
