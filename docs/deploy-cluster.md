@@ -81,11 +81,30 @@ match `${KVM_HOST%%.*}`. The client never needs `sudo` or `libvirt`
 installed — only `ssh` + the operator's SSH key. Sudo happens on the
 remote.
 
+### One-time remote setup
+
+The shim assumes a sibling checkout of hummingbird-k8s already exists
+on the KVM host at `$HBIRD_REMOTE_REPO` (default `~/hummingbird-k8s`).
+Operator does the one-time clone:
+
+```bash
+ssh $KVM_HOST 'git clone https://github.com/aatchison/hummingbird-k8s ~/hummingbird-k8s'
+```
+
+The shim intentionally does **not** auto-clone — the operator
+decides which branch/ref the remote tracks. If the directory is
+missing the shim exits with a clear remediation hint pointing at the
+clone URL.
+
+### Usage
+
 ```bash
 # From a laptop. KVM_HOST should be an SSH alias (~/.ssh/config) that
-# can reach the operator's libvirt host as a user with passwordless
-# sudo. The shim ssh -t's into KVM_HOST, sudo env=...allowlist...,
-# then bash -s the script body via stdin.
+# can reach the operator's libvirt host as a user with sudo. The shim
+# ssh -t's into KVM_HOST, runs `cd $HBIRD_REMOTE_REPO`, then sudo
+# env=...allowlist... bash $remote_script, executing the script from
+# disk on the remote (NOT streamed via stdin — that pattern was
+# incompatible with the wrapped scripts' source-lookup logic).
 export KVM_HOST=geary
 make deploy-cluster CONFIG=cluster.local.conf
 ```
@@ -95,16 +114,66 @@ name matches `${KVM_HOST%%.*}` (operator already on the KVM host), or
 when the script body is being re-executed on the remote side
 (`HBIRD_REMOTE_REEXEC=1` sentinel).
 
+`KVM_HOST` is expected to be an SSH alias (`~/.ssh/config` entry) or a
+hostname whose first label matches the local hostname when you're
+already on the KVM host. Bare IP literals and unrelated FQDNs are
+accepted but won't trip the "already local" guard correctly — use
+`~/.ssh/config` to define a stable alias.
+
+NOPASSWD sudo on the remote is RECOMMENDED for unattended runs, but
+not mandatory — with the round-2 checkout-on-remote model, sudo can
+prompt normally on the SSH TTY.
+
+### Pre-flight checks
+
+Before the re-exec, the shim verifies (in order):
+
+1. SSH reachability (`ssh -o BatchMode=yes -o ConnectTimeout=5
+   $KVM_HOST true`). Fails fast with "cannot reach KVM_HOST=… via
+   SSH — check ~/.ssh/config + key auth" if the host is wrong, the
+   key isn't loaded, or the network is down.
+2. Remote checkout existence (`ssh $KVM_HOST 'test -d
+   $HBIRD_REMOTE_REPO/scripts'`). Fails with a one-liner remediation
+   hint pointing at the clone URL when the checkout is missing.
+
+Skip both checks (test/CI use only) with
+`HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1`.
+
+### Env-var passthrough
+
 Env-var passthrough is an **explicit allowlist** maintained in
 `scripts/lib/ssh-wrap.sh` and pinned by `tests/scripts/ssh-wrap.bats`.
 Opaque forwarding was rejected as a footgun: an operator's local
 `AWS_*` or `PROXY_*` exports must not silently change remote behavior.
 Adding a new tunable to the four wrapped scripts requires a
 corresponding entry in `HBIRD_SSH_WRAP_ALLOWED_ENV` (and the test
-will fail until you add it). `CONFIG=<local-path>` is special-cased:
-the local config file is `scp`'d to a remote `mktemp -d` and the
-remote `CONFIG=` is rewritten to point at the copy before `bash -s`
-runs.
+will fail until you add it).
+
+Current allowlist:
+
+| Group | Vars |
+| --- | --- |
+| Config + flags | `CONFIG`, `FLAGS` |
+| Image + auto-update | `IMAGE_SOURCE`, `GHCR_TAG`, `AUTO_UPDATE_CP`, `SWITCH_TO_GHCR`, `BOOTC_UPDATE_SCHEDULE`, `BOOTC_UPDATE_REPO_K8S`, `BOOTC_UPDATE_REPO_WORKER` |
+| Update-cluster flags | `DRY_RUN`, `SKIP_DRAIN`, `WORKERS_ONLY`, `NODE`, `START_FROM`, `PARALLEL` |
+| Timeouts | `READY_TIMEOUT`, `DRAIN_TIMEOUT`, `APISERVER_TIMEOUT`, `SSH_TIMEOUT`, `INTER_NODE_SLEEP`, `DAEMONSET_TIMEOUT` |
+| Topology | `CP_NAME`, `WORKER_NAMES`, `POOL_DIR` |
+| Image-build knobs | `VM_USER`, `STORAGE_DRIVER`, `PODMAN_ROOT`, `PODMAN_RUNROOT`, `APISERVER_EXTRA_SANS` |
+| Shim itself | `HBIRD_AUTOLOAD_CONFIG_LOCAL`, `HBIRD_REMOTE_REPO` |
+
+Every value is passed through `printf %q` before being interpolated
+into the remote command, so values with spaces, quotes, or shell
+metas reach the remote unmangled.
+
+`CONFIG=<local-path>` is special-cased: the local config file is
+`scp`'d to a remote `mktemp -d` and the remote `CONFIG=` is rewritten
+to point at the copy before the script runs.
+
+### `HBIRD_REMOTE_REPO` override
+
+| Var | Default | Effect |
+| --- | --- | --- |
+| `HBIRD_REMOTE_REPO` | `~/hummingbird-k8s` | Absolute path on `$KVM_HOST` to the remote git checkout the shim execs from. Override when you keep the repo somewhere non-standard (e.g. `/opt/hummingbird-k8s` or `/srv/repos/hummingbird-k8s`). Tilde expansion happens on the remote shell's word-splitting pass — start with `/` or `~/` only. |
 
 ## Config surface
 

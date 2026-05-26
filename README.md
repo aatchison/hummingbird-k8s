@@ -218,23 +218,34 @@ KVM_HOST=geary make kube-bench
 
 Since C3, the four libvirt-touching scripts also self-host on
 `$KVM_HOST` via SSH — so the client never needs `sudo` or `libvirt`
-locally, only `ssh` + the operator's existing SSH key:
+locally, only `ssh` + the operator's existing SSH key. One-time
+setup on the KVM host:
+
+```bash
+ssh $KVM_HOST 'git clone https://github.com/aatchison/hummingbird-k8s ~/hummingbird-k8s'
+```
+
+Then, from a client:
 
 ```bash
 export KVM_HOST=geary
-make deploy-cluster   CONFIG=cluster.local.conf  # ssh -t geary sudo bash -s -- ...
+make deploy-cluster   CONFIG=cluster.local.conf  # ssh -t $KVM_HOST cd ~/hummingbird-k8s && sudo bash scripts/deploy-cluster.sh ...
 make destroy-cluster  CONFIG=cluster.local.conf
 make update-cluster   CONFIG=cluster.local.conf
 make spawn-workers    COUNT=2
 ```
 
-The shim is a no-op when `KVM_HOST` is unset or when `$(hostname -s)`
-already matches `${KVM_HOST%%.*}` (you're on the KVM host already).
-Local `CONFIG=` files are `scp`'d to the remote before re-exec.
-Env-var forwarding is an explicit allowlist pinned by
-`tests/scripts/ssh-wrap.bats` — see
+The shim execs scripts FROM DISK on the remote at `$HBIRD_REMOTE_REPO`
+(default `~/hummingbird-k8s`); override the env var if you keep the
+checkout elsewhere. The shim is a no-op when `KVM_HOST` is unset or
+when `$(hostname -s)` already matches `${KVM_HOST%%.*}` (you're on the
+KVM host already). Local `CONFIG=` files are `scp`'d to the remote
+before re-exec, and every env value + arg is `printf %q` quoted
+on the way out. Env-var forwarding is an explicit allowlist pinned
+by `tests/scripts/ssh-wrap.bats` — see
 [`docs/deploy-cluster.md`](docs/deploy-cluster.md#remote-kvm-host-operation-kvm_host)
-for the full allowlist and rationale.
+for the full allowlist, `HBIRD_REMOTE_REPO` override, and pre-flight
+diagnostics.
 
 ### Cluster lifecycle
 

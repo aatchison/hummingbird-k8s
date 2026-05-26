@@ -6,7 +6,13 @@ forward to a new image" entry point. It reads the same
 cluster one node at a time:
 
 ```bash
+# On the KVM host:
 sudo make update-cluster CONFIG=cluster.local.conf
+
+# From a client laptop (since C3 / #232) — re-execs on the KVM host
+# via SSH; client never needs sudo or libvirt locally. See
+# "Remote KVM-host operation" below for the full picture.
+KVM_HOST=geary make update-cluster CONFIG=cluster.local.conf
 ```
 
 It complements — does not replace — the per-VM
@@ -107,6 +113,51 @@ Environment variables the script honors:
 All knobs honor the standard `VAR=value make …` pattern; the Makefile
 targets pass them through via `sudo -E`. See
 [Performance tuning](#performance-tuning) for guidance.
+
+## Remote KVM-host operation (`KVM_HOST=`)
+
+Since C3 (#232), `update-cluster.sh` (alongside `deploy-cluster.sh`,
+`destroy-cluster.sh`, and `spawn-workers.sh`) self-hosts on the KVM
+host via SSH when `KVM_HOST` is set and the local short hostname
+doesn't match `${KVM_HOST%%.*}`. The client never needs `sudo` or
+`libvirt` installed — only `ssh` + the operator's SSH key. Sudo
+happens on the remote.
+
+The shim assumes a sibling checkout of hummingbird-k8s already exists
+on the KVM host at `$HBIRD_REMOTE_REPO` (default
+`~/hummingbird-k8s`). One-time setup:
+
+```bash
+ssh $KVM_HOST 'git clone https://github.com/aatchison/hummingbird-k8s ~/hummingbird-k8s'
+```
+
+Then, from a client:
+
+```bash
+export KVM_HOST=geary
+make update-cluster CONFIG=cluster.local.conf
+make update-cluster CONFIG=cluster.local.conf FLAGS=--workers-only
+make update-cluster CONFIG=cluster.local.conf FLAGS=--node=hbird-w1
+```
+
+The shim is a no-op when `KVM_HOST` is unset, when the local short
+hostname matches `${KVM_HOST%%.*}` (operator already on the KVM host),
+or when the script body is being re-executed on the remote side
+(`HBIRD_REMOTE_REEXEC=1` sentinel).
+
+`KVM_HOST` is expected to be an SSH alias (`~/.ssh/config`) or a
+short/long hostname whose first label matches the local hostname when
+operating directly on the KVM host. Bare IP literals and unrelated
+FQDNs are accepted but won't short-circuit the "already local" guard
+correctly — use an `~/.ssh/config` alias instead.
+
+Env-var passthrough is an **explicit allowlist** maintained in
+`scripts/lib/ssh-wrap.sh` and pinned by `tests/scripts/ssh-wrap.bats`.
+Local `CONFIG=` files are `scp`'d to the remote before re-exec. See
+[`docs/deploy-cluster.md`](deploy-cluster.md#remote-kvm-host-operation-kvm_host)
+for the full allowlist, the `HBIRD_REMOTE_REPO` override, and the
+remediation hints emitted on pre-flight failure (unreachable KVM host
+or missing remote checkout).
 
 ### Env-var validation (security)
 
