@@ -7,7 +7,8 @@
 #   KVM_HOST      — SSH alias of the KVM host (required). Pulled from config.local.sh if present.
 #   KCFG          — Path to a kubeconfig with `server: https://localhost:6443` (default: /tmp/k8s-kubeconfig)
 #   LOCAL_PORT    — Local port for the tunnel (default: 6443)
-#   VM_NAME       — libvirt domain of the control plane (default: hummingbird-k8s)
+#   CP_NAME       — libvirt domain of the control plane (default: hummingbird-k8s).
+#                   VM_NAME is honored as a backward-compat alias.
 set -euo pipefail
 
 _KK_REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
@@ -18,13 +19,16 @@ fi
 
 : "${KCFG:=/tmp/k8s-kubeconfig}"
 : "${LOCAL_PORT:=6443}"
-: "${VM_NAME:=hummingbird-k8s}"
+# Align on CP_NAME (used by cluster.local.conf, deploy-cluster.sh, et al);
+# preserve VM_NAME as a backward-compat alias so operator shell history
+# from before this rename keeps working. See PR #219 round-1 review (H3).
+: "${CP_NAME:=${VM_NAME:-hummingbird-k8s}}"
 : "${KVM_HOST:?Set KVM_HOST (SSH alias of the KVM host) — see config.example.sh}"
 
 if ! ss -ltn | grep -q "127.0.0.1:${LOCAL_PORT} "; then
-  VM_IP=$(ssh "$KVM_HOST" "sudo virsh -c qemu:///system domifaddr ${VM_NAME}" \
+  VM_IP=$(ssh "$KVM_HOST" "sudo virsh -c qemu:///system domifaddr ${CP_NAME}" \
             | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')
-  [[ -n "$VM_IP" ]] || { echo "Could not find ${VM_NAME} IP" >&2; exit 1; }
+  [[ -n "$VM_IP" ]] || { echo "Could not find ${CP_NAME} IP" >&2; exit 1; }
   echo "Starting tunnel: localhost:${LOCAL_PORT} -> ${VM_IP}:6443 via ${KVM_HOST}" >&2
   ssh -fNL "${LOCAL_PORT}:${VM_IP}:6443" "$KVM_HOST"
 fi

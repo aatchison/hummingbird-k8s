@@ -24,7 +24,10 @@ export HBIRD_AUTOLOAD_CONFIG_LOCAL=1
 # shellcheck source=../lib/build-common.sh
 source lib/build-common.sh
 
-: "${CP_VM_NAME:=hummingbird-k8s}"
+# Align on CP_NAME (used by cluster.local.conf, deploy-cluster.sh, et al);
+# preserve CP_VM_NAME as a backward-compat alias so operator shell history
+# from before this rename keeps working. See PR #219 round-1 review (H3).
+: "${CP_NAME:=${CP_VM_NAME:-hummingbird-k8s}}"
 : "${TOKEN_TTL:=2h}"
 
 # Per-worker resource knobs (override via config.local.sh or environment).
@@ -50,11 +53,11 @@ TEMPLATE="${POOL_DIR}/hummingbird-k8s-worker.qcow2"
 }
 
 # Resolve the control plane IP so we can ask it for fresh join tokens.
-CP_IP=$(virsh -c qemu:///system domifaddr "$CP_VM_NAME" 2>/dev/null \
+CP_IP=$(virsh -c qemu:///system domifaddr "$CP_NAME" 2>/dev/null \
           | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}' || true)
 if [[ -z "$CP_IP" ]]; then
-  echo "${0##*/}: could not resolve IP of CP VM '$CP_VM_NAME' via 'virsh -c qemu:///system domifaddr'." >&2
-  echo "${0##*/}: verify the CP is running ('virsh -c qemu:///system list'), or override the VM name with CP_VM_NAME=<name>." >&2
+  echo "${0##*/}: could not resolve IP of CP VM '$CP_NAME' via 'virsh -c qemu:///system domifaddr'." >&2
+  echo "${0##*/}: verify the CP is running ('virsh -c qemu:///system list'), or override the VM name with CP_NAME=<name> (CP_VM_NAME also honored as a back-compat alias)." >&2
   echo "${0##*/}: known domains: $(virsh -c qemu:///system list --all --name 2>/dev/null | tr '\n' ' ')" >&2
   exit 1
 fi
