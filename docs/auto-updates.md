@@ -49,9 +49,17 @@ unreachable), the others still get switched and the failure is logged.
 
 ### Opting out
 
-Set `BOOTC_SWITCH_TO_GHCR=0` in the environment when running `redo-*.sh`
-(or `make switch-to-ghcr`) to skip the post-install switch — appropriate
-for offline labs where the VM intentionally tracks the local build.
+To skip the post-install switch — appropriate for offline labs where
+the VM intentionally tracks the local build — there are two knobs:
+
+- `SWITCH_TO_GHCR=false` in `cluster.local.conf` keeps freshly-deployed
+  VMs pointed at `localhost/hummingbird-*:latest` (consumed by
+  `scripts/deploy-cluster.sh`; default is `true`).
+- `BOOTC_SWITCH_TO_GHCR=0` in the environment short-circuits an
+  individual `scripts/switch-to-ghcr.sh` invocation — useful when
+  running the script directly per-VM rather than via `make
+  switch-to-ghcr` (which walks every `hummingbird-*` domain on the
+  host).
 
 Each booted VM with the timer enabled will, without operator intervention:
 
