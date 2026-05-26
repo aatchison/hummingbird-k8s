@@ -1,8 +1,8 @@
 # Multi-arch image support
 
-As of k8s/v0.1.34, k3s/v0.1.13, and worker/v0.1.10, all three Hummingbird
-flavors publish a multi-arch OCI manifest index covering both
-`linux/amd64` and `linux/arm64`. Closes #107, #111.
+As of k8s/v0.1.34 and worker/v0.1.10, both Hummingbird flavors publish a
+multi-arch OCI manifest index covering both `linux/amd64` and `linux/arm64`.
+Closes #107, #111.
 
 ## What's published
 
@@ -31,9 +31,11 @@ sudo bootc switch ghcr.io/aatchison/hummingbird-k8s:vX.Y.Z
 sudo systemctl reboot
 ```
 
-The same applies to `make k3s` / `make k8s` builds on the operator's host:
-`podman build` selects the host arch by default, and `bootc-image-builder`
-honors the same selection when turning the OCI image into a qcow2.
+The same applies to local builds on the operator's host (via
+`make image-k8s` / `make image-worker` or `make deploy-cluster
+IMAGE_SOURCE=local`): `podman build` selects the host arch by default,
+and `bootc-image-builder` honors the same selection when turning the OCI
+image into a qcow2.
 
 ## Verifying multi-arch locally
 
@@ -76,8 +78,8 @@ The k8s flavor's Containerfile (`containers/k8s/Containerfile`) uses
 `ARG TARGETARCH` to fetch the architecture-matching `cilium-cli` tarball
 (`cilium-linux-${TARGETARCH}.tar.gz`). `TARGETARCH` is set automatically
 by buildah/podman when `--platform` is passed (linux/amd64 → `amd64`,
-linux/arm64 → `arm64`). The k3s and worker Containerfiles have no
-arch-specific download steps; their RPM installs are arch-aware via dnf.
+linux/arm64 → `arm64`). The worker Containerfile has no arch-specific
+download steps; its RPM installs are arch-aware via dnf.
 
 ## Boot-test coverage
 

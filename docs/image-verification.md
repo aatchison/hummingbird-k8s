@@ -1,6 +1,6 @@
 # Image verification (cosign keyless)
 
-The three OCI images published by this repo are signed with
+The OCI images published by this repo are signed with
 [cosign](https://github.com/sigstore/cosign) using **keyless** OIDC signing:
 no long-lived signing key exists. Each signature is bound to:
 
@@ -10,7 +10,7 @@ no long-lived signing key exists. Each signature is bound to:
 
 ## Why this matters
 
-A consumer running `bootc switch ghcr.io/aatchison/hummingbird-k3s:vX.Y.Z`
+A consumer running `bootc switch ghcr.io/aatchison/hummingbird-k8s:vX.Y.Z`
 otherwise has no way to know that the image they pull was actually built
 from this repo's `main` by this repo's workflows. Without verification, a
 compromised registry credential or a typosquatted tag could substitute a
@@ -30,20 +30,20 @@ security-sensitive.
 
 If you need a stricter binding, you can extend the
 `--certificate-identity-regexp` below to pin the workflow path, e.g.
-`^https://github.com/aatchison/hummingbird-k8s/\.github/workflows/build-k3s\.yml@`.
+`^https://github.com/aatchison/hummingbird-k8s/\.github/workflows/build-k8s\.yml@` (CP) or `build-worker\.yml@` (worker).
 
 ## Verifying an image manually
 
 ```sh
-# Example: verify hummingbird-k3s vX.Y.Z
+# Example: verify hummingbird-k8s vX.Y.Z
 COSIGN_EXPERIMENTAL=1 cosign verify \
   --certificate-identity-regexp '^https://github.com/aatchison/hummingbird-k8s/' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  ghcr.io/aatchison/hummingbird-k3s:vX.Y.Z
+  ghcr.io/aatchison/hummingbird-k8s:vX.Y.Z
 ```
 
-Substitute the real flavor (`hummingbird-k3s`, `hummingbird-k8s`, or
-`hummingbird-k8s-worker`) and version tag. The command exits non-zero if
+Substitute the real flavor (`hummingbird-k8s` or `hummingbird-k8s-worker`)
+and version tag. The command exits non-zero if
 the image is unsigned, signed by a different identity, or not present in
 the Rekor transparency log.
 
@@ -53,7 +53,7 @@ You can also verify by digest, which is what the publish workflow signs:
 COSIGN_EXPERIMENTAL=1 cosign verify \
   --certificate-identity-regexp '^https://github.com/aatchison/hummingbird-k8s/' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  ghcr.io/aatchison/hummingbird-k3s@sha256:<digest>
+  ghcr.io/aatchison/hummingbird-k8s@sha256:<digest>
 ```
 
 ## Single-arch caveat
@@ -74,7 +74,7 @@ that points at it). Minimal example:
   "default": [{"type": "reject"}],
   "transports": {
     "docker": {
-      "ghcr.io/aatchison/hummingbird-k3s": [
+      "ghcr.io/aatchison/hummingbird-k8s": [
         {
           "type": "sigstoreSigned",
           "fulcio": {
@@ -90,7 +90,7 @@ that points at it). Minimal example:
 }
 ```
 
-With this in place, `bootc switch ghcr.io/aatchison/hummingbird-k3s:vX.Y.Z`
+With this in place, `bootc switch ghcr.io/aatchison/hummingbird-k8s:vX.Y.Z`
 will fail closed if the image is missing a valid signature from this repo's
 workflows. The Fulcio root CA and Rekor public key are available from
 <https://github.com/sigstore/root-signing>.

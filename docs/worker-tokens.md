@@ -44,23 +44,28 @@ and `kubeadm token create` needs to read `/etc/kubernetes/pki/`.
 
 ## Adding a worker
 
-The control plane VM must be running. From the KVM host:
+The control plane VM must be running. Adding workers happens as part of
+`make deploy-cluster` (the script grows `WORKER_NAMES`), or you can call
+the worker primitive directly from the KVM host for ad-hoc additions:
 
 ```sh
-sudo make spawn COUNT=1
-# or directly: sudo bash scripts/spawn-workers.sh 1
+sudo bash scripts/spawn-workers.sh 1
 ```
 
 That clones the template, asks the running CP for a fresh ~2h token, injects
 it into the new VM's disk, and starts the VM. Repeat with a higher count to
-add several at once. To add a single worker alongside existing workers, set
-the count appropriately (the script skips names already defined in libvirt).
+add several at once. The script skips names already defined in libvirt, so
+re-running it is idempotent.
 
 Override the token TTL or the CP VM name if needed:
 
 ```sh
-sudo TOKEN_TTL=30m CP_VM_NAME=hummingbird-k8s bash scripts/spawn-workers.sh 1
+sudo TOKEN_TTL=30m CP_NAME=hummingbird-k8s bash scripts/spawn-workers.sh 1
 ```
+
+(`CP_VM_NAME=` is also honored as a backward-compat alias, with a
+deprecation warning to stderr — see PR #219. New scripts and docs
+should use `CP_NAME=` to match `cluster.local.conf`.)
 
 ## How injection works
 

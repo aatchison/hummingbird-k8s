@@ -8,10 +8,9 @@ FROM quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0
 # bumps; the trade-off is determinism — two builds of the same Containerfile
 # at different times can produce different images. Acceptable for a lab.
 #
-# Must match the control-plane image's K8S_VERSION; the k3s flavor pins
-# patch instead because its installer fetches a specific tagged binary. (#82)
-#
-# Bump deliberately (e.g., v1.32) when promoting to a new minor release.
+# Must match the control-plane image's K8S_VERSION so worker kubelet stays
+# in lock-step with the CP. Bump deliberately (e.g., v1.32) when promoting
+# to a new minor release.
 ARG K8S_VERSION=v1.31
 
 # Optional cloud-init support. Default OFF — the canonical Hummingbird

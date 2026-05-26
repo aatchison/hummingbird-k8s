@@ -4,24 +4,21 @@
 
 # hummingbird-k8s
 
-Fedora Hummingbird bootc images with Kubernetes baked in, in three flavors,
-run as KVM VMs via libvirt (`qemu:///system`) on a single host. Each flavor is
-published as a signed OCI image to GHCR:
+Fedora Hummingbird bootc images with upstream `kubeadm` Kubernetes baked in,
+run as KVM VMs via libvirt (`qemu:///system`) on a single host. Two flavors
+are published as signed OCI images to GHCR:
 
-- `ghcr.io/aatchison/hummingbird-k3s:vX.Y.Z` — k3s single-binary, single-node.
 - `ghcr.io/aatchison/hummingbird-k8s:vX.Y.Z` — upstream `kubeadm`/`kubelet`/`cri-o` control plane.
 - `ghcr.io/aatchison/hummingbird-k8s-worker:vX.Y.Z` — worker that auto-joins the CP on first boot.
 
-All three derive from `quay.io/hummingbird-community/bootc-os`, are built with
+Both derive from `quay.io/hummingbird-community/bootc-os`, are built with
 `podman build`, converted to `qcow2` via `bootc-image-builder`, and defined
 under libvirt. Design notes and gotchas live in [`NOTES.md`](NOTES.md); this
 README is the operator-facing entry point.
 
 ## Topology
 
-A single KVM host runs one of two layouts.
-
-Upstream-k8s, control plane + N workers:
+A single KVM host runs one control plane + N workers:
 
 ```text
         client laptop
@@ -40,15 +37,9 @@ Upstream-k8s, control plane + N workers:
    +-------------------------------------------------+
 ```
 
-k3s single-node:
-
-```text
-        client laptop --(ssh)--> KVM host --> hummingbird-k3s VM
-```
-
 ## Prerequisites
 
-Before running `make k3s` / `make k8s`, the KVM host needs:
+Before running `make deploy-cluster`, the KVM host needs:
 
 - Fedora 41+ or RHEL 9.x with libvirt 10+ and `qemu:///system` reachable
   (`virsh -c qemu:///system list` should succeed without errors).
@@ -74,13 +65,12 @@ Before running `make k3s` / `make k8s`, the KVM host needs:
 ## Resource requirements
 
 VM sizing defaults are tuned for a small homelab cluster. Override per host
-via `config.local.sh`.
+via `cluster.local.conf`.
 
 | Flavor | RAM | vCPU | qcow2 disk |
 | --- | --- | --- | --- |
 | `hummingbird-k8s` (control plane) | 8 GB | 4 | 30 GB |
 | `hummingbird-k8s-worker` (each) | 4 GB | 2 | 20 GB |
-| `hummingbird-k3s` (single-node) | 4 GB | 2 | 20 GB |
 
 Sizing guidance:
 
@@ -91,7 +81,7 @@ Sizing guidance:
   for noticeably better etcd write latency; HDDs work but `etcdctl defrag`
   cadence matters more.
 - CP/worker memory and vCPU are tunable via `CP_MEMORY`, `CP_VCPUS`,
-  `WORKER_MEMORY`, `WORKER_VCPUS` (see #91 once configurable sizing lands).
+  `WORKER_MEMORY`, `WORKER_VCPUS` in `cluster.local.conf`.
 
 ## Quick start (operator)
 
@@ -99,17 +89,30 @@ On a freshly-set-up KVM host (libvirtd running, `qemu:///system` reachable,
 `podman` + `bootc-image-builder` available):
 
 ```bash
-make help                      # cheatsheet of all targets
-sudo make k3s                  # build + define hummingbird-k3s VM
-sudo make k8s                  # build + define hummingbird-k8s control plane
-sudo make workers COUNT=2      # spawn 2 workers (depends on k8s being up)
-make verify-all                # encryption + hardening + app-deploy smoke test
+make help                                                  # cheatsheet of all targets
+cp cluster.example.conf cluster.local.conf                 # edit per host
+sudo make deploy-cluster  CONFIG=cluster.local.conf        # 1 CP + N workers, end-to-end
+make verify-all                                            # encryption + hardening + app-deploy smoke test
 ```
 
+Coming from `make k3s` / `make k8s` / `make workers`? See
+[Migration from pre-#216](#migration-from-pre-216).
+
+`make deploy-cluster` is the only supported way to stand up a cluster. It
+drives the full `image -> qcow2 -> virt-install -> kubeadm join` flow from a
+single config file (`cluster.local.conf`), with cloud-init carrying per-VM
+dynamic state (hostname, worker join token, post-boot runcmd). Two image
+sources are supported:
+
+- `IMAGE_SOURCE=ghcr` (default) — pulls the published GHCR images.
+- `IMAGE_SOURCE=local` — builds fresh from `containers/k8s` +
+  `containers/k8s-worker` in this repo.
+
 The Makefile is the operator entry point — every recipe delegates to a script
-under [`scripts/`](scripts/). Run `make help` for the full target list. Direct
-script invocations still work (`sudo bash scripts/redo-k8s.sh`); see
-[`docs/makefile.md`](docs/makefile.md) for honored env vars.
+under [`scripts/`](scripts/). Run `make help` for the full target list. See
+[`docs/makefile.md`](docs/makefile.md) for honored env vars and
+[`docs/deploy-cluster.md`](docs/deploy-cluster.md) for the deploy flow's
+full reference.
 
 From a client machine with `KVM_HOST` pointed at the KVM host SSH alias:
 
@@ -122,6 +125,37 @@ make kubectl ARGS='get pods -A'
 `scripts/kubectl-k8s.sh` opens an SSH tunnel to the CP's apiserver on
 `127.0.0.1:6443` and runs `kubectl` in a container against the fetched
 admin kubeconfig.
+
+## Migration from pre-#216
+
+PR #216 retired the k3s flavor entirely and removed the legacy single-VM
+Makefile targets in favor of a single `make deploy-cluster` entry point.
+If you have muscle-memory or scripts that invoke the older targets, here
+is the mapping:
+
+| Old command | Replacement |
+| --- | --- |
+| `make k3s` | No replacement. The k3s flavor is retired. Existing k3s VMs keep running, but the `ghcr.io/aatchison/hummingbird-k3s` registry is now **frozen** — pin a specific tag, or rebase the VM to `hummingbird-k8s`. |
+| `make k8s` | `sudo make deploy-cluster CONFIG=cluster.local.conf` (CP-only: set `WORKER_NAMES=()` in the config). |
+| `make workers COUNT=2` | Set `WORKER_NAMES=(worker-1 worker-2)` in `cluster.local.conf`, then `sudo make deploy-cluster CONFIG=cluster.local.conf`. |
+| `make spawn` / `sudo bash scripts/redo-*.sh` | Removed. Use `make deploy-cluster` (initial deploy) and `make update-cluster` (rolling image bump). |
+| `CP_VM_NAME=` / `VM_NAME=` env var | Replaced by `CP_NAME=` (legacy names still honored as deprecated aliases, with a stderr warning — see PR #219). |
+
+`config.local.sh` still tunes **image-build inputs** (default user, SSH
+keys, build-time knobs); **cluster-topology** knobs (`CP_NAME`,
+`WORKER_NAMES`, per-VM RAM/vCPU sizing) moved to `cluster.local.conf`.
+The two files have non-overlapping responsibilities — operators usually
+maintain both.
+
+### Deprecated images
+
+`ghcr.io/aatchison/hummingbird-k3s` and
+`ghcr.io/aatchison/hummingbird-k3s-worker` are **frozen** as of #216.
+No further tags will be cut. Existing tags remain pullable so live
+deploys keep working, but the registry is no longer receiving security
+updates or bootc-base bumps. Operators on k3s should rebase their VMs
+to `hummingbird-k8s` via `bootc switch` plus a fresh deploy through
+`make deploy-cluster`.
 
 ## Useful commands
 
@@ -169,15 +203,13 @@ KVM_HOST=geary make kube-bench
 ### Cluster lifecycle
 
 ```bash
-# Single-host quickstart (dev iteration)
-sudo make k8s                    # CP
-sudo make workers COUNT=2        # workers
-sudo make clean-vms              # tear down all hummingbird-* VMs
-
-# Production-style deploy (hybrid bib + cloud-init)
-cp cluster.example.conf cluster.local.conf   # edit it
+# Deploy (hybrid bib + cloud-init, the only supported path)
+cp cluster.example.conf cluster.local.conf            # edit it
 sudo make deploy-cluster  CONFIG=cluster.local.conf
 sudo make destroy-cluster CONFIG=cluster.local.conf
+
+# Tear down stragglers (any hummingbird-* libvirt domain on this host)
+sudo make clean-vms
 
 # Point already-deployed VMs at GHCR so the auto-update timer pulls
 sudo make switch-to-ghcr
@@ -334,9 +366,14 @@ Exercised end-to-end by `integration-export-argocd.yml` (see
 
 ## Configuration
 
-Per-host overrides live in `config.local.sh` (gitignored). Copy
-[`config.example.sh`](config.example.sh) to start. Variables are sourced by
-the `scripts/build-*.sh` and `scripts/define-vm*.sh` scripts.
+Cluster topology + behavior knobs live in `cluster.local.conf` (gitignored).
+Copy [`cluster.example.conf`](cluster.example.conf) to start. `deploy-cluster`
+and `update-cluster` source the same file.
+
+Image-build inputs (default user, SSH keys, sudo password) are tuned via the
+optional per-host `config.local.sh`; [`config.example.sh`](config.example.sh)
+is the template. The build scripts (`scripts/build-*.sh`) source it when
+`HBIRD_AUTOLOAD_CONFIG_LOCAL=1` is set.
 
 | Variable | Default | Controls | Override when |
 | --- | --- | --- | --- |
@@ -357,11 +394,11 @@ Existing bootc-based VMs can switch to a published Hummingbird image without
 rebuilding locally:
 
 ```bash
-sudo bootc switch ghcr.io/aatchison/hummingbird-k3s:v0.1.0
+sudo bootc switch ghcr.io/aatchison/hummingbird-k8s:v0.1.0
 sudo systemctl reboot
 ```
 
-Substitute `hummingbird-k8s` or `hummingbird-k8s-worker` as needed. Images are
+Substitute `hummingbird-k8s-worker` for the worker flavor. Images are
 signed with cosign (keyless OIDC) at publish time. Verify before switching;
 see [`docs/image-verification.md`](docs/image-verification.md) for the
 `cosign verify` command and the expected issuer/identity.
@@ -372,14 +409,13 @@ GitHub Actions builds and publishes one flavor per tag:
 
 | Tag pattern | Workflow | Published image |
 | --- | --- | --- |
-| `k3s/vX.Y.Z` | `build-k3s.yml` | `ghcr.io/aatchison/hummingbird-k3s:vX.Y.Z` |
 | `k8s/vX.Y.Z` | `build-k8s.yml` | `ghcr.io/aatchison/hummingbird-k8s:vX.Y.Z` |
 | `worker/vX.Y.Z` | `build-worker.yml` | `ghcr.io/aatchison/hummingbird-k8s-worker:vX.Y.Z` |
 
 Flavors version independently:
 
 ```bash
-git tag k3s/v0.2.0
+git tag k8s/v0.2.0
 git push --tags
 ```
 
@@ -390,6 +426,7 @@ The publish job refuses to run if the tagged commit isn't reachable from
 
 Day-2 documentation lives under [`docs/`](docs):
 
+- [`docs/deploy-cluster.md`](docs/deploy-cluster.md) — `make deploy-cluster` hybrid bib + cloud-init orchestrator for deploying 1 CP + N workers from a single config file.
 - [`docs/makefile.md`](docs/makefile.md) — `make` cheatsheet over the underlying driver scripts.
 - [`docs/image-verification.md`](docs/image-verification.md) — verify GHCR images with cosign.
 - [`docs/etcd-encryption.md`](docs/etcd-encryption.md) — enable encryption-at-rest for etcd.
@@ -407,7 +444,6 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/cloud-init.md`](docs/cloud-init.md) — opt-in cloud-init support (`ENABLE_CLOUD_INIT=1`) for per-VM user-data injection via libvirt seed ISO.
 - [`docs/multi-arch.md`](docs/multi-arch.md) — multi-arch (linux/amd64 + linux/arm64) manifest index, cosign verification, and CI boot-test coverage.
 - [`docs/orchestrator.md`](docs/orchestrator.md) — weekly verify orchestrator (encryption + hardening + app-deploy against the live cluster).
-- [`docs/deploy-cluster.md`](docs/deploy-cluster.md) — `make deploy-cluster` hybrid bib + cloud-init orchestrator for deploying 1 CP + N workers from a single config file.
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.
@@ -416,10 +452,11 @@ run on a self-hosted runner on the operator's KVM host.
 
 ```
 containers/<flavor>/   per-flavor Containerfile + first-boot scripts
-                       (k3s, k8s, k8s-worker). Shared in-image assets
-                       under containers/shared/.
-scripts/               every driver script (build, define, redo, spawn,
-                       kubectl wrapper, verifiers, kube-bench).
+                       (k8s control plane, k8s-worker). Shared in-image
+                       assets under containers/shared/.
+scripts/               every driver script (build, deploy-cluster,
+                       update-cluster, destroy-cluster, kubectl wrapper,
+                       verifiers, kube-bench).
 lib/                   build-common.sh — sourced by scripts/build-*.sh;
                        shared SSH/log helpers documented in docs/development.md.
 docs/                  day-2 docs (image verification, hardening, etc.).
@@ -443,12 +480,12 @@ Common failures and the first thing to try. For deeper context, see
   `CONFIG_BPF_SYSCALL=y` on the VM kernel.
 - **`k8s-init.service` failed in `cilium install`.** Fixed in v0.1.10+
   (`$HOME` was unset under the systemd unit). Upgrade the CP image.
-- **Worker stays `NotReady` after `make workers`.** The Cilium daemonset
-  hasn't scheduled there yet; wait ~60s after join, then re-check
+- **Worker stays `NotReady` after `make deploy-cluster`.** The Cilium
+  daemonset hasn't scheduled there yet; wait ~60s after join, then re-check
   `kubectl get nodes`.
 - **`bootc-image-builder` qcow2 build fails inside a container.** Usually
   the podman storage driver — overlay-on-overlay can't run bib. Export
-  `STORAGE_DRIVER=vfs` before `make k8s` (see #124).
+  `STORAGE_DRIVER=vfs` before `make deploy-cluster` (see #124).
 - **`ssh-keygen` host-key conflict on a freshly redefined VM.** The libvirt
   NAT lease was reused; clear the stale entry:
 

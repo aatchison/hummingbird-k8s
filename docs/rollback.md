@@ -1,9 +1,9 @@
 # Rollback (manual + auto)
 
 `bootc` keeps the previous deployment around at all times, so any
-`hummingbird-k8s` / `hummingbird-k3s` / `hummingbird-k8s-worker` VM can be
-returned to the image it was running before its most recent upgrade with a
-single command:
+`hummingbird-k8s` / `hummingbird-k8s-worker` VM can be returned to the
+image it was running before its most recent upgrade with a single
+command:
 
 ```bash
 sudo bootc rollback
@@ -94,8 +94,7 @@ The script. Logic:
    created is via the drop-in described below.
 2. If the marker exists, delete it immediately. A persistent failure
    should never trigger more than one rollback per upgrade event.
-3. Check `systemctl is-active kubelet.service` (or `k3s.service` on the
-   k3s flavor, which bundles kubelet into k3s).
+3. Check `systemctl is-active kubelet.service`.
 4. On the CP image only (detected by the presence of
    `/etc/kubernetes/manifests/kube-apiserver.yaml`), `curl
    https://127.0.0.1:6443/livez` with a 5-second timeout.
@@ -181,8 +180,8 @@ sudo systemctl mask health-check-rollback.timer
 ## Disabling fleet-wide
 
 Drop `enable health-check-rollback.timer` from the per-flavor preset file
-(`containers/k8s/10-k8s.preset`, `containers/k3s/10-k3s.preset`,
-`containers/k8s-worker/10-k8s-worker.preset`) and rebuild that flavor.
+(`containers/k8s/10-k8s.preset`, `containers/k8s-worker/10-k8s-worker.preset`)
+and rebuild that flavor.
 
 ## Validating auto-rollback by hand
 

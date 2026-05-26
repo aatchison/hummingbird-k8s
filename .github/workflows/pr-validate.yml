@@ -125,7 +125,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        flavor: [k3s, k8s, k8s-worker]
+        flavor: [k8s, k8s-worker]
     steps:
       - uses: actions/checkout@v6
 
@@ -143,7 +143,6 @@ jobs:
         id: cf
         run: |
           case "${{ matrix.flavor }}" in
-            k3s)        image=hummingbird-k3s        ; path="$(make -s print-containerfile-k3s)" ;;
             k8s)        image=hummingbird-k8s        ; path="$(make -s print-containerfile-k8s)" ;;
             k8s-worker) image=hummingbird-k8s-worker ; path="$(make -s print-containerfile-worker)" ;;
           esac

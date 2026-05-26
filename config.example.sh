@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Copy to config.local.sh (gitignored) and adjust per-host. Sourced by scripts/build-*.sh.
+# Copy to config.local.sh (gitignored) and adjust per-host.
+#
+# Sourced by scripts/build-k8s.sh and scripts/build-worker.sh (and the
+# `image-*` Makefile targets that delegate to them) when
+# HBIRD_AUTOLOAD_CONFIG_LOCAL=1 is set. This tunes image-build inputs only;
+# cluster-topology knobs (CP_NAME, WORKER_NAMES, IMAGE_SOURCE, etc.) live in
+# cluster.local.conf (see cluster.example.conf) and are consumed by
+# scripts/deploy-cluster.sh / scripts/update-cluster.sh.
 
 # Initial user account inside the VM.
 # export VM_USER=core
@@ -24,28 +31,26 @@ export ENABLE_ROOT_SSH=1                # 1 = bake same pubkeys into root@ (defa
 # libvirt storage pool target directory on this host.
 # export POOL_DIR=/var/lib/libvirt/images
 
-# ---- VM resource knobs (#91) --------------------------------------------------
-# Per-flavor virt-install --memory / --vcpus values. Defaults match the
-# pre-knob hardcoded sizes, so unset = unchanged behavior. Override here
-# for resource-constrained labs or larger node sizing.
+# ---- VM resource knobs --------------------------------------------------------
+# Per-flavor virt-install --memory / --vcpus values. The deploy-cluster path
+# reads these from cluster.local.conf (see cluster.example.conf). The legacy
+# build scripts also honor them via this file for image-build-only flows that
+# don't go through deploy-cluster.
 #
-# Control plane (scripts/define-vm-k8s.sh):
+# Control plane:
 # export CP_MEMORY=8192          # MiB
 # export CP_VCPUS=4
 #
-# k3s single-node (scripts/define-vm.sh):
-# export K3S_MEMORY=6144
-# export K3S_VCPUS=4
-#
-# Workers (scripts/spawn-workers.sh, per worker):
+# Workers (per worker):
 # export WORKER_MEMORY=4096
 # export WORKER_VCPUS=2
 
 # ---- spawn-workers retry tuning (#90) ----------------------------------------
-# When chaining redo-k8s.sh -> redo-workers.sh, the CP may still be coming
-# up the first time spawn-workers.sh SSHes in to mint a join token. The
-# script retries CP_SSH_RETRIES times, sleeping CP_SSH_RETRY_SLEEP seconds
-# between attempts (each attempt has ConnectTimeout=10s).
+# When deploy-cluster.sh / spawn-workers.sh comes up right after the CP boots,
+# the CP may still be initializing the first time the script SSHes in to mint
+# a join token. The script retries CP_SSH_RETRIES times, sleeping
+# CP_SSH_RETRY_SLEEP seconds between attempts (each attempt has
+# ConnectTimeout=10s).
 # export CP_SSH_RETRIES=5
 # export CP_SSH_RETRY_SLEEP=10
 
@@ -69,4 +74,7 @@ export ENABLE_ROOT_SSH=1                # 1 = bake same pubkeys into root@ (defa
 # package + NoCloud datasource into the image so operators can inject
 # per-VM user-data (SSH keys, runcmd, packages) at `virt-install` time
 # via `--cloud-init` or a libvirt seed ISO. See docs/cloud-init.md.
+#
+# Note: deploy-cluster.sh requires ENABLE_CLOUD_INIT=1 in cluster.local.conf;
+# this setting controls the standalone image-* build targets only.
 # export ENABLE_CLOUD_INIT=1

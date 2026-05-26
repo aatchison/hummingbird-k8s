@@ -12,7 +12,7 @@ have diverged.
   sets 60s. Docs say "writes to `/etc/foo`" but the code writes to
   `/var/lib/foo`.
 - **Stale paths and filenames**: a rename in the PR that didn't update the
-  doc references (`Containerfile` → `Containerfile.k3s`, etc.).
+  doc references (e.g. `Containerfile` → `containers/k8s/Containerfile`).
 - **Stale architectural claims**: README says "uses flannel" but the PR
   swaps to Cilium and the README wasn't updated. README claims a verification
   step covers X but the actual verify script doesn't.

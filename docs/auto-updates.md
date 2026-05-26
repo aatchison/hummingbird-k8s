@@ -1,12 +1,11 @@
 # Automatic bootc updates
 
-`hummingbird-k3s` and `hummingbird-k8s-worker` ship with
-`bootc-fetch-apply-updates.timer` **enabled by default**. The
-`hummingbird-k8s` control-plane image ships with the timer **disabled by
-default** — opt in per host via `systemctl enable --now` (see below). The
-rationale: a single-CP cluster suffers a full apiserver outage during the
-CP reboot, so auto-update on the CP needs to be an explicit operator
-choice (#48).
+`hummingbird-k8s-worker` ships with `bootc-fetch-apply-updates.timer`
+**enabled by default**. The `hummingbird-k8s` control-plane image ships
+with the timer **disabled by default** — opt in per host via
+`systemctl enable --now` (see below). The rationale: a single-CP cluster
+suffers a full apiserver outage during the CP reboot, so auto-update on
+the CP needs to be an explicit operator choice (#48).
 
 ## Tracking GHCR vs localhost
 
@@ -17,9 +16,9 @@ timer fires on schedule but has nothing to pull — every GHCR release sits
 on the registry while the VM stays frozen at whatever was last built
 locally (#138).
 
-To make auto-updates actually work, the VM has to track a remote ref. The
-`redo-*.sh` deploy scripts now run `scripts/switch-to-ghcr.sh` against each
-freshly-installed VM as their last step, which does:
+To make auto-updates actually work, the VM has to track a remote ref.
+`scripts/deploy-cluster.sh` (and the helper `scripts/switch-to-ghcr.sh`)
+runs against each freshly-installed VM and does:
 
 ```bash
 bootc switch ghcr.io/aatchison/hummingbird-<flavor>:latest
@@ -30,8 +29,8 @@ GHCR. To verify on any node:
 
 ```bash
 sudo bootc status --json | jq .status.booted.image.image.image
-# → "ghcr.io/aatchison/hummingbird-k3s:latest"   (good)
-# → "localhost/hummingbird-k3s:latest"           (bad — timer can't pull)
+# → "ghcr.io/aatchison/hummingbird-k8s:latest"   (good)
+# → "localhost/hummingbird-k8s:latest"           (bad — timer can't pull)
 ```
 
 ### Switching an already-deployed cluster
@@ -50,9 +49,19 @@ unreachable), the others still get switched and the failure is logged.
 
 ### Opting out
 
-Set `BOOTC_SWITCH_TO_GHCR=0` in the environment when running `redo-*.sh`
-(or `make switch-to-ghcr`) to skip the post-install switch — appropriate
-for offline labs where the VM intentionally tracks the local build.
+To skip the post-install switch — appropriate for offline labs where
+the VM intentionally tracks the local build — there are two knobs:
+
+- `SWITCH_TO_GHCR=false` in `cluster.local.conf` keeps freshly-deployed
+  VMs pointed at `localhost/hummingbird-*:latest` (consumed by
+  `scripts/deploy-cluster.sh`; default is `true`).
+- `BOOTC_SWITCH_TO_GHCR=0` in the environment short-circuits
+  `scripts/switch-to-ghcr.sh` itself. It applies to either invocation
+  path — `make switch-to-ghcr` (which walks every `hummingbird-*`
+  domain on the host) and direct `scripts/switch-to-ghcr.sh <vm-name>
+  <ref>` calls (used by `deploy-cluster.sh` / `spawn-workers.sh`
+  after a fresh deploy). The check is at the top of the script
+  (line 30), so it triggers regardless of caller.
 
 Each booted VM with the timer enabled will, without operator intervention:
 

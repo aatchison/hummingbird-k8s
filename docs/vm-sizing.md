@@ -6,14 +6,13 @@ sizing guidance behind them. Closes #88.
 
 ## Defaults
 
-The values below come from `scripts/define-vm.sh`,
-`scripts/define-vm-k8s.sh`, and `scripts/spawn-workers.sh`. qcow2 disk size
-is whatever `bootc-image-builder` produces for the rootfs (no explicit size
-override today); the values listed reflect the rootfs size after first boot.
+The values below come from `scripts/deploy-cluster.sh` and
+`scripts/spawn-workers.sh`. qcow2 disk size is whatever
+`bootc-image-builder` produces for the rootfs (no explicit size override
+today); the values listed reflect the rootfs size after first boot.
 
 | Flavor | RAM | vCPU | qcow2 size |
 | --- | --- | --- | --- |
-| `hummingbird-k3s` (single-node) | 6144 MB | 4 | 20 GB |
 | `hummingbird-k8s` (control plane) | 8192 MB | 4 | 30 GB |
 | `hummingbird-k8s-worker` (each) | 4096 MB | 2 | 20 GB |
 
@@ -21,18 +20,17 @@ Total for a 1 CP + 2 worker lab: 16 GB RAM, 8 vCPU, ~70 GB disk.
 
 ## Tunables
 
-Memory and vCPU are env-driven (closes #91). Override via `config.local.sh`
-or the environment; defaults match the pre-knob hardcoded values so unset
-== unchanged behavior. See [`config.example.sh`](../config.example.sh) for
-the canonical list.
+Memory and vCPU are env-driven (closes #91). Override via
+`cluster.local.conf` (the canonical knob set for `make deploy-cluster`)
+or `config.local.sh` for image-build-only flows; defaults match the
+pre-knob hardcoded values so unset == unchanged behavior. See
+[`cluster.example.conf`](../cluster.example.conf) for the canonical list.
 
 | Variable | Default | Applies to |
 | --- | --- | --- |
-| `CP_MEMORY` | `8192` | Control plane VM (`define-vm-k8s.sh`) |
+| `CP_MEMORY` | `8192` | Control plane VM |
 | `CP_VCPUS` | `4` | Control plane VM |
-| `K3S_MEMORY` | `6144` | k3s VM (`define-vm.sh`) |
-| `K3S_VCPUS` | `4` | k3s VM |
-| `WORKER_MEMORY` | `4096` | Each worker (`spawn-workers.sh`) |
+| `WORKER_MEMORY` | `4096` | Each worker (`spawn-workers.sh` / `deploy-cluster.sh`) |
 | `WORKER_VCPUS` | `2` | Each worker |
 | `POOL_DIR` | `/var/lib/libvirt/images` | libvirt storage pool path |
 

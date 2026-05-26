@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Seed the repo with backlog issues. Run once after `gh repo create`.
+# Seed the repo with backlog issues. Historical: this was the bootstrap
+# script run once after `gh repo create`. Most of its issues are closed
+# already; it stays in-tree for archival reference of the early backlog.
 set -euo pipefail
 
 REPO="${REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
@@ -8,7 +10,6 @@ REPO="${REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 for spec in \
   'hardening|d73a4a|Security or operational hardening' \
   'verify|0e8a16|Has a verification script the orchestrator should run' \
-  'k3s|c5def5|hummingbird-k3s VM' \
   'k8s|c5def5|hummingbird-k8s VM' \
   'worker|c5def5|hummingbird-k8s-worker VM' \
   'ci|fbca04|CI / GitHub Actions' \
@@ -26,10 +27,7 @@ issue() {
   gh issue create --repo "$REPO" --title "$title" --label "$labels" --body "$body"
 }
 
-issue "Rename hummingbird VM to hummingbird-k3s" "k3s" \
-"The current k3s VM on the KVM host is still under the legacy name \`hummingbird\`. Run \`sudo bash redo.sh\` once and verify the new domain name shows up in Cockpit."
-
-issue "Drop hardcoded sudo password from build scripts" "hardening,k3s,k8s,worker" \
+issue "Drop hardcoded sudo password from build scripts" "hardening,k8s,worker" \
 "\`build*.sh\` bake \`1234asdf\` as the sudo password via \`bib-config.toml\`. Switch to SSH-key-only (drop \`password =\` from the bib config) and require explicit key auth."
 
 issue "Disable sshd password authentication in images" "hardening" \
@@ -59,8 +57,8 @@ issue "Run kube-bench and fix high-severity findings" "hardening,k8s,verify" \
 issue "HA control plane: 3 CPs + keepalived/haproxy VIP" "k8s,verify" \
 "Add a \`ROLE=cp\` variant of \`Containerfile.k8s\` that also installs keepalived+haproxy, configured to front a VIP (e.g. 192.168.122.10). First CP runs \`kubeadm init --control-plane-endpoint=<vip>:6443 --upload-certs\`. Workers + subsequent CPs point at the VIP. Verify: kill one CP, cluster keeps working."
 
-issue "End-to-end bootc upgrade test" "verify,k3s,k8s,worker" \
-"Spin a VM from \`ghcr.io/<OWNER>/hummingbird-<flavor>:vA\`, push \`:vB\` to GHCR, run \`bootc upgrade && systemctl reboot\` in the guest, confirm the new digest is the booted deployment and that k3s/kubelet are still healthy."
+issue "End-to-end bootc upgrade test" "verify,k8s,worker" \
+"Spin a VM from \`ghcr.io/<OWNER>/hummingbird-<flavor>:vA\`, push \`:vB\` to GHCR, run \`bootc upgrade && systemctl reboot\` in the guest, confirm the new digest is the booted deployment and that kubelet is still healthy."
 
 issue "Apiserver audit logging" "hardening,k8s" \
 "Drop an \`audit-policy.yaml\` and pass \`--audit-policy-file\` + \`--audit-log-path\` via the kubeadm config. Logs to \`/var/log/k8s-audit.log\`, mounted as a HostPath."
@@ -72,4 +70,4 @@ issue "Orchestrator workflow: iterate open 'verify' issues and run each issue's 
 "\`.github/workflows/orchestrator.yml\`. Triggered nightly + workflow_dispatch. For each open issue labeled \`verify\`, look up a script under \`tests/issue-<n>.sh\`, run it on the self-hosted runner, post pass/fail back to the issue as a comment."
 
 issue "Document repository structure + per-image build flow in README" "docs" \
-"Flesh out README with a section per script, a topology diagram (CP + N workers), and the GHCR consumption story (\`bootc switch ghcr.io/.../hummingbird-k3s:vX\`)."
+"Flesh out README with a section per script, a topology diagram (CP + N workers), and the GHCR consumption story (\`bootc switch ghcr.io/.../hummingbird-k8s:vX\`)."

@@ -17,17 +17,11 @@
 #     - First-boot runcmd: `bootc switch` to the GHCR ref; enable the
 #       auto-update timer on the CP (overrides #48's opt-out)
 #
-# Why this is distinct from `make k8s && make workers`:
-#
-#   make k8s + make workers is the "dev iteration" path: build locally,
-#   inject the worker join via guestfish-on-qcow2. That path works but
-#   bypasses cloud-init entirely and relies on libguestfs fishing the
-#   ostree deployment dir out of a bootc image (#libguestfs-ostree note
-#   in the repo).
-#
-#   This script is the "real deploy" path: ENABLE_CLOUD_INIT=1 images,
-#   per-VM NoCloud seed ISOs attached at virt-install, worker join via
-#   cloud-init's write_files (no offline qcow2 mutation).
+# This is the canonical (and, since #216, only) supported way to stand
+# up a Hummingbird cluster: ENABLE_CLOUD_INIT=1 images, per-VM NoCloud
+# seed ISOs attached at virt-install time, worker join via cloud-init's
+# write_files (no offline qcow2 mutation, no libguestfs fishing the
+# ostree deployment dir out of the bootc image).
 #
 # Usage:
 #   sudo bash scripts/deploy-cluster.sh [path/to/cluster.local.conf]
@@ -106,10 +100,21 @@ source "$CONFIG_PATH"
 : "${CP_READY_SLEEP:=10}"
 : "${TOKEN_TTL:=2h}"
 
-# Default WORKER_NAMES to a 2-element array if unset/empty.
-if [[ -z "${WORKER_NAMES+x}" || ${#WORKER_NAMES[@]} -eq 0 ]]; then
+# Default WORKER_NAMES to a 2-element array if completely unset.
+# Distinguish "unset" (legacy configs that never declared WORKER_NAMES —
+# preserve historical 2-worker default) from "explicit empty array"
+# (`WORKER_NAMES=()` — operator's documented way to ask for CP-only;
+# README's Migration table promises this honors CP-only intent).
+#
+# Note: bash's `${arr+x}` parameter expansion returns empty for both
+# unset arrays AND empty-but-declared arrays, so it can't tell those
+# apart. `declare -p` IS reliable: it exits non-zero for unset names
+# and prints `declare -a NAME=()` for explicit empty arrays.
+if ! declare -p WORKER_NAMES >/dev/null 2>&1; then
   log "WORKER_NAMES not set — defaulting to (${CP_NAME}-w1 ${CP_NAME}-w2)"
   WORKER_NAMES=("${CP_NAME}-w1" "${CP_NAME}-w2")
+elif [[ ${#WORKER_NAMES[@]} -eq 0 ]]; then
+  log "WORKER_NAMES=() — CP-only deploy (no workers)"
 fi
 
 # Hard validation.

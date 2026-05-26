@@ -24,7 +24,27 @@ export HBIRD_AUTOLOAD_CONFIG_LOCAL=1
 # shellcheck source=../lib/build-common.sh
 source lib/build-common.sh
 
-: "${CP_VM_NAME:=hummingbird-k8s}"
+# Optional cluster-topology config (cluster.local.conf). When supplied,
+# overrides CP_NAME / WORKER_MEMORY / WORKER_VCPUS / POOL_DIR with the
+# same values the deploy-cluster flow used — operators no longer need
+# to keep two copies in sync. Matches the `make get-kubeconfig` /
+# `make update-cluster` CONFIG= pattern.
+if [[ -n "${CONFIG:-}" ]]; then
+  [[ -r "$CONFIG" ]] || { echo "${0##*/}: CONFIG not readable: $CONFIG" >&2; exit 2; }
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
+# Operator-visible deprecation signal when only the legacy name is set.
+# The alias below still resolves, but we want a one-line warning so the
+# operator notices to migrate to CP_NAME (cluster.local.conf naming).
+if [[ -n "${CP_VM_NAME:-}" && -z "${CP_NAME:-}" ]]; then
+  echo "${0##*/}: warning: CP_VM_NAME is deprecated; use CP_NAME instead (see PR #219)" >&2
+fi
+# Align on CP_NAME (used by cluster.local.conf, deploy-cluster.sh, et al);
+# preserve CP_VM_NAME as a backward-compat alias so operator shell history
+# from before this rename keeps working. See PR #219 round-1 review (H3).
+: "${CP_NAME:=${CP_VM_NAME:-hummingbird-k8s}}"
 : "${TOKEN_TTL:=2h}"
 
 # Per-worker resource knobs (override via config.local.sh or environment).
@@ -45,16 +65,16 @@ TEMPLATE="${POOL_DIR}/hummingbird-k8s-worker.qcow2"
 
 [[ -r "$TEMPLATE" ]] || {
   echo "${0##*/}: worker template qcow2 missing or unreadable: $TEMPLATE" >&2
-  echo "${0##*/}: build it first: 'sudo bash scripts/build-worker.sh' (or 'sudo make workers' to do both)." >&2
+  echo "${0##*/}: build it first via 'sudo bash scripts/build-worker.sh' (or run 'sudo make deploy-cluster CONFIG=…' to build + spawn together)." >&2
   exit 1
 }
 
 # Resolve the control plane IP so we can ask it for fresh join tokens.
-CP_IP=$(virsh -c qemu:///system domifaddr "$CP_VM_NAME" 2>/dev/null \
+CP_IP=$(virsh -c qemu:///system domifaddr "$CP_NAME" 2>/dev/null \
           | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}' || true)
 if [[ -z "$CP_IP" ]]; then
-  echo "${0##*/}: could not resolve IP of CP VM '$CP_VM_NAME' via 'virsh -c qemu:///system domifaddr'." >&2
-  echo "${0##*/}: verify the CP is running ('virsh -c qemu:///system list'), or override the VM name with CP_VM_NAME=<name>." >&2
+  echo "${0##*/}: could not resolve IP of CP VM '$CP_NAME' via 'virsh -c qemu:///system domifaddr'." >&2
+  echo "${0##*/}: verify the CP is running ('virsh -c qemu:///system list'), or override the VM name with CP_NAME=<name> (CP_VM_NAME also honored as a back-compat alias)." >&2
   echo "${0##*/}: known domains: $(virsh -c qemu:///system list --all --name 2>/dev/null | tr '\n' ' ')" >&2
   exit 1
 fi
@@ -96,7 +116,7 @@ fi
 # ships with ENABLE_ROOT_SSH=1 by default; see docs/worker-tokens.md.
 #
 # Retries up to CP_SSH_RETRIES times because the CP can still be coming up
-# when redo-workers.sh chains here right after redo-k8s.sh (#90). Each
+# when deploy-cluster.sh chains here right after a fresh CP boot (#90). Each
 # attempt has its own ConnectTimeout=10s; on success we emit the join
 # command on stdout, on persistent failure we exit non-zero so the caller
 # aborts rather than spawning a worker with no join token.

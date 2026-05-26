@@ -533,8 +533,8 @@ bootc itself across nodes) are possible.
 
 ## Interaction with the in-image auto-update timer
 
-Worker and k3s images ship `bootc-fetch-apply-updates.timer`
-**enabled** by default; the k8s CP image ships it **disabled** (see
+The worker image ships `bootc-fetch-apply-updates.timer` **enabled**
+by default; the k8s CP image ships it **disabled** (see
 [`docs/auto-updates.md`](auto-updates.md) for the rationale). On any
 node that has the timer enabled, leaving it running during a manual
 rolling upgrade risks:

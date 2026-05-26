@@ -92,8 +92,8 @@ export HBIRD_AUTOLOAD_CONFIG_LOCAL=1
 source lib/build-common.sh
 ```
 
-The build paths (`scripts/build-k3s.sh`, `scripts/build-k8s.sh`,
-`scripts/build-worker.sh`, `scripts/spawn-workers.sh`) opt in. The
+The build paths (`scripts/build-k8s.sh`, `scripts/build-worker.sh`,
+`scripts/spawn-workers.sh`) opt in. The
 cluster-orchestrator scripts (`deploy-cluster.sh`, `destroy-cluster.sh`,
 `update-cluster.sh`, `export-argocd.sh`, `verify-hardening.sh`) do
 NOT — they take their config from an explicit `CONFIG=<path>` argument
@@ -140,9 +140,8 @@ How the nested podman that BIB spawns inherits the isolation:
   forwarded as env vars (they would be inert and misleading) — the
   bind-mount above is sufficient.
 
-Consumer-side pull/build: the sibling scripts (`scripts/build-k3s.sh`,
-`scripts/build-k8s.sh`, `scripts/build-worker.sh`,
-`scripts/deploy-cluster.sh`) all run their OWN `podman pull` /
+Consumer-side pull/build: the sibling scripts (`scripts/build-k8s.sh`,
+`scripts/build-worker.sh`, `scripts/deploy-cluster.sh`) all run their OWN `podman pull` /
 `podman build` BEFORE handing the resulting image to `build_qcow2`.
 Those callers must also thread the isolation flags through, otherwise
 the image lands in the default `/var/lib/containers/storage` while

@@ -107,27 +107,6 @@ Manual run:
 gh workflow run integration-boot.yml -f tag=v0.1.33
 ```
 
-### `integration-boot-k3s.yml` (boot-time CP, k3s flavor)
-
-Same shape as the k8s boot test but for the k3s flavor.
-
-- **Triggers:**
-  - `workflow_run` on a successful `Build & publish — hummingbird-k3s`
-    (which itself runs on `k3s/v*` tag pushes).
-  - `workflow_dispatch`.
-- **What it exercises:** bib → qcow2 → virt-install → wait for
-  `k3s.service active` → assert exactly one Ready node (via `k3s kubectl`) →
-  smoke-deploy a tiny PSA-compliant nginx pod + Service and curl it from an
-  in-cluster busybox pod. `verify-hardening.sh` is intentionally NOT run —
-  the hardening suite is specific to the kubeadm-based k8s stack.
-- **Driver:** `tests/integration-boot-k3s.sh <tag>`.
-
-Manual run:
-
-```bash
-gh workflow run integration-boot-k3s.yml -f tag=k3s/v0.1.12
-```
-
 ### `integration-workers-join.yml` (worker join flow)
 
 Stands up a CP and N worker VMs from the published worker template, with
@@ -299,11 +278,12 @@ Beyond the baseline in `docs/self-hosted-runner.md`:
 ## Teardown + isolation
 
 All drivers use a unique VM name keyed on `GITHUB_RUN_ID`
-(`hummingbird-it-boot-<run_id>`, `hummingbird-it-boot-k3s-<run_id>`,
-`hummingbird-it-upgrade-<run_id>`, `hummingbird-it-rollback-<run_id>`,
+(`hummingbird-it-boot-<run_id>`, `hummingbird-it-upgrade-<run_id>`,
+`hummingbird-it-rollback-<run_id>`,
 `hummingbird-it-workers-<run_id>-{cp,wN}`), so parallel runs don't collide
-and the long-lived cluster VMs on the host (`hummingbird-k3s`,
-`hummingbird-k8s`, `hummingbird-k8s-worker-{1,2}`) are NEVER touched.
+and the long-lived cluster VMs on the host (`hummingbird-k8s`,
+`hummingbird-k8s-worker-{1,2}` — or whatever names the operator picks via
+`cluster.local.conf`) are NEVER touched.
 A trap-based cleanup always:
 
 - `virsh destroy` + `virsh undefine --nvram`
