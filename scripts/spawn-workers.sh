@@ -84,7 +84,7 @@ TEMPLATE="${POOL_DIR}/hummingbird-k8s-worker.qcow2"
 
 [[ -r "$TEMPLATE" ]] || {
   echo "${0##*/}: worker template qcow2 missing or unreadable: $TEMPLATE" >&2
-  echo "${0##*/}: build it first via 'sudo bash scripts/build-worker.sh' (or run 'sudo make deploy-cluster CONFIG=…' to build + spawn together)." >&2
+  echo "${0##*/}: build it first via 'sudo bash scripts/build-worker.sh' (or run 'make deploy-cluster CONFIG=…' to build + spawn together)." >&2
   exit 1
 }
 

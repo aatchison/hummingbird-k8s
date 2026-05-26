@@ -34,7 +34,7 @@
 #   18. Cluster-lifecycle recipes (deploy-cluster, destroy-cluster,
 #       update-cluster, update-workers, update-node) do NOT prefix `sudo`
 #       (issue #233 — sudo moved into the scripts via the SSH wrap).
-#   12. docs/makefile.md and docs/deploy-cluster.md mention
+#   19. docs/makefile.md and docs/deploy-cluster.md mention
 #       `--preserve-env` somewhere (drift fence for the local-fallback
 #       workaround when running on the KVM host with custom podman
 #       storage — issue #233, PR #237 round-2).
@@ -370,7 +370,7 @@ make_dry() {
   fi
 }
 
-@test "12. docs mention --preserve-env workaround for custom podman storage (issue #233)" {
+@test "19. docs mention --preserve-env workaround for custom podman storage (issue #233)" {
   # Drift fence (M5 from PR #237 round-2): when the Makefile dropped
   # `sudo --preserve-env=…` from the cluster-lifecycle recipes, the
   # operator-facing escape hatch became `sudo --preserve-env=… make
