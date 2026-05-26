@@ -382,7 +382,7 @@ timer_stop() {
 timer_start() {
   local ip="$1"
   if (( DRY_RUN == 1 )); then
-    log "DRY-RUN ssh root@${ip} systemctl start <bootc timer that exists>"
+    log "DRY-RUN ssh root@${ip} systemctl start bootc-semver-update.timer"
     return 0
   fi
   if (( SKIP_DRAIN == 1 )); then
