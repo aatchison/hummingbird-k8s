@@ -109,9 +109,11 @@ render_cp_user_data() {
     # honored. (#181 round-2 review.)
     printf '  - [ systemctl, disable, --now, bootc-semver-update.timer ]\n'
   fi
-  if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+  if [[ "$AUTO_UPDATE_CP" = "true" && -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
     # Re-read the drop-in cloud-init just wrote, then restart the timer
-    # so the override takes effect this boot (not just next).
+    # so the override takes effect this boot (not just next). Gated on
+    # AUTO_UPDATE_CP=true so the false-branch's disable above stays sticky
+    # (CodeRabbit #181).
     printf '  - [ systemctl, daemon-reload ]\n'
     printf '  - [ systemctl, restart, bootc-semver-update.timer ]\n'
   fi

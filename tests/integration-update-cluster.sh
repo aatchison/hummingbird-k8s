@@ -137,7 +137,7 @@ cmd_assert_dry_run_sequence() {
     'DRY-RUN ssh root@.* systemctl stop bootc-semver-update.timer bootc-fetch-apply-updates.timer' \
     'timer-stop per-node'
   assert_count "$nodes" \
-    'DRY-RUN ssh root@.* systemctl start bootc-semver-update.timer' \
+    'DRY-RUN ssh root@.* systemctl start bootc-semver-update.timer$' \
     'timer-start per-node'
 
   # CP header appears exactly once.

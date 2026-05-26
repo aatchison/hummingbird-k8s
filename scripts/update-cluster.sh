@@ -396,14 +396,22 @@ timer_start() {
   # leaving the node with neither timer running after `bootc upgrade` rc=2
   # ("no update available") paths. Probe first, then start whichever timer
   # is actually defined. (#181 round-2 review.)
+  # Exit 44 from the bash block if no timer unit is found, so we can
+  # distinguish "node has no auto-update on resume" from a real start
+  # failure (CodeRabbit #181). Both surface as a WARN; we don't fail the
+  # rolling upgrade — operator can re-enable manually.
   # shellcheck disable=SC2029
-  ssh "${SSH_OPTS[@]}" "root@${ip}" 'bash -c "
+  if ! ssh "${SSH_OPTS[@]}" "root@${ip}" 'bash -c "
     if systemctl cat bootc-semver-update.timer >/dev/null 2>&1; then
       systemctl start bootc-semver-update.timer
     elif systemctl cat bootc-fetch-apply-updates.timer >/dev/null 2>&1; then
       systemctl start bootc-fetch-apply-updates.timer
+    else
+      exit 44
     fi
-  "' || true
+  "'; then
+    log "WARN: ${ip}: bootc auto-update timer not restored (no semver/fetch-apply timer present or systemctl start failed)"
+  fi
 }
 
 # ---- EXIT trap: cordon recovery + timer restart ----------------------------
@@ -526,13 +534,19 @@ cleanup_on_exit() {
   # bootc-fetch-apply-updates.timer. Without the probe we'd silently leave
   # legacy hosts with no auto-update timer after a mid-flight abort.
   if [[ -n "$IN_FLIGHT_IP" ]] && (( DRY_RUN == 0 )) && (( SKIP_DRAIN == 0 )); then
-    ssh "${SSH_OPTS[@]}" -o ConnectTimeout=3 "root@${IN_FLIGHT_IP}" 'bash -c "
+    # Exit 44 if no timer unit is found; surface as WARN to the operator
+    # who's already inspecting the abort. (CodeRabbit #181.)
+    if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=3 "root@${IN_FLIGHT_IP}" 'bash -c "
       if systemctl cat bootc-semver-update.timer >/dev/null 2>&1; then
         systemctl start bootc-semver-update.timer
       elif systemctl cat bootc-fetch-apply-updates.timer >/dev/null 2>&1; then
         systemctl start bootc-fetch-apply-updates.timer
+      else
+        exit 44
       fi
-    "' >/dev/null 2>&1 || true
+    "'; then
+      log "WARN: ${IN_FLIGHT_IP}: bootc auto-update timer not restored on abort cleanup"
+    fi
   fi
   # Close ControlMaster sockets explicitly (ControlPersist=60s would
   # eventually expire them, but cleanup is cheap and avoids leaving

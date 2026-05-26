@@ -29,6 +29,14 @@ fi
 # semver" behavior in docs/auto-updates.md. (#181 round-1 review.)
 PREFIX="${PREFIX-v}"
 
+# Validate PREFIX is regex-safe before interpolating into grep -E below.
+# Restrict to alphanumeric + . _ - so a malformed env override can't widen
+# tag matching (CodeRabbit #181). Empty PREFIX is fine (unprefixed semver).
+if [[ -n "$PREFIX" && ! "$PREFIX" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  logger -t bootc-semver-update -p user.err -- "invalid PREFIX '${PREFIX}': only [A-Za-z0-9._-] allowed"
+  exit 1
+fi
+
 # Resolve the highest semver tag at REPO.
 #
 # Run skopeo first into a temp file so we can distinguish three failure

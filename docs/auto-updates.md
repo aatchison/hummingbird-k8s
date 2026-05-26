@@ -163,7 +163,7 @@ To dry-run the discovery without invoking `bootc switch`:
 sudo source /etc/hummingbird/bootc-update.env
 skopeo list-tags "docker://${REPO}" \
   | jq -r '.Tags[]' \
-  | grep -E "^${PREFIX:-v}[0-9]+\.[0-9]+\.[0-9]+$" \
+  | grep -E "^${PREFIX-v}[0-9]+\.[0-9]+\.[0-9]+$" \
   | sort -V \
   | tail -1
 ```
