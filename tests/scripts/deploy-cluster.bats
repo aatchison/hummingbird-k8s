@@ -512,6 +512,60 @@ EOF
   [[ "$output" != *"appending operator workstation pubkey"* ]]
 }
 
+# ---------------------------------------------------------------------------
+# worker_user_data — per-worker hostname emission (#254)
+# ---------------------------------------------------------------------------
+#
+# #254: workers were registering in Kubernetes as humbird-worker-<machine-id>
+# instead of the names declared in WORKER_NAMES. Pin that the rendered
+# worker user-data emits `hostname: <worker_name>` per worker. (The
+# in-VM application of that hostname is exercised by the integration
+# test below; this bats case covers just the seed render.)
+
+# Helper: source the script and emit worker_user_data to a tmpfile,
+# returning its contents on stdout. Mirrors the `render` helper above.
+render_worker() {
+  local worker_name="$1"
+  local tmp="${BATS_TEST_TMPDIR}/worker-userdata-${worker_name}.yaml"
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  worker_user_data "$worker_name" "$tmp"
+  cat "$tmp"
+}
+
+@test "deploy-cluster: worker_user_data emits hostname per worker (#254)" {
+  # Minimal env worker_user_data needs.
+  export SSH_PUBKEY_CONTENT="ssh-ed25519 AAAA-test-key user@host"
+  export JOIN_CMD="kubeadm join 10.0.0.1:6443 --token abc.def --discovery-token-ca-cert-hash sha256:deadbeef"
+  export SWITCH_TO_GHCR=true
+  export GHCR_TAG=v9.9.9
+  export BOOTC_UPDATE_SCHEDULE=""
+  export BOOTC_UPDATE_REPO_WORKER=""
+  run render_worker "hbird-w1"
+  [ "$status" -eq 0 ]
+  # The fix: a `hostname:` line per worker, matching the argument.
+  [[ "$output" == *"hostname: hbird-w1"* ]]
+  # Sanity: write_files for the join cmd is still there.
+  [[ "$output" == *"/etc/hummingbird/worker-join.env"* ]]
+  [[ "$output" == *"kubeadm join"* ]]
+}
+
+@test "deploy-cluster: worker_user_data hostname matches arg, not env (#254)" {
+  # Different worker names produce different hostname directives — pin that
+  # the function is honoring its argument, not picking up a stale env var.
+  export SSH_PUBKEY_CONTENT="ssh-ed25519 AAAA-test-key user@host"
+  export JOIN_CMD="kubeadm join 10.0.0.1:6443 --token a.b --discovery-token-ca-cert-hash sha256:deadbeef"
+  export SWITCH_TO_GHCR=false
+  export GHCR_TAG=latest
+  export BOOTC_UPDATE_SCHEDULE=""
+  export BOOTC_UPDATE_REPO_WORKER=""
+  run render_worker "custom-worker-name-42"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"hostname: custom-worker-name-42"* ]]
+  # Must NOT contain the other test's name.
+  [[ "$output" != *"hostname: hbird-w1"* ]]
+}
+
 @test "deploy-cluster: IMAGE_SOURCE=garbage rejected (#231)" {
   local driver="${BATS_TEST_TMPDIR}/driver-garbage.sh"
   cat > "$driver" <<EOF

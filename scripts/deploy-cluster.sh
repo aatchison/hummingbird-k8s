@@ -119,9 +119,73 @@ render_cp_user_data() {
   fi
 }
 
+# worker_user_data — emit a worker cloud-init user-data YAML to a file.
+# Inputs:
+#   $1 — worker_name (becomes the cloud-init hostname:)
+#   $2 — out_file path
+# Env vars: SSH_PUBKEY_CONTENT, JOIN_CMD, BOOTC_UPDATE_SCHEDULE,
+#           BOOTC_UPDATE_REPO_WORKER, SWITCH_TO_GHCR, GHCR_TAG.
+#
+# Defined here (above the source-only guard, alongside render_cp_user_data)
+# so tests/scripts/deploy-cluster.bats can exercise the rendered output
+# without invoking the rest of the script (root + libvirt + bib). (#254.)
+worker_user_data() {
+  local worker_name="$1" out_file="$2"
+  {
+    printf '#cloud-config\n'
+    printf 'hostname: %s\n' "$worker_name"
+    # See CP user-data for the disable_root / users-as-root rationale.
+    printf 'disable_root: false\n'
+    printf 'users:\n'
+    printf '  - name: root\n'
+    printf '    ssh_authorized_keys:\n'
+    printf '      - %s\n' "$SSH_PUBKEY_CONTENT"
+    printf 'write_files:\n'
+    printf '  - path: /etc/hummingbird/worker-join.env\n'
+    printf '    owner: root:root\n'
+    printf "    permissions: '0600'\n"
+    printf '    content: |\n'
+    # Indent the join command exactly 6 spaces to match YAML block scalar
+    # under "content: |" at 4-space indent.
+    printf '      %s\n' "$JOIN_CMD"
+    # bootc-semver-update overrides. Only emit each entry when the
+    # corresponding operator var is set.
+    if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+      printf '  - path: /etc/systemd/system/bootc-semver-update.timer.d/schedule.conf\n'
+      printf '    owner: root:root\n'
+      printf "    permissions: '0644'\n"
+      printf '    content: |\n'
+      printf '      [Timer]\n'
+      printf '      OnCalendar=\n'
+      printf '      OnCalendar=%s\n' "$BOOTC_UPDATE_SCHEDULE"
+    fi
+    if [[ -n "${BOOTC_UPDATE_REPO_WORKER:-}" ]]; then
+      printf '  - path: /etc/hummingbird/bootc-update.env\n'
+      printf '    owner: root:root\n'
+      printf "    permissions: '0644'\n"
+      printf '    content: |\n'
+      printf '      REPO=%s\n' "$BOOTC_UPDATE_REPO_WORKER"
+      printf '      PREFIX=v\n'
+    fi
+    if [[ "$SWITCH_TO_GHCR" = "true" || -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+      printf 'runcmd:\n'
+      if [[ "$SWITCH_TO_GHCR" = "true" ]]; then
+        printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s-worker:%s ]\n' "$GHCR_TAG"
+      fi
+      if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+        # Re-read the drop-in cloud-init just wrote, then restart the
+        # timer so the override takes effect this boot.
+        printf '  - [ systemctl, daemon-reload ]\n'
+        printf '  - [ systemctl, restart, bootc-semver-update.timer ]\n'
+      fi
+    fi
+  } > "$out_file"
+}
+
 # Source-only mode for bats: when HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1, return
-# from `source` here so the test can call render_cp_user_data without the
-# script's root/libvirt orchestration kicking in. (#181 round-2 review.)
+# from `source` here so the test can call render_cp_user_data / worker_user_data
+# without the script's root/libvirt orchestration kicking in. (#181 round-2,
+# extended for #254 worker_user_data coverage.)
 if [[ "${HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY:-0}" = 1 ]]; then
   return 0
 fi
@@ -419,59 +483,9 @@ JOIN_CMD="$(cp_ssh "kubeadm token create --ttl ${TOKEN_TTL} --print-join-command
 [[ "$JOIN_CMD" == kubeadm\ join* ]] || fail "did not get a valid 'kubeadm join ...' command from the CP. Got: ${JOIN_CMD:-<empty>}"
 
 # ---- Per-worker seed + virt-install (parallel) ------------------------------
-
-worker_user_data() {
-  local worker_name="$1" out_file="$2"
-  {
-    printf '#cloud-config\n'
-    printf 'hostname: %s\n' "$worker_name"
-    # See CP user-data for the disable_root / users-as-root rationale.
-    printf 'disable_root: false\n'
-    printf 'users:\n'
-    printf '  - name: root\n'
-    printf '    ssh_authorized_keys:\n'
-    printf '      - %s\n' "$SSH_PUBKEY_CONTENT"
-    printf 'write_files:\n'
-    printf '  - path: /etc/hummingbird/worker-join.env\n'
-    printf '    owner: root:root\n'
-    printf "    permissions: '0600'\n"
-    printf '    content: |\n'
-    # Indent the join command exactly 6 spaces to match YAML block scalar
-    # under "content: |" at 4-space indent.
-    printf '      %s\n' "$JOIN_CMD"
-    # bootc-semver-update overrides. Only emit each entry when the
-    # corresponding operator var is set.
-    if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
-      printf '  - path: /etc/systemd/system/bootc-semver-update.timer.d/schedule.conf\n'
-      printf '    owner: root:root\n'
-      printf "    permissions: '0644'\n"
-      printf '    content: |\n'
-      printf '      [Timer]\n'
-      printf '      OnCalendar=\n'
-      printf '      OnCalendar=%s\n' "$BOOTC_UPDATE_SCHEDULE"
-    fi
-    if [[ -n "${BOOTC_UPDATE_REPO_WORKER:-}" ]]; then
-      printf '  - path: /etc/hummingbird/bootc-update.env\n'
-      printf '    owner: root:root\n'
-      printf "    permissions: '0644'\n"
-      printf '    content: |\n'
-      printf '      REPO=%s\n' "$BOOTC_UPDATE_REPO_WORKER"
-      printf '      PREFIX=v\n'
-    fi
-    if [[ "$SWITCH_TO_GHCR" = "true" || -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
-      printf 'runcmd:\n'
-      if [[ "$SWITCH_TO_GHCR" = "true" ]]; then
-        printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s-worker:%s ]\n' "$GHCR_TAG"
-      fi
-      if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
-        # Re-read the drop-in cloud-init just wrote, then restart the
-        # timer so the override takes effect this boot.
-        printf '  - [ systemctl, daemon-reload ]\n'
-        printf '  - [ systemctl, restart, bootc-semver-update.timer ]\n'
-      fi
-    fi
-  } > "$out_file"
-}
+# worker_user_data is defined near the top of this script (above the
+# source-only guard) so tests/scripts/deploy-cluster.bats can exercise the
+# rendered worker user-data without invoking the rest of the script. (#254.)
 
 WORKER_PIDS=()
 for w in "${WORKER_NAMES[@]}"; do

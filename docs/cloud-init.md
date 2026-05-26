@@ -146,12 +146,29 @@ that drop-in is in place before `kubeadm init` reads it.
 
 cloud-init's hostname module is **authoritative** for worker nodes. If
 your NoCloud seed declares a `local-hostname` in `meta-data` (or a
-`hostname:` directive in `#cloud-config` user-data), cloud-init sets
-it during the network stage — well before `worker-init.service`
-fires. `worker-init.sh` then inspects the current hostname and only
-falls back to its machine-id-derived `humbird-worker-<suffix>` name
-when the existing hostname matches `localhost` / `localhost.*` (the
-unseeded default). This means:
+`hostname:` directive in `#cloud-config` user-data), cloud-init writes
+that name to `/etc/hostname` during the network stage. `worker-init.sh`
+then:
+
+1. Blocks on `cloud-init status --wait` so cloud-init's hostname module
+   has definitively committed (or skipped) any user-data hostname.
+2. Reads `hostnamectl --static` (with fall-back to `/etc/hostname`),
+   which reflects what cloud-init wrote — even when the running kernel
+   hostname is still the boot-time default (`localhost.localdomain`)
+   because `systemd-hostnamed` only reads `/etc/hostname` at boot,
+   before cloud-init has a chance to run. This was the #254 regression:
+   the running kernel hostname stayed stale, the legacy
+   `hostname`-based check tripped the `localhost*` fallback, and
+   workers registered as `humbird-worker-<machine-id>` despite a
+   correct cloud-init seed.
+3. Re-asserts the persistent hostname onto the running kernel via
+   `hostnamectl set-hostname` so `kubeadm join` (which reads the
+   running kernel hostname) uses the operator-declared name.
+4. Falls back to the machine-id-derived `humbird-worker-<suffix>` name
+   only when the persistent hostname is empty or matches `localhost` /
+   `localhost.*` (the unseeded default).
+
+This means:
 
 - `make deploy-cluster` (which seeds per-VM cloud-init with the
   `WORKER_NAMES` from your cluster config) ends up with workers
