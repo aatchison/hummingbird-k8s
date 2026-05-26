@@ -34,6 +34,96 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# render_cp_user_data — emit the CP cloud-init user-data YAML to stdout.
+# Inputs (env vars): CP_NAME, SSH_PUBKEY_CONTENT, GHCR_TAG, SWITCH_TO_GHCR,
+# AUTO_UPDATE_CP, BOOTC_UPDATE_SCHEDULE, BOOTC_UPDATE_REPO_K8S.
+#
+# Extracted from the inline `{ ... } > $CP_USER_DATA` block so
+# tests/scripts/deploy-cluster.bats can exercise the rendered output
+# without invoking the rest of the script (which requires root + libvirt).
+# Defined here, above the root/sudo checks, so the source-only guard
+# below can short-circuit and expose the function to tests. (#181 round-2
+# review.)
+render_cp_user_data() {
+  printf '#cloud-config\n'
+  printf 'hostname: %s\n' "$CP_NAME"
+  # Set the key on root explicitly. The top-level `ssh_authorized_keys`
+  # defaults to cloud-init's "default user" which on Fedora is `fedora` —
+  # that fights the Hummingbird sudoless-root-only model.
+  printf 'disable_root: false\n'
+  printf 'users:\n'
+  printf '  - name: root\n'
+  printf '    ssh_authorized_keys:\n'
+  printf '      - %s\n' "$SSH_PUBKEY_CONTENT"
+  # write_files for bootc-semver-update overrides. Only emit the block
+  # when at least one override is set, otherwise the YAML stays clean
+  # (no empty write_files array).
+  if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" || -n "${BOOTC_UPDATE_REPO_K8S:-}" ]]; then
+    printf 'write_files:\n'
+    if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+      # Drop-in to override the image's OnCalendar=. Empty OnCalendar=
+      # first clears the default; the second line sets the override.
+      printf '  - path: /etc/systemd/system/bootc-semver-update.timer.d/schedule.conf\n'
+      printf '    owner: root:root\n'
+      printf "    permissions: '0644'\n"
+      printf '    content: |\n'
+      printf '      [Timer]\n'
+      printf '      OnCalendar=\n'
+      printf '      OnCalendar=%s\n' "$BOOTC_UPDATE_SCHEDULE"
+    fi
+    if [[ -n "${BOOTC_UPDATE_REPO_K8S:-}" ]]; then
+      printf '  - path: /etc/hummingbird/bootc-update.env\n'
+      printf '    owner: root:root\n'
+      printf "    permissions: '0644'\n"
+      printf '    content: |\n'
+      printf '      REPO=%s\n' "$BOOTC_UPDATE_REPO_K8S"
+      printf '      PREFIX=v\n'
+    fi
+  fi
+  # Always emit a runcmd block now: the AUTO_UPDATE_CP=false branch needs
+  # to actively disable the timer (the image's preset enables it
+  # unconditionally on factory reset, so AUTO_UPDATE_CP=false alone was a
+  # no-op pre-#181-round-2). #181 round-2 review.
+  printf 'runcmd:\n'
+  if [[ "$SWITCH_TO_GHCR" = "true" ]]; then
+    printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s:%s ]\n' "$GHCR_TAG"
+  fi
+  if [[ "$AUTO_UPDATE_CP" = "true" ]]; then
+    # Enable the semver-aware updater (this PR's mechanism) — the image's
+    # preset already enables it on a fresh boot, but a runtime `systemctl
+    # enable --now` is the belt-and-suspenders path that also makes the
+    # timer fire its OnBootSec=15min window immediately rather than after
+    # the next reboot. The legacy bootc-fetch-apply-updates.timer is
+    # disabled in the new preset; re-enabling it here would fight the
+    # operator's "advance only on new semver tags" intent.
+    printf '  - [ systemctl, enable, --now, bootc-semver-update.timer ]\n'
+    # Belt-and-suspenders: disable the legacy timer too, in case a
+    # pre-#181 host is being re-cloud-inited (the new image's preset
+    # would have already disabled it on first boot, but explicit disable
+    # is cheap and idempotent on already-disabled units). (#181 round-2
+    # review.)
+    printf '  - [ systemctl, disable, --now, bootc-fetch-apply-updates.timer ]\n'
+  else
+    # AUTO_UPDATE_CP=false: actively counter the preset's unconditional
+    # enable so the operator's "no auto-updates on the CP" intent is
+    # honored. (#181 round-2 review.)
+    printf '  - [ systemctl, disable, --now, bootc-semver-update.timer ]\n'
+  fi
+  if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+    # Re-read the drop-in cloud-init just wrote, then restart the timer
+    # so the override takes effect this boot (not just next).
+    printf '  - [ systemctl, daemon-reload ]\n'
+    printf '  - [ systemctl, restart, bootc-semver-update.timer ]\n'
+  fi
+}
+
+# Source-only mode for bats: when HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1, return
+# from `source` here so the test can call render_cp_user_data without the
+# script's root/libvirt orchestration kicking in. (#181 round-2 review.)
+if [[ "${HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY:-0}" = 1 ]]; then
+  return 0
+fi
+
 # shellcheck source=../lib/build-common.sh
 source "${REPO_ROOT}/lib/build-common.sh"
 # shellcheck source=lib/cloud-init-seed.sh
@@ -199,68 +289,9 @@ CP_QCOW="${POOL_DIR}/${CP_NAME}.qcow2"
 CP_SEED="${POOL_DIR}/${CP_NAME}-seed.iso"
 CP_USER_DATA="$(mktemp -t hbird-cp-userdata-XXXXXX.yaml)"
 
-{
-  printf '#cloud-config\n'
-  printf 'hostname: %s\n' "$CP_NAME"
-  # Set the key on root explicitly. The top-level `ssh_authorized_keys`
-  # defaults to cloud-init's "default user" which on Fedora is `fedora` —
-  # that fights the Hummingbird sudoless-root-only model.
-  printf 'disable_root: false\n'
-  printf 'users:\n'
-  printf '  - name: root\n'
-  printf '    ssh_authorized_keys:\n'
-  printf '      - %s\n' "$SSH_PUBKEY_CONTENT"
-  # write_files for bootc-semver-update overrides. Only emit the block
-  # when at least one override is set, otherwise the YAML stays clean
-  # (no empty write_files array).
-  if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" || -n "${BOOTC_UPDATE_REPO_K8S:-}" ]]; then
-    printf 'write_files:\n'
-    if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
-      # Drop-in to override the image's OnCalendar=. Empty OnCalendar=
-      # first clears the default; the second line sets the override.
-      printf '  - path: /etc/systemd/system/bootc-semver-update.timer.d/schedule.conf\n'
-      printf '    owner: root:root\n'
-      printf "    permissions: '0644'\n"
-      printf '    content: |\n'
-      printf '      [Timer]\n'
-      printf '      OnCalendar=\n'
-      printf '      OnCalendar=%s\n' "$BOOTC_UPDATE_SCHEDULE"
-    fi
-    if [[ -n "${BOOTC_UPDATE_REPO_K8S:-}" ]]; then
-      printf '  - path: /etc/hummingbird/bootc-update.env\n'
-      printf '    owner: root:root\n'
-      printf "    permissions: '0644'\n"
-      printf '    content: |\n'
-      printf '      REPO=%s\n' "$BOOTC_UPDATE_REPO_K8S"
-      printf '      PREFIX=v\n'
-    fi
-  fi
-  # Only emit the runcmd block when at least one entry is needed — keeps
-  # the user-data clean and matches the design constraint ("don't leave
-  # runcmd in and rely on systemctl no-op").
-  if [[ "$SWITCH_TO_GHCR" = "true" || "$AUTO_UPDATE_CP" = "true" || -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
-    printf 'runcmd:\n'
-    if [[ "$SWITCH_TO_GHCR" = "true" ]]; then
-      printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s:%s ]\n' "$GHCR_TAG"
-    fi
-    if [[ "$AUTO_UPDATE_CP" = "true" ]]; then
-      # Enable the semver-aware updater (this PR's mechanism) — the image's
-      # preset already enables it on a fresh boot, but a runtime `systemctl
-      # enable --now` is the belt-and-suspenders path that also makes the
-      # timer fire its OnBootSec=15min window immediately rather than after
-      # the next reboot. The legacy bootc-fetch-apply-updates.timer is
-      # disabled in the new preset; re-enabling it here would fight the
-      # operator's "advance only on new semver tags" intent.
-      printf '  - [ systemctl, enable, --now, bootc-semver-update.timer ]\n'
-    fi
-    if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
-      # Re-read the drop-in cloud-init just wrote, then restart the timer
-      # so the override takes effect this boot (not just next).
-      printf '  - [ systemctl, daemon-reload ]\n'
-      printf '  - [ systemctl, restart, bootc-semver-update.timer ]\n'
-    fi
-  fi
-} > "$CP_USER_DATA"
+# render_cp_user_data is defined near the top of this script (above the
+# root/sudo checks) so the source-only test guard can expose it.
+render_cp_user_data > "$CP_USER_DATA"
 
 log "building CP cloud-init seed ${CP_SEED}"
 build_cloud_init_seed "$CP_NAME" "$CP_USER_DATA" "$CP_SEED"
