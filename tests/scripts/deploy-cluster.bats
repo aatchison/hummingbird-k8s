@@ -337,6 +337,33 @@ EOF
   [[ "$output" == *"IMAGE_SOURCE=ghcr"* ]]
 }
 
+@test "deploy-cluster: IMAGE_SOURCE= (set-but-empty) defaults to ghcr (#231 pin colon semantics)" {
+  # The script uses `: "${IMAGE_SOURCE:=ghcr}"` (colon form), which treats
+  # both unset AND set-but-empty as "fall through to the default". A future
+  # refactor to `${IMAGE_SOURCE=ghcr}` (no colon) would silently regress on
+  # the empty case — an operator with `IMAGE_SOURCE=` in cluster.local.conf
+  # would land at validation with IMAGE_SOURCE="" and hit the `garbage`
+  # branch's failure. This test pins the colon semantics so that regression
+  # breaks loudly. (#231 round-2 review H1.)
+  local driver="${BATS_TEST_TMPDIR}/driver-empty.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+fail() { printf 'fail: %s\n' "\$*" >&2; exit 1; }
+# Mirror a cluster.local.conf line of literal \`IMAGE_SOURCE=\` (empty rvalue).
+IMAGE_SOURCE=""
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/image-source.snippet"
+printf 'IMAGE_SOURCE=%s\n' "\$IMAGE_SOURCE"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"IMAGE_SOURCE=ghcr"* ]]
+  # Must not have hit the validation fail-branch (empty != 'ghcr' or 'local').
+  [[ "$output" != *"fail:"* ]]
+}
+
 @test "deploy-cluster: IMAGE_SOURCE=garbage rejected (#231)" {
   local driver="${BATS_TEST_TMPDIR}/driver-garbage.sh"
   cat > "$driver" <<EOF
