@@ -457,6 +457,18 @@ Today the script snapshots
 `.status.booted.image.digest` for older bootc JSON schemas) via
 `bootc status --json | jq` before and after the upgrade:
 
+> `jq` runs on the bootc host (not the operator), so it has to be
+> in the image. It is baked into the primary `dnf install -y` layer
+> of `containers/k8s/Containerfile` and
+> `containers/k8s-worker/Containerfile` alongside
+> `kubeadm`/`kubectl`/`cri-o`. Pre-#257 builds placed `jq` only in
+> the optional `bootc-semver-update` install layer, which was easy
+> to misread as conditional; moving it to the primary layer keeps
+> the dependency obvious and prevents a silent regression of this
+> detection (and of `bootc-semver-update.sh`'s own tag parsing).
+> A bats drift fence in `tests/containers/containerfile-deps.bats`
+> pins `jq` to that line.
+
 | pre digest | post digest | ssh stayed up? | Interpretation |
 | --- | --- | --- | --- |
 | sha256:A | sha256:A | yes | No update available — short-circuit waits, move on. |
