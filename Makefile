@@ -12,10 +12,15 @@
 #   * verify-*        — post-deploy verifiers (PSA, audit, encryption, etc.)
 #   * clean-*         — tear down local VMs / images
 #
-# Most VM-touching targets require sudo (libvirt qemu:///system, bib
-# loopback mounts). The `image-*` and `push-image-*` targets are
-# rootless: they only invoke `podman build` / `podman push` and run
-# entirely as the calling user.
+# Cluster-lifecycle targets (deploy-cluster, destroy-cluster,
+# update-cluster, update-workers, update-node) run without `sudo` on the
+# client. The wrapped scripts re-exec themselves over SSH to `KVM_HOST`
+# (set in the operator's config or environment), where sudo happens
+# transparently. On-KVM-host operators running locally still need root —
+# the scripts probe for it and fail with a one-line hint if missing.
+# The `image-*` and `push-image-*` targets are rootless: they only
+# invoke `podman build` / `podman push` and run entirely as the calling
+# user.
 #
 # Run `make help` to see the discoverable target list.
 
@@ -230,28 +235,27 @@ push-image-worker: image-worker ## podman tag + push the worker OCI image to $(G
 
 push-image-all: push-image-k8s push-image-worker ## podman push both OCI images (CP + worker) to $(GHCR_REGISTRY)
 
-# ---- cluster lifecycle (sudo) ------------------------------------------
+# ---- cluster lifecycle -------------------------------------------------
 # The canonical operator entry point. `deploy-cluster` builds (or pulls)
 # the CP + worker images, converts them to qcow2 via bib, generates per-VM
 # cloud-init seeds, virt-installs the CP, waits for it Ready, then joins
 # the workers. Tear down with `destroy-cluster`, roll bootc upgrades with
 # `update-cluster`. See docs/deploy-cluster.md for the full flow.
 #
-# --preserve-env passes HOME (used by cluster config templates), plus the
-# podman storage isolation vars (issue #199) so the inner sudo'd
-# deploy-cluster.sh + lib/build-common.sh:build_qcow2 see them. Outer
-# sudo --preserve-env already carries them in from CI; the Makefile recipe
-# re-launches sudo a second time and would otherwise strip the vars at the
-# inner sudo's env_reset.
+# `sudo` is intentionally absent here (post-C3, issue #233). The wrapped
+# scripts in scripts/ source scripts/lib/ssh-wrap.sh and re-exec over SSH
+# to `$KVM_HOST` (set in the operator's CONFIG or env), where sudo runs
+# transparently. On-KVM-host operators running locally still need root —
+# each script probes EUID and prints a one-line "need root locally OR
+# set KVM_HOST=…" hint if neither path is available. The Makefile no
+# longer makes the sudo-vs-SSH decision; that's the script's job.
 deploy-cluster: ## Deploy a hybrid bib+cloud-init cluster from CONFIG=<path> (see cluster.example.conf)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required (start from cluster.example.conf)' >&2; exit 2; }
-	sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
-	  bash scripts/deploy-cluster.sh "$(CONFIG)"
+	bash scripts/deploy-cluster.sh "$(CONFIG)"
 
 destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs + qcow2s + seed ISOs)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
-	  bash scripts/destroy-cluster.sh "$(CONFIG)"
+	bash scripts/destroy-cluster.sh "$(CONFIG)"
 
 # update-cluster delegates to scripts/update-cluster.sh. FLAGS= is a
 # passthrough for extra flags so operators don't have to drop down to the
@@ -261,19 +265,16 @@ destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs +
 #   make update-cluster CONFIG=cluster.local.conf FLAGS='--dry-run --parallel=2'
 update-cluster: ## Rolling bootc upgrade across CP + workers (with bootID + daemonset gates) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,CONFIG \
-	  bash scripts/update-cluster.sh $(FLAGS)
+	@CONFIG="$(CONFIG)" bash scripts/update-cluster.sh $(FLAGS)
 
 update-workers: ## Rolling bootc upgrade across workers only (with bootID + daemonset gates) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,CONFIG \
-	  bash scripts/update-cluster.sh --workers-only $(FLAGS)
+	@CONFIG="$(CONFIG)" bash scripts/update-cluster.sh --workers-only $(FLAGS)
 
 update-node: ## Update a single node (NODE=name) (with bootID + daemonset gates) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@[ -n "$(NODE)" ]   || { echo 'NODE=<name> required (CP_NAME or one of WORKER_NAMES)' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" NODE="$(NODE)" sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT,CONFIG,NODE \
-	  bash scripts/update-cluster.sh --node="$(NODE)" $(FLAGS)
+	@CONFIG="$(CONFIG)" NODE="$(NODE)" bash scripts/update-cluster.sh --node="$(NODE)" $(FLAGS)
 
 export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1, PROXY_JUMP=)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
