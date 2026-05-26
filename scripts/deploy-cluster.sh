@@ -166,7 +166,13 @@ source "$CONFIG_PATH"
 # Required scalars.
 : "${CP_NAME:?CP_NAME is required in $CONFIG_PATH}"
 : "${SSH_PUBKEY_FILE:?SSH_PUBKEY_FILE is required in $CONFIG_PATH}"
-: "${IMAGE_SOURCE:?IMAGE_SOURCE is required (ghcr or local) in $CONFIG_PATH}"
+# IMAGE_SOURCE defaults to ghcr — the registry-first golden path. A
+# workstation operator running `make deploy-cluster` should get a
+# GHCR-pulled image with no local-build prerequisite. `IMAGE_SOURCE=local`
+# stays a valid power-user / fast-iteration choice (build fresh from
+# containers/k8s and containers/k8s-worker) — see cluster.example.conf
+# and docs/deploy-cluster.md. (#231)
+: "${IMAGE_SOURCE:=ghcr}"
 
 # Defaults for optional knobs.
 : "${GHCR_TAG:=latest}"

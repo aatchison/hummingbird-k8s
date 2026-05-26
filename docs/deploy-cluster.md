@@ -33,12 +33,13 @@ The KVM host that will run the deploy needs:
 - `libvirt-daemon-system` running + `qemu:///system` reachable as root
 - `libvirt-clients` (`virsh`) + `virt-install` (`virtinst`/`virt-install` package) on `$PATH`
 - `podman` (for image pulls from GHCR or local builds)
-- `bootc-image-builder` accessible (the bib container image is pulled from `quay.io/centos-bootc/bootc-image-builder`)
+- `bootc-image-builder` accessible (the bib container image is pulled from `quay.io/centos-bootc/bootc-image-builder`) — only needed if you set `IMAGE_SOURCE=local`
 - `cloud-localds` (`cloud-utils` package) **or** `genisoimage`/`mkisofs`
   on `$PATH` — used to build the NoCloud seed ISO
-- The published GHCR images for the tag you'll pin to (`IMAGE_SOURCE=ghcr`)
-  reachable, **or** the ability to run `make image-k8s-with-cloud-init`
-  locally (`IMAGE_SOURCE=local`)
+- The published GHCR images for the tag you'll pin to (default
+  `IMAGE_SOURCE=ghcr`) reachable, **or** the ability to run
+  `make image-k8s-with-cloud-init` locally (`IMAGE_SOURCE=local`, the
+  fast-iteration path for testing an unpublished image)
 - A clean libvirt: no existing domains with the names you're about to
   use (`virsh -c qemu:///system list --all`). The script refuses to
   overwrite an existing domain.
@@ -80,7 +81,7 @@ The full set is in `cluster.example.conf`; the essentials:
 | `CP_NAME` | yes | — | libvirt domain name for the CP. |
 | `WORKER_NAMES` | no | `(${CP_NAME}-w1 ${CP_NAME}-w2)` | bash array of worker domain names. |
 | `SSH_PUBKEY_FILE` | yes | — | Path to the operator's public key; baked AND in cloud-init. |
-| `IMAGE_SOURCE` | yes | — | `ghcr` (pull from registry) or `local` (build from this repo). |
+| `IMAGE_SOURCE` | no | `ghcr` | `ghcr` (pull from registry — the registry-first golden path) or `local` (build from this repo — power-user / fast iteration). |
 | `GHCR_TAG` | no | `latest` | Tag used for `bootc switch` and for `ghcr` pulls. |
 | `ENABLE_CLOUD_INIT` | yes, must be `1` | — | The deploy script refuses to run without it. |
 | `AUTO_UPDATE_CP` | no | `true` | Emit a runcmd to enable `bootc-fetch-apply-updates.timer` on the CP. Overrides #48's opt-out. |
@@ -102,9 +103,11 @@ for `SWITCH_TO_GHCR=false`.
 
 1. **Validate config.** Hard-fail if `ENABLE_CLOUD_INIT != 1`,
    `SSH_PUBKEY_FILE` missing, `IMAGE_SOURCE` invalid, etc.
-2. **Acquire images.** `podman pull` from GHCR (`IMAGE_SOURCE=ghcr`) or
+   `IMAGE_SOURCE` defaults to `ghcr` when unset.
+2. **Acquire images.** `podman pull` from GHCR (default
+   `IMAGE_SOURCE=ghcr` — the registry-first golden path) or
    `make image-k8s-with-cloud-init image-worker-with-cloud-init`
-   (`IMAGE_SOURCE=local`).
+   (`IMAGE_SOURCE=local`, for testing an unpublished image).
 3. **Build qcow2 templates** via `lib/build-common.sh`'s
    `render_bib_config` + `build_qcow2` — same path `scripts/build-k8s.sh`
    and `scripts/build-worker.sh` use. Output:
