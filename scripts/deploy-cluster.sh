@@ -126,6 +126,20 @@ if [[ "${HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY:-0}" = 1 ]]; then
   return 0
 fi
 
+# ---- Remote KVM-host re-exec shim (C3, #232) -------------------------------
+# When KVM_HOST is set and we're NOT on the KVM host, re-exec this script
+# on the remote host via SSH. The client never needs sudo or libvirt —
+# only ssh + the operator's existing SSH key. Sudo happens on the remote.
+#
+# Env-var passthrough: EXPLICIT ALLOWLIST. Anything else stays client-side.
+# Add new vars to ALLOWED_ENV in hbird_ssh_wrap below if the script grows
+# new tunables. The allowlist is pinned by tests/scripts/ssh-wrap.bats.
+#
+# shellcheck source=lib/ssh-wrap.sh
+source "${SCRIPT_DIR}/lib/ssh-wrap.sh"
+hbird_ssh_wrap_maybe_reexec "$0" "$@"
+# ---- End remote re-exec shim -----------------------------------------------
+
 # shellcheck source=../lib/build-common.sh
 source "${REPO_ROOT}/lib/build-common.sh"
 # shellcheck source=lib/cloud-init-seed.sh

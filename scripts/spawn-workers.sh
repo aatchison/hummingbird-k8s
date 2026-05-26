@@ -9,6 +9,25 @@
 # token baked into the published worker image).
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+# Source-only mode for bats: when HBIRD_SPAWN_WORKERS_SOURCE_ONLY=1,
+# return from `source` here so tests can inspect helpers without
+# triggering the SSH-wrap or libvirt orchestration. (C3, #232.)
+if [[ "${HBIRD_SPAWN_WORKERS_SOURCE_ONLY:-0}" = 1 ]]; then
+  return 0
+fi
+
+# ---- Remote KVM-host re-exec shim (C3, #232) -------------------------------
+# When KVM_HOST is set and we're NOT on the KVM host, re-exec this script
+# on the remote host via SSH. Placed BEFORE the EUID/SUDO_USER checks so
+# the client never needs sudo locally — sudo happens on the remote.
+# See scripts/lib/ssh-wrap.sh for the contract.
+# shellcheck source=lib/ssh-wrap.sh
+source "${SCRIPT_DIR}/lib/ssh-wrap.sh"
+hbird_ssh_wrap_maybe_reexec "$0" "$@"
+# ---- End remote re-exec shim -----------------------------------------------
+
 if [[ $EUID -ne 0 ]]; then
   echo "${0##*/}: must be run as root — clones the worker qcow2 + virt-installs under qemu:///system. Try: sudo bash $0 [count]" >&2
   exit 1
@@ -16,7 +35,7 @@ fi
 
 : "${SUDO_USER:?must be invoked via sudo so ssh uses the calling user known_hosts/key}"
 
-cd "$(dirname "$(readlink -f "$0")")/.."
+cd "${SCRIPT_DIR}/.."
 # Opt into autoloading config.local.sh — spawn-workers has always relied
 # on it for WORKER_MEMORY / WORKER_VCPUS / POOL_DIR overrides. See
 # docs/development.md for the HBIRD_AUTOLOAD_CONFIG_LOCAL flag rationale.

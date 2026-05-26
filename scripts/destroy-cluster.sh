@@ -11,6 +11,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Source-only mode for bats: when HBIRD_DESTROY_CLUSTER_SOURCE_ONLY=1,
+# return from `source` here so tests can inspect helpers without
+# triggering the SSH-wrap or libvirt orchestration. (C3, #232.)
+if [[ "${HBIRD_DESTROY_CLUSTER_SOURCE_ONLY:-0}" = 1 ]]; then
+  return 0
+fi
+
+# ---- Remote KVM-host re-exec shim (C3, #232) -------------------------------
+# When KVM_HOST is set and we're NOT on the KVM host, re-exec this script
+# on the remote host via SSH. See scripts/lib/ssh-wrap.sh for the contract.
+# shellcheck source=lib/ssh-wrap.sh
+source "${SCRIPT_DIR}/lib/ssh-wrap.sh"
+hbird_ssh_wrap_maybe_reexec "$0" "$@"
+# ---- End remote re-exec shim -----------------------------------------------
+
 # shellcheck source=../lib/build-common.sh
 source "${REPO_ROOT}/lib/build-common.sh"
 setup_logging "[destroy-cluster]"
