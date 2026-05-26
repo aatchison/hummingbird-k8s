@@ -477,3 +477,43 @@ EOF
   [ "$status" -ne 0 ]
   [[ "$output" == *"symlink"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Issue #247: cp_ssh must pass -t so sudo on the remote can prompt for a
+# password when the operator's sudo cache is cold. The fix is in
+# scripts/export-argocd.sh:314 (cp_ssh definition).
+# ---------------------------------------------------------------------------
+
+@test "cp_ssh invocation includes -t for remote sudo (issue #247)" {
+  local cfg out stub_dir argv_capture
+  cfg="$(_make_stub_config)"
+  out="$BATS_TEST_TMPDIR/out.yaml"
+  stub_dir="$(_make_stub_bin)"
+  argv_capture="$BATS_TEST_TMPDIR/ssh-argv"
+
+  run env CONFIG="$cfg" \
+    KVM_HOST=geary \
+    SSH_ARGV_CAPTURE="$argv_capture" \
+    PATH="${stub_dir}:${PATH}" \
+    bash "$SCRIPT" --output "$out"
+
+  [ -f "$argv_capture" ]
+  # `-t` must appear in the argv. Each line in $argv_capture is one ssh arg,
+  # so a bare-line grep for `-t` is the right shape. busybox grep treats
+  # `-t` as a flag, so use `-e` to pass it as the pattern.
+  grep -qxF -e '-t' "$argv_capture"
+}
+
+@test "export-argocd source: cp_ssh definition uses 'ssh -t' (regression guard)" {
+  # Belt-and-suspenders against a future refactor that re-introduces the
+  # bug by editing cp_ssh in a way that drops -t (but otherwise still
+  # passes the argv-capture test if someone moves the call elsewhere).
+  grep -qE 'cp_ssh\(\)[[:space:]]*\{[[:space:]]*ssh -t ' "${REPO_ROOT}/scripts/export-argocd.sh"
+}
+
+@test "export-argocd source: admin.conf fetch pipes through 'tr -d' for CR stripping" {
+  # ssh -t allocates a remote TTY which makes sshd inject \r on every \n.
+  # The fetched YAML must have \r stripped before yq / sed see it.
+  grep -qE "cp_ssh .sudo cat /etc/kubernetes/admin.conf. \\| tr -d " \
+    "${REPO_ROOT}/scripts/export-argocd.sh"
+}

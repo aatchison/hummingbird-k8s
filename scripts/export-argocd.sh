@@ -311,7 +311,12 @@ if [[ -n "$PROXY_JUMP" ]]; then
 else
   ssh_opts_array CP_SSH_OPTS
 fi
-cp_ssh() { ssh "${CP_SSH_OPTS[@]}" "root@${CP_IP}" "$@"; }
+# ssh -t allocates a remote TTY so sudo can prompt for a password when the
+# remote sudo cache is cold. Even though the deploy flow logs in as root
+# (sudo is a passthrough), the non-root-SSH-user case documented below
+# would otherwise fail with `sudo: a terminal is required to read the
+# password`. See issue #247.
+cp_ssh() { ssh -t "${CP_SSH_OPTS[@]}" "root@${CP_IP}" "$@"; }
 
 # ---- pull admin.conf --------------------------------------------------------
 # umask 077 in the subshell so the temp file is mode 0600 from creation —
@@ -328,7 +333,11 @@ log "fetching /etc/kubernetes/admin.conf from root@${CP_IP}"
 # Let ssh's own stderr flow through to the operator — host-key mismatches,
 # Permission denied (publickey), sudo-no-tty, connection-refused all need
 # to be visible. The post-check fail() just appends a reminder.
-if ! cp_ssh "sudo cat /etc/kubernetes/admin.conf" > "$TMP_KUBECONFIG"; then
+# `tr -d '\r'`: ssh -t allocates a remote TTY which causes sshd to inject
+# carriage returns on every newline of the captured stdout. Strip them so
+# the YAML / yq path / sed-fallback path all see clean LF line endings
+# (issue #247).
+if ! cp_ssh "sudo cat /etc/kubernetes/admin.conf" | tr -d '\r' > "$TMP_KUBECONFIG"; then
   fail "ssh root@${CP_IP} 'sudo cat /etc/kubernetes/admin.conf' failed — see ssh diagnostic above (is the CP up and reachable on $SSH_PRIVKEY_FILE?)"
 fi
 [[ -s "$TMP_KUBECONFIG" ]] || fail "fetched admin.conf is empty"
