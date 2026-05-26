@@ -166,14 +166,14 @@ This is the mechanism the integration workflows (`integration-update-
 cluster.yml`, `integration-export-argocd.yml`) use to keep concurrent
 self-hosted runs from corrupting each other's overlay graph.
 
-Known limitation: the operator-only `make image-*` targets (workstation
-fast-iterate; not exercised by any workflow) still call bare
-`podman build` and therefore do NOT participate in storage isolation.
-Threading isolation through those targets would require either an
-intermediate shell wrapper script or reading the env vars inline in
-the recipe; both expand scope and the workflows that actually need
-isolation drive `make deploy-cluster` (which goes via the `scripts/`
-path, which IS threaded). Tracked as a follow-up.
+Workstation `make image-*` targets (and the sibling `make push-image-*`
+publish path) also honor the isolation vars: the Makefile defines
+`PODMAN_BUILD_OPTS` from `STORAGE_DRIVER` / `PODMAN_ROOT` /
+`PODMAN_RUNROOT` and threads it into every `podman build` / `podman
+tag` / `podman push` invocation. Unset = no flag emitted = default
+podman storage = byte-identical to pre-#230 behavior on workstations
+that don't need isolation. Closes the follow-up flagged in earlier
+revisions of this section (issue #230).
 
 ### Bats tests
 

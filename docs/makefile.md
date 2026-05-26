@@ -18,13 +18,89 @@ make verify-all                                # verify-encryption + verify-hard
 ```
 
 Stand-alone image builds (no qcow2, no VM — fast iteration on Containerfile
-changes, mirrors what `pr-validate.yml` does):
+changes, mirrors what `pr-validate.yml` does). These run **rootless** as
+the invoking user; no `sudo` is needed because the recipes only call
+`podman build` (qcow2 + libvirt steps that DO need root live behind
+`make deploy-cluster`):
 
 ```bash
-make image-k8s            # control plane OCI image
-make image-worker         # worker template OCI image
+make image-k8s            # control plane OCI image (rootless)
+make image-worker         # worker template OCI image (rootless)
 make image-all            # both
 ```
+
+Publish locally-built images to GHCR (companion to the tag-driven GHA
+workflow under `.github/workflows/build-*.yml`; useful for cutting an
+ad-hoc tag from a workstation without going through a tag push):
+
+```bash
+gh auth login                                                          # if not already
+gh auth token | podman login ghcr.io -u <github-user> --password-stdin # GH_TOKEN with write:packages
+make push-image-k8s    IMAGE_TAG=v0.1.x                                # tag + push CP image
+make push-image-worker IMAGE_TAG=v0.1.x                                # tag + push worker image
+make push-image-all    IMAGE_TAG=v0.1.x                                # both
+```
+
+The `--password-stdin` form keeps your PAT out of shell history /
+`ps aux` snapshots. The older interactive `podman login ghcr.io`
+prompt still works if you'd rather paste, but `--password-stdin` is
+the documented default. Each `make push-image-*` runs a
+`podman login --get-login` preflight against the registry host —
+if you skipped the login step, you get a single-line "ERROR: not
+logged in to ghcr.io" with the exact command to fix it, rather than
+a raw `podman push` "unauthorized" from the registry.
+
+`IMAGE_TAG` defaults to `latest`; override per release. `GHCR_REGISTRY`
+defaults to `ghcr.io/aatchison` — override for forks/mirrors.
+
+Operator-supplied values for `STORAGE_DRIVER`, `PODMAN_ROOT`,
+`PODMAN_RUNROOT`, `IMAGE_TAG`, and `GHCR_REGISTRY` are validated
+against a conservative character allowlist at Makefile parse time
+(see [Variables → validated character set](#variables)). A value
+containing characters outside the allowlist aborts `make` before any
+recipe runs — so a stray space or shell metachar fails fast instead
+of being spliced into a `podman` argv.
+
+### Rebuild-on-push behavior
+
+`push-image-{k8s,worker,all}` depends on the matching `image-*`
+target, so each push **always rebuilds** the local OCI image first.
+This is intentional — it keeps every `IMAGE_TAG=…` cut reproducible
+from a single command and matches the GHA workflow's
+build-then-push contract. The cost is a podman cache hit (seconds)
+on a no-op rebuild; the benefit is that `make push-image-k8s
+IMAGE_TAG=v0.1.5` can never push a stale layer from a previous
+local build. If you specifically want to retag-without-rebuild
+(e.g. cutting a new tag from the exact bits you just pushed),
+either invoke `podman tag … && podman push …` directly, or use
+`make -t push-image-k8s` to treat prereqs as up-to-date.
+
+### Sharing PODMAN_ROOT / PODMAN_RUNROOT between build and push
+
+If you set `STORAGE_DRIVER` / `PODMAN_ROOT` / `PODMAN_RUNROOT` for
+storage isolation (issue #199), set them for the **whole `make`
+invocation**, not just the `push-image-*` half. `podman tag` and
+`podman push` only see the image the build placed in the alternate
+graphroot if they are invoked with the same `--root` / `--runroot`.
+Two common shapes:
+
+```bash
+# One `make` call: build + tag + push share the env.
+PODMAN_ROOT=/tmp/r PODMAN_RUNROOT=/tmp/rr \
+  make push-image-k8s IMAGE_TAG=v0.1.x
+
+# Two `make` calls: export the env so BOTH inherit it.
+export STORAGE_DRIVER=overlay
+export PODMAN_ROOT=/tmp/r
+export PODMAN_RUNROOT=/tmp/rr
+make image-k8s
+make push-image-k8s IMAGE_TAG=v0.1.x
+```
+
+Splitting the env between a `make image-*` and a follow-up
+`make push-image-*` shell silently lets the second `make` invocation
+use the default graphroot — the tag step then fails image-not-found
+because the image lives in `$PODMAN_ROOT` instead.
 
 Ad-hoc `kubectl` from the client (needs `KVM_HOST` set, see `config.example.sh`):
 
@@ -68,14 +144,16 @@ test surface.
 
 ## Variables
 
-| Variable   | Default                       | Used by                       |
-| ---        | ---                           | ---                           |
-| `CONFIG`   | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig` |
-| `NODE`     | (required for `update-node`)  | `update-node`                 |
-| `FLAGS`    | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
-| `ARGS`     | empty                         | `kubectl`                     |
-| `POOL_DIR` | `/var/lib/libvirt/images`     | `clean-vms`                   |
-| `KVM_HOST` | unset                         | `kubectl` / `nodes`           |
+| Variable        | Default                       | Used by                       |
+| ---             | ---                           | ---                           |
+| `CONFIG`        | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig` |
+| `NODE`          | (required for `update-node`)  | `update-node`                 |
+| `FLAGS`         | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
+| `ARGS`          | empty                         | `kubectl`                     |
+| `POOL_DIR`      | `/var/lib/libvirt/images`     | `clean-vms`                   |
+| `KVM_HOST`      | unset                         | `kubectl` / `nodes`           |
+| `IMAGE_TAG`     | `latest`                      | `push-image-k8s`, `push-image-worker`, `push-image-all` |
+| `GHCR_REGISTRY` | `ghcr.io/aatchison`           | `push-image-*` (override for forks/mirrors) |
 
 Any other env vars honored by `cluster.local.conf` / `config.local.sh`
 (e.g. `VM_USER`, `APISERVER_EXTRA_SANS`, `STORAGE_DRIVER`, `PODMAN_ROOT`,
