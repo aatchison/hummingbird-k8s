@@ -127,6 +127,22 @@ make nodes
 make kubectl ARGS='get pods -A'
 ```
 
+When you've used a non-default `CP_NAME` in `cluster.local.conf` (e.g.
+`CP_NAME=hbird-cp1` instead of the legacy default `hummingbird-k8s`),
+thread the same `CONFIG=` you use elsewhere so `make kubectl` /
+`make nodes` resolve the right libvirt domain without you having to
+re-export `CP_NAME` in the shell (issue #220):
+
+```bash
+make nodes   CONFIG=cluster.local.conf
+make kubectl CONFIG=cluster.local.conf ARGS='get pods -A'
+```
+
+`CONFIG=` is optional here — the script falls back to `config.local.sh`
++ the default `hummingbird-k8s` for the common single-cluster case.
+`KVM_HOST` is read from `CONFIG` when set, so you can drop the
+`KVM_HOST=…` env prefix once `cluster.local.conf` carries it.
+
 Tear it all down:
 
 ```bash
@@ -182,7 +198,7 @@ test surface.
 
 | Variable            | Default                       | Used by                       |
 | ---                 | ---                           | ---                           |
-| `CONFIG`            | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig` |
+| `CONFIG`            | (required for deploy/destroy/update; optional for kubectl/nodes) | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig`, `kubectl`, `nodes` |
 | `NODE`              | (required for `update-node`)  | `update-node`                 |
 | `FLAGS`             | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
 | `ARGS`              | empty                         | `kubectl`                     |

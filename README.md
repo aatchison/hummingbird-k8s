@@ -179,6 +179,11 @@ KVM_HOST=geary make nodes
 KVM_HOST=geary make kubectl ARGS='get pods -A'
 KVM_HOST=geary make kubectl ARGS='-n kube-system logs ds/cilium'
 
+# With CP_NAME / KVM_HOST already in cluster.local.conf — no shell exports
+# needed (issue #220):
+make nodes   CONFIG=cluster.local.conf
+make kubectl CONFIG=cluster.local.conf ARGS='get pods -A'
+
 # Verify suite (PSA + audit + kubelet protect-kernel + rotate-certs)
 KVM_HOST=geary make verify-hardening
 KVM_HOST=geary make verify-encryption

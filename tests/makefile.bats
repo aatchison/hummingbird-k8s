@@ -37,6 +37,18 @@
 #       `--preserve-env` somewhere (drift fence for the local-fallback
 #       workaround when running on the KVM host with custom podman
 #       storage — issue #233, PR #237 round-2).
+#   20. `make -n kubectl CONFIG=… ARGS=…` threads CONFIG= into the env
+#       prefix on scripts/kubectl-k8s.sh, AND passes ARGS through (issue
+#       #220 — operators with a non-default CP_NAME in cluster.local.conf
+#       should not have to re-export it just to run `make kubectl`).
+#   21. `make -n nodes CONFIG=…` likewise threads CONFIG= into the env
+#       prefix on scripts/kubectl-k8s.sh and resolves to `get nodes`.
+#   22. `make -n kubectl` / `make -n nodes` with NO CONFIG= still works
+#       — the env-prefix expands to `CONFIG=""` and the script falls
+#       back to config.local.sh + the default `hummingbird-k8s` (the
+#       common single-cluster case).
+#   23. docs/makefile.md "Variables" table lists `kubectl` and `nodes`
+#       under the CONFIG= row (drift fence for issue #220).
 
 setup() {
   # All recipes are anchored at repo root. tests/ lives one level down, so
@@ -368,6 +380,78 @@ make_dry() {
     echo "$output" >&2
     return 1
   fi
+}
+
+@test "20. make -n kubectl CONFIG=… ARGS=… threads CONFIG into the env prefix and passes ARGS through (#220)" {
+  # Operator with CP_NAME=hbird-cp1 in cluster.local.conf should reach the
+  # script with CONFIG= already set — no re-export needed in the shell.
+  # The rendered recipe line must contain BOTH the CONFIG= env-prefix on
+  # the bash invocation AND the trailing ARGS verbatim.
+  make_dry kubectl CONFIG=cluster.example.conf ARGS='get nodes'
+  [[ "$output" == *"CONFIG=\"cluster.example.conf\" bash scripts/kubectl-k8s.sh get nodes"* ]] || {
+    echo "kubectl recipe missing CONFIG= threading or ARGS pass-through:" >&2
+    echo "$output" >&2
+    return 1
+  }
+
+  # Multi-token ARGS — also exercises the `kubectl -n kube-system logs …`
+  # operator example from the README.
+  make_dry kubectl CONFIG=cluster.example.conf ARGS='-n kube-system logs ds/cilium'
+  [[ "$output" == *"CONFIG=\"cluster.example.conf\" bash scripts/kubectl-k8s.sh -n kube-system logs ds/cilium"* ]]
+}
+
+@test "21. make -n nodes CONFIG=… threads CONFIG into the env prefix on kubectl-k8s.sh (#220)" {
+  make_dry nodes CONFIG=cluster.example.conf
+  [[ "$output" == *"CONFIG=\"cluster.example.conf\" bash scripts/kubectl-k8s.sh get nodes"* ]] || {
+    echo "nodes recipe missing CONFIG= threading:" >&2
+    echo "$output" >&2
+    return 1
+  }
+}
+
+@test "22. make -n kubectl / nodes with no CONFIG= still works (default single-cluster case, #220)" {
+  # Acceptance: `make kubectl` without CONFIG= must still render — the
+  # script falls back to config.local.sh + the default CP_NAME. Make
+  # expands an unset variable to the empty string, so the env-prefix
+  # becomes `CONFIG=""` (harmless: the script's `[[ -n "${CONFIG:-}" ]]`
+  # treats empty-string as unset and skips sourcing).
+  make_dry kubectl ARGS='get nodes'
+  [[ "$output" == *"bash scripts/kubectl-k8s.sh get nodes"* ]] || {
+    echo "kubectl recipe broken with no CONFIG=:" >&2
+    echo "$output" >&2
+    return 1
+  }
+  make_dry nodes
+  [[ "$output" == *"bash scripts/kubectl-k8s.sh get nodes"* ]] || {
+    echo "nodes recipe broken with no CONFIG=:" >&2
+    echo "$output" >&2
+    return 1
+  }
+}
+
+@test "23. docs/makefile.md Variables table lists kubectl + nodes under CONFIG= (#220 drift fence)" {
+  # Drift fence: when the kubectl/nodes targets gained CONFIG= threading
+  # (issue #220), the docs/makefile.md "Variables" table's CONFIG row had
+  # to grow to mention them. A future edit that drops them from the row
+  # silently re-introduces the documentation gap that #220 closed.
+  [ -f docs/makefile.md ] || { echo "missing doc: docs/makefile.md" >&2; return 1; }
+  # Find the CONFIG row and require both `kubectl` and `nodes` to appear
+  # somewhere on it. The row format is `| \`CONFIG\` | (required) | ... |`.
+  config_row="$(grep -E '^\| `CONFIG`' docs/makefile.md || true)"
+  [ -n "$config_row" ] || {
+    echo "docs/makefile.md no longer has a \`CONFIG\` row in the Variables table" >&2
+    return 1
+  }
+  [[ "$config_row" == *"kubectl"* ]] || {
+    echo "docs/makefile.md CONFIG row does not mention 'kubectl' (#220 drift):" >&2
+    echo "$config_row" >&2
+    return 1
+  }
+  [[ "$config_row" == *"nodes"* ]] || {
+    echo "docs/makefile.md CONFIG row does not mention 'nodes' (#220 drift):" >&2
+    echo "$config_row" >&2
+    return 1
+  }
 }
 
 @test "19. docs mention --preserve-env workaround for custom podman storage (issue #233)" {

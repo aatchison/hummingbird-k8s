@@ -91,7 +91,15 @@ sudo bash scripts/deploy-cluster.sh cluster.local.conf
 
 When the script finishes, it prints the CP IP and a one-liner for
 `kubectl` access. `make nodes` (which uses `scripts/kubectl-k8s.sh` to
-SSH-tunnel the apiserver) works against the deployed CP.
+SSH-tunnel the apiserver) works against the deployed CP. If you used a
+non-default `CP_NAME` in `cluster.local.conf`, thread the same `CONFIG=`
+through so `make kubectl` / `make nodes` resolve the right libvirt
+domain (issue #220):
+
+```bash
+make nodes   CONFIG=cluster.local.conf
+make kubectl CONFIG=cluster.local.conf ARGS='get pods -A'
+```
 
 ## Remote KVM-host operation (`KVM_HOST=`)
 
