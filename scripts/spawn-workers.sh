@@ -24,6 +24,17 @@ export HBIRD_AUTOLOAD_CONFIG_LOCAL=1
 # shellcheck source=../lib/build-common.sh
 source lib/build-common.sh
 
+# Optional cluster-topology config (cluster.local.conf). When supplied,
+# overrides CP_NAME / WORKER_MEMORY / WORKER_VCPUS / POOL_DIR with the
+# same values the deploy-cluster flow used — operators no longer need
+# to keep two copies in sync. Matches the `make get-kubeconfig` /
+# `make update-cluster` CONFIG= pattern.
+if [[ -n "${CONFIG:-}" ]]; then
+  [[ -r "$CONFIG" ]] || { echo "${0##*/}: CONFIG not readable: $CONFIG" >&2; exit 2; }
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
 # Align on CP_NAME (used by cluster.local.conf, deploy-cluster.sh, et al);
 # preserve CP_VM_NAME as a backward-compat alias so operator shell history
 # from before this rename keeps working. See PR #219 round-1 review (H3).

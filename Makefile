@@ -179,11 +179,11 @@ switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbir
 
 # ---- convenience -------------------------------------------------------
 
-nodes: ## kubectl get nodes via the SSH-tunnel wrapper
-	bash scripts/kubectl-k8s.sh get nodes
+nodes: ## kubectl get nodes via the SSH-tunnel wrapper (CONFIG=<path> to read CP_NAME/KVM_HOST from cluster.local.conf)
+	@CONFIG="$(CONFIG)" bash scripts/kubectl-k8s.sh get nodes
 
-kubectl: ## kubectl pass-through; use ARGS='get pods -A' to forward args
-	bash scripts/kubectl-k8s.sh $(ARGS)
+kubectl: ## kubectl pass-through; ARGS='get pods -A' (CONFIG=<path> to read CP_NAME/KVM_HOST from cluster.local.conf)
+	@CONFIG="$(CONFIG)" bash scripts/kubectl-k8s.sh $(ARGS)
 
 # ---- verification ------------------------------------------------------
 

@@ -4,7 +4,13 @@
 # podman-run kubectl container for hosts without kubectl installed.
 #
 # Env:
-#   KVM_HOST      — SSH alias of the KVM host (required). Pulled from config.local.sh if present.
+#   CONFIG        — Optional path to cluster.local.conf. When set, sourced
+#                   so CP_NAME / KVM_HOST come from the topology file
+#                   (matches the `make get-kubeconfig` / `make update-cluster`
+#                   pattern). Falls through to config.local.sh + defaults
+#                   if unset.
+#   KVM_HOST      — SSH alias of the KVM host (required). Pulled from
+#                   CONFIG or config.local.sh if present.
 #   KCFG          — Path to a kubeconfig with `server: https://localhost:6443` (default: /tmp/k8s-kubeconfig)
 #   LOCAL_PORT    — Local port for the tunnel (default: 6443)
 #   CP_NAME       — libvirt domain of the control plane (default: hummingbird-k8s).
@@ -12,7 +18,14 @@
 set -euo pipefail
 
 _KK_REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-if [[ -r "${_KK_REPO_ROOT}/config.local.sh" ]]; then
+# Prefer CONFIG (cluster topology) when supplied — that's where CP_NAME
+# now lives post-#216. Fall back to config.local.sh (image-build inputs),
+# which historically carried VM_NAME for single-VM deploys.
+if [[ -n "${CONFIG:-}" ]]; then
+  [[ -r "$CONFIG" ]] || { echo "${0##*/}: CONFIG not readable: $CONFIG" >&2; exit 2; }
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+elif [[ -r "${_KK_REPO_ROOT}/config.local.sh" ]]; then
   # shellcheck disable=SC1091
   source "${_KK_REPO_ROOT}/config.local.sh"
 fi
