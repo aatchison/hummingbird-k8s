@@ -151,7 +151,7 @@ test surface.
 | `FLAGS`         | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
 | `ARGS`          | empty                         | `kubectl`                     |
 | `POOL_DIR`      | `/var/lib/libvirt/images`     | `clean-vms`                   |
-| `KVM_HOST`      | unset                         | `kubectl` / `nodes`           |
+| `KVM_HOST`      | unset                         | `kubectl` / `nodes` — and since C3 (#232) also `deploy-cluster`, `destroy-cluster`, `update-cluster`, `spawn-workers` (re-exec on the KVM host via SSH; client needs only `ssh`, no local `sudo`). See [`docs/deploy-cluster.md`](deploy-cluster.md#remote-kvm-host-operation-kvm_host). |
 | `IMAGE_TAG`     | `latest`                      | `push-image-k8s`, `push-image-worker`, `push-image-all` |
 | `GHCR_REGISTRY` | `ghcr.io/aatchison`           | `push-image-*` (override for forks/mirrors) |
 

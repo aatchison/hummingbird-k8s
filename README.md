@@ -214,6 +214,28 @@ KVM_HOST=geary make verify-all          # all three in sequence
 KVM_HOST=geary make kube-bench
 ```
 
+#### Remote KVM-host operation for deploy/destroy/update/spawn (#232)
+
+Since C3, the four libvirt-touching scripts also self-host on
+`$KVM_HOST` via SSH — so the client never needs `sudo` or `libvirt`
+locally, only `ssh` + the operator's existing SSH key:
+
+```bash
+export KVM_HOST=geary
+make deploy-cluster   CONFIG=cluster.local.conf  # ssh -t geary sudo bash -s -- ...
+make destroy-cluster  CONFIG=cluster.local.conf
+make update-cluster   CONFIG=cluster.local.conf
+make spawn-workers    COUNT=2
+```
+
+The shim is a no-op when `KVM_HOST` is unset or when `$(hostname -s)`
+already matches `${KVM_HOST%%.*}` (you're on the KVM host already).
+Local `CONFIG=` files are `scp`'d to the remote before re-exec.
+Env-var forwarding is an explicit allowlist pinned by
+`tests/scripts/ssh-wrap.bats` — see
+[`docs/deploy-cluster.md`](docs/deploy-cluster.md#remote-kvm-host-operation-kvm_host)
+for the full allowlist and rationale.
+
 ### Cluster lifecycle
 
 ```bash

@@ -72,6 +72,40 @@ When the script finishes, it prints the CP IP and a one-liner for
 `kubectl` access. `make nodes` (which uses `scripts/kubectl-k8s.sh` to
 SSH-tunnel the apiserver) works against the deployed CP.
 
+## Remote KVM-host operation (`KVM_HOST=`)
+
+Since C3 (#232), `deploy-cluster.sh`, `destroy-cluster.sh`,
+`update-cluster.sh`, and `spawn-workers.sh` self-host on the KVM host
+via SSH when `KVM_HOST` is set and the local short hostname doesn't
+match `${KVM_HOST%%.*}`. The client never needs `sudo` or `libvirt`
+installed — only `ssh` + the operator's SSH key. Sudo happens on the
+remote.
+
+```bash
+# From a laptop. KVM_HOST should be an SSH alias (~/.ssh/config) that
+# can reach the operator's libvirt host as a user with passwordless
+# sudo. The shim ssh -t's into KVM_HOST, sudo env=...allowlist...,
+# then bash -s the script body via stdin.
+export KVM_HOST=geary
+make deploy-cluster CONFIG=cluster.local.conf
+```
+
+The shim is a no-op when `KVM_HOST` is unset, when the local host short
+name matches `${KVM_HOST%%.*}` (operator already on the KVM host), or
+when the script body is being re-executed on the remote side
+(`HBIRD_REMOTE_REEXEC=1` sentinel).
+
+Env-var passthrough is an **explicit allowlist** maintained in
+`scripts/lib/ssh-wrap.sh` and pinned by `tests/scripts/ssh-wrap.bats`.
+Opaque forwarding was rejected as a footgun: an operator's local
+`AWS_*` or `PROXY_*` exports must not silently change remote behavior.
+Adding a new tunable to the four wrapped scripts requires a
+corresponding entry in `HBIRD_SSH_WRAP_ALLOWED_ENV` (and the test
+will fail until you add it). `CONFIG=<local-path>` is special-cased:
+the local config file is `scp`'d to a remote `mktemp -d` and the
+remote `CONFIG=` is rewritten to point at the copy before `bash -s`
+runs.
+
 ## Config surface
 
 The full set is in `cluster.example.conf`; the essentials:
