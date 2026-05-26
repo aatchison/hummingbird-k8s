@@ -48,7 +48,9 @@ setup() {
         IMAGE_SOURCE GHCR_TAG DRY_RUN SKIP_DRAIN WORKERS_ONLY NODE \
         START_FROM PARALLEL READY_TIMEOUT DRAIN_TIMEOUT APISERVER_TIMEOUT \
         SSH_TIMEOUT INTER_NODE_SLEEP DAEMONSET_TIMEOUT CP_NAME \
-        WORKER_NAMES POOL_DIR
+        WORKER_NAMES POOL_DIR \
+        VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS \
+        HBIRD_AUTOLOAD_CONFIG_LOCAL
 
   LOCAL_HOST="$(hostname -s 2>/dev/null || hostname)"
 }
@@ -169,6 +171,77 @@ invoke_shim() {
 }
 
 # ---------------------------------------------------------------------------
+# M7: shell-meta-safety. Values with spaces and shell metas MUST be quoted
+# on the way out, not word-split by the remote bash. (Round-2 HIGH fix.)
+# ---------------------------------------------------------------------------
+
+@test "ssh-wrap: FLAGS with embedded space is printf %q quoted in the remote command" {
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    FLAGS="--foo bar" \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  # Extract the SSH_WRAP_CMD line only — the shim ALSO emits a
+  # human-readable "[foo.sh] re-execing ... (env: ...)" log line where
+  # the env array is rendered unquoted by design (for operator
+  # readability). The bytes that actually reach the remote bash are on
+  # the SSH_WRAP_CMD line.
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [ -n "$ssh_cmd_line" ]
+  # printf %q of "--foo bar" renders as `--foo\ bar` (backslash-escaped
+  # space) on modern bash, or `'--foo bar'` on some variants. Either is
+  # acceptable — what matters is the embedded space is NOT a bare
+  # unquoted value on the SSH command line.
+  [[ "$ssh_cmd_line" != *"FLAGS=--foo bar "* ]]
+  [[ "$ssh_cmd_line" == *"FLAGS=--foo\\ bar"* || "$ssh_cmd_line" == *"FLAGS='--foo bar'"* ]]
+}
+
+@test "ssh-wrap: positional arg with shell meta is printf %q quoted" {
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    run invoke_shim 'arg with space' '--evil=$(rm -rf /)'
+  [ "$status" -eq 0 ]
+  # The literal `$(rm -rf /)` substring (unquoted) must NOT appear in the
+  # output — printf %q escapes the `$(` / spaces.
+  [[ "$output" != *' --evil=$(rm -rf /)'* ]]
+  # And the embedded space in 'arg with space' must not appear as a bare
+  # value either (would be three separate words on the remote).
+  [[ "$output" != *' arg with space '* ]]
+}
+
+# ---------------------------------------------------------------------------
+# M3: CONFIG scp branch coverage
+# ---------------------------------------------------------------------------
+
+@test "ssh-wrap: CONFIG=<local file> triggers scp branch and rewrites CONFIG to remote path" {
+  # Create a real local file so the `[[ -f "$CONFIG" ]]` test passes.
+  # mktemp(1) on alpine/busybox doesn't support `-t TEMPLATE.conf`
+  # suffix syntax — use a portable path instead.
+  tmp_dir="${BATS_TEST_TMPDIR:-/tmp}/hbird-wrap-test-$$"
+  mkdir -p "$tmp_dir"
+  tmp_cfg="${tmp_dir}/cluster.local.conf"
+  echo "# test config" > "$tmp_cfg"
+
+  KVM_HOST=otherhost \
+    HBIRD_SSH_WRAP_DRY_RUN=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_SCP=1 \
+    CONFIG="$tmp_cfg" \
+    run invoke_shim
+
+  rm -rf "$tmp_dir"
+
+  [ "$status" -eq 0 ]
+  # Stub scp message printed to stderr.
+  [[ "$output" == *"SCP_WOULD_RUN: ${tmp_cfg} -> otherhost:/tmp/hbird-dryrun/cluster.local.conf"* ]]
+  # Rewritten CONFIG entry points at the remote tempdir path, not the
+  # local path.
+  [[ "$output" == *"CONFIG=/tmp/hbird-dryrun/cluster.local.conf"* ]]
+  # And the local path does NOT appear as a forwarded env value on the
+  # actual SSH command line.
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [[ "$ssh_cmd_line" != *"CONFIG=${tmp_cfg} "* ]]
+}
+
+# ---------------------------------------------------------------------------
 # The pinned allowlist itself
 # ---------------------------------------------------------------------------
 #
@@ -191,6 +264,8 @@ invoke_shim() {
     READY_TIMEOUT DRAIN_TIMEOUT APISERVER_TIMEOUT SSH_TIMEOUT
     INTER_NODE_SLEEP DAEMONSET_TIMEOUT
     CP_NAME WORKER_NAMES POOL_DIR
+    VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS
+    HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_REMOTE_REPO
   )
   # Sorted compare so reordering doesn't trip the test (the contract is
   # the set, not the order).
