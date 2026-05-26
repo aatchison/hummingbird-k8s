@@ -242,6 +242,78 @@ invoke_shim() {
 }
 
 # ---------------------------------------------------------------------------
+# #245: positional CONFIG arg rewrite
+# ---------------------------------------------------------------------------
+#
+# deploy-cluster.sh (and friends) take CONFIG as a positional arg via the
+# Makefile recipe `bash scripts/deploy-cluster.sh "$(CONFIG)"`, and the
+# script's CONFIG_PATH="${1:-...}" prefers $1 over $CONFIG. If the shim
+# only rewrites the CONFIG env var (as it did pre-#245), the operator's
+# local file gets scp'd but then ignored — the remote reads whatever
+# stale cluster.local.conf is in the on-disk checkout. Pin the rewrite
+# of any positional arg whose value == $CONFIG to the same
+# $remote_config_path used for the env-var rewrite.
+
+@test "ssh-wrap: positional arg matching CONFIG is rewritten to remote temp path (#245)" {
+  tmp_dir="${BATS_TEST_TMPDIR:-/tmp}/hbird-wrap-pos-$$"
+  mkdir -p "$tmp_dir"
+  tmp_cfg="${tmp_dir}/cluster.local.conf"
+  echo "# test config" > "$tmp_cfg"
+
+  # Pass the same path both as CONFIG env AND as a positional arg —
+  # mirrors `make deploy-cluster CONFIG=./cluster.local.conf` which
+  # expands to `bash scripts/deploy-cluster.sh ./cluster.local.conf`
+  # with CONFIG=./cluster.local.conf in the env.
+  KVM_HOST=otherhost \
+    HBIRD_SSH_WRAP_DRY_RUN=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_SCP=1 \
+    CONFIG="$tmp_cfg" \
+    run invoke_shim "$tmp_cfg"
+
+  rm -rf "$tmp_dir"
+
+  [ "$status" -eq 0 ]
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [ -n "$ssh_cmd_line" ]
+  # The rewritten remote path MUST appear as the positional arg after
+  # the remote script path. printf %q of an absolute /tmp/... path is
+  # the path verbatim.
+  [[ "$ssh_cmd_line" == *"/scripts/foo.sh /tmp/hbird-dryrun/cluster.local.conf"* ]]
+  # The original local path MUST NOT appear as a positional arg on the
+  # SSH command line. (It can — and does — appear in the SCP_WOULD_RUN
+  # diagnostic on stderr, but never as a forwarded arg.)
+  [[ "$ssh_cmd_line" != *"/scripts/foo.sh ${tmp_cfg}"* ]]
+}
+
+@test "ssh-wrap: positional arg NOT matching CONFIG passes through unchanged (#245)" {
+  tmp_dir="${BATS_TEST_TMPDIR:-/tmp}/hbird-wrap-pos-passthru-$$"
+  mkdir -p "$tmp_dir"
+  tmp_cfg="${tmp_dir}/cluster.local.conf"
+  echo "# test config" > "$tmp_cfg"
+
+  # CONFIG points at tmp_cfg, but the positional args are unrelated
+  # flags. They MUST pass through verbatim — the rewrite is narrow,
+  # matching only args whose literal value equals $CONFIG.
+  KVM_HOST=otherhost \
+    HBIRD_SSH_WRAP_DRY_RUN=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_SCP=1 \
+    CONFIG="$tmp_cfg" \
+    run invoke_shim --workers-only --node=hbird-w1
+
+  rm -rf "$tmp_dir"
+
+  [ "$status" -eq 0 ]
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [ -n "$ssh_cmd_line" ]
+  # Both flags pass through verbatim, unchanged.
+  [[ "$ssh_cmd_line" == *"/scripts/foo.sh --workers-only --node=hbird-w1"* ]]
+  # And the remote_config_path didn't leak into the positional slot.
+  [[ "$ssh_cmd_line" != *"/scripts/foo.sh /tmp/hbird-dryrun/cluster.local.conf"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # The pinned allowlist itself
 # ---------------------------------------------------------------------------
 #
