@@ -82,6 +82,7 @@ RUN printf '[kubernetes]\nname=Kubernetes\nbaseurl=https://pkgs.k8s.io/core:/sta
 RUN dnf install -y \
       cri-o kubelet kubeadm kubectl \
       iptables-nft iproute-tc socat conntrack-tools ethtool \
+      jq \
  && dnf clean all
 
 # Same bootc /usr fix as the CP image.
@@ -113,15 +114,15 @@ RUN chmod +x /usr/libexec/health-check-rollback.sh
 # Semver-aware bootc updater. Replaces stock bootc-fetch-apply-updates.timer
 # (which follows :latest, a mutable pointer) with a daily skopeo+jq query for
 # the highest semver tag at this image's GHCR repo. See docs/auto-updates.md.
-# skopeo is already in the Hummingbird base; jq is not, so install it here.
+# skopeo is already in the Hummingbird base; jq is installed in the primary
+# package layer above (also load-bearing for update-cluster.sh's bootc
+# `status --json` digest parse — see #257).
 # These files MUST be COPY'd before the `systemctl preset` line below — the
 # preset run can't reference a unit that's not yet on disk.
 COPY containers/shared/bootc-semver-update.sh /usr/libexec/bootc-semver-update.sh
 COPY containers/shared/bootc-semver-update.service /etc/systemd/system/bootc-semver-update.service
 COPY containers/shared/bootc-semver-update.timer /etc/systemd/system/bootc-semver-update.timer
-RUN dnf install -y jq \
- && dnf clean all \
- && chmod +x /usr/libexec/bootc-semver-update.sh \
+RUN chmod +x /usr/libexec/bootc-semver-update.sh \
  && mkdir -p /etc/hummingbird \
  && printf 'REPO=ghcr.io/aatchison/hummingbird-%s\nPREFIX=v\n' 'k8s-worker' \
       > /etc/hummingbird/bootc-update.env
