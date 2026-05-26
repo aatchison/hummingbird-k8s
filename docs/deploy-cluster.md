@@ -236,7 +236,7 @@ The full set is in `cluster.example.conf`; the essentials:
 | Knob | Required? | Default | Purpose |
 | --- | --- | --- | --- |
 | `CP_NAME` | yes | — | libvirt domain name for the CP. |
-| `WORKER_NAMES` | no | `(${CP_NAME}-w1 ${CP_NAME}-w2)` | bash array of worker domain names. |
+| `WORKER_NAMES` | no | `(${CP_NAME}-w1 ${CP_NAME}-w2)` | bash array of worker domain names — also seeded as each worker's cloud-init hostname, so the names are visible verbatim in `virsh list`, `/etc/hostname`, AND `kubectl get nodes`. Set `WORKER_NAMES=()` for a CP-only deploy. (#254.) |
 | `SSH_PUBKEY_FILE` | yes | — | Path to the operator's public key; baked AND in cloud-init. |
 | `IMAGE_SOURCE` | no | `ghcr` | `ghcr` (pull from registry — the registry-first golden path) or `local` (build from this repo — power-user / fast iteration). |
 | `GHCR_TAG` | no | `latest` | Tag used for `bootc switch` and for `ghcr` pulls. |
@@ -282,11 +282,13 @@ for `SWITCH_TO_GHCR=false`.
 7. **Mint join token** on the CP: `kubeadm token create --ttl 2h
    --print-join-command`. Short TTL on purpose — see
    [`docs/worker-tokens.md`](worker-tokens.md).
-8. **Per-worker seed.** Emit `#cloud-config` with hostname, SSH key,
-   `write_files` for `/etc/hummingbird/worker-join.env`, and the
-   `bootc switch` runcmd. Worker-init.service has
-   `After=cloud-init.target`, so cloud-final's write_files completes
-   before kubeadm join fires.
+8. **Per-worker seed.** Emit `#cloud-config` with `hostname:
+   ${WORKER_NAMES[i]}`, SSH key, `write_files` for
+   `/etc/hummingbird/worker-join.env`, and the `bootc switch` runcmd.
+   `worker-init.sh` blocks on `cloud-init status --wait` then reads
+   `hostnamectl --static` (which reflects what cloud-init wrote to
+   `/etc/hostname`) so kubeadm join uses the operator-declared name
+   even when the running kernel hostname is stale — see #254.
 9. **virt-install workers in parallel.** Each gets its own seed ISO.
 10. **Wait for `N+1` nodes Ready.**
 11. **Optional verify.** `RUN_VERIFY=true` runs
