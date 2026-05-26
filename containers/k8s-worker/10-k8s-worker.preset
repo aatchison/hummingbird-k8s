@@ -1,3 +1,19 @@
+# Hummingbird k8s-worker systemd preset.
+#
+# This file is deliberately identical to containers/k8s/10-k8s.preset in its
+# bootc-update timer policy: both flavors disable the legacy
+# bootc-fetch-apply-updates.timer (mutable :latest tracking) and enable the
+# semver-aware bootc-semver-update.timer. See docs/auto-updates.md.
+#
+# The CP/worker auto-update posture split documented in docs/auto-updates.md
+# (single-CP outage rationale, #48) is enforced at deploy-time by
+# scripts/deploy-cluster.sh via the AUTO_UPDATE_CP cloud-init knob — NOT at
+# the preset layer. Workers have no equivalent disable knob: a worker reboot
+# only drains one node, not the apiserver, so unattended auto-updates are
+# the default posture.
+#
+# If you came here thinking the two presets had "drifted" — they haven't.
+# The drift is intentional and lives at the deploy-cluster layer. See #225.
 disable bootc-fetch-apply-updates.timer
 enable bootc-semver-update.timer
 enable crio.service
