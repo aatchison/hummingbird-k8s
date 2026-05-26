@@ -117,9 +117,10 @@ Set `IMAGE_SOURCE=local` in `cluster.local.conf` when you're intentionally
 testing an unpublished image (a Containerfile change, a local cri-o patch,
 etc.). The deploy script will then drive the local
 `image-k8s-with-cloud-init` + `image-worker-with-cloud-init` Makefile
-targets before standing up the qcow2s. This needs `podman` and
-`bootc-image-builder` on the KVM host. For the registry-first path neither
-is required.
+targets before standing up the qcow2s. This needs `podman` AND
+`bootc-image-builder` on the KVM host. The registry-first path needs no
+`bootc-image-builder` (BIB); `podman` is still used (to pull the qcow2
+layer from GHCR).
 
 The Makefile is the operator entry point — every recipe delegates to a script
 under [`scripts/`](scripts/). Run `make help` for the full target list. See

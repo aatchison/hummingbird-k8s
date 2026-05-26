@@ -102,8 +102,10 @@ for `SWITCH_TO_GHCR=false`.
 ## What runs, in order
 
 1. **Validate config.** Hard-fail if `ENABLE_CLOUD_INIT != 1`,
-   `SSH_PUBKEY_FILE` missing, `IMAGE_SOURCE` invalid, etc.
-   `IMAGE_SOURCE` defaults to `ghcr` when unset.
+   `SSH_PUBKEY_FILE` missing, `IMAGE_SOURCE` invalid, etc. Defaults
+   fill in for the optional knobs — notably `IMAGE_SOURCE` falls
+   through to `ghcr` when unset (a one-line log notice records the
+   fall-through so the operator sees what was resolved).
 2. **Acquire images.** `podman pull` from GHCR (default
    `IMAGE_SOURCE=ghcr` — the registry-first golden path) or
    `make image-k8s-with-cloud-init image-worker-with-cloud-init`
