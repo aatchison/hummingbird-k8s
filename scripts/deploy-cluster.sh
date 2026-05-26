@@ -172,6 +172,17 @@ source "$CONFIG_PATH"
 # stays a valid power-user / fast-iteration choice (build fresh from
 # containers/k8s and containers/k8s-worker) — see cluster.example.conf
 # and docs/deploy-cluster.md. (#231)
+#
+# Track whether the operator set IMAGE_SOURCE explicitly so we can emit
+# a one-line stderr notice when we fall through to the default. Pre-#231
+# this was a hard-fail (`:?` form) that doubled as a guardrail; the
+# silent switch to a default could surprise operators upgrading on a
+# config that never had IMAGE_SOURCE in it. The notice is informational,
+# not a warning — `ghcr` is the documented default — but it makes the
+# resolution visible in the log so an operator who wanted `local` and
+# forgot to set it sees what happened. (#231 round-2 review M1.)
+_image_source_was_unset=0
+[[ -z "${IMAGE_SOURCE:-}" ]] && _image_source_was_unset=1
 : "${IMAGE_SOURCE:=ghcr}"
 
 # Defaults for optional knobs.
@@ -224,6 +235,15 @@ case "$IMAGE_SOURCE" in
 esac
 case "$AUTO_UPDATE_CP" in true|false) ;; *) fail "AUTO_UPDATE_CP must be true or false (got '$AUTO_UPDATE_CP')" ;; esac
 case "$SWITCH_TO_GHCR" in true|false) ;; *) fail "SWITCH_TO_GHCR must be true or false (got '$SWITCH_TO_GHCR')" ;; esac
+
+# If IMAGE_SOURCE wasn't in the operator's config (pre-#231 was a
+# `:?` hard-fail; #231 made `ghcr` the default), surface the resolution
+# in the log so an operator who forgot to set `local` isn't surprised
+# by a GHCR pull. Informational — `ghcr` is the documented default in
+# cluster.example.conf and docs/deploy-cluster.md. (#231 round-2 review M1.)
+if (( _image_source_was_unset )); then
+  log "IMAGE_SOURCE unset in $CONFIG_PATH — defaulting to 'ghcr' (set IMAGE_SOURCE=local for unpublished images; GHCR_TAG=${GHCR_TAG})"
+fi
 
 SSH_PUBKEY_CONTENT="$(< "$SSH_PUBKEY_FILE")"
 [[ -n "$SSH_PUBKEY_CONTENT" ]] || fail "SSH_PUBKEY_FILE is empty: $SSH_PUBKEY_FILE"

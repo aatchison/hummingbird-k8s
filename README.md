@@ -100,7 +100,8 @@ The shipped `cluster.example.conf` is registry-first by default
 (`IMAGE_SOURCE=ghcr`). `deploy-cluster.sh` also defaults to `ghcr` when
 `IMAGE_SOURCE` is unset, so a minimal config that only defines `CP_NAME`,
 `SSH_PUBKEY_FILE`, and `ENABLE_CLOUD_INIT=1` will pull from GHCR
-out-of-the-box.
+out-of-the-box. Building locally instead of pulling? See
+[Fast iteration](#fast-iteration-build-locally-instead-of-pulling-from-ghcr).
 
 Coming from `make k3s` / `make k8s` / `make workers`? See
 [Migration from pre-#216](#migration-from-pre-216).
