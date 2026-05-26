@@ -244,7 +244,14 @@ CP_USER_DATA="$(mktemp -t hbird-cp-userdata-XXXXXX.yaml)"
       printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s:%s ]\n' "$GHCR_TAG"
     fi
     if [[ "$AUTO_UPDATE_CP" = "true" ]]; then
-      printf '  - [ systemctl, enable, --now, bootc-fetch-apply-updates.timer ]\n'
+      # Enable the semver-aware updater (this PR's mechanism) — the image's
+      # preset already enables it on a fresh boot, but a runtime `systemctl
+      # enable --now` is the belt-and-suspenders path that also makes the
+      # timer fire its OnBootSec=15min window immediately rather than after
+      # the next reboot. The legacy bootc-fetch-apply-updates.timer is
+      # disabled in the new preset; re-enabling it here would fight the
+      # operator's "advance only on new semver tags" intent.
+      printf '  - [ systemctl, enable, --now, bootc-semver-update.timer ]\n'
     fi
     if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
       # Re-read the drop-in cloud-init just wrote, then restart the timer
