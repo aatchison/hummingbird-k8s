@@ -58,7 +58,7 @@ jobs:
     # Mirrors `make test-lib` for local/CI parity.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: bats unit tests for lib/
         run: |
           podman run --rm -v "${{ github.workspace }}:/repo:Z" -w /repo \
@@ -73,7 +73,7 @@ jobs:
     # container as unit-tests-lib.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: bats unit tests for scripts/
         run: |
           podman run --rm -v "${{ github.workspace }}:/repo:Z" -w /repo \
@@ -112,7 +112,7 @@ jobs:
     # containerfile-build matrix below.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install bats
         run: |
           sudo apt-get update
