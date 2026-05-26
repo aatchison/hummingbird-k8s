@@ -90,6 +90,28 @@ setup() {
     return 1
   }
 
+  # Extract the IMAGE_SOURCE default+validation block for #231 tests.
+  # Spans from the IMAGE_SOURCE default-assign line through the matching
+  # `esac` of the validation case. The block we want is the single line
+  # `: "${IMAGE_SOURCE:=ghcr}"` plus the multi-line `case "$IMAGE_SOURCE"
+  # in ... esac` that follows.
+  #
+  # awk regex avoids `{`/`}` literals (some awk flavors treat them as
+  # interval quantifiers — busybox-awk and POSIX-strict gawk both reject
+  # `\{` in a regex). We anchor on the unique substring `IMAGE_SOURCE:=ghcr`
+  # via `index()` instead, then on the literal `case "$IMAGE_SOURCE"` line
+  # to start emitting the case block.
+  awk '
+    index($0, "IMAGE_SOURCE:=ghcr") { capture=1; print; next }
+    capture && $0 ~ /^case "\$IMAGE_SOURCE"/ { in_case=1; print; next }
+    capture && in_case { print }
+    capture && in_case && $0 ~ /^esac$/ { exit }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/image-source.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/image-source.snippet" ] || {
+    echo "FATAL: failed to extract IMAGE_SOURCE block from ${SCRIPT}" >&2
+    return 1
+  }
+
   cat > "$HARNESS" <<'HARNESS_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -248,4 +270,115 @@ EOF
   # Runcmd reloads + restarts the timer so the override takes effect this boot.
   [[ "$output" == *"systemctl, daemon-reload"* ]]
   [[ "$output" == *"systemctl, restart, bootc-semver-update.timer"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# IMAGE_SOURCE default + validation (#231 — registry-first golden path)
+# ---------------------------------------------------------------------------
+#
+# Pre-#231 deploy-cluster.sh hard-required IMAGE_SOURCE in cluster.local.conf.
+# #231 made `ghcr` the fall-through default so a workstation operator can
+# `make deploy-cluster` against a minimal config with no IMAGE_SOURCE line.
+# `local` is still accepted as a power-user / fast-iteration choice.
+#
+# Extracted block is the literal `: "${IMAGE_SOURCE:=ghcr}"` line plus the
+# `case "$IMAGE_SOURCE" in ghcr|local) ;; *) fail ...` validation that
+# follows. Keeping the snippet a verbatim extract (not a paraphrase) means
+# any future drift in the script breaks these tests loudly.
+
+@test "deploy-cluster: IMAGE_SOURCE unset defaults to ghcr (#231)" {
+  local driver="${BATS_TEST_TMPDIR}/driver-default.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+fail() { printf 'fail: %s\n' "\$*" >&2; exit 1; }
+# Don't set IMAGE_SOURCE — that's the whole point of this test.
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/image-source.snippet"
+printf 'IMAGE_SOURCE=%s\n' "\$IMAGE_SOURCE"
+EOF
+  chmod +x "$driver"
+  run env -u IMAGE_SOURCE bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"IMAGE_SOURCE=ghcr"* ]]
+}
+
+@test "deploy-cluster: IMAGE_SOURCE=local still accepted (#231 regression)" {
+  local driver="${BATS_TEST_TMPDIR}/driver-local.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+fail() { printf 'fail: %s\n' "\$*" >&2; exit 1; }
+IMAGE_SOURCE=local
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/image-source.snippet"
+printf 'IMAGE_SOURCE=%s\n' "\$IMAGE_SOURCE"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"IMAGE_SOURCE=local"* ]]
+}
+
+@test "deploy-cluster: IMAGE_SOURCE=ghcr explicit still accepted (#231)" {
+  local driver="${BATS_TEST_TMPDIR}/driver-ghcr.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+fail() { printf 'fail: %s\n' "\$*" >&2; exit 1; }
+IMAGE_SOURCE=ghcr
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/image-source.snippet"
+printf 'IMAGE_SOURCE=%s\n' "\$IMAGE_SOURCE"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"IMAGE_SOURCE=ghcr"* ]]
+}
+
+@test "deploy-cluster: IMAGE_SOURCE= (set-but-empty) defaults to ghcr (#231 pin colon semantics)" {
+  # The script uses `: "${IMAGE_SOURCE:=ghcr}"` (colon form), which treats
+  # both unset AND set-but-empty as "fall through to the default". A future
+  # refactor to `${IMAGE_SOURCE=ghcr}` (no colon) would silently regress on
+  # the empty case — an operator with `IMAGE_SOURCE=` in cluster.local.conf
+  # would land at validation with IMAGE_SOURCE="" and hit the `garbage`
+  # branch's failure. This test pins the colon semantics so that regression
+  # breaks loudly. (#231 round-2 review H1.)
+  local driver="${BATS_TEST_TMPDIR}/driver-empty.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+fail() { printf 'fail: %s\n' "\$*" >&2; exit 1; }
+# Mirror a cluster.local.conf line of literal \`IMAGE_SOURCE=\` (empty rvalue).
+IMAGE_SOURCE=""
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/image-source.snippet"
+printf 'IMAGE_SOURCE=%s\n' "\$IMAGE_SOURCE"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"IMAGE_SOURCE=ghcr"* ]]
+  # Must not have hit the validation fail-branch (empty != 'ghcr' or 'local').
+  [[ "$output" != *"fail:"* ]]
+}
+
+@test "deploy-cluster: IMAGE_SOURCE=garbage rejected (#231)" {
+  local driver="${BATS_TEST_TMPDIR}/driver-garbage.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+fail() { printf 'fail: %s\n' "\$*" >&2; exit 1; }
+IMAGE_SOURCE=garbage
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/image-source.snippet"
+printf 'should-not-reach\n'
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"fail:"* ]]
+  [[ "$output" == *"IMAGE_SOURCE must be 'ghcr' or 'local'"* ]]
+  [[ "$output" != *"should-not-reach"* ]]
 }

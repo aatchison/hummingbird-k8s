@@ -85,8 +85,9 @@ Sizing guidance:
 
 ## Quick start (operator)
 
-On a freshly-set-up KVM host (libvirtd running, `qemu:///system` reachable,
-`podman` + `bootc-image-builder` available):
+**Registry-first is the golden path.** On a freshly-set-up KVM host
+(libvirtd running, `qemu:///system` reachable, `podman` available), pull
+the published images straight from GHCR — no local build needed:
 
 ```bash
 make help                                                  # cheatsheet of all targets
@@ -95,18 +96,31 @@ sudo make deploy-cluster  CONFIG=cluster.local.conf        # 1 CP + N workers, e
 make verify-all                                            # encryption + hardening + app-deploy smoke test
 ```
 
+The shipped `cluster.example.conf` is registry-first by default
+(`IMAGE_SOURCE=ghcr`). `deploy-cluster.sh` also defaults to `ghcr` when
+`IMAGE_SOURCE` is unset, so a minimal config that only defines `CP_NAME`,
+`SSH_PUBKEY_FILE`, and `ENABLE_CLOUD_INIT=1` will pull from GHCR
+out-of-the-box. Building locally instead of pulling? See
+[Fast iteration](#fast-iteration-build-locally-instead-of-pulling-from-ghcr).
+
 Coming from `make k3s` / `make k8s` / `make workers`? See
 [Migration from pre-#216](#migration-from-pre-216).
 
 `make deploy-cluster` is the only supported way to stand up a cluster. It
 drives the full `image -> qcow2 -> virt-install -> kubeadm join` flow from a
 single config file (`cluster.local.conf`), with cloud-init carrying per-VM
-dynamic state (hostname, worker join token, post-boot runcmd). Two image
-sources are supported:
+dynamic state (hostname, worker join token, post-boot runcmd).
 
-- `IMAGE_SOURCE=ghcr` (default) — pulls the published GHCR images.
-- `IMAGE_SOURCE=local` — builds fresh from `containers/k8s` +
-  `containers/k8s-worker` in this repo.
+### Fast iteration: build locally instead of pulling from GHCR
+
+Set `IMAGE_SOURCE=local` in `cluster.local.conf` when you're intentionally
+testing an unpublished image (a Containerfile change, a local cri-o patch,
+etc.). The deploy script will then drive the local
+`image-k8s-with-cloud-init` + `image-worker-with-cloud-init` Makefile
+targets before standing up the qcow2s. This needs `podman` AND
+`bootc-image-builder` on the KVM host. The registry-first path needs no
+`bootc-image-builder` (BIB); `podman` is still used (to pull the qcow2
+layer from GHCR).
 
 The Makefile is the operator entry point — every recipe delegates to a script
 under [`scripts/`](scripts/). Run `make help` for the full target list. See
