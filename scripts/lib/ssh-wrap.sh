@@ -79,7 +79,24 @@
 #                               (/tmp/hbird-dryrun) instead of actually
 #                               calling scp. Lets bats exercise the
 #                               CONFIG-rewrite path without a working
-#                               remote.
+#                               remote. Also used by the operator-pubkey
+#                               scp branch (#248).
+#
+# Operator workstation pubkey (#248):
+#   When the local CONFIG declares `SSH_PUBKEY_FILE=`, that path is
+#   resolved against the OPERATOR's workstation — but the script runs on
+#   the KVM host, where the same absolute path may point at a DIFFERENT
+#   pubkey (the KVM host's own key, not the operator's). Result: the CP
+#   gets the KVM host's key baked, the operator can't SSH directly from
+#   their workstation.
+#
+#   Fix (Model 2, additive — no private keys travel): in addition to scp'ing
+#   the CONFIG, also scp the operator's pubkey to the remote tempdir and
+#   forward its remote path via `HBIRD_OPERATOR_PUBKEY_FILE`. The deploy
+#   script ADDS that path to `SSH_PUBKEY_FILES` (colon-separated), so the
+#   CP ends up with BOTH the KVM host's key (used by the script to SSH to
+#   the freshly-booted CP) AND the operator's workstation key (used by the
+#   operator for direct access). See issue #248.
 
 # Default for the remote checkout path. Operator can override via the
 # environment or cluster.local.conf. The remote MUST have a git clone
@@ -100,6 +117,7 @@ HBIRD_SSH_WRAP_ALLOWED_ENV=(
   CP_NAME WORKER_NAMES POOL_DIR
   VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS
   HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_REMOTE_REPO
+  HBIRD_OPERATOR_PUBKEY_FILE
 )
 
 # hbird_ssh_wrap_maybe_reexec "$0" "$@"
@@ -150,6 +168,13 @@ hbird_ssh_wrap_maybe_reexec() {
   local env_args=()
   local v i
   for v in "${HBIRD_SSH_WRAP_ALLOWED_ENV[@]}"; do
+    # HBIRD_OPERATOR_PUBKEY_FILE is shim-managed (#248): the shim derives
+    # it from the scp'd pubkey path below and appends it AFTER the
+    # visible-env log line. Skip it here so a stale value from the
+    # operator's shell doesn't end up double-forwarded or in the log.
+    # The var stays in the allowlist (and in the bats pin test) so that
+    # `sudo env` accepts the forwarded value on the remote.
+    [[ "$v" == HBIRD_OPERATOR_PUBKEY_FILE ]] && continue
     if [[ -n "${!v+x}" ]]; then
       env_args+=("${v}=${!v}")
     fi
@@ -158,8 +183,8 @@ hbird_ssh_wrap_maybe_reexec() {
   # If CONFIG is a local file, scp it to a tempdir on the remote and
   # rewrite the CONFIG entry in env_args so the remote script sources
   # the copied file.
+  local remote_tmp="" remote_config_path=""
   if [[ -n "${CONFIG:-}" && -f "$CONFIG" ]]; then
-    local remote_tmp remote_config_path
     if [[ "${HBIRD_SSH_WRAP_DRY_RUN_SCP:-0}" = 1 ]]; then
       remote_tmp="/tmp/hbird-dryrun"
       remote_config_path="${remote_tmp}/$(basename "$CONFIG")"
@@ -184,21 +209,41 @@ hbird_ssh_wrap_maybe_reexec() {
     for i in "${!env_args[@]}"; do
       [[ "${env_args[i]}" == CONFIG=* ]] && env_args[i]="CONFIG=${remote_config_path}"
     done
+
+    # #248: also scp the operator's workstation pubkey to the remote
+    # tempdir and forward its remote path via HBIRD_OPERATOR_PUBKEY_FILE.
+    # The deploy script ADDS this path to SSH_PUBKEY_FILES so the CP
+    # gets BOTH the KVM host's key (used by the script to SSH to the
+    # freshly-booted CP) AND the operator's key (used by the operator
+    # for direct workstation->CP SSH). No private keys travel.
+    #
+    # Parse SSH_PUBKEY_FILE out of the local CONFIG in a subshell so we
+    # don't pollute the parent env. The operator might also set
+    # SSH_PUBKEY_FILE in their shell env (cluster.example.conf doesn't
+    # encourage this, but ":${SSH_PUBKEY_FILE:-}" honors both).
+    local local_pubkey_file=""
+    local_pubkey_file="$(
+      bash -c "set +u; source $(printf '%q' "$CONFIG") >/dev/null 2>&1 || true; printf '%s' \"\${SSH_PUBKEY_FILE:-}\""
+    )" || true
+    if [[ -n "$local_pubkey_file" && -r "$local_pubkey_file" ]]; then
+      local remote_pubkey_path
+      remote_pubkey_path="${remote_tmp}/$(basename "$local_pubkey_file")"
+      if [[ "${HBIRD_SSH_WRAP_DRY_RUN_SCP:-0}" = 1 ]]; then
+        echo "SCP_WOULD_RUN: ${local_pubkey_file} -> ${KVM_HOST}:${remote_pubkey_path}" >&2
+      else
+        if ! scp "$local_pubkey_file" "${KVM_HOST}:${remote_pubkey_path}"; then
+          echo "[${script_basename}] scp of operator pubkey to ${KVM_HOST}:${remote_pubkey_path} failed" >&2
+          exit 1
+        fi
+      fi
+      # Stash for the post-log append below (so it stays out of the
+      # operator-facing visible-env log line — it's a shim-internal var,
+      # not something the operator set).
+      HBIRD_OPERATOR_PUBKEY_FILE="$remote_pubkey_path"
+      export HBIRD_OPERATOR_PUBKEY_FILE
+    fi
   fi
 
-  # Properly quote every env-arg and positional arg using printf %q.
-  # This closes the round-1 command-injection HIGH finding: values
-  # containing spaces, quotes, or shell metas now reach the remote
-  # bash unmangled.
-  local quoted_env=""
-  for v in "${env_args[@]}"; do
-    # env_args entries look like NAME=value; split on first '=' so we
-    # can quote NAME and value independently. NAME is allowlisted so
-    # never contains metachars in practice, but quote it anyway.
-    local name="${v%%=*}"
-    local val="${v#*=}"
-    quoted_env+="$(printf '%q=%q ' "$name" "$val")"
-  done
   # Rewrite any positional arg matching the local CONFIG path to the
   # scp'd remote temp path. This closes #245: scripts like
   # deploy-cluster.sh take CONFIG as a positional arg via the Makefile
@@ -223,6 +268,29 @@ hbird_ssh_wrap_maybe_reexec() {
   # Resolve the remote script path against the operator's checkout.
   local remote_script="${HBIRD_REMOTE_REPO}/scripts/${script_basename}"
   echo "[${script_basename}] re-execing on ${KVM_HOST}:${remote_script} (env: ${env_args[*]:-(empty)})" >&2
+
+  # #248: append the operator-pubkey forwarding var AFTER the
+  # operator-facing visible-env log line above. It's a shim-internal
+  # var (not something the operator set), so it'd be noise in the log,
+  # but it MUST be on the remote command line so deploy-cluster.sh sees
+  # it. The remote pubkey path itself is benign (no key material in the
+  # path; the .pub content lives in the scp'd file at that path).
+  if [[ -n "${HBIRD_OPERATOR_PUBKEY_FILE:-}" ]]; then
+    env_args+=("HBIRD_OPERATOR_PUBKEY_FILE=${HBIRD_OPERATOR_PUBKEY_FILE}")
+  fi
+
+  # Properly quote every env-arg using printf %q. This closes the
+  # round-1 command-injection HIGH finding: values containing spaces,
+  # quotes, or shell metas now reach the remote bash unmangled.
+  local quoted_env=""
+  for v in "${env_args[@]}"; do
+    # env_args entries look like NAME=value; split on first '=' so we
+    # can quote NAME and value independently. NAME is allowlisted so
+    # never contains metachars in practice, but quote it anyway.
+    local name="${v%%=*}"
+    local val="${v#*=}"
+    quoted_env+="$(printf '%q=%q ' "$name" "$val")"
+  done
 
   # Test hook: print the would-be command and exit. Lets bats assert the
   # exact env-var allowlist + quoting behavior without spawning real ssh.
