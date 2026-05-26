@@ -297,7 +297,7 @@ For that, the orchestrated complement is
 `make update-cluster`:
 
 ```bash
-sudo make update-cluster CONFIG=cluster.local.conf
+make update-cluster CONFIG=cluster.local.conf
 ```
 
 It walks the cluster one node at a time — CP first (no drain, brief

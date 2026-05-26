@@ -92,7 +92,7 @@ the published images straight from GHCR — no local build needed:
 ```bash
 make help                                                  # cheatsheet of all targets
 cp cluster.example.conf cluster.local.conf                 # edit per host
-sudo make deploy-cluster  CONFIG=cluster.local.conf        # 1 CP + N workers, end-to-end
+make deploy-cluster       CONFIG=cluster.local.conf        # 1 CP + N workers, end-to-end
 make verify-all                                            # encryption + hardening + app-deploy smoke test
 ```
 
@@ -150,8 +150,8 @@ is the mapping:
 | Old command | Replacement |
 | --- | --- |
 | `make k3s` | No replacement. The k3s flavor is retired. Existing k3s VMs keep running, but the `ghcr.io/aatchison/hummingbird-k3s` registry is now **frozen** — pin a specific tag, or rebase the VM to `hummingbird-k8s`. |
-| `make k8s` | `sudo make deploy-cluster CONFIG=cluster.local.conf` (CP-only: set `WORKER_NAMES=()` in the config). |
-| `make workers COUNT=2` | Set `WORKER_NAMES=(worker-1 worker-2)` in `cluster.local.conf`, then `sudo make deploy-cluster CONFIG=cluster.local.conf`. |
+| `make k8s` | `make deploy-cluster CONFIG=cluster.local.conf` (CP-only: set `WORKER_NAMES=()` in the config). |
+| `make workers COUNT=2` | Set `WORKER_NAMES=(worker-1 worker-2)` in `cluster.local.conf`, then `make deploy-cluster CONFIG=cluster.local.conf`. |
 | `make spawn` / `sudo bash scripts/redo-*.sh` | Removed. Use `make deploy-cluster` (initial deploy) and `make update-cluster` (rolling image bump). |
 | `CP_VM_NAME=` / `VM_NAME=` env var | Replaced by `CP_NAME=` (legacy names still honored as deprecated aliases, with a stderr warning — see PR #219). |
 
@@ -252,8 +252,8 @@ diagnostics.
 ```bash
 # Deploy (hybrid bib + cloud-init, the only supported path)
 cp cluster.example.conf cluster.local.conf            # edit it
-sudo make deploy-cluster  CONFIG=cluster.local.conf
-sudo make destroy-cluster CONFIG=cluster.local.conf
+make deploy-cluster       CONFIG=cluster.local.conf
+make destroy-cluster      CONFIG=cluster.local.conf
 
 # Tear down stragglers (any hummingbird-* libvirt domain on this host)
 sudo make clean-vms
@@ -277,14 +277,14 @@ the update.
 ```bash
 # Full rolling update: CP first (no drain — brief apiserver outage), then
 # each worker drained -> upgraded -> uncordoned in WORKER_NAMES order.
-sudo make update-cluster  CONFIG=cluster.local.conf
+make update-cluster       CONFIG=cluster.local.conf
 
 # Skip the CP; only roll the workers (useful if CP is already on latest).
-sudo make update-workers  CONFIG=cluster.local.conf
+make update-workers       CONFIG=cluster.local.conf
 
 # Touch exactly one node — useful for spot-fixing a stuck worker or for
 # canarying a new image against a single node before rolling the rest.
-sudo make update-node     CONFIG=cluster.local.conf NODE=hbird-w1
+make update-node          CONFIG=cluster.local.conf NODE=hbird-w1
 ```
 
 Heads-up: single-CP means the apiserver is unavailable for ~60-120s while

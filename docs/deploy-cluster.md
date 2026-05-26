@@ -6,7 +6,7 @@ entry point. One config file → one CP + N workers, end-to-end:
 ```bash
 cp cluster.example.conf cluster.local.conf
 $EDITOR cluster.local.conf
-sudo make deploy-cluster CONFIG=cluster.local.conf
+make deploy-cluster CONFIG=cluster.local.conf
 ```
 
 This is the only supported way to stand up a cluster after #216 retired
@@ -61,10 +61,13 @@ The KVM host that will run the deploy needs:
 cp cluster.example.conf cluster.local.conf
 $EDITOR cluster.local.conf
 
-# 2. Deploy. CONFIG= is mandatory.
-sudo make deploy-cluster CONFIG=cluster.local.conf
+# 2. Deploy. CONFIG= is mandatory. No `sudo` required (issue #233);
+#    the script re-execs on $KVM_HOST via SSH when set, or probes for
+#    local root and prints a hint if neither path is available.
+make deploy-cluster CONFIG=cluster.local.conf
 
-# Equivalent direct invocation:
+# Equivalent direct invocation (the script handles privilege escalation
+# itself — see docs/deploy-cluster.md for the three no-op paths):
 sudo bash scripts/deploy-cluster.sh cluster.local.conf
 ```
 

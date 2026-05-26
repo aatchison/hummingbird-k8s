@@ -6,13 +6,14 @@ forward to a new image" entry point. It reads the same
 cluster one node at a time:
 
 ```bash
-# On the KVM host:
-sudo make update-cluster CONFIG=cluster.local.conf
-
 # From a client laptop (since C3 / #232) — re-execs on the KVM host
 # via SSH; client never needs sudo or libvirt locally. See
 # "Remote KVM-host operation" below for the full picture.
 KVM_HOST=geary make update-cluster CONFIG=cluster.local.conf
+
+# On the KVM host (post-#233: the Makefile recipe no longer prefixes
+# sudo, so on-host operators either run as root or prepend it themselves):
+sudo make update-cluster CONFIG=cluster.local.conf
 ```
 
 It complements — does not replace — the per-VM
@@ -186,7 +187,7 @@ before reaching `ssh` / `kubectl`.
 Skip the CP entirely; only roll workers.
 
 ```bash
-sudo make update-workers CONFIG=cluster.local.conf
+make update-workers CONFIG=cluster.local.conf
 # or directly:
 sudo -E bash scripts/update-cluster.sh --workers-only
 ```
@@ -203,7 +204,7 @@ Update exactly one node — either the CP or a single worker.
 
 ```bash
 # Update one specific worker:
-sudo make update-node CONFIG=cluster.local.conf NODE=hbird-w1
+make update-node CONFIG=cluster.local.conf NODE=hbird-w1
 
 # Or directly:
 sudo -E bash scripts/update-cluster.sh --node=hbird-w1
@@ -678,7 +679,7 @@ ssh root@<cp-ip> 'kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon <node
 
 # 4. Re-run the rolling update from where you left off. --node=NAME
 #    lets you resume on a single node without re-rolling the rest.
-sudo make update-node CONFIG=cluster.local.conf NODE=<node>
+make update-node CONFIG=cluster.local.conf NODE=<node>
 ```
 
 If the script aborted before drain, no recovery is needed beyond
@@ -808,7 +809,7 @@ make update-cluster CONFIG=cluster.local.conf \
   FLAGS='--dry-run --start-from=hbird-w2 --parallel=2 --no-delete-emptydir-data'
 
 # Resume an aborted roll, best-effort across remaining workers:
-sudo make update-cluster CONFIG=cluster.local.conf \
+make update-cluster CONFIG=cluster.local.conf \
   FLAGS='--start-from=hbird-w2 --continue-on-error'
 ```
 
