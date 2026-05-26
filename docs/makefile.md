@@ -144,20 +144,24 @@ test surface.
 
 ## Variables
 
-| Variable        | Default                       | Used by                       |
-| ---             | ---                           | ---                           |
-| `CONFIG`        | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig` |
-| `NODE`          | (required for `update-node`)  | `update-node`                 |
-| `FLAGS`         | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
-| `ARGS`          | empty                         | `kubectl`                     |
-| `POOL_DIR`      | `/var/lib/libvirt/images`     | `clean-vms`                   |
-| `KVM_HOST`      | unset                         | `kubectl` / `nodes`           |
-| `IMAGE_TAG`     | `latest`                      | `push-image-k8s`, `push-image-worker`, `push-image-all` |
-| `GHCR_REGISTRY` | `ghcr.io/aatchison`           | `push-image-*` (override for forks/mirrors) |
+| Variable            | Default                       | Used by                       |
+| ---                 | ---                           | ---                           |
+| `CONFIG`            | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig` |
+| `NODE`              | (required for `update-node`)  | `update-node`                 |
+| `FLAGS`             | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
+| `ARGS`              | empty                         | `kubectl`                     |
+| `POOL_DIR`          | `/var/lib/libvirt/images`     | `clean-vms`                   |
+| `KVM_HOST`          | unset                         | `kubectl` / `nodes` — and since C3 (#232) also `deploy-cluster`, `destroy-cluster`, `update-cluster`, `spawn-workers` (re-exec on the KVM host via SSH; client needs only `ssh`, no local `sudo`). See [`docs/deploy-cluster.md`](deploy-cluster.md#remote-kvm-host-operation-kvm_host). |
+| `HBIRD_REMOTE_REPO` | `~/hummingbird-k8s`           | Path on `$KVM_HOST` to the remote git checkout of hummingbird-k8s. Used by the C3 SSH-wrap shim — when the shim fires it `cd`s here and execs `bash scripts/<name>.sh` from disk. Override when the checkout lives somewhere other than `$HOME/hummingbird-k8s`. See [`docs/deploy-cluster.md`](deploy-cluster.md#hbird_remote_repo-override). |
+| `IMAGE_TAG`         | `latest`                      | `push-image-k8s`, `push-image-worker`, `push-image-all` |
+| `GHCR_REGISTRY`     | `ghcr.io/aatchison`           | `push-image-*` (override for forks/mirrors) |
 
 Any other env vars honored by `cluster.local.conf` / `config.local.sh`
 (e.g. `VM_USER`, `APISERVER_EXTRA_SANS`, `STORAGE_DRIVER`, `PODMAN_ROOT`,
 `PODMAN_RUNROOT`) flow through to the underlying scripts unchanged.
+These knobs are also on the SSH-wrap forwarding allowlist (since #232
+round-2) so they reach the remote when `KVM_HOST` triggers the
+re-exec.
 
 ## Version pinning
 
