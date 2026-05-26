@@ -439,6 +439,31 @@ git push --tags
 The publish job refuses to run if the tagged commit isn't reachable from
 `main`, so accidental tags on a topic branch will not produce a release.
 
+### Publishing images locally (workstation path)
+
+The Makefile also exposes `make push-image-*` for operators who want to
+cut an ad-hoc tag from a workstation without going through a tag push
+(handy for pre-release validation, or when iterating against a hosted
+KVM host that pulls from GHCR rather than building locally). The build
+itself runs **rootless** as the invoking user.
+
+```bash
+gh auth login                                # one-time, if not already
+podman login ghcr.io                         # GH_TOKEN with write:packages
+
+make image-k8s                               # smoke-build (no push)
+make push-image-k8s    IMAGE_TAG=v0.1.x      # tag + push CP image
+make push-image-worker IMAGE_TAG=v0.1.x      # tag + push worker image
+make push-image-all    IMAGE_TAG=v0.1.x      # both
+```
+
+`IMAGE_TAG` defaults to `latest`; override per release. `GHCR_REGISTRY`
+defaults to `ghcr.io/aatchison` — override for forks/mirrors. The tagged
+release workflow above is still the canonical signed-+-SBOM path; the
+`push-image-*` targets are the unsigned local equivalent for fast
+iteration. See [`docs/makefile.md`](docs/makefile.md) for the full
+variable surface.
+
 ## Operations
 
 Day-2 documentation lives under [`docs/`](docs):

@@ -18,13 +18,31 @@ make verify-all                                # verify-encryption + verify-hard
 ```
 
 Stand-alone image builds (no qcow2, no VM — fast iteration on Containerfile
-changes, mirrors what `pr-validate.yml` does):
+changes, mirrors what `pr-validate.yml` does). These run **rootless** as
+the invoking user; no `sudo` is needed because the recipes only call
+`podman build` (qcow2 + libvirt steps that DO need root live behind
+`make deploy-cluster`):
 
 ```bash
-make image-k8s            # control plane OCI image
-make image-worker         # worker template OCI image
+make image-k8s            # control plane OCI image (rootless)
+make image-worker         # worker template OCI image (rootless)
 make image-all            # both
 ```
+
+Publish locally-built images to GHCR (companion to the tag-driven GHA
+workflow under `.github/workflows/build-*.yml`; useful for cutting an
+ad-hoc tag from a workstation without going through a tag push):
+
+```bash
+gh auth login                                       # if not already
+podman login ghcr.io                                # GH_TOKEN with write:packages
+make push-image-k8s    IMAGE_TAG=v0.1.x             # tag + push CP image
+make push-image-worker IMAGE_TAG=v0.1.x             # tag + push worker image
+make push-image-all    IMAGE_TAG=v0.1.x             # both
+```
+
+`IMAGE_TAG` defaults to `latest`; override per release. `GHCR_REGISTRY`
+defaults to `ghcr.io/aatchison` — override for forks/mirrors.
 
 Ad-hoc `kubectl` from the client (needs `KVM_HOST` set, see `config.example.sh`):
 
@@ -68,14 +86,16 @@ test surface.
 
 ## Variables
 
-| Variable   | Default                       | Used by                       |
-| ---        | ---                           | ---                           |
-| `CONFIG`   | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig` |
-| `NODE`     | (required for `update-node`)  | `update-node`                 |
-| `FLAGS`    | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
-| `ARGS`     | empty                         | `kubectl`                     |
-| `POOL_DIR` | `/var/lib/libvirt/images`     | `clean-vms`                   |
-| `KVM_HOST` | unset                         | `kubectl` / `nodes`           |
+| Variable        | Default                       | Used by                       |
+| ---             | ---                           | ---                           |
+| `CONFIG`        | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig` |
+| `NODE`          | (required for `update-node`)  | `update-node`                 |
+| `FLAGS`         | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
+| `ARGS`          | empty                         | `kubectl`                     |
+| `POOL_DIR`      | `/var/lib/libvirt/images`     | `clean-vms`                   |
+| `KVM_HOST`      | unset                         | `kubectl` / `nodes`           |
+| `IMAGE_TAG`     | `latest`                      | `push-image-k8s`, `push-image-worker`, `push-image-all` |
+| `GHCR_REGISTRY` | `ghcr.io/aatchison`           | `push-image-*` (override for forks/mirrors) |
 
 Any other env vars honored by `cluster.local.conf` / `config.local.sh`
 (e.g. `VM_USER`, `APISERVER_EXTRA_SANS`, `STORAGE_DRIVER`, `PODMAN_ROOT`,
