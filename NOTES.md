@@ -149,3 +149,10 @@ they collided with `deploy-cluster`'s operator-chosen names, hardcoded
 operator-specific qcow2 paths (the geary-host-local pool), and carried CI cost for
 a flavor that was no longer deployed. `make deploy-cluster` is now the
 single supported entry point.
+
+PR #219 followed up by documenting the `ghcr.io/aatchison/hummingbird-k3s`
+and `hummingbird-k3s-worker` GHCR packages as **deprecated** (frozen,
+no further tags). The operator-side closeout (push a `:deprecated` tag
+pointing at the last good image, update the GHCR package description,
+mark the package archived in the UI) is tracked in #226 and documented
+in [`docs/k3s-ghcr-deprecation.md`](docs/k3s-ghcr-deprecation.md).

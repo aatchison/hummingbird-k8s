@@ -176,9 +176,25 @@ maintain both.
 `ghcr.io/aatchison/hummingbird-k3s-worker` are **frozen** as of #216.
 No further tags will be cut. Existing tags remain pullable so live
 deploys keep working, but the registry is no longer receiving security
-updates or bootc-base bumps. Operators on k3s should rebase their VMs
-to `hummingbird-k8s` via `bootc switch` plus a fresh deploy through
-`make deploy-cluster`.
+updates or bootc-base bumps.
+
+To find the last good build, look for the explicit `:deprecated` tag
+on either package — it points at the final pre-deprecation image and
+is the recommended pin for any operator who can't migrate immediately:
+
+```bash
+skopeo inspect docker://ghcr.io/aatchison/hummingbird-k3s:deprecated
+skopeo inspect docker://ghcr.io/aatchison/hummingbird-k3s-worker:deprecated
+```
+
+`:latest` on both k3s packages is also frozen at the last pre-#219
+image and won't move again — but `:deprecated` is the
+explicit, intent-signalling pin and is preferred. Operators on k3s
+should rebase their VMs to `hummingbird-k8s` via `bootc switch` plus a
+fresh deploy through `make deploy-cluster`. See
+[`docs/k3s-ghcr-deprecation.md`](docs/k3s-ghcr-deprecation.md) for the
+operator-side runbook (`skopeo copy` to apply the `:deprecated` tag,
+GHCR package-description update, archive checkbox).
 
 ## Useful commands
 

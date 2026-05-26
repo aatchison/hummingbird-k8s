@@ -62,6 +62,27 @@ the post-boot health-check-rollback timer fires after the next reboot
 and can auto-roll-back if the cluster comes up unhealthy. See
 `docs/rollback.md`.
 
+### k3s flavor (deprecated)
+
+The `ghcr.io/aatchison/hummingbird-k3s` and
+`ghcr.io/aatchison/hummingbird-k3s-worker` packages are **frozen** as of
+PR #216 and tagged `:deprecated` (see PR #219 +
+[`docs/k3s-ghcr-deprecation.md`](k3s-ghcr-deprecation.md)). The semver
+timer on a k3s VM will keep resolving the highest semver tag already
+pushed — but no new tags will be cut, so the timer effectively no-ops
+forever. Operators still running k3s VMs have two reasonable paths
+forward:
+
+- **Pin and stop tracking.** Disable the timer
+  (`systemctl disable --now bootc-semver-update.timer`) and either
+  `bootc switch ghcr.io/aatchison/hummingbird-k3s:deprecated` to
+  pin the final image explicitly, or leave the VM on its existing
+  semver pin. Either way, no further updates flow.
+- **Migrate to `hummingbird-k8s`.** `bootc switch` to
+  `ghcr.io/aatchison/hummingbird-k8s` and re-deploy the cluster via
+  `make deploy-cluster` so the upstream-kubeadm CP/worker layout
+  takes over. This is the recommended path.
+
 ## Configuration
 
 Each image bakes a flavor-specific default into `/etc/hummingbird/bootc-update.env`:
