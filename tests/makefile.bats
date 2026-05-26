@@ -31,6 +31,9 @@
 #   17. push-image-{k8s,worker} runs a `podman login --get-login` preflight
 #       against the registry host extracted from GHCR_REGISTRY, with a
 #       diagnostic that names the host the operator must `podman login` to.
+#   18. Cluster-lifecycle recipes (deploy-cluster, destroy-cluster,
+#       update-cluster, update-workers, update-node) do NOT prefix `sudo`
+#       (issue #233 — sudo moved into the scripts via the SSH wrap).
 
 setup() {
   # All recipes are anchored at repo root. tests/ lives one level down, so
@@ -332,4 +335,26 @@ make_dry() {
   [ -n "$build_line" ] && [ -n "$tag_line" ] && [ -n "$push_line" ]
   [ "$build_line" -lt "$tag_line" ]
   [ "$tag_line"   -lt "$push_line" ]
+}
+
+@test "18. cluster-lifecycle recipes do not prefix sudo (issue #233)" {
+  # Post-#233: the Makefile no longer prefixes `sudo` on the recipes for
+  # deploy-cluster/destroy-cluster/update-cluster/update-workers/
+  # update-node. Sudo happens inside the scripts via the C3 SSH wrap
+  # (scripts/lib/ssh-wrap.sh) — re-exec'd remotely on $KVM_HOST, or
+  # probed locally when running on the KVM host directly.
+  for t in deploy-cluster destroy-cluster update-cluster update-workers; do
+    make_dry "$t" CONFIG=cluster.example.conf
+    if printf '%s\n' "$output" | grep -E '^[[:space:]]*sudo([[:space:]]|$)' >/dev/null; then
+      echo "recipe for $t still contains a leading sudo:" >&2
+      echo "$output" >&2
+      return 1
+    fi
+  done
+  make_dry update-node CONFIG=cluster.example.conf NODE=stub-node
+  if printf '%s\n' "$output" | grep -E '^[[:space:]]*sudo([[:space:]]|$)' >/dev/null; then
+    echo "recipe for update-node still contains a leading sudo:" >&2
+    echo "$output" >&2
+    return 1
+  fi
 }
