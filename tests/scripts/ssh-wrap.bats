@@ -50,7 +50,8 @@ setup() {
         SSH_TIMEOUT INTER_NODE_SLEEP DAEMONSET_TIMEOUT CP_NAME \
         WORKER_NAMES POOL_DIR \
         VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS \
-        HBIRD_AUTOLOAD_CONFIG_LOCAL
+        HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_OPERATOR_PUBKEY_FILE \
+        HBIRD_SSH_WRAP_DRY_RUN_SCP
 
   LOCAL_HOST="$(hostname -s 2>/dev/null || hostname)"
 }
@@ -314,6 +315,152 @@ invoke_shim() {
 }
 
 # ---------------------------------------------------------------------------
+# #248: operator workstation pubkey scp + forwarding
+# ---------------------------------------------------------------------------
+#
+# The shim scp's the operator's CONFIG to the KVM host, but
+# SSH_PUBKEY_FILE inside that config is a PATH that the script (on the
+# KVM host) would otherwise resolve against the KVM host's filesystem —
+# returning the KVM host's pubkey, not the operator's. To close the
+# identity gap, the shim ALSO scp's the operator's workstation pubkey
+# (the file referenced by SSH_PUBKEY_FILE in the local CONFIG) to the
+# remote tempdir and forwards its remote path via the shim-internal
+# HBIRD_OPERATOR_PUBKEY_FILE env var. The deploy script then APPENDS
+# that path to SSH_PUBKEY_FILES so the CP gets BOTH keys baked.
+# No private key material travels.
+
+@test "ssh-wrap: CONFIG with readable SSH_PUBKEY_FILE -> scp's pubkey and sets HBIRD_OPERATOR_PUBKEY_FILE (#248)" {
+  tmp_dir="${BATS_TEST_TMPDIR:-/tmp}/hbird-wrap-pubkey-$$"
+  mkdir -p "$tmp_dir"
+  tmp_pubkey="${tmp_dir}/id_ed25519.pub"
+  echo "ssh-ed25519 AAAA-fake-operator-key operator@workstation" > "$tmp_pubkey"
+  tmp_cfg="${tmp_dir}/cluster.local.conf"
+  cat > "$tmp_cfg" <<EOF
+# test config
+SSH_PUBKEY_FILE=${tmp_pubkey}
+EOF
+
+  KVM_HOST=otherhost \
+    HBIRD_SSH_WRAP_DRY_RUN=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_SCP=1 \
+    CONFIG="$tmp_cfg" \
+    run invoke_shim
+
+  rm -rf "$tmp_dir"
+
+  [ "$status" -eq 0 ]
+  # Stub scp message printed to stderr — for BOTH the CONFIG and the
+  # operator pubkey.
+  [[ "$output" == *"SCP_WOULD_RUN: ${tmp_cfg} -> otherhost:/tmp/hbird-dryrun/cluster.local.conf"* ]]
+  [[ "$output" == *"SCP_WOULD_RUN: ${tmp_pubkey} -> otherhost:/tmp/hbird-dryrun/id_ed25519.pub"* ]]
+  # HBIRD_OPERATOR_PUBKEY_FILE is on the SSH command line, pointing at
+  # the REMOTE tempdir path.
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [ -n "$ssh_cmd_line" ]
+  [[ "$ssh_cmd_line" == *"HBIRD_OPERATOR_PUBKEY_FILE=/tmp/hbird-dryrun/id_ed25519.pub"* ]]
+  # And the local pubkey path does NOT appear as a forwarded env value.
+  [[ "$ssh_cmd_line" != *"HBIRD_OPERATOR_PUBKEY_FILE=${tmp_pubkey}"* ]]
+}
+
+@test "ssh-wrap: HBIRD_OPERATOR_PUBKEY_FILE is HIDDEN from the operator-facing visible-env log line (#248)" {
+  # The log line `[foo.sh] re-execing on host:script (env: ...)` is what
+  # the operator reads on stderr. Shim-internal vars (the forwarded
+  # operator pubkey) belong on the SSH command line but NOT in the log,
+  # which is reserved for env vars the operator themselves set.
+  tmp_dir="${BATS_TEST_TMPDIR:-/tmp}/hbird-wrap-pubkey-log-$$"
+  mkdir -p "$tmp_dir"
+  tmp_pubkey="${tmp_dir}/id_ed25519.pub"
+  echo "ssh-ed25519 AAAA-fake-key user@host" > "$tmp_pubkey"
+  tmp_cfg="${tmp_dir}/cluster.local.conf"
+  cat > "$tmp_cfg" <<EOF
+SSH_PUBKEY_FILE=${tmp_pubkey}
+EOF
+
+  KVM_HOST=otherhost \
+    HBIRD_SSH_WRAP_DRY_RUN=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_SCP=1 \
+    CONFIG="$tmp_cfg" \
+    run invoke_shim
+
+  rm -rf "$tmp_dir"
+
+  [ "$status" -eq 0 ]
+  log_line="$(printf '%s\n' "$output" | grep 're-execing on otherhost:')"
+  [ -n "$log_line" ]
+  # Operator-facing log: must NOT mention the shim-internal var.
+  [[ "$log_line" != *"HBIRD_OPERATOR_PUBKEY_FILE"* ]]
+  # But the SSH command line MUST forward it.
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [[ "$ssh_cmd_line" == *"HBIRD_OPERATOR_PUBKEY_FILE="* ]]
+}
+
+@test "ssh-wrap: CONFIG without SSH_PUBKEY_FILE -> no pubkey scp, no HBIRD_OPERATOR_PUBKEY_FILE in env (#248)" {
+  # An older / minimal CONFIG that doesn't declare SSH_PUBKEY_FILE at
+  # all. The deploy script will fail validation downstream; that's
+  # not the shim's job. The shim must NOT scp anything pubkey-related
+  # and must NOT forward the var.
+  tmp_dir="${BATS_TEST_TMPDIR:-/tmp}/hbird-wrap-pubkey-missing-$$"
+  mkdir -p "$tmp_dir"
+  tmp_cfg="${tmp_dir}/cluster.local.conf"
+  echo "# no SSH_PUBKEY_FILE here" > "$tmp_cfg"
+
+  KVM_HOST=otherhost \
+    HBIRD_SSH_WRAP_DRY_RUN=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_SCP=1 \
+    CONFIG="$tmp_cfg" \
+    run invoke_shim
+
+  rm -rf "$tmp_dir"
+
+  [ "$status" -eq 0 ]
+  # CONFIG scp still happens.
+  [[ "$output" == *"SCP_WOULD_RUN: ${tmp_cfg} ->"* ]]
+  # Pubkey scp does NOT happen (no second SCP_WOULD_RUN line for a .pub).
+  pubkey_scp_lines="$(printf '%s\n' "$output" | grep 'SCP_WOULD_RUN:' | grep -c '\.pub' || true)"
+  [ "$pubkey_scp_lines" = 0 ]
+  # And the env var is not forwarded.
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [[ "$ssh_cmd_line" != *"HBIRD_OPERATOR_PUBKEY_FILE"* ]]
+}
+
+@test "ssh-wrap: CONFIG with UNREADABLE SSH_PUBKEY_FILE -> shim continues (deploy validates) (#248)" {
+  # Operator's CONFIG points at a path that doesn't exist (typo, or the
+  # path is only readable on the KVM host but not the workstation —
+  # which is exactly the situation #248 is about). The shim must NOT
+  # exit 1 here; the deploy script's `[[ -r "$SSH_PUBKEY_FILE" ]]` check
+  # is the authoritative gate. The shim just quietly skips the pubkey
+  # scp branch — the deploy script will either find a usable key (via
+  # the KVM-host-resolved path, which IS the pre-#248 behavior) or fail
+  # loudly with a clear message.
+  tmp_dir="${BATS_TEST_TMPDIR:-/tmp}/hbird-wrap-pubkey-unreadable-$$"
+  mkdir -p "$tmp_dir"
+  tmp_cfg="${tmp_dir}/cluster.local.conf"
+  cat > "$tmp_cfg" <<EOF
+SSH_PUBKEY_FILE=/nonexistent/no/such/key.pub
+EOF
+
+  KVM_HOST=otherhost \
+    HBIRD_SSH_WRAP_DRY_RUN=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_SCP=1 \
+    CONFIG="$tmp_cfg" \
+    run invoke_shim
+
+  rm -rf "$tmp_dir"
+
+  [ "$status" -eq 0 ]
+  # CONFIG scp happens; pubkey scp does not.
+  [[ "$output" == *"SCP_WOULD_RUN: ${tmp_cfg} ->"* ]]
+  pubkey_scp_lines="$(printf '%s\n' "$output" | grep 'SCP_WOULD_RUN:' | grep -c 'key\.pub' || true)"
+  [ "$pubkey_scp_lines" = 0 ]
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [[ "$ssh_cmd_line" != *"HBIRD_OPERATOR_PUBKEY_FILE"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # The pinned allowlist itself
 # ---------------------------------------------------------------------------
 #
@@ -338,6 +485,7 @@ invoke_shim() {
     CP_NAME WORKER_NAMES POOL_DIR
     VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS
     HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_REMOTE_REPO
+    HBIRD_OPERATOR_PUBKEY_FILE
   )
   # Sorted compare so reordering doesn't trip the test (the contract is
   # the set, not the order).

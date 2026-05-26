@@ -256,6 +256,14 @@ by `tests/scripts/ssh-wrap.bats` — see
 for the full allowlist, `HBIRD_REMOTE_REPO` override, and pre-flight
 diagnostics.
 
+Your workstation's `SSH_PUBKEY_FILE` (the one referenced by your local
+`CONFIG`) is also `scp`'d to the remote tempdir and baked into the CP
+alongside the KVM-host's own key (#248). Result: after deploy, you can
+SSH directly to the CP and workers from your workstation with your
+normal SSH key — no need to copy keys around or hop through the KVM
+host. No private key material travels; only the `.pub` file is
+forwarded.
+
 ### Cluster lifecycle
 
 ```bash

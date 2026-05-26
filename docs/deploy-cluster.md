@@ -181,7 +181,7 @@ Current allowlist:
 | Timeouts | `READY_TIMEOUT`, `DRAIN_TIMEOUT`, `APISERVER_TIMEOUT`, `SSH_TIMEOUT`, `INTER_NODE_SLEEP`, `DAEMONSET_TIMEOUT` |
 | Topology | `CP_NAME`, `WORKER_NAMES`, `POOL_DIR` |
 | Image-build knobs | `VM_USER`, `STORAGE_DRIVER`, `PODMAN_ROOT`, `PODMAN_RUNROOT`, `APISERVER_EXTRA_SANS` |
-| Shim itself | `HBIRD_AUTOLOAD_CONFIG_LOCAL`, `HBIRD_REMOTE_REPO` |
+| Shim itself | `HBIRD_AUTOLOAD_CONFIG_LOCAL`, `HBIRD_REMOTE_REPO`, `HBIRD_OPERATOR_PUBKEY_FILE` (shim-managed, see #248 below) |
 
 Every value is passed through `printf %q` before being interpolated
 into the remote command, so values with spaces, quotes, or shell
@@ -190,6 +190,38 @@ metas reach the remote unmangled.
 `CONFIG=<local-path>` is special-cased: the local config file is
 `scp`'d to a remote `mktemp -d` and the remote `CONFIG=` is rewritten
 to point at the copy before the script runs.
+
+### Operator workstation pubkey baked alongside KVM-host key (#248)
+
+`SSH_PUBKEY_FILE=` inside the operator's local `CONFIG` is a **path**
+— and the deploy script (which runs on the KVM host after the shim
+re-execs) would otherwise resolve that path against the KVM host's
+filesystem, baking the KVM host's `~/.ssh/id_ed25519.pub` into the
+cluster instead of the operator's workstation key. The operator then
+couldn't SSH directly from their workstation to the CP.
+
+To fix this without transporting private keys: when the shim scp's the
+`CONFIG`, it ALSO scp's the file referenced by `SSH_PUBKEY_FILE` in
+that config to the same remote tempdir, then forwards the remote path
+via the shim-internal `HBIRD_OPERATOR_PUBKEY_FILE` env var.
+`deploy-cluster.sh` appends that path to `SSH_PUBKEY_FILES`
+(colon-separated) so `build_qcow2` bakes BOTH keys into the cluster:
+
+| Key | Used by | Path inside the cluster |
+| --- | --- | --- |
+| KVM-host's pubkey (`SSH_PUBKEY_FILE`) | `deploy-cluster.sh` itself, to SSH into the freshly-booted CP via `SSH_PRIVKEY_FILE = ${SSH_PUBKEY_FILE%.pub}` | `/root/.ssh/authorized_keys` |
+| Operator's workstation pubkey (`HBIRD_OPERATOR_PUBKEY_FILE`) | Operator, for direct `ssh root@<cp-ip>` from the workstation | `/root/.ssh/authorized_keys` (appended) |
+
+`HBIRD_OPERATOR_PUBKEY_FILE` is a shim-internal var: it's on the SSH
+command line and in the allowlist (so `sudo env` accepts it on the
+remote) but it's hidden from the operator-facing visible-env log line
+since the operator didn't set it themselves. When the two paths
+resolve to the same file (e.g. the workstation IS the KVM host and the
+shim is a no-op anyway, or by deliberate config), the append is
+skipped — no duplicate `authorized_keys` entry.
+
+No private-key material crosses the wire; only the `.pub` file
+content. See issue #248 for the full design discussion.
 
 ### `HBIRD_REMOTE_REPO` override
 
