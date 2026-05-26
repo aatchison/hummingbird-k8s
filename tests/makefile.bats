@@ -343,17 +343,24 @@ make_dry() {
   # update-node. Sudo happens inside the scripts via the C3 SSH wrap
   # (scripts/lib/ssh-wrap.sh) — re-exec'd remotely on $KVM_HOST, or
   # probed locally when running on the KVM host directly.
+  #
+  # The check uses `grep -Ew 'sudo'` so it catches `sudo` anywhere on
+  # the line (start-of-line, after a leading env-var prefix like
+  # `CONFIG=foo sudo --preserve-env bash …`, etc.) — not just the
+  # start-anchored form. If some legitimate future recipe needs to ride
+  # a `sudo` along (e.g. a helper that wraps `sudo -E -u <user>`), add
+  # an allowlist comment here and grep -v that exact phrase.
   for t in deploy-cluster destroy-cluster update-cluster update-workers; do
     make_dry "$t" CONFIG=cluster.example.conf
-    if printf '%s\n' "$output" | grep -E '^[[:space:]]*sudo([[:space:]]|$)' >/dev/null; then
-      echo "recipe for $t still contains a leading sudo:" >&2
+    if printf '%s\n' "$output" | grep -Ew 'sudo' >/dev/null; then
+      echo "recipe for $t still contains a sudo invocation:" >&2
       echo "$output" >&2
       return 1
     fi
   done
   make_dry update-node CONFIG=cluster.example.conf NODE=stub-node
-  if printf '%s\n' "$output" | grep -E '^[[:space:]]*sudo([[:space:]]|$)' >/dev/null; then
-    echo "recipe for update-node still contains a leading sudo:" >&2
+  if printf '%s\n' "$output" | grep -Ew 'sudo' >/dev/null; then
+    echo "recipe for update-node still contains a sudo invocation:" >&2
     echo "$output" >&2
     return 1
   fi
