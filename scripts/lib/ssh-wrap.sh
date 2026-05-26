@@ -56,12 +56,22 @@
 # Test hooks:
 #   HBIRD_REMOTE_REEXEC=1     — Sentinel set by the SSH'd remote side
 #                               to prevent infinite re-exec. Also used by
-#                               tests to bypass the shim entirely.
+#                               tests to bypass the shim entirely. We
+#                               `unset` it on the client side before
+#                               building the remote command, as a
+#                               defense against client-side env
+#                               pollution.
 #   HBIRD_SSH_WRAP_DRY_RUN=1  — Print the SSH command we WOULD run
 #                               (prefixed `SSH_WRAP_CMD: `) and exit 0,
 #                               instead of actually exec'ing ssh. Used
 #                               by ssh-wrap.bats to pin the env
-#                               allowlist contract.
+#                               allowlist + quoting contract.
+#   HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1
+#                             — Skip the SSH reachability + remote-repo
+#                               existence pre-flight checks. Used by
+#                               bats so tests don't have to stub a
+#                               working ssh path to otherwise-foreign
+#                               hosts.
 
 # Default for the remote checkout path. Operator can override via the
 # environment or cluster.local.conf. The remote MUST have a git clone
@@ -95,7 +105,37 @@ hbird_ssh_wrap_maybe_reexec() {
   local local_host
   local_host="$(hostname -s 2>/dev/null || hostname)"
   # Compare against KVM_HOST stripped to short form (geary == geary.lan).
+  # Note: this assumes KVM_HOST is an ssh alias / short hostname, not a
+  # bare IPv4/IPv6 literal or an unrelated FQDN whose label set doesn't
+  # overlap with the local hostname. See docs/deploy-cluster.md for the
+  # supported value space.
   [[ "$local_host" != "${KVM_HOST%%.*}" ]] || return 0
+
+  # Defense against client-side env pollution: clear the sentinel
+  # locally so a stray HBIRD_REMOTE_REEXEC=1 in the operator's shell
+  # can't trick us into building a remote command that re-disables
+  # itself. (We already returned 0 above if the sentinel was truly
+  # set; this `unset` defends against future code that might consult
+  # the variable below.)
+  unset HBIRD_REMOTE_REEXEC
+
+  local script_basename
+  script_basename="$(basename "$self")"
+
+  # Pre-flight checks (skip with HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 for
+  # tests). Friendly errors here save a confusing failure later.
+  if [[ "${HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT:-0}" != 1 ]]; then
+    if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$KVM_HOST" true 2>/dev/null; then
+      echo "[${script_basename}] cannot reach KVM_HOST='${KVM_HOST}' via SSH — check ~/.ssh/config + key auth" >&2
+      exit 1
+    fi
+    if ! ssh "$KVM_HOST" "test -d ${HBIRD_REMOTE_REPO}/scripts" 2>/dev/null; then
+      echo "[${script_basename}] remote repo not found at ${KVM_HOST}:${HBIRD_REMOTE_REPO}/scripts" >&2
+      echo "  fix: ssh ${KVM_HOST} 'git clone https://github.com/aatchison/hummingbird-k8s ${HBIRD_REMOTE_REPO}'" >&2
+      echo "  (or override HBIRD_REMOTE_REPO env var)" >&2
+      exit 1
+    fi
+  fi
 
   local env_args=()
   local v i
@@ -137,8 +177,6 @@ hbird_ssh_wrap_maybe_reexec() {
     quoted_args+="$(printf '%q ' "$a")"
   done
 
-  local script_basename
-  script_basename="$(basename "$self")"
   # Resolve the remote script path against the operator's checkout.
   local remote_script="${HBIRD_REMOTE_REPO}/scripts/${script_basename}"
   echo "[${script_basename}] re-execing on ${KVM_HOST}:${remote_script} (env: ${env_args[*]:-(empty)})" >&2

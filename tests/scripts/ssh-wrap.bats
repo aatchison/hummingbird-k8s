@@ -41,7 +41,8 @@ setup() {
   [ -r "$LIB" ] || { echo "FATAL: $LIB not readable" >&2; return 1; }
 
   # Each test starts from a clean slate — no inherited KVM_HOST / sentinel.
-  unset KVM_HOST HBIRD_REMOTE_REEXEC HBIRD_SSH_WRAP_DRY_RUN HBIRD_REMOTE_REPO
+  unset KVM_HOST HBIRD_REMOTE_REEXEC HBIRD_SSH_WRAP_DRY_RUN \
+        HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT HBIRD_REMOTE_REPO
   unset CONFIG FLAGS AUTO_UPDATE_CP SWITCH_TO_GHCR \
         BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER \
         IMAGE_SOURCE GHCR_TAG DRY_RUN SKIP_DRAIN WORKERS_ONLY NODE \
@@ -72,19 +73,19 @@ invoke_shim() {
 }
 
 @test "ssh-wrap: KVM_HOST == hostname -> no re-exec (operator on the KVM host)" {
-  KVM_HOST="$LOCAL_HOST" HBIRD_SSH_WRAP_DRY_RUN=1 run invoke_shim
+  KVM_HOST="$LOCAL_HOST" HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 run invoke_shim
   [ "$status" -eq 0 ]
   [[ "$output" != *"SSH_WRAP_CMD:"* ]]
 }
 
 @test "ssh-wrap: KVM_HOST=<hostname>.<domain> short-form matches -> no re-exec" {
-  KVM_HOST="${LOCAL_HOST}.example.lan" HBIRD_SSH_WRAP_DRY_RUN=1 run invoke_shim
+  KVM_HOST="${LOCAL_HOST}.example.lan" HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 run invoke_shim
   [ "$status" -eq 0 ]
   [[ "$output" != *"SSH_WRAP_CMD:"* ]]
 }
 
 @test "ssh-wrap: HBIRD_REMOTE_REEXEC=1 sentinel -> no re-exec (we ARE the remote)" {
-  KVM_HOST=otherhost HBIRD_REMOTE_REEXEC=1 HBIRD_SSH_WRAP_DRY_RUN=1 run invoke_shim
+  KVM_HOST=otherhost HBIRD_REMOTE_REEXEC=1 HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 run invoke_shim
   [ "$status" -eq 0 ]
   [[ "$output" != *"SSH_WRAP_CMD:"* ]]
 }
@@ -94,7 +95,7 @@ invoke_shim() {
 # ---------------------------------------------------------------------------
 
 @test "ssh-wrap: KVM_HOST=otherhost fires re-exec, prints SSH_WRAP_CMD with remote script path" {
-  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 run invoke_shim
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 run invoke_shim
   [ "$status" -eq 0 ]
   # Round-2 shape: ssh -t HOST cd <REPO> && sudo env ... bash <REMOTE_SCRIPT> ARGS
   [[ "$output" == *"SSH_WRAP_CMD: ssh -t otherhost cd "* ]]
@@ -106,13 +107,13 @@ invoke_shim() {
 }
 
 @test "ssh-wrap: positional args are forwarded verbatim after the remote script path" {
-  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 run invoke_shim --workers-only --node=hbird-w1
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 run invoke_shim --workers-only --node=hbird-w1
   [ "$status" -eq 0 ]
   [[ "$output" == *"/scripts/foo.sh --workers-only --node=hbird-w1"* ]]
 }
 
 @test "ssh-wrap: default HBIRD_REMOTE_REPO is ~/hummingbird-k8s" {
-  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 run invoke_shim
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 run invoke_shim
   [ "$status" -eq 0 ]
   [[ "$output" == *"cd ~/hummingbird-k8s"* ]]
   [[ "$output" == *"bash ~/hummingbird-k8s/scripts/foo.sh"* ]]
@@ -120,7 +121,7 @@ invoke_shim() {
 
 @test "ssh-wrap: HBIRD_REMOTE_REPO override is honored in the remote command" {
   KVM_HOST=otherhost HBIRD_REMOTE_REPO=/opt/hummingbird-k8s \
-    HBIRD_SSH_WRAP_DRY_RUN=1 \
+    HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
     run invoke_shim
   [ "$status" -eq 0 ]
   [[ "$output" == *"cd /opt/hummingbird-k8s"* ]]
@@ -128,12 +129,11 @@ invoke_shim() {
 }
 
 @test "ssh-wrap: only allowlisted env vars are forwarded (CONFIG, IMAGE_SOURCE present; SECRET absent)" {
-  # CONFIG=/dev/null is on the allowlist AND a real file, so the shim
-  # will try to scp it. Use HBIRD_SSH_WRAP_DRY_RUN=1 BEFORE the CONFIG
-  # check fires — we want to skip the scp branch too. Use a non-file
-  # CONFIG value so the `-f` test fails and the scp branch is skipped.
+  # CONFIG=/nonexistent skips the scp branch (the `-f` test fails),
+  # so we exercise only the env-allowlist path here.
   KVM_HOST=otherhost \
     HBIRD_SSH_WRAP_DRY_RUN=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
     CONFIG=/nonexistent/cluster.local.conf \
     IMAGE_SOURCE=ghcr \
     GHCR_TAG=v0.4.2 \
@@ -159,7 +159,7 @@ invoke_shim() {
   # treats empty-set as set. Empty SKIP_DRAIN= is a legit operator value
   # ("disable" vs unset = "default"), so it should be forwarded.
   # printf %q of empty string renders as `''`; printf %q of "1" is `1`.
-  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 \
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
     DRY_RUN= SKIP_DRAIN=1 \
     run invoke_shim
   [ "$status" -eq 0 ]
