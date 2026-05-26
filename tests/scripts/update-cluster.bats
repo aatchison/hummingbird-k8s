@@ -133,8 +133,12 @@ _load_example_workers() {
   run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
   [ "$status" -eq 0 ]
   # cluster.example.conf: 1 CP + 2 workers = 3 nodes.
-  stop_n="$(echo "$output" | grep -cE 'DRY-RUN ssh root@.* systemctl stop bootc-fetch-apply-updates.timer' || true)"
-  start_n="$(echo "$output" | grep -cE 'DRY-RUN ssh root@.* systemctl start bootc-fetch-apply-updates.timer' || true)"
+  # Post-#181: stop targets both semver + legacy timers (mid-migration
+  # hosts may have either active); start only restarts the semver timer
+  # so update-cluster.sh doesn't silently re-enable the legacy unit on
+  # operators who intentionally disabled it.
+  stop_n="$(echo "$output" | grep -cE 'DRY-RUN ssh root@.* systemctl stop bootc-semver-update.timer bootc-fetch-apply-updates.timer' || true)"
+  start_n="$(echo "$output" | grep -cE 'DRY-RUN ssh root@.* systemctl start bootc-semver-update.timer$' || true)"
   [ "$stop_n" -eq 3 ]
   [ "$start_n" -eq 3 ]
 }

@@ -22,14 +22,25 @@ top of it:
 
 ## Why we have this
 
-`bootc-fetch-apply-updates.timer` will, on hosts where it's enabled, pull
-a new image and reboot the VM without operator intervention (see
-`docs/auto-updates.md`). If the new image fails to bring the cluster back
-up — kubelet won't start, the apiserver static pod is wedged, a binary
-moved between paths — the host is now a degraded node nobody is watching.
-The auto-rollback machinery in this doc is the conservative answer: if the
-cluster doesn't come back within a fixed post-boot window, return to the
-previous deployment automatically.
+Post-#181, the canonical in-image updater is `bootc-semver-update.timer`
+(see `docs/auto-updates.md`). That timer fires daily, picks the highest
+semver tag at GHCR, and `bootc switch`es + `bootc upgrade`s — staging the
+new deployment. It does **not** reboot; the actual swap to the new image
+happens when an operator runs `make update-cluster` (which performs the
+drain/uncordon dance plus a `bootc upgrade --apply` that triggers the
+reboot), or via the legacy `bootc-fetch-apply-updates.service` if the
+operator manually invokes `bootc upgrade` on a node.
+
+The auto-rollback machinery in this doc is the conservative answer for
+*either* path: if a freshly-rebooted node doesn't bring the cluster back
+up within a fixed post-boot window — kubelet won't start, the apiserver
+static pod is wedged, a binary moved between paths — return to the
+previous deployment automatically. The marker pattern below still hangs
+off `bootc-fetch-apply-updates.service` (which remains present on every
+image even when its timer is disabled), so the rollback trigger fires
+whenever that service runs: the operator-driven `bootc upgrade` from
+`update-cluster.sh`, a hand-typed `bootc upgrade` on a node, or the
+legacy timer on pre-#181 hosts that still have it enabled.
 
 This is not a substitute for staged rollouts or for operator-supervised
 upgrades. It's a "don't lose the fleet to a single bad image" backstop.
@@ -111,10 +122,21 @@ ExecStartPost=/usr/bin/touch /var/lib/bootc-just-upgraded
 ```
 
 The upstream `bootc-fetch-apply-updates.service` is the unit that stages
-a new deployment and triggers a reboot when the timer fires. The drop-in
-runs after the unit's main `ExecStart`, so the marker is on disk before
-the reboot. After the reboot, the marker is what tells the health-check
-script "you should actually run today".
+a new deployment when `bootc upgrade` runs. Post-#181 its timer is
+disabled in the preset, but the **service itself is still present** on
+every image — so the drop-in still hangs off the service and the marker
+still gets touched whenever the service runs. The drop-in applies
+whenever `bootc-fetch-apply-updates.service` runs, including via
+`bootc upgrade` orchestrated by `update-cluster.sh` (which is the
+post-#181 canonical reboot path), a hand-typed `bootc upgrade` on a
+node, or — on pre-#181 hosts — the legacy
+`bootc-fetch-apply-updates.timer`.
+
+The drop-in runs after the unit's main `ExecStart`, so the marker is on
+disk before the reboot (whether the reboot comes from `--apply`,
+`update-cluster.sh`, or a manual `systemctl reboot`). After the reboot,
+the marker is what tells the health-check script "you should actually
+run today".
 
 This is the supported override path: drop-ins under
 `/etc/systemd/system/<unit>.service.d/` don't require modifying the
@@ -122,14 +144,19 @@ upstream unit and survive package updates to it.
 
 ## How it composes
 
-Timeline of a timer-driven auto-upgrade with auto-rollback armed:
+Timeline of an operator-driven auto-upgrade with auto-rollback armed
+(the post-#181 canonical path — `make update-cluster` driving the
+reboot):
 
-1. `bootc-fetch-apply-updates.timer` fires on the cadence (~24h with
-   jitter).
-2. `bootc-fetch-apply-updates.service` runs: `bootc upgrade` stages a
-   new deployment.
-3. `ExecStartPost` touches `/var/lib/bootc-just-upgraded`.
-4. The service triggers `systemctl reboot`.
+1. `bootc-semver-update.timer` fires on the cadence (~24h with jitter),
+   resolves the highest semver tag at GHCR, runs `bootc switch` +
+   `bootc upgrade` — staging the new deployment but **not** rebooting.
+2. Operator runs `make update-cluster`. The script invokes `bootc
+   upgrade --apply` on each node in turn, which internally runs
+   `bootc-fetch-apply-updates.service`.
+3. `ExecStartPost` (from the marker drop-in) touches
+   `/var/lib/bootc-just-upgraded`.
+4. `bootc upgrade --apply` triggers `systemctl reboot`.
 5. VM comes back on the new deployment.
 6. 3 minutes after boot, `health-check-rollback.timer` fires
    `health-check-rollback.service`, which runs the script.
@@ -228,7 +255,8 @@ exercise, not a CI test):
 
 ## Cross-references
 
-- `docs/auto-updates.md` — `bootc-fetch-apply-updates.timer` setup and
+- `docs/auto-updates.md` — `bootc-semver-update.timer` (post-#181
+  canonical) and `bootc-fetch-apply-updates.timer` (legacy) setup and
   per-host opt-out / mask guidance.
 - `docs/cilium-migration.md` (section "Rollback limitations") — etcd
   state implications when rolling back across the CNI swap.

@@ -211,7 +211,10 @@ sudo make destroy-cluster CONFIG=cluster.local.conf
 # Tear down stragglers (any hummingbird-* libvirt domain on this host)
 sudo make clean-vms
 
-# Point already-deployed VMs at GHCR so the auto-update timer pulls
+# Point already-deployed VMs at GHCR so the semver-aware auto-update
+# timer (docs/auto-updates.md) has a remote ref to pull from. Without
+# this, VMs that booted from a local qcow2 still track localhost:latest
+# and the timer can't resolve a remote tag list.
 sudo make switch-to-ghcr
 ```
 
@@ -432,7 +435,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/etcd-encryption.md`](docs/etcd-encryption.md) — enable encryption-at-rest for etcd.
 - [`docs/worker-tokens.md`](docs/worker-tokens.md) — short-TTL, per-VM kubeadm join tokens.
 - [`docs/self-hosted-runner.md`](docs/self-hosted-runner.md) — register a KVM-capable GitHub Actions runner.
-- [`docs/auto-updates.md`](docs/auto-updates.md) — bootc auto-update timer behavior.
+- [`docs/auto-updates.md`](docs/auto-updates.md) — semver-aware bootc auto-update timer (advances only on new immutable `vMAJOR.MINOR.PATCH` tags, replacing the upstream `:latest`-tracking unit).
 - [`docs/rollback.md`](docs/rollback.md) — manual + auto-rollback (`bootc rollback`, health-check timer).
 - [`docs/security-hardening.md`](docs/security-hardening.md) — PodSecurity restricted + apiserver audit + kubelet protect-kernel-defaults; run `make verify-hardening` (or `scripts/verify-hardening.sh`) after each redeploy.
 - [`docs/app-deploy-verify.md`](docs/app-deploy-verify.md) — end-to-end smoke test of a PSA-restricted nginx deploy + pod-to-pod networking.

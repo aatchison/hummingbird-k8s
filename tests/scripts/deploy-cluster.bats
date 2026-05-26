@@ -1,29 +1,72 @@
 #!/usr/bin/env bats
 #
-# Unit tests for scripts/deploy-cluster.sh config parsing — specifically
-# the WORKER_NAMES resolution block (PR #219 round-2 H1).
+# Unit tests for scripts/deploy-cluster.sh — covering both:
 #
-# README's Migration table promises that `WORKER_NAMES=()` in
-# cluster.local.conf yields a CP-only deploy. The original block
-# treated empty arrays the same as "unset" and silently filled in
-# two default workers, contradicting the README. These tests pin the
-# three-state behavior:
+# 1. The WORKER_NAMES resolution block (PR #219 round-2 H1).
 #
-#   1. unset             — defaults to (${CP_NAME}-w1 ${CP_NAME}-w2)  [legacy]
-#   2. WORKER_NAMES=()   — honored as explicit CP-only intent
-#   3. WORKER_NAMES=(…)  — used verbatim
+#    README's Migration table promises that `WORKER_NAMES=()` in
+#    cluster.local.conf yields a CP-only deploy. The original block
+#    treated empty arrays the same as "unset" and silently filled in
+#    two default workers, contradicting the README. These tests pin the
+#    three-state behavior:
 #
-# We can't invoke deploy-cluster.sh end-to-end here (it asserts EUID==0
-# and runs virt-install). Instead, we extract just the resolver block
-# and source it from a harness that supplies the inputs. Keeping the
-# tested code as a literal extract (not a paraphrase) makes the test
-# meaningful: any future edit to the block has to be mirrored here.
+#      a. unset             — defaults to (${CP_NAME}-w1 ${CP_NAME}-w2)  [legacy]
+#      b. WORKER_NAMES=()   — honored as explicit CP-only intent
+#      c. WORKER_NAMES=(…)  — used verbatim
 #
-# Run via:  bats tests/scripts/deploy-cluster.bats
+#    We can't invoke deploy-cluster.sh end-to-end here (it asserts EUID==0
+#    and runs virt-install). Instead, we extract just the resolver block
+#    and source it from a harness that supplies the inputs. Keeping the
+#    tested code as a literal extract (not a paraphrase) makes the test
+#    meaningful: any future edit to the block has to be mirrored here.
+#
+# 2. The render_cp_user_data function (PR #181 round-2).
+#
+#    These tests focus on the render_cp_user_data function — extracted from
+#    the inline `{ ... } > $CP_USER_DATA` block so we can exercise the
+#    AUTO_UPDATE_CP true/false branches without invoking the rest of the
+#    script (which requires root + libvirt + bib).
+#
+#    The script supports a HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1 mode that
+#    returns from `source` after defining the render function — see the
+#    guard near the top of deploy-cluster.sh. That sentinel was added by
+#    this same PR (#181 round-2) explicitly so this test could exist.
+#
+#    Coverage:
+#      1. AUTO_UPDATE_CP=true emits enable bootc-semver-update.timer AND
+#         disable bootc-fetch-apply-updates.timer.
+#      2. AUTO_UPDATE_CP=false emits a disable for bootc-semver-update.timer
+#         (the regression #181 round-2 fixes: false used to be a no-op, but
+#         the preset enables the timer unconditionally on factory reset).
+#      3. SWITCH_TO_GHCR=true / false emits / omits the bootc switch line.
+#      4. BOOTC_UPDATE_SCHEDULE emits a write_files override + a restart of
+#         the timer in runcmd.
+#
+# Run via:
+#   podman run --rm -v "$PWD:/repo:Z" -w /repo \
+#     docker.io/bats/bats:latest tests/scripts/deploy-cluster.bats
+# OR locally:
+#   bats tests/scripts/deploy-cluster.bats
 
 setup() {
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
   SCRIPT="${REPO_ROOT}/scripts/deploy-cluster.sh"
+
+  # ---- For #181 render_cp_user_data tests ---------------------------------
+  # All tests using `render` (below) run in source-only mode — the script
+  # returns from source immediately after defining render_cp_user_data when
+  # this env var is 1. No root / libvirt / bib calls happen.
+  export HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1
+  # Minimal env render_cp_user_data needs. Tests override per-case.
+  export CP_NAME=hbird-cp1
+  export SSH_PUBKEY_CONTENT="ssh-ed25519 AAAA-test-key user@host"
+  export GHCR_TAG=v0.4.2
+  export SWITCH_TO_GHCR=true
+  export AUTO_UPDATE_CP=true
+  export BOOTC_UPDATE_SCHEDULE=""
+  export BOOTC_UPDATE_REPO_K8S=""
+
+  # ---- For #219 WORKER_NAMES resolver tests -------------------------------
   HARNESS="${BATS_TEST_TMPDIR}/resolve.sh"
   export HOME="$BATS_TEST_TMPDIR/home"
   mkdir -p "$HOME"
@@ -62,8 +105,16 @@ HARNESS_EOF
   chmod +x "$HARNESS"
 }
 
+# Helper: source the script (which defines render_cp_user_data) and emit
+# the rendered cloud-init output to stdout.
+render() {
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  render_cp_user_data
+}
+
 # ---------------------------------------------------------------------------
-# WORKER_NAMES resolution — three-state behavior (H1)
+# WORKER_NAMES resolution — three-state behavior (#219 H1)
 # ---------------------------------------------------------------------------
 
 @test "deploy-cluster: WORKER_NAMES unset -> legacy 2-worker default" {
@@ -124,4 +175,77 @@ EOF
   # Neither default-fill nor CP-only branch should fire.
   [[ "$output" != *"WORKER_NAMES not set"* ]]
   [[ "$output" != *"CP-only deploy"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# render_cp_user_data — AUTO_UPDATE_CP=true (#181)
+# ---------------------------------------------------------------------------
+
+@test "deploy-cluster: AUTO_UPDATE_CP=true enables semver timer and disables legacy" {
+  AUTO_UPDATE_CP=true
+  run render
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"runcmd:"* ]]
+  [[ "$output" == *"systemctl, enable, --now, bootc-semver-update.timer"* ]]
+  [[ "$output" == *"systemctl, disable, --now, bootc-fetch-apply-updates.timer"* ]]
+  # Must NOT also emit a disable of the semver timer (that's the false-branch).
+  ! [[ "$output" == *"systemctl, disable, --now, bootc-semver-update.timer"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# render_cp_user_data — AUTO_UPDATE_CP=false regression (#181 round-2)
+# ---------------------------------------------------------------------------
+#
+# Pre-round-2, AUTO_UPDATE_CP=false omitted the runcmd entirely. But the
+# image's preset enables bootc-semver-update.timer unconditionally on
+# factory reset, so the operator's intent ("no auto-updates on the CP")
+# was silently ignored. Round-2 emits a disable runcmd in this case.
+
+@test "deploy-cluster: AUTO_UPDATE_CP=false emits disable runcmd for semver timer" {
+  AUTO_UPDATE_CP=false
+  run render
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"runcmd:"* ]]
+  [[ "$output" == *"systemctl, disable, --now, bootc-semver-update.timer"* ]]
+  # Must NOT enable the semver timer when AUTO_UPDATE_CP=false.
+  ! [[ "$output" == *"systemctl, enable, --now, bootc-semver-update.timer"* ]]
+  # Must NOT touch the legacy timer in the false branch — we leave the
+  # legacy state alone on pre-#181 hosts the operator may be deliberately
+  # using.
+  ! [[ "$output" == *"bootc-fetch-apply-updates.timer"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# render_cp_user_data — SWITCH_TO_GHCR true / false (#181)
+# ---------------------------------------------------------------------------
+
+@test "deploy-cluster: SWITCH_TO_GHCR=true emits bootc switch runcmd with the tag" {
+  SWITCH_TO_GHCR=true
+  GHCR_TAG=v9.9.9
+  run render
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"bootc, switch, ghcr.io/aatchison/hummingbird-k8s:v9.9.9"* ]]
+}
+
+@test "deploy-cluster: SWITCH_TO_GHCR=false omits bootc switch runcmd" {
+  SWITCH_TO_GHCR=false
+  run render
+  [ "$status" -eq 0 ]
+  ! [[ "$output" == *"bootc, switch"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# render_cp_user_data — BOOTC_UPDATE_SCHEDULE override (#181)
+# ---------------------------------------------------------------------------
+
+@test "deploy-cluster: BOOTC_UPDATE_SCHEDULE emits override drop-in + restart" {
+  BOOTC_UPDATE_SCHEDULE="Mon *-*-* 04:00:00"
+  run render
+  [ "$status" -eq 0 ]
+  # write_files entry to override OnCalendar via a drop-in.
+  [[ "$output" == *"bootc-semver-update.timer.d/schedule.conf"* ]]
+  [[ "$output" == *"OnCalendar=Mon *-*-* 04:00:00"* ]]
+  # Runcmd reloads + restarts the timer so the override takes effect this boot.
+  [[ "$output" == *"systemctl, daemon-reload"* ]]
+  [[ "$output" == *"systemctl, restart, bootc-semver-update.timer"* ]]
 }

@@ -110,9 +110,26 @@ COPY containers/shared/bootc-fetch-apply-updates.service.d/10-mark-upgrade.conf 
      /etc/systemd/system/bootc-fetch-apply-updates.service.d/10-mark-upgrade.conf
 RUN chmod +x /usr/libexec/health-check-rollback.sh
 
+# Semver-aware bootc updater. Replaces stock bootc-fetch-apply-updates.timer
+# (which follows :latest, a mutable pointer) with a daily skopeo+jq query for
+# the highest semver tag at this image's GHCR repo. See docs/auto-updates.md.
+# skopeo is already in the Hummingbird base; jq is not, so install it here.
+# These files MUST be COPY'd before the `systemctl preset` line below — the
+# preset run can't reference a unit that's not yet on disk.
+COPY containers/shared/bootc-semver-update.sh /usr/libexec/bootc-semver-update.sh
+COPY containers/shared/bootc-semver-update.service /etc/systemd/system/bootc-semver-update.service
+COPY containers/shared/bootc-semver-update.timer /etc/systemd/system/bootc-semver-update.timer
+RUN dnf install -y jq \
+ && dnf clean all \
+ && chmod +x /usr/libexec/bootc-semver-update.sh \
+ && mkdir -p /etc/hummingbird \
+ && printf 'REPO=ghcr.io/aatchison/hummingbird-%s\nPREFIX=v\n' 'k8s-worker' \
+      > /etc/hummingbird/bootc-update.env
+
 COPY containers/k8s-worker/10-k8s-worker.preset /usr/lib/systemd/system-preset/10-k8s-worker.preset
 RUN systemctl preset crio.service kubelet.service worker-init.service \
-      bootc-fetch-apply-updates.timer health-check-rollback.timer || true
+      bootc-fetch-apply-updates.timer health-check-rollback.timer \
+      bootc-semver-update.timer || true
 
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s

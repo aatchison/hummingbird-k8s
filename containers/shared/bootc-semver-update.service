@@ -1,0 +1,17 @@
+[Unit]
+Description=Advance bootc to the latest semver-tagged image at the configured repo
+Documentation=https://github.com/aatchison/hummingbird-k8s/blob/main/docs/auto-updates.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/bootc-semver-update.sh
+# Touch the marker the health-check-rollback timer reads on next boot (#104).
+# Same pattern as the drop-in on bootc-fetch-apply-updates.service: if the
+# script staged a new deployment, the next boot lands on it, sees the marker,
+# and runs the post-boot cluster health check. Set even when the script was a
+# no-op (already on target) — the marker is consumed (deleted) on read, and
+# false-positive "check after no-op reboot" is harmless (cluster will be
+# healthy, no rollback fires).
+ExecStartPost=/usr/bin/touch /var/lib/bootc-just-upgraded

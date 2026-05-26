@@ -130,11 +130,14 @@ cmd_assert_dry_run_sequence() {
 
   # timer_stop / timer_start fire once per node (CP + each worker). The
   # script emits one "DRY-RUN ssh root@... systemctl stop ..." per node.
+  # Post-#181: timer_stop stops both the semver-update timer (canonical
+  # post-PR unit) AND the legacy fetch-apply timer (still active on
+  # mid-migration hosts); timer_start only restarts the semver timer.
   assert_count "$nodes" \
-    'DRY-RUN ssh root@.* systemctl stop bootc-fetch-apply-updates.timer' \
+    'DRY-RUN ssh root@.* systemctl stop bootc-semver-update.timer bootc-fetch-apply-updates.timer' \
     'timer-stop per-node'
   assert_count "$nodes" \
-    'DRY-RUN ssh root@.* systemctl start bootc-fetch-apply-updates.timer' \
+    'DRY-RUN ssh root@.* systemctl start bootc-semver-update.timer$' \
     'timer-start per-node'
 
   # CP header appears exactly once.
