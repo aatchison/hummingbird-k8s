@@ -364,6 +364,154 @@ EOF
   [[ "$output" != *"fail:"* ]]
 }
 
+# ---------------------------------------------------------------------------
+# HBIRD_OPERATOR_PUBKEY_FILE append (#248)
+# ---------------------------------------------------------------------------
+#
+# When the C3 SSH-wrap shim scp's the operator's workstation pubkey to
+# the KVM host's remote tempdir, it forwards the remote path via
+# HBIRD_OPERATOR_PUBKEY_FILE. deploy-cluster.sh must APPEND that path
+# to SSH_PUBKEY_FILES (colon-separated) so build_qcow2 bakes BOTH the
+# KVM host's pubkey (which the script uses to SSH to the freshly-booted
+# CP, since SSH_PRIVKEY_FILE = ${SSH_PUBKEY_FILE%.pub}) AND the
+# operator's workstation pubkey (which the operator uses for direct
+# workstation->CP access).
+#
+# We can't run the full script (root + libvirt), so extract just the
+# append block by awk markers — same pattern as the WORKER_NAMES + IMAGE_SOURCE
+# block extractions above.
+
+@test "deploy-cluster: HBIRD_OPERATOR_PUBKEY_FILE set + readable + differs -> appended to SSH_PUBKEY_FILES (#248)" {
+  # Extract the #248 block from deploy-cluster.sh.
+  awk '
+    /^# #248:/ { capture=1 }
+    capture { print }
+    capture && /^fi$/ { exit }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/pubkey-append.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/pubkey-append.snippet" ] || {
+    echo "FATAL: failed to extract #248 block from ${SCRIPT}" >&2
+    return 1
+  }
+
+  # Two real files so [[ -r ]] passes; different paths so the dedup
+  # branch doesn't fire.
+  local kvm_pubkey="${BATS_TEST_TMPDIR}/kvm-host.pub"
+  local op_pubkey="${BATS_TEST_TMPDIR}/operator.pub"
+  echo "ssh-ed25519 kvm-host-key kvm@host" > "$kvm_pubkey"
+  echo "ssh-ed25519 operator-key user@workstation" > "$op_pubkey"
+
+  local driver="${BATS_TEST_TMPDIR}/driver-append.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+log() { printf 'log: %s\n' "\$*"; }
+SSH_PUBKEY_FILE="${kvm_pubkey}"
+SSH_PUBKEY_FILES="\${SSH_PUBKEY_FILE}"
+export SSH_PUBKEY_FILES
+HBIRD_OPERATOR_PUBKEY_FILE="${op_pubkey}"
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/pubkey-append.snippet"
+printf 'SSH_PUBKEY_FILES=%s\n' "\$SSH_PUBKEY_FILES"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"SSH_PUBKEY_FILES=${kvm_pubkey}:${op_pubkey}"* ]]
+  [[ "$output" == *"appending operator workstation pubkey to bake list: ${op_pubkey}"* ]]
+}
+
+@test "deploy-cluster: HBIRD_OPERATOR_PUBKEY_FILE == SSH_PUBKEY_FILE -> no duplicate append (#248)" {
+  awk '
+    /^# #248:/ { capture=1 }
+    capture { print }
+    capture && /^fi$/ { exit }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/pubkey-append-dup.snippet"
+
+  local pubkey="${BATS_TEST_TMPDIR}/same.pub"
+  echo "ssh-ed25519 shared-key user@host" > "$pubkey"
+
+  local driver="${BATS_TEST_TMPDIR}/driver-dedup.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+log() { printf 'log: %s\n' "\$*"; }
+SSH_PUBKEY_FILE="${pubkey}"
+SSH_PUBKEY_FILES="\${SSH_PUBKEY_FILE}"
+export SSH_PUBKEY_FILES
+HBIRD_OPERATOR_PUBKEY_FILE="${pubkey}"
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/pubkey-append-dup.snippet"
+printf 'SSH_PUBKEY_FILES=%s\n' "\$SSH_PUBKEY_FILES"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  # SSH_PUBKEY_FILES stays unchanged — no `:` appended, no dup entry.
+  [[ "$output" == *"SSH_PUBKEY_FILES=${pubkey}"* ]]
+  [[ "$output" != *"SSH_PUBKEY_FILES=${pubkey}:${pubkey}"* ]]
+  [[ "$output" != *"appending operator workstation pubkey"* ]]
+}
+
+@test "deploy-cluster: HBIRD_OPERATOR_PUBKEY_FILE unset -> unchanged behavior (#248)" {
+  awk '
+    /^# #248:/ { capture=1 }
+    capture { print }
+    capture && /^fi$/ { exit }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/pubkey-append-unset.snippet"
+
+  local kvm_pubkey="${BATS_TEST_TMPDIR}/kvm-only.pub"
+  echo "ssh-ed25519 kvm-only user@host" > "$kvm_pubkey"
+
+  local driver="${BATS_TEST_TMPDIR}/driver-unset.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+log() { printf 'log: %s\n' "\$*"; }
+SSH_PUBKEY_FILE="${kvm_pubkey}"
+SSH_PUBKEY_FILES="\${SSH_PUBKEY_FILE}"
+export SSH_PUBKEY_FILES
+# HBIRD_OPERATOR_PUBKEY_FILE deliberately unset.
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/pubkey-append-unset.snippet"
+printf 'SSH_PUBKEY_FILES=%s\n' "\$SSH_PUBKEY_FILES"
+EOF
+  chmod +x "$driver"
+  run env -u HBIRD_OPERATOR_PUBKEY_FILE bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"SSH_PUBKEY_FILES=${kvm_pubkey}"* ]]
+  [[ "$output" != *"appending operator workstation pubkey"* ]]
+}
+
+@test "deploy-cluster: HBIRD_OPERATOR_PUBKEY_FILE set but UNREADABLE -> no append (#248)" {
+  awk '
+    /^# #248:/ { capture=1 }
+    capture { print }
+    capture && /^fi$/ { exit }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/pubkey-append-unreadable.snippet"
+
+  local kvm_pubkey="${BATS_TEST_TMPDIR}/kvm-only2.pub"
+  echo "ssh-ed25519 kvm-only user@host" > "$kvm_pubkey"
+
+  local driver="${BATS_TEST_TMPDIR}/driver-unreadable.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+log() { printf 'log: %s\n' "\$*"; }
+SSH_PUBKEY_FILE="${kvm_pubkey}"
+SSH_PUBKEY_FILES="\${SSH_PUBKEY_FILE}"
+export SSH_PUBKEY_FILES
+HBIRD_OPERATOR_PUBKEY_FILE="/nonexistent/no/such/key.pub"
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/pubkey-append-unreadable.snippet"
+printf 'SSH_PUBKEY_FILES=%s\n' "\$SSH_PUBKEY_FILES"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"SSH_PUBKEY_FILES=${kvm_pubkey}"* ]]
+  [[ "$output" != *"appending operator workstation pubkey"* ]]
+}
+
 @test "deploy-cluster: IMAGE_SOURCE=garbage rejected (#231)" {
   local driver="${BATS_TEST_TMPDIR}/driver-garbage.sh"
   cat > "$driver" <<EOF
