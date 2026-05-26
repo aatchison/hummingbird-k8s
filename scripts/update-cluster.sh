@@ -9,7 +9,10 @@
 #   2. Each worker, in WORKER_NAMES order (drained, upgraded, uncordoned)
 #
 # Per worker the flow is:
-#   systemctl stop bootc-fetch-apply-updates.timer (avoid race with auto-timer)
+#   systemctl stop bootc-{semver,fetch-apply}-update.timer (avoid race
+#     with the on-host auto-update timers — we stop both because the
+#     semver timer is the post-#181 canonical unit and the legacy fetch
+#     timer may still be active on hosts mid-migration)
 #   kubectl drain NODE --ignore-daemonsets --delete-emptydir-data --timeout=5m
 #   capture pre-reboot .status.nodeInfo.bootID (race-free reboot proof)
 #   ssh root@NODE_IP "bootc upgrade --apply"   # --apply auto-reboots
@@ -18,7 +21,8 @@
 #     kubectl reports the node Ready, then wait until kube-system
 #     DaemonSet pods (Cilium / kube-proxy / coredns) on the node are Ready
 #   kubectl uncordon NODE
-#   systemctl start bootc-fetch-apply-updates.timer (restore auto-update)
+#   systemctl start bootc-semver-update.timer (restore semver auto-update;
+#     the legacy fetch timer is left stopped — see timer_start)
 #   sleep 5
 #
 # For the CP (single-CP topology) we skip drain — there are no peers to
@@ -65,8 +69,8 @@
 #   --skip-drain               Emergency rollback escape hatch — skip
 #                              kubectl drain for workers (CP already skips
 #                              drain by design). Also skips the
-#                              bootc-fetch-apply-updates.timer stop/restart
-#                              dance (operator-driven mode).
+#                              bootc-*-update.timer stop/restart dance
+#                              (operator-driven mode).
 #   --skip-gates               Operator escape hatch — skip the bootID-changed
 #                              and DaemonSet-readiness gates. Only use if
 #                              you've verified the cluster is healthy via
@@ -353,37 +357,44 @@ bootc_booted_digest() {
     2>/dev/null || true
 }
 
-# Stop/start the on-host auto-update timer so it doesn't race the manual run.
-# The worker preset enables bootc-fetch-apply-updates.timer; CP can have it
-# enabled via AUTO_UPDATE_CP=true. Stopping during a manual upgrade avoids
-# two concurrent staged deployments.
+# Stop/start the on-host auto-update timer(s) so they don't race the manual run.
+# Post-#181 the canonical timer is bootc-semver-update.timer (enabled by preset
+# on new images). Pre-#181 hosts still have bootc-fetch-apply-updates.timer
+# enabled. We stop/start BOTH unconditionally — `systemctl stop` on an inactive
+# unit is a no-op and the `|| true` swallows the "Unit not loaded" exit on
+# images that don't ship one of the units. This keeps update-cluster.sh
+# correct across the migration window where the fleet is mixed.
 timer_stop() {
   local ip="$1"
   if (( DRY_RUN == 1 )); then
-    log "DRY-RUN ssh root@${ip} systemctl stop bootc-fetch-apply-updates.timer"
+    log "DRY-RUN ssh root@${ip} systemctl stop bootc-semver-update.timer bootc-fetch-apply-updates.timer"
     return 0
   fi
   if (( SKIP_DRAIN == 1 )); then
-    log "  --skip-drain set: leaving bootc-fetch-apply-updates.timer alone on ${ip}"
+    log "  --skip-drain set: leaving bootc-*-update.timer alone on ${ip}"
     return 0
   fi
   # shellcheck disable=SC2029
   ssh "${SSH_OPTS[@]}" "root@${ip}" \
-    "systemctl stop bootc-fetch-apply-updates.timer 2>/dev/null || true" || true
+    "systemctl stop bootc-semver-update.timer bootc-fetch-apply-updates.timer 2>/dev/null || true" || true
 }
 
 timer_start() {
   local ip="$1"
   if (( DRY_RUN == 1 )); then
-    log "DRY-RUN ssh root@${ip} systemctl start bootc-fetch-apply-updates.timer"
+    log "DRY-RUN ssh root@${ip} systemctl start bootc-semver-update.timer"
     return 0
   fi
   if (( SKIP_DRAIN == 1 )); then
     return 0
   fi
+  # Only restart the semver timer — the legacy timer is intentionally left
+  # stopped on the new image and we don't want update-cluster.sh to silently
+  # re-enable it. Operators who explicitly want the legacy :latest tracking
+  # can `systemctl start bootc-fetch-apply-updates.timer` themselves.
   # shellcheck disable=SC2029
   ssh "${SSH_OPTS[@]}" "root@${ip}" \
-    "systemctl start bootc-fetch-apply-updates.timer 2>/dev/null || true" || true
+    "systemctl start bootc-semver-update.timer 2>/dev/null || true" || true
 }
 
 # ---- EXIT trap: cordon recovery + timer restart ----------------------------
@@ -500,10 +511,14 @@ cleanup_on_exit() {
   fi
   # Try to restart the auto-update timer on the in-flight node so the
   # cluster doesn't permanently lose its auto-update behavior after a
-  # mid-flight abort. Best-effort — node may be unreachable.
+  # mid-flight abort. Best-effort — node may be unreachable. Targets the
+  # semver-update timer (the post-#181 canonical unit); we deliberately do
+  # NOT auto-restart bootc-fetch-apply-updates.timer here even on legacy
+  # hosts — if an operator's pre-update state had it enabled, they can
+  # restart it themselves after diagnosing the abort.
   if [[ -n "$IN_FLIGHT_IP" ]] && (( DRY_RUN == 0 )) && (( SKIP_DRAIN == 0 )); then
     ssh "${SSH_OPTS[@]}" -o ConnectTimeout=3 "root@${IN_FLIGHT_IP}" \
-      "systemctl start bootc-fetch-apply-updates.timer 2>/dev/null || true" \
+      "systemctl start bootc-semver-update.timer 2>/dev/null || true" \
       >/dev/null 2>&1 || true
   fi
   # Close ControlMaster sockets explicitly (ControlPersist=60s would
