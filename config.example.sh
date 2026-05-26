@@ -31,19 +31,9 @@ export ENABLE_ROOT_SSH=1                # 1 = bake same pubkeys into root@ (defa
 # libvirt storage pool target directory on this host.
 # export POOL_DIR=/var/lib/libvirt/images
 
-# ---- VM resource knobs --------------------------------------------------------
-# Per-flavor virt-install --memory / --vcpus values. The deploy-cluster path
-# reads these from cluster.local.conf (see cluster.example.conf). The legacy
-# build scripts also honor them via this file for image-build-only flows that
-# don't go through deploy-cluster.
-#
-# Control plane:
-# export CP_MEMORY=8192          # MiB
-# export CP_VCPUS=4
-#
-# Workers (per worker):
-# export WORKER_MEMORY=4096
-# export WORKER_VCPUS=2
+# VM-sizing knobs (CP_MEMORY / CP_VCPUS / WORKER_MEMORY / WORKER_VCPUS) live in
+# cluster.local.conf — see cluster.example.conf. They no longer belong here
+# (the `define-vm*.sh` consumers were removed in #216).
 
 # ---- spawn-workers retry tuning (#90) ----------------------------------------
 # When deploy-cluster.sh / spawn-workers.sh comes up right after the CP boots,
