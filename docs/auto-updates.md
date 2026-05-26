@@ -144,9 +144,18 @@ On any node:
 
 ```bash
 systemctl is-active bootc-semver-update.timer       # → active
+systemctl status bootc-semver-update.timer          # full state + last trigger
+systemctl status bootc-semver-update.service        # service unit details
 systemctl list-timers bootc-semver-update.timer     # next + last run
 journalctl -t bootc-semver-update --since today     # latest run output
 ```
+
+`systemctl status` on both the `.timer` and `.service` is the canonical
+"what's the timer doing right now" diagnostic — `is-active` only tells
+you the timer is loaded, not whether the most recent service run
+succeeded. `status` on the service unit surfaces the last
+ExecMainStatus rc and the most recent journal lines, which is what an
+operator wants when they suspect the daily run silently failed.
 
 To dry-run the discovery without invoking `bootc switch`:
 

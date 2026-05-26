@@ -10,20 +10,30 @@ sudo make update-cluster CONFIG=cluster.local.conf
 ```
 
 It complements — does not replace — the per-VM
-`bootc-fetch-apply-updates.timer` described in
-[`docs/auto-updates.md`](auto-updates.md). The timer is best for
-unattended worker rollouts; this script is the coordinated path for
-single-CP clusters where the operator wants drain/uncordon, ordering,
-and a clean abort surface.
+`bootc-semver-update.timer` described in
+[`docs/auto-updates.md`](auto-updates.md). That timer (the canonical
+post-#181 in-image updater) resolves the highest semver tag at GHCR and
+stages the new image without rebooting; this script is the coordinated
+path for single-CP clusters where the operator wants drain/uncordon,
+ordering, a real reboot, and a clean abort surface.
+
+On pre-#181 hosts the in-image timer is the legacy
+`bootc-fetch-apply-updates.timer` (the stock unit that follows whatever
+mutable ref is pinned, typically `:latest`); this script handles both
+units transparently — see [Interaction with the in-image auto-update
+timer](#interaction-with-the-in-image-auto-update-timer) for the
+both-stop / semver-start fallback logic.
 
 ## Overview
 
 For each node in order — CP first, then each worker in `WORKER_NAMES`
 order — the script:
 
-1. Stops `bootc-fetch-apply-updates.timer` on the node (avoids racing
+1. Stops both `bootc-semver-update.timer` (post-#181 canonical) **and**
+   `bootc-fetch-apply-updates.timer` (legacy) on the node — best-effort
+   per unit so whichever timer is present is paused. This avoids racing
    the in-image auto-update timer described in
-   [`docs/auto-updates.md`](auto-updates.md)).
+   [`docs/auto-updates.md`](auto-updates.md).
 2. For workers only: `kubectl drain NODE --ignore-daemonsets
    --delete-emptydir-data --timeout=5m`. The CP is **not** drained —
    it's a single-CP topology, there's nowhere to drain to.
@@ -41,7 +51,11 @@ order — the script:
    every kube-system DaemonSet pod on the node to be Ready (see
    [Daemonset readiness gate](#daemonset-readiness-gate)).
 7. For workers: `kubectl uncordon NODE`.
-8. Restarts `bootc-fetch-apply-updates.timer` on the node.
+8. Restarts the in-image auto-update timer on the node. The script
+   probes for `bootc-semver-update.timer` first (post-#181 canonical)
+   and falls back to `bootc-fetch-apply-updates.timer` on pre-#181
+   hosts — see [Interaction with the in-image auto-update
+   timer](#interaction-with-the-in-image-auto-update-timer).
 9. Sleeps 5s before moving on (small breather; not load-bearing).
 
 The CP is rolled before workers so that any apiserver outage happens
@@ -160,9 +174,10 @@ Mutually exclusive with `--workers-only`. The value must match either
 
 Emergency rollback escape hatch. For workers, skips
 `kubectl drain` (the CP already skips drain by design). Also skips the
-`bootc-fetch-apply-updates.timer` stop/restart dance — appropriate when
-you're driving an upgrade manually and don't want the orchestrator
-touching the in-image timer.
+in-image timer stop/restart dance (covers both
+`bootc-semver-update.timer` and `bootc-fetch-apply-updates.timer`) —
+appropriate when you're driving an upgrade manually and don't want the
+orchestrator touching the in-image timer.
 
 ```bash
 sudo -E bash scripts/update-cluster.sh --skip-drain
@@ -533,25 +548,52 @@ bootc itself across nodes) are possible.
 
 ## Interaction with the in-image auto-update timer
 
-The worker image ships `bootc-fetch-apply-updates.timer` **enabled**
-by default; the k8s CP image ships it **disabled** (see
-[`docs/auto-updates.md`](auto-updates.md) for the rationale). On any
-node that has the timer enabled, leaving it running during a manual
-rolling upgrade risks:
+Post-#181, both Hummingbird flavors (`k8s` and `k8s-worker`) ship
+`bootc-semver-update.timer` **enabled** by default — that's the
+canonical in-image updater (semver-aware, no reboot, see
+[`docs/auto-updates.md`](auto-updates.md)). The legacy
+`bootc-fetch-apply-updates.timer` is **disabled** in the new preset
+but still present on the image, and pre-#181 hosts only have the
+legacy timer.
+
+On any node with an auto-update timer enabled, leaving it running
+during a manual rolling upgrade risks:
 
 - Two concurrent staged deployments racing each other.
-- The timer kicking off a reboot while `kubectl drain` is still
-  evicting pods.
+- The timer kicking off (post-#181: a `bootc switch`; pre-#181: a
+  reboot) while `kubectl drain` is still evicting pods.
 
-To avoid both, `update-cluster.sh` stops the timer on each node before
-the per-node upgrade and starts it again afterward. `--skip-drain`
-turns the dance off — appropriate when you're already running the
-upgrade manually and don't want the orchestrator restarting a timer
-you intentionally have stopped.
+To avoid both, `update-cluster.sh` stops **both timer units** on each
+node before the per-node upgrade — best-effort per unit so the call
+succeeds whether the host is post- or pre-#181. After the per-node
+upgrade lands, the script probes the remote for which timer unit
+exists and restarts the right one:
 
-The EXIT trap also best-effort restarts the timer on the in-flight
-node, so an aborted run doesn't leave the cluster with auto-updates
-permanently off.
+```bash
+if systemctl cat bootc-semver-update.timer >/dev/null 2>&1; then
+  systemctl start bootc-semver-update.timer    # post-#181 canonical
+elif systemctl cat bootc-fetch-apply-updates.timer >/dev/null 2>&1; then
+  systemctl start bootc-fetch-apply-updates.timer  # pre-#181 fallback
+fi
+```
+
+This means a pre-#181 host being rolled forward by `update-cluster.sh`
+keeps its legacy timer running until the in-place upgrade actually
+swaps the image to one with the new preset — at which point subsequent
+`update-cluster.sh` runs pick up `bootc-semver-update.timer` instead.
+Without the probe, blindly starting `bootc-semver-update.timer` on a
+pre-#181 host returned rc=5 (no such unit), swallowed by `|| true`,
+leaving the node with no auto-update timer running after a `bootc
+upgrade` rc=2 ("no update available") path.
+
+`--skip-drain` turns the dance off — appropriate when you're already
+running the upgrade manually and don't want the orchestrator restarting
+a timer you intentionally have stopped.
+
+The EXIT trap also best-effort restarts the auto-update timer (with
+the same post-#181 / pre-#181 probe) on the in-flight node, so an
+aborted run doesn't leave the cluster with auto-updates permanently
+off.
 
 ## Recovery from interruption
 
