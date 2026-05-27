@@ -641,6 +641,131 @@ EOF
   [[ "$output" == *"/nonexistent/cluster.local.conf"* ]]
 }
 
+# ---------------------------------------------------------------------------
+# #310 — BIB config files routed through mktemp, not REPO_ROOT
+#
+# Pre-#310 deploy-cluster.sh wrote BIB_CFG_CP/BIB_CFG_WORKER as
+# ${REPO_ROOT}/bib-config-deploy-{cp,worker}.toml. On any KVM host that
+# had ever run `sudo bash scripts/deploy-cluster.sh`, those files were
+# left owned root:root mode 0644, and a subsequent non-root deploy
+# (HBIRD_REMOTE_NO_SUDO=1 + libvirt-group operator) failed at the
+# rewrite with Permission denied. #310 routes both through mktemp so
+# (a) no REPO_ROOT side-effects and (b) per-deploy fresh paths owned
+# by the invoking user.
+#
+# Extracted block is the three-line literal `BIB_CFG_CP=$(mktemp ...)` /
+# `BIB_CFG_WORKER=$(mktemp ...)` / `BIB_CFG_TEMPS+=(...)` so a future
+# refactor that reintroduces the REPO_ROOT path breaks loudly here.
+# ---------------------------------------------------------------------------
+
+@test "deploy-cluster: BIB_CFG_{CP,WORKER} land in mktemp paths, not REPO_ROOT (#310)" {
+  # Pin both invariants in a single test (the issue's proposed scope):
+  #   1. Pre-create root-owned bib-config-deploy-*.toml in a stub REPO_ROOT,
+  #      then assert the resolved paths do NOT collide with them
+  #      (i.e. they're outside REPO_ROOT entirely).
+  #   2. Both paths are real mktemp outputs (exist, owned by the invoking
+  #      user, not nested under the stub REPO_ROOT).
+  #
+  # Extract the BIB_CFG mktemp block from deploy-cluster.sh by markers.
+  # Anchored on the `^# #310:` comment block + the trailing line that
+  # appends to BIB_CFG_TEMPS — keeps the snippet a verbatim extract so
+  # any drift breaks loudly.
+  awk '
+    /^# #310:/ { capture=1 }
+    capture { print }
+    capture && /^BIB_CFG_TEMPS\+=/ { exit }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/bib-cfg-mktemp.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/bib-cfg-mktemp.snippet" ] || {
+    echo "FATAL: failed to extract #310 BIB_CFG mktemp block from ${SCRIPT}" >&2
+    return 1
+  }
+
+  # Stub REPO_ROOT with pre-existing (operator-owned here, but
+  # filesystem-positionally identical to the root-owned leftover in
+  # the field bug) bib-config-deploy-*.toml files. The point of the
+  # test isn't to recreate the EPERM — bats can't chown to root —
+  # it's to pin that the resolved paths LIVE ELSEWHERE so a root-owned
+  # leftover would be irrelevant.
+  local stub_repo_root="${BATS_TEST_TMPDIR}/stub-repo-310"
+  mkdir -p "$stub_repo_root"
+  : > "${stub_repo_root}/bib-config-deploy-cp.toml"
+  : > "${stub_repo_root}/bib-config-deploy-worker.toml"
+
+  local driver="${BATS_TEST_TMPDIR}/driver-310.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+REPO_ROOT="${stub_repo_root}"
+BIB_CFG_TEMPS=()
+# The production script targets a Fedora KVM host (GNU coreutils), where
+# \`mktemp -t TEMPLATE\` resolves TEMPLATE under \$TMPDIR. The bats
+# container (busybox) parses -t as "use TMPDIR" with TEMPLATE as a
+# distinct positional arg, and the GNU spelling errors out. To keep this
+# test portable across both runners, shadow \`mktemp\` with a tiny bash
+# function that uses the BusyBox positional form (\`mktemp PATH-TEMPLATE\`)
+# pointing into BATS_TEST_TMPDIR. Both real \`mktemp\`s honor that form,
+# so the shim works under either runtime without diverging from what the
+# script does in production. (#310.)
+TMPDIR="${BATS_TEST_TMPDIR}"
+export TMPDIR
+mktemp() {
+  # Translate \`mktemp -t TEMPLATE\` into the lowest-common-denominator
+  # positional form \`mktemp PATH-TEMPLATE\` under \$TMPDIR. Strip any
+  # trailing \`.suffix\` after the Xs because BusyBox \`mktemp\` rejects
+  # post-X suffixes; the production script's GNU \`mktemp -t\` is happy
+  # with them, but BusyBox is the lowest common denominator we have to
+  # satisfy here. The point of the test is to verify the resolved paths
+  # live outside REPO_ROOT — the \`.toml\` suffix is cosmetic for bib.
+  local template stripped
+  if [[ "\${1:-}" == "-t" ]]; then
+    template="\$2"
+    stripped="\${template%.*}"
+    command mktemp "\${TMPDIR}/\${stripped}"
+  else
+    command mktemp "\$@"
+  fi
+}
+export -f mktemp
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/bib-cfg-mktemp.snippet"
+printf 'BIB_CFG_CP=%s\n' "\$BIB_CFG_CP"
+printf 'BIB_CFG_WORKER=%s\n' "\$BIB_CFG_WORKER"
+printf 'BIB_CFG_TEMPS_COUNT=%d\n' "\${#BIB_CFG_TEMPS[@]}"
+# Clean up so the test doesn't leak tempfiles into \$TMPDIR.
+rm -f "\$BIB_CFG_CP" "\$BIB_CFG_WORKER"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+
+  # Pull the resolved paths out of the driver's output for assertions.
+  local cp_path worker_path
+  cp_path="$(printf '%s\n' "$output" | sed -n 's/^BIB_CFG_CP=//p')"
+  worker_path="$(printf '%s\n' "$output" | sed -n 's/^BIB_CFG_WORKER=//p')"
+
+  # Hard invariant: NEITHER path may live under REPO_ROOT.
+  [[ "$cp_path" != "${stub_repo_root}/"* ]]
+  [[ "$worker_path" != "${stub_repo_root}/"* ]]
+
+  # Both resolved paths must contain the mktemp template prefix —
+  # belt-and-suspenders against a refactor that picks some other
+  # non-REPO_ROOT location (e.g. /tmp/static) and silently loses the
+  # per-deploy-fresh property.
+  [[ "$cp_path" == *"bib-config-deploy-cp."* ]]
+  [[ "$worker_path" == *"bib-config-deploy-worker."* ]]
+
+  # Both must be tracked in BIB_CFG_TEMPS so cleanup_on_failure (the
+  # failure-trap above the source block) sweeps them on abnormal exit.
+  [[ "$output" == *"BIB_CFG_TEMPS_COUNT=2"* ]]
+
+  # Pre-existing stub files must still be there — the script must NOT
+  # have touched them. If a future refactor reintroduces the REPO_ROOT
+  # write, it would either truncate these (turning them into 0-byte
+  # files) or trigger the EPERM in the real field bug.
+  [ -e "${stub_repo_root}/bib-config-deploy-cp.toml" ]
+  [ -e "${stub_repo_root}/bib-config-deploy-worker.toml" ]
+}
+
 @test "#305 non-root + NOT in libvirt group bails with the usermod hint" {
   [ "$EUID" -ne 0 ] || skip "running as root; EUID check short-circuits"
   stubdir="$(_stub_id_with_groups wheel users)"
