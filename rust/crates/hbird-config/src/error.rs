@@ -93,4 +93,38 @@ pub enum Error {
         /// The raw value text (post-unquote).
         raw: String,
     },
+
+    /// A boolean field whose bash twin hard-validates as exactly
+    /// `true` / `false` (`AUTO_UPDATE_CP`, `SWITCH_TO_GHCR` — see the
+    /// `case "$X" in true|false) ;; *) fail` blocks in
+    /// `scripts/deploy-cluster.sh`) received something else. Mirrors the
+    /// bash failure mode so a typo (`truue`, `TRUE`, `1`) doesn't
+    /// silently fall back to a default in the Rust path while erroring
+    /// in bash. (PR #315 round-2 review Lens 2 HIGH.)
+    #[error(
+        "invalid boolean for {field} at line {line_no}: {raw:?} (expected literal `true` or `false`)"
+    )]
+    InvalidBool {
+        /// Field name that failed to parse.
+        field: &'static str,
+        /// 1-based line number.
+        line_no: usize,
+        /// The raw value text (post-unquote).
+        raw: String,
+    },
+
+    /// A quoted scalar (`KEY="..."` / `KEY='...'`) closed cleanly but
+    /// had non-comment non-whitespace text after the close quote — e.g.
+    /// `CP_NAME="hbird" garbage`. Bash would tokenize that as two
+    /// statements and error; the pre-#315-round-2 Rust parser silently
+    /// dropped everything past the close quote, masking operator typos
+    /// like a missing `#` before the comment. (PR #315 round-2 review
+    /// Lens 2 HIGH.)
+    #[error("trailing content after closing quote on line {line_no}: {raw:?}")]
+    TrailingContent {
+        /// 1-based line number.
+        line_no: usize,
+        /// The raw line as it appeared in the file.
+        raw: String,
+    },
 }

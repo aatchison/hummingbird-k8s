@@ -114,12 +114,18 @@ fn is_valid_key(s: &str) -> bool {
 
 /// Parse a scalar RHS (everything after the `=`). Handles `"..."`,
 /// `'...'`, and bare values with optional trailing whitespace-led `#`
-/// comment.
+/// comment. PR #315 round-2 review Lens 2 HIGH: after a closing quote,
+/// only whitespace or a `#` comment is allowed; anything else
+/// (`CP_NAME="hbird" garbage`) errors via `Error::TrailingContent`
+/// rather than silently dropping the trailing text.
 fn parse_scalar(line_no: usize, raw_line: &str, rhs: &str) -> Result<String> {
     let trimmed = rhs.trim_start();
     if let Some(rest) = trimmed.strip_prefix('"') {
         match rest.find('"') {
-            Some(end) => Ok(rest[..end].to_string()),
+            Some(end) => {
+                check_trailing_after_quote(rest, end, line_no, raw_line)?;
+                Ok(rest[..end].to_string())
+            }
             None => Err(Error::UnterminatedQuote {
                 line_no,
                 raw: raw_line.to_string(),
@@ -127,7 +133,10 @@ fn parse_scalar(line_no: usize, raw_line: &str, rhs: &str) -> Result<String> {
         }
     } else if let Some(rest) = trimmed.strip_prefix('\'') {
         match rest.find('\'') {
-            Some(end) => Ok(rest[..end].to_string()),
+            Some(end) => {
+                check_trailing_after_quote(rest, end, line_no, raw_line)?;
+                Ok(rest[..end].to_string())
+            }
             None => Err(Error::UnterminatedQuote {
                 line_no,
                 raw: raw_line.to_string(),
@@ -137,6 +146,27 @@ fn parse_scalar(line_no: usize, raw_line: &str, rhs: &str) -> Result<String> {
         // Bare scalar. Strip a trailing `# comment` ONLY when the `#` is
         // preceded by whitespace (bash rule). `GHCR_TAG=tag#v1` keeps `#v1`.
         Ok(strip_trailing_comment(trimmed).trim_end().to_string())
+    }
+}
+
+/// Helper for parse_scalar: after locating the close-quote at position
+/// `end` in `rest` (the slice starting AFTER the open-quote), verify
+/// the remainder is whitespace or a `#`-led comment. Anything else is
+/// a `TrailingContent` error. (PR #315 round-2 review Lens 2 HIGH.)
+fn check_trailing_after_quote(
+    rest: &str,
+    end: usize,
+    line_no: usize,
+    raw_line: &str,
+) -> Result<()> {
+    let tail = rest[end + 1..].trim_start();
+    if tail.is_empty() || tail.starts_with('#') {
+        Ok(())
+    } else {
+        Err(Error::TrailingContent {
+            line_no,
+            raw: raw_line.to_string(),
+        })
     }
 }
 
@@ -265,8 +295,8 @@ fn build_config(
         image_source: take_scalar_or_default(&mut raw, "IMAGE_SOURCE", "ghcr"),
         ghcr_tag: take_scalar_or_default(&mut raw, "GHCR_TAG", "latest"),
         enable_cloud_init: take_u32_or_default(&mut raw, "ENABLE_CLOUD_INIT", 0)?,
-        auto_update_cp: take_bool_or_default(&mut raw, "AUTO_UPDATE_CP", true),
-        switch_to_ghcr: take_bool_or_default(&mut raw, "SWITCH_TO_GHCR", true),
+        auto_update_cp: take_bool_strict_or_default(&mut raw, "AUTO_UPDATE_CP", true)?,
+        switch_to_ghcr: take_bool_strict_or_default(&mut raw, "SWITCH_TO_GHCR", true)?,
         cp_memory: take_u32_or_default(&mut raw, "CP_MEMORY", 8192)?,
         cp_vcpus: take_u32_or_default(&mut raw, "CP_VCPUS", 4)?,
         worker_memory: take_u32_or_default(&mut raw, "WORKER_MEMORY", 4096)?,
@@ -337,24 +367,63 @@ fn take_u32_or_default(
     }
 }
 
+/// Lenient bool parser for fields whose bash twin uses `[[ "$X" = "true" ]]`
+/// (truthy-string semantics). Currently only `RUN_VERIFY`. Empty string
+/// falls through to the caller's default (mirrors bash `${VAR:=default}`
+/// — empty-string explicit assignment re-applies the default). Unknown
+/// non-empty spellings fall through to default rather than erroring,
+/// matching the bash side's loose handling.
+///
+/// PR #315 round-2 review Lens 2 HIGH: the pre-round-2 code mapped `""`
+/// to `false` regardless of the caller's default, so `RUN_VERIFY=""` and
+/// `AUTO_UPDATE_CP=""` both returned `false` even when the default was
+/// `true`. Fixed by removing the `""` arm so it falls through to default.
 fn take_bool_or_default(
     raw: &mut HashMap<String, (usize, Value)>,
     key: &'static str,
     default: bool,
 ) -> bool {
-    // Mirror bash truthiness as the operator-facing docs describe it.
-    // `cluster.example.conf` uses `true`/`false` literally; the script
-    // checks `[[ "$VAR" == "true" ]]` in some places and `[[ "$VAR" -eq 1 ]]`
-    // in others, so we accept both spellings on the safe side.
     match raw.remove(key) {
         Some((_, Value::Scalar(v))) => match v.to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => true,
-            "false" | "0" | "no" | "off" | "" => false,
-            // Unknown spellings fall through to the default rather than
-            // erroring — bash would just treat them as truthy strings.
+            "false" | "0" | "no" | "off" => false,
+            // Empty string AND unknown spellings fall through to the
+            // caller's default — bash's `${VAR:=default}` would resolve
+            // empty to the default, and lenient truthy-string semantics
+            // tolerate unknown spellings.
             _ => default,
         },
         _ => default,
+    }
+}
+
+/// Strict bool parser for fields whose bash twin hard-fails on anything
+/// other than literal `true` / `false` (`AUTO_UPDATE_CP`, `SWITCH_TO_GHCR`;
+/// see `case "$X" in true|false) ;; *) fail` blocks in
+/// `scripts/deploy-cluster.sh`). Returns `Error::InvalidBool` so a typo
+/// like `truue` errors in the Rust path the same way bash would, rather
+/// than silently falling back to a default.
+///
+/// PR #315 round-2 review Lens 2 HIGH. Case-sensitive (matches bash's
+/// case-sensitive comparison). Empty string falls through to the
+/// caller's default (matches bash `:=`).
+fn take_bool_strict_or_default(
+    raw: &mut HashMap<String, (usize, Value)>,
+    key: &'static str,
+    default: bool,
+) -> Result<bool> {
+    match raw.remove(key) {
+        Some((line_no, Value::Scalar(v))) => match v.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            "" => Ok(default),
+            _ => Err(Error::InvalidBool {
+                field: key,
+                line_no,
+                raw: v,
+            }),
+        },
+        _ => Ok(default),
     }
 }
 

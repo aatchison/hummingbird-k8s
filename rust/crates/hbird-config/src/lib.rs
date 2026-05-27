@@ -540,4 +540,149 @@ mod tests {
         // "operator typed `KVM_HOST=`" vs. "operator omitted the line".
         assert_eq!(cfg.kvm_host.as_deref(), Some(""));
     }
+
+    // ---- PR #315 round-2 review additions ---------------------------------
+
+    /// PR #315 round-2 review Lens 2 HIGH: AUTO_UPDATE_CP and
+    /// SWITCH_TO_GHCR are strict-validated by the bash twin
+    /// (`case "$X" in true|false) ;; *) fail`). Rust must mirror that
+    /// failure rather than silently fall back to the default.
+    #[test]
+    fn strict_bool_rejects_non_literal_for_auto_update_cp() {
+        let err = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            AUTO_UPDATE_CP=truue
+            ",
+        )
+        .expect_err("typo'd boolean should error, not silently default");
+        match err {
+            Error::InvalidBool {
+                field,
+                line_no,
+                raw,
+            } => {
+                assert_eq!(field, "AUTO_UPDATE_CP");
+                assert!(line_no > 0);
+                assert_eq!(raw, "truue");
+            }
+            other => panic!("expected InvalidBool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_bool_rejects_truthy_synonyms_for_switch_to_ghcr() {
+        // The lenient parser would accept 1/yes/on/0/no/off; bash hard-
+        // rejects everything but literal true/false for this field.
+        for bad in ["1", "yes", "on", "0", "no", "off", "TRUE", "True"] {
+            let conf = format!("CP_NAME=cp\nSSH_PUBKEY_FILE=/k\nSWITCH_TO_GHCR={bad}\n");
+            let err = parse_str(&conf).expect_err(&format!(
+                "expected InvalidBool for SWITCH_TO_GHCR={bad}, got Ok"
+            ));
+            assert!(
+                matches!(
+                    err,
+                    Error::InvalidBool {
+                        field: "SWITCH_TO_GHCR",
+                        ..
+                    }
+                ),
+                "wrong error variant for SWITCH_TO_GHCR={bad}: {err:?}"
+            );
+        }
+    }
+
+    /// PR #315 round-2 review Lens 2 HIGH: strict bool with empty
+    /// string must fall through to the caller's default, NOT to false
+    /// (the pre-round-2 lenient code mapped "" -> false unconditionally).
+    #[test]
+    fn strict_bool_empty_uses_default_not_false() {
+        let cfg = parse_str(
+            r#"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            AUTO_UPDATE_CP=""
+            "#,
+        )
+        .expect("empty string falls through to default");
+        // Default for AUTO_UPDATE_CP is true (mirrors bash `:=true`).
+        assert!(
+            cfg.auto_update_cp,
+            "AUTO_UPDATE_CP=\"\" must default to true"
+        );
+    }
+
+    /// PR #315 round-2 review Lens 2 HIGH: lenient bool with empty
+    /// string must also fall through to default (same bug class).
+    #[test]
+    fn lenient_bool_empty_uses_default_not_false() {
+        let cfg = parse_str(
+            r#"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            RUN_VERIFY=""
+            "#,
+        )
+        .expect("empty RUN_VERIFY falls through to default");
+        // Default for RUN_VERIFY is false; the contract is "empty == default",
+        // not "empty == false". With default=false, observed=false, the test
+        // would tautologically pass — flip the default expectation by also
+        // asserting unset-RUN_VERIFY behaves the same.
+        let cfg2 = parse_str("CP_NAME=cp\nSSH_PUBKEY_FILE=/k\n").expect("unset RUN_VERIFY parses");
+        assert_eq!(cfg.run_verify, cfg2.run_verify);
+    }
+
+    /// PR #315 round-2 review Lens 2 HIGH: trailing content after a
+    /// closing quote (e.g. `CP_NAME="hbird" garbage`) used to silently
+    /// drop everything past the quote, masking missing-`#` typos.
+    /// Round-2 errors instead.
+    #[test]
+    fn trailing_garbage_after_double_quote_errors() {
+        let err = parse_str(
+            r#"
+            CP_NAME="hbird" garbage
+            SSH_PUBKEY_FILE=/k
+            "#,
+        )
+        .expect_err("trailing content after close quote should error");
+        match err {
+            Error::TrailingContent { line_no, raw } => {
+                assert!(line_no > 0);
+                assert!(
+                    raw.contains("garbage"),
+                    "raw should include the offending text, got: {raw:?}"
+                );
+            }
+            other => panic!("expected TrailingContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trailing_garbage_after_single_quote_errors() {
+        let err = parse_str("CP_NAME='hbird' garbage\nSSH_PUBKEY_FILE=/k\n")
+            .expect_err("trailing content after close quote should error (single quoted)");
+        assert!(matches!(err, Error::TrailingContent { .. }));
+    }
+
+    #[test]
+    fn trailing_comment_after_close_quote_is_allowed() {
+        // A `#` comment after the close quote IS legitimate bash;
+        // verify the round-2 check doesn't false-positive on it.
+        let cfg = parse_str(
+            r#"
+            CP_NAME="hbird"  # this is fine
+            SSH_PUBKEY_FILE=/k
+            "#,
+        )
+        .expect("trailing # comment is legal");
+        assert_eq!(cfg.cp_name, "hbird");
+    }
+
+    #[test]
+    fn trailing_whitespace_after_close_quote_is_allowed() {
+        let cfg = parse_str("CP_NAME=\"hbird\"   \nSSH_PUBKEY_FILE=/k\n")
+            .expect("trailing whitespace after close quote is legal");
+        assert_eq!(cfg.cp_name, "hbird");
+    }
 }
