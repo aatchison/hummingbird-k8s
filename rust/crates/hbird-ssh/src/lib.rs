@@ -249,6 +249,12 @@ impl Client {
     // dozens per worker); operators flip on `RUST_LOG=hbird_ssh=debug`
     // when triaging a stuck remote command. (#323; PR #317 round-2
     // review L8 DISCUSS originally surfaced this.)
+    // `err(Debug)` directive demoted to a manual `tracing::debug!` event in
+    // the Err branch so callers (not this wrapper) decide ERROR-vs-debug
+    // policy per call site. `verify-hardening` PSA enforcement expects
+    // `kubectl apply` to exit non-zero as the PASS condition; the auto
+    // ERROR event from `err(Debug)` left an alarming log line on a passing
+    // verify-all run. (#331; original wiring #326.)
     #[tracing::instrument(
         level = "debug",
         skip(self, stdin),
@@ -257,9 +263,13 @@ impl Client {
             has_stdin = stdin.is_some(),
             cmd_len = command.len(),
         ),
-        err(Debug),
     )]
     fn run_inner(&self, command: &str, stdin: Option<&[u8]>) -> Result<RunOutput> {
+        self.run_inner_impl(command, stdin)
+            .inspect_err(|err| tracing::debug!(error = ?err, "ssh run_inner failed"))
+    }
+
+    fn run_inner_impl(&self, command: &str, stdin: Option<&[u8]>) -> Result<RunOutput> {
         if let Some(path) = self.options.identity_file()
             && !path.exists()
         {
