@@ -2,7 +2,8 @@
 
 Tracked by epic [#279](https://github.com/aatchison/hummingbird-k8s/issues/279).
 Foundation laid in [#280](https://github.com/aatchison/hummingbird-k8s/issues/280)
-(this PR).
+(PR #313). CI wired in [#281](https://github.com/aatchison/hummingbird-k8s/issues/281)
+via `.github/workflows/rust-ci.yml`.
 
 The bash equivalents under [`../scripts/`](../scripts/) remain canonical
 until each Rust subcommand reaches behavioral parity with its bash twin
@@ -43,8 +44,8 @@ rust/
 
 | Phase | Tracked by | Status |
 |-------|-----------|--------|
-| Foundation — devcontainer + workspace | [#280](https://github.com/aatchison/hummingbird-k8s/issues/280) | this PR |
-| Foundation — CI workflow | [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | pending |
+| Foundation — devcontainer + workspace | [#280](https://github.com/aatchison/hummingbird-k8s/issues/280) | landed (PR #313) |
+| Foundation — CI workflow | [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | this PR |
 | Foundation — ClusterConfig parser | [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | pending |
 | Transport — clap command tree | [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | pending |
 | Transport — virt + qemu+ssh URI | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | pending |
@@ -68,3 +69,12 @@ Workspace defaults (`Cargo.toml`):
 
 Pre-commit (`../.pre-commit-config.yaml`) enforces `cargo fmt --check` +
 `cargo clippy -- -D warnings` on every commit that touches `rust/**`.
+
+CI (`../.github/workflows/rust-ci.yml`) re-runs fmt + clippy + build +
+nextest + `cargo deny` on every PR that touches `rust/**`, plus a
+`devcontainer-smoke` job that builds the actual `.devcontainer/Containerfile`
+and runs `cargo check` inside it (dev/CI parity gate). A
+`lint-inheritance` job enforces that every `rust/crates/*/Cargo.toml`
+declares `[lints]\nworkspace = true` so the workspace's
+`unsafe_code = "forbid"` / clippy policy cannot be silently bypassed by a
+future crate that forgets the stanza.
