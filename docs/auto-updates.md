@@ -216,11 +216,24 @@ sudo bootc status --json | jq .status.booted.image.image.image
 ### Switching an already-deployed cluster
 
 For a cluster deployed before the GHCR-switch existed, run the Makefile
-target on the KVM host:
+target. It works from either side of the workstation→KVM-host axis:
 
 ```bash
-make switch-to-ghcr
+# On the KVM host (legacy path — local virsh):
+sudo make switch-to-ghcr
+
+# From a workstation with no local libvirt (#271 F1):
+KVM_HOST=geary make switch-to-ghcr
 ```
+
+The workstation path uses the C3 SSH-wrap shim (same as
+`make deploy-cluster` / `make destroy-cluster` / `make update-cluster` /
+`make spawn-workers`): when `KVM_HOST` is set and you're not already on
+it, `scripts/switch-to-ghcr.sh` re-execs itself on the KVM host via
+SSH. The client only needs `ssh` + your existing SSH key — no `sudo`
+typed locally, no libvirt installed locally. See `scripts/lib/ssh-wrap.sh`
+for the contract; the one-time setup is `ssh $KVM_HOST 'git clone
+https://github.com/aatchison/hummingbird-k8s ~/hummingbird-k8s'`.
 
 The script is best-effort per VM: failures on one VM don't block the
 others, and they're logged so you can retry.

@@ -24,13 +24,47 @@
 
 set -euo pipefail
 
+# ---- Locate self / repo root ------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
 log() { printf '[switch-to-ghcr] %s\n' "$*" >&2; }
+
+# Source-only mode for bats: when HBIRD_SWITCH_TO_GHCR_SOURCE_ONLY=1, return
+# from `source` here so the test can introspect the script (e.g. assert the
+# C3 SSH-wrap shim is wired in) without the script's libvirt orchestration
+# kicking in. Mirrors the HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY guard in
+# scripts/deploy-cluster.sh. (#271 F1.)
+if [[ "${HBIRD_SWITCH_TO_GHCR_SOURCE_ONLY:-0}" = 1 ]]; then
+  return 0
+fi
 
 # Escape hatch: operator can disable the auto-switch entirely.
 if [[ "${BOOTC_SWITCH_TO_GHCR:-1}" = "0" ]]; then
   log "BOOTC_SWITCH_TO_GHCR=0; skipping."
   exit 0
 fi
+
+# ---- Remote KVM-host re-exec shim (C3, #232; #271 F1) ----------------------
+# When KVM_HOST is set and we're NOT on the KVM host, re-exec this script
+# on the remote host via SSH. The client never needs sudo or libvirt —
+# only ssh + the operator's existing SSH key. Sudo happens on the remote.
+#
+# This script's all-VMs mode (no positional args) iterates every running
+# hummingbird-* libvirt domain via `virsh -c qemu:///system`, so it must
+# run on the KVM host. The single-VM mode (called by deploy-cluster.sh /
+# spawn-workers.sh) ALSO needs local libvirt — those callers themselves
+# C3-wrap, so when this script is invoked from inside one of them on the
+# KVM host the shim is a no-op (HBIRD_REMOTE_REEXEC=1 sentinel set).
+#
+# Env-var passthrough: EXPLICIT ALLOWLIST in lib/ssh-wrap.sh. The vars
+# this script honors (BOOTC_SWITCH_TO_GHCR, GHCR_ORG, GHCR_TAG) all need
+# to be added to HBIRD_SSH_WRAP_ALLOWED_ENV there if operators expect
+# workstation-set values to reach the remote side. (GHCR_TAG already is.)
+#
+# shellcheck source=lib/ssh-wrap.sh
+source "${SCRIPT_DIR}/lib/ssh-wrap.sh"
+hbird_ssh_wrap_maybe_reexec "$0" "$@"
+# ---- End remote re-exec shim -----------------------------------------------
 
 # When invoked via sudo (so virsh has qemu:///system access), the VM-side
 # authorized_keys was baked with the calling user's pubkey, not root's. Drop
