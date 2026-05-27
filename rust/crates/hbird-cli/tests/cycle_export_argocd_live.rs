@@ -77,7 +77,12 @@ impl Drop for OutputCleanup {
     }
 }
 
+// Round-2 lens L5 HIGH: `#[ignore]` so the test reports IGNORED (not
+// PASS) when not opted-in. Same pattern as PR #330 round-2 applied to
+// verify_*_live + cp_kubectl_live. Operator opts in with `--ignored` +
+// `HBIRD_LIVE_TEST=1`.
 #[test]
+#[ignore = "live cluster test; opt in with --ignored + HBIRD_LIVE_TEST=1"]
 fn live_export_argocd_emits_valid_kubeconfig() {
     if env::var("HBIRD_LIVE_TEST").ok().as_deref() != Some("1") {
         eprintln!("HBIRD_LIVE_TEST!=1 — skipping live cluster test");

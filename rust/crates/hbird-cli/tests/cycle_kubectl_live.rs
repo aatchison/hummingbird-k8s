@@ -19,7 +19,10 @@ fn env_with_hbird_fallback(key: &str) -> Option<String> {
     env_var(key).or_else(|| env_var(&format!("HBIRD_{key}")))
 }
 
+// Round-2 lens L5 HIGH: `#[ignore]` so the test reports IGNORED (not
+// PASS) when not opted-in.
 #[test]
+#[ignore = "live cluster test; opt in with --ignored + HBIRD_LIVE_TEST=1"]
 fn live_kubectl_get_pods_returns_running_table() {
     if env::var("HBIRD_LIVE_TEST").ok().as_deref() != Some("1") {
         eprintln!("HBIRD_LIVE_TEST!=1 — skipping live cluster test");

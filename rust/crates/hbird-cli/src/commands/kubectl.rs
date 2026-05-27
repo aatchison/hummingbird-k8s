@@ -18,6 +18,38 @@ use clap::Args;
 
 use crate::cp_kubectl::{CpTarget, cp_kubectl_raw};
 
+/// Round-2 lens L3 HIGH: when the remote `kubectl` exits non-zero,
+/// the bash twin (`scripts/kubectl-k8s.sh` under `set -e`) propagates
+/// `$?` verbatim — kubectl-not-found is 127, validation is 1,
+/// resource-not-found is 1, etc. The default `Result<()>` → anyhow
+/// path always exits 1, hiding the kubectl exit code.
+///
+/// This helper inspects the anyhow chain for an `hbird_ssh::Error::NonZeroExit`
+/// — if found, emits its stdout/stderr verbatim and `std::process::exit`s
+/// with the captured kubectl status code. Falls through to the normal
+/// anyhow-error path for any other failure shape (SSH transport, metachar
+/// guard, IdentityFileMissing, etc.) so operator diagnostics are preserved.
+/// Pub re-export so sibling subcommands (`nodes`) can share the same
+/// kubectl-exit-code propagation contract without copy-paste.
+pub fn propagate_kubectl_exit_or_bail_pub(err: anyhow::Error) -> Result<()> {
+    propagate_kubectl_exit_or_bail(err)
+}
+
+fn propagate_kubectl_exit_or_bail(err: anyhow::Error) -> Result<()> {
+    if let Some(hbird_ssh::Error::NonZeroExit {
+        status,
+        stdout,
+        stderr,
+        ..
+    }) = err.downcast_ref::<hbird_ssh::Error>()
+    {
+        let _ = io::stdout().write_all(stdout.as_bytes());
+        let _ = io::stderr().write_all(stderr.as_bytes());
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Err(err)
+}
+
 /// Arguments for `hbird kubectl`.
 #[derive(Debug, Args)]
 pub struct KubectlArgs {
@@ -90,14 +122,18 @@ pub fn run(args: KubectlArgs) -> Result<()> {
     }
     let target = resolve_target(&args)?;
     let command = args.args.join(" ");
-    let out = cp_kubectl_raw(&target, &command)?;
-    io::stdout()
-        .write_all(&out.stdout)
-        .context("write kubectl stdout")?;
-    io::stderr()
-        .write_all(&out.stderr)
-        .context("write kubectl stderr")?;
-    Ok(())
+    match cp_kubectl_raw(&target, &command) {
+        Ok(out) => {
+            io::stdout()
+                .write_all(&out.stdout)
+                .context("write kubectl stdout")?;
+            io::stderr()
+                .write_all(&out.stderr)
+                .context("write kubectl stderr")?;
+            Ok(())
+        }
+        Err(e) => propagate_kubectl_exit_or_bail(e),
+    }
 }
 
 /// Resolve a [`CpTarget`] — same defaulting order as

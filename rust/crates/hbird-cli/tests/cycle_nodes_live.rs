@@ -44,7 +44,10 @@ fn env_with_hbird_fallback(key: &str) -> Option<String> {
 /// We don't go through the binary (no PATH dance, no env juggling)
 /// — the SSH chain is the load-bearing part, and `cp_kubectl_raw`
 /// is exercised by the existing `cp_kubectl_live` test (cycle 1).
+// Round-2 lens L5 HIGH: `#[ignore]` so the test reports IGNORED (not
+// PASS) when not opted-in.
 #[test]
+#[ignore = "live cluster test; opt in with --ignored + HBIRD_LIVE_TEST=1"]
 fn live_nodes_returns_ready_table() {
     if env::var("HBIRD_LIVE_TEST").ok().as_deref() != Some("1") {
         eprintln!("HBIRD_LIVE_TEST!=1 — skipping live cluster test");

@@ -30,7 +30,10 @@ impl Drop for OutputCleanup {
     }
 }
 
+// Round-2 lens L5 HIGH: `#[ignore]` so the test reports IGNORED (not
+// PASS) when not opted-in.
 #[test]
+#[ignore = "live cluster test; opt in with --ignored + HBIRD_LIVE_TEST=1"]
 fn live_get_kubeconfig_emits_valid_kubeconfig() {
     if env::var("HBIRD_LIVE_TEST").ok().as_deref() != Some("1") {
         eprintln!("HBIRD_LIVE_TEST!=1 — skipping live cluster test");

@@ -54,20 +54,29 @@ pub struct NodesArgs {
 /// to empty before `source $CONFIG` ran.
 pub fn run(args: NodesArgs) -> Result<()> {
     let target = resolve_target(&args)?;
-    let out = cp_kubectl_raw(&target, "get nodes")?;
-    // Forward stdout verbatim — same bytes a `make nodes` operator
-    // already pipes into grep. We don't add the `[nodes]` prefix the
-    // way update-cluster does; the bash twin's `kubectl-k8s.sh get
-    // nodes` doesn't either.
-    io::stdout()
-        .write_all(&out.stdout)
-        .context("write kubectl stdout")?;
-    // kubectl emits warnings on stderr (`Warning: ...`); preserve that
-    // separation so log-grep operators see them in the expected stream.
-    io::stderr()
-        .write_all(&out.stderr)
-        .context("write kubectl stderr")?;
-    Ok(())
+    // Round-2 lens L3 HIGH: propagate kubectl's exit code on non-zero
+    // (bash twin under `set -e` preserves `$?` — kubectl-not-found is
+    // 127, validation is 1, etc). Default Result<()> anyhow path exits
+    // 1 always, hiding the real status. Same pattern as kubectl.rs.
+    match cp_kubectl_raw(&target, "get nodes") {
+        Ok(out) => {
+            // Forward stdout verbatim — same bytes a `make nodes` operator
+            // already pipes into grep. We don't add the `[nodes]` prefix the
+            // way update-cluster does; the bash twin's `kubectl-k8s.sh get
+            // nodes` doesn't either.
+            io::stdout()
+                .write_all(&out.stdout)
+                .context("write kubectl stdout")?;
+            // kubectl emits warnings on stderr (`Warning: ...`); preserve
+            // that separation so log-grep operators see them in the expected
+            // stream.
+            io::stderr()
+                .write_all(&out.stderr)
+                .context("write kubectl stderr")?;
+            Ok(())
+        }
+        Err(e) => crate::commands::kubectl::propagate_kubectl_exit_or_bail_pub(e),
+    }
 }
 
 /// Resolve a [`CpTarget`] from a mix of CLI args, env vars, and
