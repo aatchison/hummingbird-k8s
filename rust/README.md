@@ -35,7 +35,8 @@ rust/
 ├── Cargo.toml             # workspace root
 ├── rust-toolchain.toml    # pinned to stable + rustfmt + clippy
 └── crates/
-    └── hbird-core/        # placeholder (#280); future crates land per phasing
+    ├── hbird-common/      # placeholder (#280); future crates land per phasing
+    └── deny.toml           # cargo-deny license/security policy
 ```
 
 ## Phasing (per [epic #279])

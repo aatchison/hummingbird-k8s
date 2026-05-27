@@ -1,6 +1,8 @@
 [package]
-name = "hbird-core"
+name = "hbird-common"
 version = "0.0.1"
+# Named "common" (not "core") so the future transport/runtime nucleus can
+# claim the `hbird-core` name when it lands per the epic (#284/#285).
 description = "Placeholder crate for the hummingbird-k8s Rust rewrite (#280 workspace bootstrap)."
 edition.workspace = true
 license.workspace = true

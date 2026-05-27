@@ -11,7 +11,7 @@ edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.85"
 repository = "https://github.com/aatchison/hummingbird-k8s"
-authors = ["Arron Atchison"]
+authors = ["Arron Atchison <arron.atchison@gmail.com>"]
 
 # Shared lints — overridable per-crate via `[lints]` (workspace inheritance
 # explicitly opt-in: each crate adds `[lints] workspace = true`).

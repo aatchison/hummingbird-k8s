@@ -14,7 +14,7 @@
   "containerEnv": {
     "CARGO_TERM_COLOR": "always"
   },
-  "postCreateCommand": "if git rev-parse --git-dir >/dev/null 2>&1; then pre-commit install --hook-type pre-commit; else echo '[devcontainer] workspace is not a usable git repo (likely a git worktree whose gitdir is outside the bind mount); skipping pre-commit install — run it from the host instead'; fi",
+  "postCreateCommand": "if ! command -v pre-commit >/dev/null 2>&1; then echo '[devcontainer] pre-commit binary missing from image; skipping hook install' >&2; elif git rev-parse --git-dir >/dev/null 2>&1; then pre-commit install --hook-type pre-commit || echo '[devcontainer] pre-commit install failed; install manually with: pre-commit install --hook-type pre-commit' >&2; else echo '[devcontainer] workspace is not a usable git repo (likely a git worktree whose gitdir is outside the bind mount); skipping pre-commit install — run it from the host instead' >&2; fi",
   "customizations": {
     "vscode": {
       "extensions": [

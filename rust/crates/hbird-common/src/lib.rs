@@ -5,7 +5,7 @@
 //! transport, etc.).
 
 /// Marketing name of the project. Pinned here so future crates can depend
-/// on `hbird_core::PROJECT` instead of duplicating the literal.
+/// on `hbird_common::PROJECT` instead of duplicating the literal.
 pub const PROJECT: &str = "hummingbird-k8s";
 
 /// Epic this workspace tracks. Convenience for log lines + diagnostics
