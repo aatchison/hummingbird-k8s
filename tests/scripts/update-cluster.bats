@@ -709,6 +709,9 @@ _load_example_workers() {
   run bash "$SCRIPT" --help
   [ "$status" -eq 0 ]
   echo "$output" | grep -q "SSH_DROP_TIMEOUT"
+}
+
+# ---------------------------------------------------------------------------
 # #260 — k8s node name resolution + --node-name-override
 #
 # scripts/update-cluster.sh used to issue `kubectl drain $libvirt_domain`,
