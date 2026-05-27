@@ -112,9 +112,10 @@ impl Plan {
             count: args.count,
             worker_memory: config.worker_memory,
             worker_vcpus: config.worker_vcpus,
-            // Bash twin hardcodes TOKEN_TTL=2h default; config doesn't
-            // surface this knob. Keep parity.
-            token_ttl: "2h".to_string(),
+            // Round-2 lens L2 MEDIUM: honor TOKEN_TTL env var (bash twin
+            // line 68: `: "${TOKEN_TTL:=2h}"`). Operators can override
+            // for short-lived tokens (e.g. `TOKEN_TTL=30m`).
+            token_ttl: std::env::var("TOKEN_TTL").unwrap_or_else(|_| "2h".to_string()),
             kvm_host: args.kvm_host.clone().or(config.kvm_host),
             no_sudo: args.no_sudo,
             dry_run: args.dry_run,
@@ -214,6 +215,14 @@ fn plan_worker_loop(plan: &Plan, cp_ip: &str) -> Result<()> {
 // ---- Block #6: bootc switch-to-ghcr -----------------------------------------
 
 fn plan_bootc_switch(plan: &Plan) -> Result<()> {
+    // Round-2 lens L2 MEDIUM: honor BOOTC_SWITCH_TO_GHCR=0 to skip
+    // (bash twin `spawn-workers.sh:295`). Operators set this when their
+    // workers are already on the GHCR image and the re-switch is
+    // unnecessary churn.
+    if std::env::var("BOOTC_SWITCH_TO_GHCR").as_deref() == Ok("0") {
+        log("skipped (BOOTC_SWITCH_TO_GHCR=0)");
+        return Ok(());
+    }
     if plan.dry_run {
         for i in 1..=plan.count {
             let name = plan.worker_name(i);

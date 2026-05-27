@@ -4,7 +4,7 @@
 [deploy-cluster] DRY-RUN would podman pull ghcr.io/aatchison/hummingbird-k8s-worker:v0.42.0
 [deploy-cluster] DRY-RUN would render bib config + build /mnt/pool/hummingbird-k8s-deploy.qcow2 from ghcr.io/aatchison/hummingbird-k8s:v0.42.0
 [deploy-cluster] DRY-RUN would render bib config + build /mnt/pool/hummingbird-k8s-worker-deploy.qcow2 from ghcr.io/aatchison/hummingbird-k8s-worker:v0.42.0
-[deploy-cluster]   (bib invocation requires rootful podman — see #311; the live path will honor #311's skip-if-exists shortcut)
+[deploy-cluster]   (bib invocation requires rootful podman — see #311; the live path will honor `FORCE_REBUILD=1` to override #311(d)'s skip-if-exists shortcut landed in PR #336)
 [deploy-cluster] DRY-RUN would render CP cloud-init user-data (auto-update-cp=true, switch-to-ghcr=true, ghcr-tag=v0.42.0)
 [deploy-cluster] DRY-RUN would build CP cloud-init seed /mnt/pool/hbird-cp1-seed.iso
 [deploy-cluster] DRY-RUN would refuse to overwrite if CP VM 'hbird-cp1' already defined

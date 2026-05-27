@@ -227,7 +227,7 @@ fn plan_build_qcow2(plan: &Plan, cp_ref: &str, worker_ref: &str) -> Result<(Stri
             "DRY-RUN would render bib config + build {worker_template} from {worker_ref}"
         ));
         log(
-            "  (bib invocation requires rootful podman — see #311; the live path will honor #311's skip-if-exists shortcut)",
+            "  (bib invocation requires rootful podman — see #311; the live path will honor `FORCE_REBUILD=1` to override #311(d)'s skip-if-exists shortcut landed in PR #336)",
         );
         return Ok((cp_template, worker_template));
     }

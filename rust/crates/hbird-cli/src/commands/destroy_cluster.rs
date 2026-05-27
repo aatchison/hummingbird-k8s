@@ -106,9 +106,16 @@ struct Plan {
 
 impl Plan {
     fn from_args(args: &DestroyClusterArgs, config: ClusterConfig) -> Self {
-        // WORKER_NAMES default: legacy 2-worker is preserved by
-        // resolved_worker_names(); explicit empty stays empty.
-        let worker_names = config.resolved_worker_names();
+        // Round-2 lens L2 MEDIUM: destroy-cluster should NOT default
+        // worker names. Bash twin (`destroy-cluster.sh:71`) uses
+        // `${WORKER_NAMES[@]:-}` which is unset → no workers. The
+        // resolved_worker_names() helper applies a 2-worker default
+        // (suitable for DEPLOY but not destroy), so with an unset
+        // config Rust would try to destroy `${CP_NAME}-w1` + `-w2` +
+        // their qcow2/seed artifacts. Idempotent on missing domains so
+        // impact is just spurious log lines + extra SSH calls, but
+        // it's a real semantic split worth fixing in destroy.
+        let worker_names = config.worker_names.unwrap_or_default();
         Self {
             config_path: args.config.clone(),
             cp_name: config.cp_name,
@@ -163,24 +170,56 @@ impl Plan {
 ///    diagnostic the bash twin emits).
 ///
 /// Live mode only; dry-run is handled in [`run_dry_run`] up the stack.
+/// Round-2 lens L3#1: returns `Ok(warning_count)` on Ok-with-WARNs, or
+/// `Err` for fatal transport failures the caller must surface. Lets
+/// `run()` correctly aggregate partial-failure exit codes instead of
+/// the previous shape where every internal error swallowed to
+/// `tracing::debug!` and the `failed` vec was always empty.
 #[tracing::instrument(level = "debug", skip(conn, plan), fields(vm = name), err(Debug))]
-fn destroy_one(conn: &Connection, plan: &Plan, name: &str) -> Result<()> {
+fn destroy_one(conn: &Connection, plan: &Plan, name: &str) -> Result<usize> {
     // Step 1: dominfo probe. We treat any error here as "VM not
     // defined" — same as the bash twin's `>/dev/null 2>&1` redirect.
-    // Distinguishing transport failures would be nice but the bash
-    // twin doesn't, so we don't either (parity over polish).
-    let exists = conn.dominfo(name).is_ok();
+    // Round-2 lens L3#2 HIGH: distinguish transport failures from
+    // "domain absent". Bash twin uses `>/dev/null 2>&1` which has the
+    // same flaw — Rust improves on bash here. A bad --kvm-host or a
+    // dropped network produces VirtError::Ssh (transport); a known-good
+    // KVM host with the domain undefined produces VirtError::VirshFailed
+    // ("Domain not found"). Collapsing both to "absent" lets the cluster
+    // survive untouched + exit 0 — actively dangerous.
+    let exists = match conn.dominfo(name) {
+        Ok(_) => true,
+        Err(VirtError::VirshFailed { .. }) => false,
+        Err(e) => {
+            // Transport or other fatal — propagate so run() short-circuits
+            // and the operator sees the SSH error rather than silent skips.
+            return Err(anyhow::Error::new(e).context(format!(
+                "dominfo probe for {name} failed (transport, not domain-absence)"
+            )));
+        }
+    };
+
+    // Round-2 lens L3#1 HIGH: count per-step warnings into the outcome
+    // so run() can bail with a non-zero exit when any step warned. The
+    // prior shape returned Ok(()) on every internal warning, leaving
+    // run()'s `failed` vec always empty and the exit-3 promise dead.
+    let mut warnings = 0usize;
+
     if exists {
         log(&format!("destroying {name}"));
-        // Step 2 + 3: destroy + undefine. `|| true` — swallow errors.
+        // Steps 2 + 3: destroy + undefine. Bash twin's `|| true`
+        // swallows errors and continues — we surface them as WARN so
+        // the operator sees the divergence and run() can bail non-zero.
         if let Err(e) = conn.destroy_domain(name) {
-            // Match bash's silence here — only surface if the operator
-            // cranked tracing up. Operators won't see this at default
-            // log level, matching parity with `|| true`.
-            tracing::debug!(error = ?e, "virsh destroy returned non-zero (likely already shut off — bash twin silences this)");
+            log_warn(&format!(
+                "WARN: virsh destroy returned non-zero for {name}: {e}"
+            ));
+            warnings += 1;
         }
         if let Err(e) = conn.undefine_domain(name) {
-            tracing::debug!(error = ?e, "virsh undefine returned non-zero (bash twin silences this)");
+            log_warn(&format!(
+                "WARN: virsh undefine returned non-zero for {name}: {e}"
+            ));
+            warnings += 1;
         }
     } else {
         log(&format!("{name}: no such domain (already torn down)"));
@@ -194,6 +233,7 @@ fn destroy_one(conn: &Connection, plan: &Plan, name: &str) -> Result<()> {
             Ok(true) => {}
             Err(e) => {
                 log_warn(&format!("WARN: could not check existence of {path}: {e}"));
+                warnings += 1;
                 continue;
             }
         }
@@ -203,9 +243,10 @@ fn destroy_one(conn: &Connection, plan: &Plan, name: &str) -> Result<()> {
             log_warn(&format!(
                 "WARN: could not remove {path}: {e}. If pre-#305 root-owned, run once as root: sudo rm -f {path}"
             ));
+            warnings += 1;
         }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 // ---- Block #5: scratch-dir cleanup -----------------------------------------
@@ -361,16 +402,26 @@ pub fn run(args: DestroyClusterArgs) -> Result<()> {
         plan.config_path.display(),
     ));
 
-    let mut failed: Vec<(String, VirtError)> = Vec::new();
+    // Round-2 lens L3#1 HIGH fix: destroy_one now returns Ok(warnings)
+    // / Err(fatal-transport). Aggregate the counts; bail when any step
+    // warned. The prior `failed: Vec<(String, VirtError)>` was always
+    // empty because destroy_one's old shape swallowed every internal
+    // error to debug! and returned Ok(()).
+    let mut total_warnings = 0usize;
     for vm in plan.vms() {
-        if let Err(e) = destroy_one(&conn, &plan, &vm) {
-            // destroy_one returns Ok in all artifact-cleanup paths; an
-            // Err here is a transport-level failure we couldn't recover
-            // from. Surface as WARN and continue (bash twin keeps going
-            // through every VM even if one fails).
-            log_warn(&format!("WARN: destroy failed for {vm}: {e}"));
-            if let Some(ve) = e.downcast_ref::<VirtError>() {
-                failed.push((vm.clone(), clone_virt_err(ve)));
+        match destroy_one(&conn, &plan, &vm) {
+            Ok(w) => total_warnings += w,
+            Err(e) => {
+                // Fatal transport — cluster state is unknown, stop walking
+                // the VM list rather than silently skipping the rest.
+                // Bash twin keeps going (because every command has `|| true`)
+                // but that's exactly the regression L3#2 surfaced — a bad
+                // --kvm-host produces "everything already torn down" + exit 0.
+                return Err(e.context(format!(
+                    "destroy-cluster aborting on {vm}: fatal SSH/transport \
+                     failure; cluster state unknown — check --kvm-host + \
+                     network reachability before re-running"
+                )));
             }
         }
     }
@@ -379,30 +430,17 @@ pub fn run(args: DestroyClusterArgs) -> Result<()> {
 
     log("done.");
 
-    if !failed.is_empty() {
-        // Aggregate exit code 3 (mirrors update-cluster's partial-failure
-        // pattern). The bash twin doesn't distinguish; we surface it.
+    if total_warnings > 0 {
+        // Exit code 3 mirrors update-cluster's partial-failure pattern.
+        // The bash twin always exits 0; Rust improves on this by
+        // surfacing the divergence (per the existing PR body comment).
         bail!(
-            "destroy-cluster: {} domain(s) failed to fully tear down — see WARN log lines above",
-            failed.len(),
+            "destroy-cluster: {} step(s) had warnings — see WARN log lines above",
+            total_warnings,
         );
     }
 
     Ok(())
-}
-
-/// Best-effort clone of a [`VirtError`] for aggregation. The error type
-/// is `non_exhaustive` + carries a non-Clone inner SSH error in some
-/// variants, so a flat string-coercion preserves the operator-relevant
-/// info without needing the upstream crate to add a `Clone` derive.
-fn clone_virt_err(e: &VirtError) -> VirtError {
-    // We can't actually clone VirtError without upstream changes; fold
-    // into VirshFailed with the Display string. Accepted lossy form;
-    // operators read WARN lines, not this aggregate.
-    VirtError::VirshFailed {
-        command: "<aggregated>".to_string(),
-        stderr: format!("{e}"),
-    }
 }
 
 #[cfg(test)]

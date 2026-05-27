@@ -315,9 +315,13 @@ impl Connection {
         self.run(&cmd).map(|_| ())
     }
 
-    /// Recursively remove a directory on the remote KVM host
-    /// (`rm -rf --`). Used to clean the `${POOL_DIR}/deploy-cluster`
-    /// scratch dir.
+    /// **DESTRUCTIVE**: recursively remove a directory on the remote
+    /// KVM host (`rm -rf --`). Callers MUST validate that `path` is a
+    /// known scratch dir (e.g. under `${POOL_DIR}/`) — never operator-
+    /// supplied raw input. A pre-flight guard rejects `/`, top-level
+    /// system dirs (`/etc`, `/home`, `/var`, ...), empty paths,
+    /// non-absolute paths, and any path containing `..` segments. See
+    /// [`reject_destructive_path`] for the full rejection rules.
     ///
     /// Bash twin: `scripts/destroy-cluster.sh::113` —
     /// `_scratch_err=$(rm -rf -- "${POOL_DIR}/deploy-cluster" 2>&1)`.
@@ -327,9 +331,16 @@ impl Connection {
     ///
     /// - [`Error::Ssh`] for SSH transport failures.
     /// - [`Error::VirshFailed`] (overloaded — captures `rm`'s stderr)
-    ///   when `rm` exits non-zero.
+    ///   when `rm` exits non-zero or when the destructive-path guard
+    ///   refuses the request.
     #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path), err(Debug))]
     pub fn remote_rm_rf(&self, path: &str) -> Result<()> {
+        // Round-2 lens L5#H2 + L1 MED (convergent): pre-flight guard
+        // against catastrophic paths. `rm -rf -- '/'` on a root SSH
+        // session would wipe the KVM host. Bash twin gets away with
+        // this because POOL_DIR is interpolated into longer paths; the
+        // Rust API exposes the raw string so we MUST refuse here.
+        reject_destructive_path(path)?;
         let cmd = format!("rm -rf -- {}", shell_quote(path));
         self.run(&cmd).map(|_| ())
     }
@@ -390,6 +401,56 @@ impl Connection {
 /// fat-fingered config inject shell metacharacters via a domain name
 /// from `cluster.local.conf`. Single-quote wrap; escape any embedded
 /// single quote with `'\''`.
+/// Reject paths that would be catastrophic for [`Connection::remote_rm_rf`].
+/// Round-2 lens L5#H2 + L1 MED on PR #337: `rm -rf -- '/'`, empty paths,
+/// `..`-bearing paths, and top-level system dirs are all rejected at
+/// the API boundary so an upstream bug or malicious config can't trigger
+/// a host-wide wipe via a root SSH session.
+///
+/// Defense-in-depth — the legitimate callers (destroy-cluster + future
+/// deploy-cluster cleanup) always pass `${POOL_DIR}/<subdir>` which
+/// won't trip this guard, but a defaulting bug or a config injection
+/// could.
+fn reject_destructive_path(path: &str) -> Result<()> {
+    if path.is_empty() {
+        return Err(Error::VirshFailed {
+            command: "remote_rm_rf".to_string(),
+            stderr: "refusing empty path: rm -rf '' would target cwd".to_string(),
+        });
+    }
+    if !path.starts_with('/') {
+        return Err(Error::VirshFailed {
+            command: "remote_rm_rf".to_string(),
+            stderr: format!("refusing non-absolute path: {path:?} (must start with /)"),
+        });
+    }
+    if path.split('/').any(|seg| seg == "..") {
+        return Err(Error::VirshFailed {
+            command: "remote_rm_rf".to_string(),
+            stderr: format!("refusing path with `..` segment: {path:?}"),
+        });
+    }
+    // Reject `/` and the top-level system dirs an operator should
+    // never need to recursively delete via this helper.
+    let banned = [
+        "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/proc", "/root", "/run",
+        "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var",
+    ];
+    let trimmed = path.trim_end_matches('/');
+    let to_check = if trimmed.is_empty() { "/" } else { trimmed };
+    if banned.contains(&to_check) {
+        return Err(Error::VirshFailed {
+            command: "remote_rm_rf".to_string(),
+            stderr: format!(
+                "refusing destructive path: {path:?} is a top-level system \
+                 directory; remote_rm_rf is only meant for cluster scratch \
+                 dirs under POOL_DIR"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
