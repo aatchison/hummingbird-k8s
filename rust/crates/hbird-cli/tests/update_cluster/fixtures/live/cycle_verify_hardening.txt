@@ -76,7 +76,7 @@ Three categories of divergence:
     Rust path is MORE correct than bash. Operator action:
     - Short-term: trust the Rust verifier when it disagrees.
     - Follow-up: fix bash twin's kc-via-kubectl-k8s.sh stdin
-      handling — separate issue (verify-hardening + verify-app-deploy
+      handling — tracked by #332 (verify-hardening + verify-app-deploy
       both rely on kc apply -f -).
 
 (2) Rust emits one ERROR span event with the kubectl-stderr

@@ -346,9 +346,19 @@ fn run_verify_encryption(plan: &VerifyPlan) -> Result<()> {
         }
     }
     if !out.success {
+        // Round-2 lens L3 HIGH: preserve bash twin's grep-anchored
+        // failure-class wording. The on-image script's stderr (forwarded
+        // verbatim above) already carries `[verify-encryption] FAIL: …`
+        // lines naming the specific failure class (etcd unreachable,
+        // could-not-read key, secret in etcd is plaintext). Surface
+        // the marker explicitly in the bail so operators grepping for
+        // "[verify-encryption] FAIL" find both the on-image emit AND
+        // the Rust-side bail.
         bail!(
-            "verify-encryption: remote /usr/libexec/verify-encryption.sh \
-             exited non-zero on {}",
+            "[verify-encryption] FAIL: remote /usr/libexec/verify-encryption.sh \
+             on {} failed — see [verify-encryption] FAIL: lines above for the \
+             specific class (etcd unreachable / could not read key / secret \
+             stored plaintext)",
             plan.target.cp_ip
         );
     }
@@ -394,13 +404,25 @@ spec:
          --ignore-not-found=true --wait=false",
     );
     let combined = format!("{}\n{}", out.stdout, out.stderr);
-    if combined.contains("violates PodSecurity") {
+    // Round-2 lens L3 HIGH: PASS requires BOTH the expected stderr marker
+    // AND kubectl exit non-zero (i.e. PSA actually rejected). Without the
+    // !success guard, a transport-level success that echoes the marker
+    // (e.g. future apiserver wording change with admission warning +
+    // accept) would be a false PASS.
+    if !out.success && combined.contains("violates PodSecurity") {
         log(prefix, "  PASS: privileged pod rejected by PodSecurity");
         Ok(true)
+    } else if out.success {
+        log(
+            prefix,
+            "  FAIL: privileged pod was NOT rejected (kubectl exit 0 — PSA may be misconfigured)",
+        );
+        log(prefix, &format!("  apiserver output: {combined}"));
+        Ok(false)
     } else {
         log(
             prefix,
-            "  FAIL: privileged pod was not rejected by PodSecurity",
+            "  FAIL: privileged pod was rejected but marker missing — apiserver wording may have changed",
         );
         log(prefix, &format!("  apiserver output: {combined}"));
         Ok(false)
@@ -740,9 +762,12 @@ pub fn run(args: VerifyArgs) -> Result<()> {
         }
         VerifySubcommand::All(c) => {
             let plan = VerifyPlan::from_args(&c)?;
-            run_verify_encryption(&plan)?;
-            run_verify_hardening(&plan)?;
-            run_verify_app_deploy(&plan)
+            // Round-2 lens L3 MEDIUM: tag each sub-step into anyhow's
+            // chain so operators see "verify-all step N/3: <verifier>"
+            // at the top of the error, not just the inner FAIL message.
+            run_verify_encryption(&plan).context("verify-all step 1/3: encryption")?;
+            run_verify_hardening(&plan).context("verify-all step 2/3: hardening")?;
+            run_verify_app_deploy(&plan).context("verify-all step 3/3: app-deploy")
         }
     }
 }

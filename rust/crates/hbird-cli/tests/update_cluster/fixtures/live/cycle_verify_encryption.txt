@@ -9,6 +9,8 @@
 #
 # bash:   CONFIG=cluster.local.conf KVM_HOST=geary CP_NAME=hbird-cp1 \
 #           bash scripts/verify-encryption.sh
+#         (bash invoked directly because `make verify-encryption` does
+#          not forward CONFIG/KVM_HOST — tracked by #333)
 # Rust:   HBIRD_LIVE_TEST=1 CP_IP=192.168.122.212 KVM_HOST=aatchison@geary \
 #           cargo test -p hbird-cli --test verify_encryption_live -- --nocapture
 #

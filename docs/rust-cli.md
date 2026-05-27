@@ -28,7 +28,7 @@ subcommands land per the phasing table in
 | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | landed (PR #317) |
 | [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | `update-cluster` Phase 1A — dry-run parity + orchestration scaffold | landed (PR #321) |
 | [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycle 1 (`cp_kubectl` + drain/uncordon) landed (PR #325); cycles 2–4 pending |
-| [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | `verify-*` Phase 2 — encryption / hardening / app-deploy / all | landed (PR #287) — live-validated 2026-05-27 |
+| [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | `verify-*` Phase 2 — encryption / hardening / app-deploy / all | landed (PR #330) — live-validated 2026-05-27 |
 
 ## Foundation crates landed so far
 
@@ -64,8 +64,11 @@ hbird kubectl …           <-> make kubectl             (body tracked by #288)
 
 Every subcommand currently returns
 `Err("not yet implemented — tracked by #XXX")` with the appropriate
-sub-issue link. The flag set + help text are stable; the Makefile will
-start dispatching to `hbird` per-target as each implementation lands.
+sub-issue link — *except* `verify {encryption,hardening,app-deploy,all}`
+(PR #330) and `update-cluster --dry-run` (PR #321), which now reach live
+or dry-run execution per the phasing table above. The flag set + help
+text are stable; the Makefile will start dispatching to `hbird`
+per-target as each implementation lands.
 
 Tracing/logging — `tracing` + `tracing-subscriber` (chosen by [#323],
 PR #326). Library crates (`hbird-config`, `hbird-ssh`, `hbird-virt`)

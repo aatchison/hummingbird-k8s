@@ -47,7 +47,15 @@ fn hbird_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_hbird"))
 }
 
+// Round-2 lens L5 MEDIUM: `#[ignore]` so the test reports as IGNORED
+// (operator-visible signal "this test didn't run"), not PASS (which is
+// what `return` from the body produced). Operator opts in with
+// `cargo test --test verify_encryption_live -- --ignored` AND
+// `HBIRD_LIVE_TEST=1` env. Belt-and-suspenders: the env check still
+// runs first so an `--ignored` invocation without the env still skips
+// cleanly rather than running blind against an absent cluster.
 #[test]
+#[ignore = "live cluster test; opt in with --ignored + HBIRD_LIVE_TEST=1"]
 fn live_verify_encryption_pass() {
     if env::var("HBIRD_LIVE_TEST").ok().as_deref() != Some("1") {
         eprintln!("HBIRD_LIVE_TEST!=1 — skipping live cluster test");
