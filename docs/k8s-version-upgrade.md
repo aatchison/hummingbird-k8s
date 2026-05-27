@@ -41,6 +41,17 @@ Before any upgrade, regardless of path:
   pinned version) before any K8s bump. If the target K8s minor falls
   outside that window, bump Cilium first in a separate PR. See
   [`docs/cilium-migration.md`](cilium-migration.md).
+
+  This step is codified by `make check-cilium-k8s-compat` (issue #303),
+  which reads the pinned Cilium + K8s versions from
+  `containers/k8s/k8s-init.sh` + `containers/k8s/Containerfile` and
+  warns if the pair is out of range. Run it before bumping `K8S_VERSION`:
+
+  ```bash
+  make check-cilium-k8s-compat                 # warn on currently-committed pins
+  make check-cilium-k8s-compat K8S=v1.32       # "what if I bump K8s to v1.32?"
+  make check-cilium-k8s-compat STRICT=1        # exit 1 on mismatch (CI gate form)
+  ```
 - **Read the upstream changelog.** Removed/graduated APIs (`storage.k8s.io`,
   `flowcontrol.apiserver.k8s.io`, `policy/v1beta1`-style deprecations) bite
   hardest on minor bumps.

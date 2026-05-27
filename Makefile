@@ -114,6 +114,7 @@ endif
         switch-to-ghcr \
         nodes kubectl \
         verify-encryption verify-hardening verify-app-deploy verify-all \
+        check-cilium-k8s-compat \
         kube-bench \
         backup-etcd restore-etcd rotate-etcd-key \
         ci-build-k8s ci-build-worker \
@@ -341,6 +342,18 @@ verify-app-deploy: ## End-to-end PSA-restricted nginx + pod-to-pod test (CONFIG=
 	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" bash scripts/verify-app-deploy.sh
 
 verify-all: verify-encryption verify-hardening verify-app-deploy ## All three verifiers in sequence (CONFIG=<path>, KVM_HOST=<alias>)
+
+# Pre-flight: warn (or fail with STRICT=1) when the pinned Cilium version
+# doesn't cover the pinned (or target) K8s minor. See issue #303 and
+# docs/k8s-version-upgrade.md "Pre-flight checklist". CILIUM= and K8S=
+# are passthroughs for what-if checks ("can I bump K8s to v1.32 without
+# bumping Cilium?"); STRICT=1 escalates a mismatch from warning to
+# exit-1 for use as a pre-merge gate.
+check-cilium-k8s-compat: ## Warn on Cilium/K8s version-compatibility mismatch (CILIUM=X.Y.Z, K8S=vX.Y, STRICT=1)
+	@bash scripts/check-cilium-k8s-compat.sh \
+	  $(if $(CILIUM),--cilium=$(CILIUM),) \
+	  $(if $(K8S),--k8s=$(K8S),) \
+	  $(if $(STRICT),--strict,)
 
 kube-bench: ## Run CIS Kubernetes Benchmark (kube-bench) against the cluster
 	bash scripts/run-kube-bench.sh

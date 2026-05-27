@@ -294,3 +294,25 @@ KUBE_BENCH_VERSION=v0.15.5 ./scripts/run-kube-bench.sh
 
 See [`kube-bench.md`](kube-bench.md) for the full env-var surface of
 that script.
+
+### Cilium ↔ K8s compatibility pre-check
+
+Cilium's per-minor support window for Kubernetes is independent of the
+two pins above (`K8S_VERSION` in the Containerfile and the
+`cilium install --version` line in `k8s-init.sh`). To guard against
+bumping `K8S_VERSION` past the pinned Cilium minor's tested window
+(issue #303), run:
+
+```bash
+make check-cilium-k8s-compat                  # warn-only on currently-committed pins
+make check-cilium-k8s-compat K8S=v1.32        # "what if I bump K8s to v1.32?"
+make check-cilium-k8s-compat CILIUM=1.17.0    # "what if I bump Cilium to 1.17.0?"
+make check-cilium-k8s-compat STRICT=1         # exit 1 on mismatch (pre-merge gate form)
+```
+
+The embedded matrix mirrors the per-minor pages at
+<https://docs.cilium.io/en/v1.16/network/kubernetes/compatibility/>
+(swap the `v1.16` segment to consult another release). Refresh it in
+`scripts/check-cilium-k8s-compat.sh` when bumping the Cilium pin past
+the highest known minor; `tests/scripts/check-cilium-k8s-compat.bats`
+pins specific cells so an accidental row flip is loud.
