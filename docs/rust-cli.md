@@ -17,11 +17,21 @@ foundation; subcommands land per the phasing table in
 | Sub-issue | What | Status |
 |-----------|------|--------|
 | [#280](https://github.com/aatchison/hummingbird-k8s/issues/280) | Devcontainer + cargo workspace skeleton | landed (PR #313) |
-| [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | CI workflow (fmt / clippy / test / deny / pre-commit / devcontainer smoke / lint inheritance) | in PR (this) |
-| [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | `ClusterConfig` parser (first real crate) | pending (parallel with #281) |
+| [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | CI workflow (fmt / clippy / test / deny / pre-commit / devcontainer smoke / lint inheritance) | landed (PR #314) |
+| [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | `ClusterConfig` parser (first real crate) | this PR |
 | [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | clap command tree (binary crate) | pending (gated on foundation) |
 | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | pending |
 | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | pending |
+
+## Foundation crates landed so far
+
+| Crate | Purpose | Tracked by |
+|-------|---------|-----------|
+| `hbird-common` | Workspace bootstrap placeholder (project constants). | [#280] |
+| `hbird-config` | Typed parser for `cluster.local.conf`. | [#282] |
+
+[#280]: https://github.com/aatchison/hummingbird-k8s/issues/280
+[#282]: https://github.com/aatchison/hummingbird-k8s/issues/282
 
 ## When the Rust binary will appear in the `Makefile`
 
