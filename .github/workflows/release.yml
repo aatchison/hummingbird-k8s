@@ -134,9 +134,19 @@ jobs:
           set -euo pipefail
           bin="target/x86_64-unknown-linux-musl/release/hbird"
           file "$bin"
-          if ldd "$bin" 2>&1 | grep -qv 'not a dynamic executable'; then
+          # Discovered by v0.0.1 dry-run (2026-05-27): the prior shape
+          # `grep -qv 'not a dynamic executable'` was inverted-logic
+          # buggy — it returned true (i.e. "dynamic") any time ldd's
+          # output didn't literally contain that phrase, including the
+          # `statically linked` case (the desired outcome on static-pie
+          # musl builds). Replaced with a positive check that PASSES
+          # when ldd output contains either of the two known-good
+          # markers and FAILS otherwise.
+          ldd_out=$(ldd "$bin" 2>&1 || true)
+          echo "$ldd_out"
+          if [[ "$ldd_out" != *"statically linked"* ]] \
+             && [[ "$ldd_out" != *"not a dynamic executable"* ]]; then
             echo "::error::hbird is dynamically linked — musl static build failed"
-            ldd "$bin" || true
             exit 1
           fi
           ./"$bin" --version
