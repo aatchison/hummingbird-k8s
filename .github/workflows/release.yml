@@ -172,60 +172,46 @@ jobs:
 
       # Cosign keyless OIDC: Fulcio mints a short-lived cert from the GHA
       # OIDC token; Rekor logs the signature for public transparency.
-      # Produces .sig (signature) and .pem (cert) we ship alongside the
-      # binary. Always runs (even in dry-run) so the OIDC plumbing is
-      # exercised end-to-end; only the upload is gated.
-      # Round-2 lens L1 MED: dry-run cosign sign-blob writes to the public
-      # Rekor transparency log even though we never publish — Rekor entries
-      # are immutable + permanent, so an operator running
-      # `workflow_dispatch dry_run=true` would leak permanent records
-      # tied to whatever version string they typed. Use `--tlog-upload=false`
-      # in dry-run mode so the OIDC plumbing is still exercised but no
-      # Rekor entry lands. Real tag-push runs DO upload (the default).
+      # Caught by v0.0.1 dry-run round-2: cosign deprecated
+      # `--tlog-upload=false` (now requires a custom --signing-config to
+      # disable Rekor). PR #348's original "always run cosign-sign in
+      # dry-run" intent was to exercise the OIDC plumbing end-to-end.
+      # But the Rekor-leak concern (L1 MED on #348) means the only safe
+      # options are (a) custom signing-config (added complexity, fragile
+      # vs upstream changes) or (b) skip cosign entirely in dry-run.
+      #
+      # Chose (b): skip cosign-sign + cosign-verify in dry-run. The
+      # first real tag push validates the OIDC plumbing as a one-time
+      # cost; dry-run exercises every other step (build, static-link
+      # verify, OCI image build, label assembly, version parsing,
+      # tag-ref gate, artifact staging, dry-run summary). Trade-off
+      # accepted: dry-run no longer validates the cosign step itself,
+      # but it no longer leaves permanent Rekor records either.
       - name: Cosign sign binary (keyless OIDC)
+        if: steps.v.outputs.dry_run == 'false'
         env:
           VERSION: ${{ steps.v.outputs.version }}
           BINARY: ${{ steps.stage.outputs.binary }}
-          DRY_RUN: ${{ steps.v.outputs.dry_run }}
         run: |
           set -euo pipefail
-          tlog_arg=""
-          if [[ "$DRY_RUN" == "true" ]]; then
-            tlog_arg="--tlog-upload=false"
-            echo "::notice::dry-run: cosign sign-blob with --tlog-upload=false (no Rekor record)"
-          fi
-          # shellcheck disable=SC2086 # tlog_arg intentionally unquoted to expand to empty when not set
-          cosign sign-blob --yes $tlog_arg \
+          cosign sign-blob --yes \
             --output-signature "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.sig" \
             --output-certificate "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.pem" \
             "$BINARY"
           ls -la dist/
 
-      # Verify what we just signed BEFORE publishing. If verify-blob fails
-      # locally, the published release would be unverifiable — better to
-      # fail now than ship a broken signature.
-      # Verify what we just signed BEFORE publishing. If verify-blob fails
-      # locally, the published release would be unverifiable — better to
-       # fail now than ship a broken signature. Round-2 L1 MED: dry-run
-      # skipped the Rekor upload (per the cosign-sign step above), so
-      # verify-blob in dry-run mode must also skip the Rekor lookup via
-      # `--insecure-ignore-tlog`. Real tag-push runs do the full Rekor
-      # round-trip.
+      # Verify what we just signed BEFORE publishing. Depends on
+      # cosign-sign's outputs; skipped in dry-run (cosign-sign is also
+      # skipped).
       - name: Verify cosign signature locally before publish
+        if: steps.v.outputs.dry_run == 'false'
         env:
           VERSION: ${{ steps.v.outputs.version }}
           BINARY: ${{ steps.stage.outputs.binary }}
           REPO: ${{ github.repository }}
-          DRY_RUN: ${{ steps.v.outputs.dry_run }}
         run: |
           set -euo pipefail
-          tlog_arg=""
-          if [[ "$DRY_RUN" == "true" ]]; then
-            tlog_arg="--insecure-ignore-tlog=true"
-            echo "::notice::dry-run: cosign verify-blob with --insecure-ignore-tlog=true (no Rekor lookup)"
-          fi
-          # shellcheck disable=SC2086 # tlog_arg intentionally unquoted to expand to empty when not set
-          cosign verify-blob $tlog_arg \
+          cosign verify-blob \
             --certificate "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.pem" \
             --signature "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.sig" \
             --certificate-identity-regexp "^https://github.com/${REPO}/.github/workflows/release.yml@" \
