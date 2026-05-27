@@ -517,3 +517,154 @@ EOF
   grep -qE "cp_ssh .sudo cat /etc/kubernetes/admin.conf. \\| tr -d " \
     "${REPO_ROOT}/scripts/export-argocd.sh"
 }
+
+# ---------------------------------------------------------------------------
+# Issue #270: CP_IP resolution must go through resolve_cp_ip (the new
+# helper that knows about KVM_HOST + ssh) — NOT a local-only virsh call.
+# Two regression guards: a source-level grep, and an end-to-end test
+# where KVM_HOST is set and the ssh stub serves a virsh-shaped reply.
+# ---------------------------------------------------------------------------
+
+@test "export-argocd source: CP_IP resolution uses resolve_cp_ip (not raw virsh)" {
+  # The script must call resolve_cp_ip (workstation-aware), not the
+  # libvirt-only resolve_vm_ip path that issue #270 was filed for.
+  grep -qE 'resolve_cp_ip[[:space:]]+"\$CP_NAME"' \
+    "${REPO_ROOT}/scripts/export-argocd.sh"
+  # Belt-and-suspenders: no bare `resolve_vm_ip "$CP_NAME"` line should
+  # remain — that was the broken pattern.
+  ! grep -qE '^[^#]*resolve_vm_ip[[:space:]]+"\$CP_NAME"' \
+    "${REPO_ROOT}/scripts/export-argocd.sh"
+}
+
+# Helper: build a stub-bin dir where ssh both captures argv AND emits
+# different stdout depending on which remote command was requested.
+# When the remote command starts with "virsh -c qemu:///system domifaddr"
+# (resolve_cp_ip's libvirt query) we emit a domifaddr table; otherwise
+# we emit the kubeconfig fixture body that the admin.conf-fetch path
+# expects. Without this branching, a single ssh stub would either break
+# CP_IP resolution or break the admin.conf fetch.
+_make_stub_bin_with_virsh() {
+  local stub_dir="$BATS_TEST_TMPDIR/stub-bin"
+  mkdir -p "$stub_dir"
+  cat > "$stub_dir/ssh" <<'EOF'
+#!/usr/bin/env bash
+# Capture argv to a known file so the test can assert on it.
+printf '%s\n' "$@" >> "${SSH_ARGV_CAPTURE}"
+# Last arg is the remote command for `ssh ... HOST CMD`. Branch on it.
+remote_cmd="${!#}"
+if [[ "$remote_cmd" == *"virsh -c qemu:///system domifaddr"* ]]; then
+  # CP_IP resolution path — emit a single ipv4 row.
+  cat <<'YML'
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ vnet0      52:54:00:aa:bb:cc    ipv4         10.5.6.7/24
+YML
+  exit 0
+fi
+# Otherwise: admin.conf fetch path. Emit a minimal kubeconfig.
+cat <<'YML'
+apiVersion: v1
+kind: Config
+clusters:
+- name: kubernetes
+  cluster:
+    server: https://1.2.3.4:6443
+contexts:
+- name: kubernetes-admin@kubernetes
+  context:
+    cluster: kubernetes
+    user: kubernetes-admin
+current-context: kubernetes-admin@kubernetes
+users:
+- name: kubernetes-admin
+YML
+EOF
+  chmod +x "$stub_dir/ssh"
+  # Busybox mktemp shim (matches _make_stub_bin above).
+  cat > "$stub_dir/mktemp" <<'EOF'
+#!/usr/bin/env bash
+path="${TMPDIR:-/tmp}/argocd-kubeconfig-$$-$RANDOM.yaml"
+: > "$path"
+chmod 0600 "$path"
+printf '%s\n' "$path"
+EOF
+  chmod +x "$stub_dir/mktemp"
+  echo "$stub_dir"
+}
+
+# Make a CONFIG without CP_IP (so resolve_cp_ip MUST do work — either
+# ssh through KVM_HOST or fall back to local virsh). The other
+# _make_stub_config helper above sets CP_IP=127.0.0.1, which would
+# short-circuit the resolver and defeat the test.
+_make_stub_config_no_cp_ip() {
+  local cfg="$BATS_TEST_TMPDIR/cluster-no-ip.conf"
+  local stub_pub="$BATS_TEST_TMPDIR/stub.pub"
+  : > "$stub_pub"
+  : > "${stub_pub%.pub}"
+  chmod 0600 "${stub_pub%.pub}"
+  cat > "$cfg" <<EOF
+CP_NAME=hbird-cp1
+SSH_PUBKEY_FILE=${stub_pub}
+EOF
+  echo "$cfg"
+}
+
+@test "CP_IP resolution: KVM_HOST set + no CP_IP in CONFIG → ssh CMD goes through KVM_HOST" {
+  local cfg out stub_dir argv_capture
+  cfg="$(_make_stub_config_no_cp_ip)"
+  out="$BATS_TEST_TMPDIR/out.yaml"
+  stub_dir="$(_make_stub_bin_with_virsh)"
+  argv_capture="$BATS_TEST_TMPDIR/ssh-argv"
+  : > "$argv_capture"
+
+  run env CONFIG="$cfg" \
+    KVM_HOST=geary \
+    SSH_ARGV_CAPTURE="$argv_capture" \
+    PATH="${stub_dir}:${PATH}" \
+    bash "$SCRIPT" --output "$out" --force
+
+  # The argv capture file must show an ssh call where the remote command
+  # was the virsh domifaddr query. That proves resolve_cp_ip routed
+  # through KVM_HOST instead of trying local virsh.
+  [ -f "$argv_capture" ]
+  grep -qF 'virsh -c qemu:///system domifaddr' "$argv_capture"
+  grep -qxF -e 'geary' "$argv_capture"
+}
+
+@test "CP_IP resolution: workstation (no virsh, no KVM_HOST, no CP_IP) → clear failure" {
+  local cfg out clean_path
+  cfg="$(_make_stub_config_no_cp_ip)"
+  out="$BATS_TEST_TMPDIR/out.yaml"
+  # Build a PATH that has the usual coreutils + bash + grep + sed but
+  # NO virsh — emulating the workstation case in issue #270. Drop any
+  # PATH entry where a `virsh` binary actually exists (libvirt-client
+  # is sometimes pre-installed on CI runners).
+  clean_path=""
+  local entry
+  IFS=':' read -ra _parts <<<"$PATH"
+  for entry in "${_parts[@]}"; do
+    [[ -z "$entry" ]] && continue
+    if [[ -x "${entry}/virsh" ]]; then
+      continue
+    fi
+    if [[ -n "$clean_path" ]]; then
+      clean_path="${clean_path}:${entry}"
+    else
+      clean_path="$entry"
+    fi
+  done
+
+  run env -u KVM_HOST \
+    CONFIG="$cfg" \
+    PATH="$clean_path" \
+    bash "$SCRIPT" --output "$out" --force
+
+  [ "$status" -ne 0 ]
+  # The diagnostic must steer the operator to BOTH levers (override
+  # CP_IP, or set KVM_HOST). resolve_cp_ip's own stderr feeds through
+  # the script's stderr; the wrapping fail() adds a second line that
+  # also names CP_IP and KVM_HOST.
+  [[ "$output" == *"CP_IP"* ]]
+  [[ "$output" == *"KVM_HOST"* ]]
+  [ ! -e "$out" ]
+}

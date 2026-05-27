@@ -53,6 +53,23 @@
 #       (multi-NIC ambiguity; first is returned).
 #       Returns non-zero with a diagnostic on stderr if no IP appears.
 #
+#   resolve_cp_ip <vm-name> [<override-ip>]
+#       Client-side (no-libvirt) sibling of resolve_vm_ip. Pick path:
+#         1. <override-ip> arg non-empty   → echo it verbatim
+#         2. KVM_HOST env var non-empty    → ssh "$KVM_HOST" virsh ...
+#            (tries non-sudo first for libvirt-group members, falls
+#            back to `sudo -n virsh ...`; sudo path needs NOPASSWD or
+#            a warm cache because we can't allocate a TTY here)
+#         3. virsh on PATH locally          → resolve_vm_ip <vm>
+#         4. otherwise                      → fail with a diagnostic
+#       Echoes the resolved IPv4 to stdout. Returns non-zero with a
+#       clear "set CP_IP=<ip> or KVM_HOST=<host>" diagnostic on failure.
+#       Use this from any operator-facing script that may run on a
+#       workstation without local libvirt (export-argocd, get-kubeconfig,
+#       etc). Scripts that re-exec via scripts/lib/ssh-wrap.sh — those
+#       always end up running on the KVM host — can keep using
+#       resolve_vm_ip directly. (issue #270)
+#
 #   derive_ssh_privkey_file <pubkey-path>
 #       Echoes "${pubkey%.pub}" — the conventional private-key path next
 #       to the pubkey. Hard-fails (rc=2) if the input does not end in
@@ -481,6 +498,89 @@ resolve_vm_ip() {
   done
 
   echo "resolve_vm_ip: could not resolve IPv4 for domain '${vm}' via 'virsh -c qemu:///system domifaddr' after ${attempts} attempt(s). The DHCP lease may not be ready yet, or the domain may be powered off." >&2
+  return 1
+}
+
+# resolve_cp_ip <vm-name> [<override-ip>]
+# Client-side IP resolver — picks the best path for the operator's
+# environment (workstation, KVM host, or remote with KVM_HOST set).
+#
+# Resolution order:
+#   1. <override-ip> non-empty → echo verbatim and return.
+#   2. KVM_HOST env set        → ssh "$KVM_HOST" virsh domifaddr ...
+#      We try non-sudo first (operators in libvirt group will succeed),
+#      then fall back to `sudo -n virsh ...` (NOPASSWD or warm cache
+#      required because BatchMode=yes is needed to keep the function
+#      callable from scripts that don't allocate a TTY).
+#   3. virsh on PATH locally    → delegate to resolve_vm_ip (KVM host).
+#   4. None of the above        → fail with a clear diagnostic.
+#
+# The hostname pattern resembles ssh-wrap's local_host check — but
+# resolve_cp_ip is consumed by scripts that DON'T re-exec (e.g.
+# export-argocd produces a kubeconfig on the operator's workstation),
+# so we don't try to be clever about "are we on the KVM host" — we
+# just pick the first working path. Operators running on the KVM
+# host itself will hit the local-virsh branch directly. (issue #270)
+resolve_cp_ip() {
+  local vm="${1:?resolve_cp_ip requires a VM name}"
+  local override="${2:-}"
+
+  # 1. Explicit override wins outright. Trim no whitespace — the caller
+  # is responsible for sanitizing their config-sourced value, and a
+  # leading space here is more likely a typo we want to surface than
+  # something to silently strip.
+  if [[ -n "$override" ]]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+
+  # 2. KVM_HOST path: ssh through to the remote libvirt.
+  if [[ -n "${KVM_HOST:-}" ]]; then
+    local virsh_cmd="virsh -c qemu:///system domifaddr"
+    # BatchMode=yes so the function never blocks on a password prompt
+    # — operators expect this to fail fast on a misconfigured ssh
+    # rather than hang. ConnectTimeout matches our other ssh helpers.
+    local ssh_base=(ssh -o BatchMode=yes -o ConnectTimeout=10)
+    local raw=""
+    # Try non-sudo first (libvirt-group members on the remote can
+    # query qemu:///system without sudo). Capture stderr separately so
+    # a "permission denied" only triggers the sudo fallback, not a
+    # noisy operator-visible diagnostic.
+    raw="$("${ssh_base[@]}" "$KVM_HOST" "${virsh_cmd} '${vm}'" 2>/dev/null || true)"
+    local ip=""
+    ip="$(printf '%s\n' "$raw" \
+      | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')"
+    if [[ -z "$ip" ]]; then
+      # Fall back to sudo -n (NOPASSWD or warm cache required). This is
+      # the common case on KVM hosts that don't add the operator to the
+      # libvirt group. -n means "never prompt"; failure here just yields
+      # empty output and we drop through to the failure diagnostic below.
+      raw="$("${ssh_base[@]}" "$KVM_HOST" "sudo -n ${virsh_cmd} '${vm}'" 2>/dev/null || true)"
+      ip="$(printf '%s\n' "$raw" \
+        | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')"
+    fi
+    if [[ -n "$ip" ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+    # Fall through — KVM_HOST set but resolution failed. We could
+    # short-circuit to "fail" here, but if local virsh is also
+    # available, falling through gives operators on the KVM host
+    # itself (where KVM_HOST=geary may be set in their env even
+    # though they're already ON geary) a working second chance.
+  fi
+
+  # 3. Local-virsh path: operator is on the KVM host. Defers to
+  # resolve_vm_ip so retries/multi-NIC warnings stay consistent.
+  if command -v virsh >/dev/null 2>&1; then
+    if ip="$(resolve_vm_ip "$vm" 2>/dev/null)"; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  fi
+
+  # 4. None of the above worked.
+  echo "resolve_cp_ip: could not resolve IPv4 for domain '${vm}'. Set CP_IP=<ip> in your CONFIG, or export KVM_HOST=<ssh-alias> so we can query libvirt on the KVM host via SSH (workstation operators without local libvirt), or run from the KVM host with virsh installed." >&2
   return 1
 }
 

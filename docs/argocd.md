@@ -296,6 +296,20 @@ with how you fetched the file), so you typically also want
 `--server https://<reachable-address>:6443` when the CP isn't directly
 reachable from ArgoCD either.
 
+`KVM_HOST` does double duty here. Beyond ProxyJump'ing the
+admin.conf-fetch SSH session, it also routes the **CP_IP lookup**
+through the KVM host (issue #270). Workstation operators with no
+local libvirt installed don't need to pin `CP_IP=` in
+`cluster.local.conf` anymore — when the script can't find `virsh` on
+the local PATH it `ssh "$KVM_HOST" virsh -c qemu:///system domifaddr
+"$CP_NAME"` to resolve the lease. Operators who already have
+`KVM_HOST=geary` in their env for `make kubectl` get this for free.
+
+If you *do* want to pin the IP — e.g. the CP is on a static address
+and you'd rather not pay the SSH-roundtrip — set `CP_IP=<ip>` in
+`cluster.local.conf` (or your env). An explicit `CP_IP` short-circuits
+the resolver before any SSH happens.
+
 Two of these scripts honor `KVM_HOST` but the **mechanism is not the
 same**. `scripts/export-argocd.sh` and `scripts/backup-etcd.sh` add
 `-o ProxyJump=$KVM_HOST` to a single SSH session that goes from your

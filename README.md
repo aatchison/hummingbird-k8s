@@ -347,7 +347,10 @@ KUBECONFIG=./kubeconfig.yaml kubectl get nodes
 # Tunnel the CP-fetch SSH session through the KVM host when your
 # workstation can't reach the libvirt NAT directly. Either form works
 # — KVM_HOST is the env-var path most operators already have set;
-# PROXY_JUMP is the per-invocation override.
+# PROXY_JUMP is the per-invocation override. KVM_HOST=… also routes
+# CP_IP resolution through the KVM host's libvirt — workstation
+# operators without local libvirt no longer need to pin `CP_IP=` in
+# cluster.local.conf (issue #270).
 make get-kubeconfig CONFIG=cluster.local.conf KVM_HOST=geary
 make get-kubeconfig CONFIG=cluster.local.conf PROXY_JUMP=geary
 

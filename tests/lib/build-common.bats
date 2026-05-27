@@ -381,6 +381,156 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# resolve_cp_ip (issue #270) — workstation-friendly resolver that prefers
+# an explicit override, then ssh KVM_HOST, then local virsh.
+# ---------------------------------------------------------------------------
+
+@test "resolve_cp_ip: explicit override wins outright (no ssh, no virsh called)" {
+  source_lib
+  # Tripwires: if either of these is called, the test fails. The override
+  # path must not reach ssh or virsh at all.
+  ssh()   { echo "ERR: ssh should not be called" >&2; return 99; }
+  virsh() { echo "ERR: virsh should not be called" >&2; return 99; }
+  export -f ssh virsh
+  # KVM_HOST set so we'd otherwise hit the ssh path — override must
+  # still win.
+  export KVM_HOST=geary
+  run resolve_cp_ip my-vm 192.168.50.50
+  [ "$status" -eq 0 ]
+  [ "$output" = "192.168.50.50" ]
+}
+
+@test "resolve_cp_ip: KVM_HOST path — ssh-fed virsh output parsed correctly" {
+  source_lib
+  # Stub ssh: emit a representative virsh domifaddr table on stdout.
+  ssh() {
+    # Capture argv to a known file so the test can prove the right
+    # command was sent (no local virsh call leaked).
+    printf '%s\n' "$@" > "${BATS_TEST_TMPDIR}/ssh-argv"
+    cat <<'EOF'
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ vnet0      52:54:00:aa:bb:cc    ipv4         10.1.2.3/24
+EOF
+  }
+  export -f ssh
+  # virsh tripwire — must not be touched on the KVM_HOST path.
+  virsh() { echo "ERR: local virsh should not be called" >&2; return 99; }
+  export -f virsh
+
+  export KVM_HOST=geary
+  run resolve_cp_ip hbird-cp1
+  [ "$status" -eq 0 ]
+  [ "$output" = "10.1.2.3" ]
+  # The ssh argv must include the KVM_HOST and the virsh domifaddr cmd.
+  argv_capture="${BATS_TEST_TMPDIR}/ssh-argv"
+  [ -f "$argv_capture" ]
+  grep -qxF -e 'geary'                                  "$argv_capture"
+  grep -qF 'virsh -c qemu:///system domifaddr'          "$argv_capture"
+  grep -qF "hbird-cp1"                                  "$argv_capture"
+}
+
+@test "resolve_cp_ip: KVM_HOST path — non-sudo fails, sudo -n fallback succeeds" {
+  source_lib
+  # Stub ssh: first call (non-sudo) returns empty; second (sudo -n) returns IP.
+  COUNTER="$BATS_TEST_TMPDIR/counter"
+  echo 0 > "$COUNTER"
+  ssh() {
+    local n
+    n=$(cat "$COUNTER")
+    n=$((n + 1))
+    echo "$n" > "$COUNTER"
+    # The args we care about are the remote-command arg (last one).
+    local remote_cmd="${!#}"
+    if [[ "$remote_cmd" == sudo* ]]; then
+      # sudo path: emit a domifaddr row.
+      cat <<'EOF'
+ vnet0  52:54:00:aa:bb:cc  ipv4  10.9.9.9/24
+EOF
+    else
+      # non-sudo path: emit nothing (simulate "permission denied").
+      return 0
+    fi
+  }
+  export -f ssh
+  virsh() { echo "ERR: local virsh should not be called" >&2; return 99; }
+  export -f virsh
+
+  export KVM_HOST=geary
+  run resolve_cp_ip hbird-cp1
+  [ "$status" -eq 0 ]
+  [ "$output" = "10.9.9.9" ]
+  # Both attempts (non-sudo + sudo) were made.
+  [ "$(cat "$COUNTER")" = "2" ]
+}
+
+@test "resolve_cp_ip: KVM_HOST path — both ssh paths fail, falls through to local virsh" {
+  source_lib
+  # ssh returns nothing for both attempts.
+  ssh() { return 0; }
+  export -f ssh
+  # local virsh stub returns an IP — so the fall-through path resolves.
+  virsh() {
+    cat <<'EOF'
+ vnet0  52:54:00:aa:bb:cc  ipv4  172.16.0.10/24
+EOF
+  }
+  export -f virsh
+  export KVM_HOST=geary
+  run resolve_cp_ip hbird-cp1
+  [ "$status" -eq 0 ]
+  [ "$output" = "172.16.0.10" ]
+}
+
+@test "resolve_cp_ip: no override, no KVM_HOST — uses local virsh" {
+  source_lib
+  unset KVM_HOST
+  ssh() { echo "ERR: ssh should not be called" >&2; return 99; }
+  export -f ssh
+  virsh() {
+    cat <<'EOF'
+ vnet0  52:54:00:aa:bb:cc  ipv4  192.168.122.7/24
+EOF
+  }
+  export -f virsh
+  run resolve_cp_ip hbird-cp1
+  [ "$status" -eq 0 ]
+  [ "$output" = "192.168.122.7" ]
+}
+
+@test "resolve_cp_ip: no override, no KVM_HOST, no virsh — fails with clear diagnostic" {
+  source_lib
+  unset KVM_HOST
+  unset -f virsh 2>/dev/null || true
+  unset -f ssh 2>/dev/null || true
+  empty_path="$BATS_TEST_TMPDIR/emptybin"
+  mkdir -p "$empty_path"
+  PATH="$empty_path" run resolve_cp_ip hbird-cp1
+  [ "$status" -ne 0 ]
+  # The diagnostic must mention both CP_IP and KVM_HOST so the operator
+  # can decide which lever to pull.
+  [[ "$output" == *"CP_IP"* ]]
+  [[ "$output" == *"KVM_HOST"* ]]
+  [[ "$output" == *"hbird-cp1"* ]]
+}
+
+@test "resolve_cp_ip: KVM_HOST set but ssh + local virsh both fail — fails loudly" {
+  source_lib
+  export KVM_HOST=geary
+  ssh() { return 0; }     # empty stdout on both attempts
+  export -f ssh
+  # Strip virsh from PATH (and unset any function) so the local
+  # fallback can't resolve either.
+  unset -f virsh 2>/dev/null || true
+  empty_path="$BATS_TEST_TMPDIR/emptybin"
+  mkdir -p "$empty_path"
+  PATH="$empty_path" run resolve_cp_ip hbird-cp1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"CP_IP"* ]]
+  [[ "$output" == *"KVM_HOST"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # derive_ssh_privkey_file (issue #190)
 # ---------------------------------------------------------------------------
 
