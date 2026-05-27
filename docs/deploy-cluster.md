@@ -106,7 +106,7 @@ can be invoked without sudo entirely via `HBIRD_REMOTE_NO_SUDO=1` —
 see [Running without sudo](#running-without-sudo-libvirt-group-operator-305)
 below (#269, extended to deploy/destroy by #305). `spawn-workers.sh`
 still requires root on the remote — that's the remaining piece of
-#269's original scope.
+`#269`'s original scope.
 
 ### One-time remote setup
 
@@ -175,7 +175,12 @@ ssh $KVM_HOST 'sudo usermod -aG libvirt $USER && newgrp libvirt'
 #    inherit the libvirt group, so qemu (which is also in libvirt) can
 #    read them after libvirt's dynamic_ownership chowns to qemu:qemu at
 #    VM start.
-ssh $KVM_HOST "sudo chgrp libvirt \$POOL_DIR && sudo chmod 2775 \$POOL_DIR"
+#
+#    Substitute the actual POOL_DIR value from your cluster.local.conf —
+#    the placeholder below is illustrative. Example for the geary host
+#    where cluster.local.conf has POOL_DIR=/mnt/mass2/vms:
+#      ssh geary 'sudo chgrp libvirt /mnt/mass2/vms && sudo chmod 2775 /mnt/mass2/vms'
+ssh $KVM_HOST "sudo chgrp libvirt <POOL_DIR_from_cluster.local.conf> && sudo chmod 2775 <POOL_DIR_from_cluster.local.conf>"
 ```
 
 **Invocation from a workstation:**
@@ -212,9 +217,12 @@ Diagnostic when the operator is neither root nor in the `libvirt`
 group on the KVM host:
 
 ```text
-[deploy-cluster] FAIL: must be root or a member of the libvirt group on this host. Add yourself with:
+[deploy-cluster] ERROR: must be root or a member of the libvirt group on this host. Add yourself with:
   sudo usermod -aG libvirt $USER && newgrp libvirt
-then rerun. POOL_DIR must also be group-writable (`sudo chgrp libvirt $POOL_DIR && sudo chmod 2775 $POOL_DIR`) — see docs/deploy-cluster.md#running-without-sudo.
+then rerun. POOL_DIR must also be group-writable. One-time setup (substitute your POOL_DIR from cluster.local.conf — defaults to /var/lib/libvirt/images):
+  sudo chgrp libvirt /var/lib/libvirt/images
+  sudo chmod 2775 /var/lib/libvirt/images
+See docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305.
 ```
 
 The same diagnostic shape is emitted by `destroy-cluster.sh` (with

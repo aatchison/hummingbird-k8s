@@ -226,8 +226,16 @@ if [[ $EUID -ne 0 ]]; then
   if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx libvirt; then
     fail "must be root or a member of the libvirt group on this host. Add yourself with:
   sudo usermod -aG libvirt \$USER && newgrp libvirt
-then rerun. POOL_DIR must also be group-writable (\`sudo chgrp libvirt \$POOL_DIR && sudo chmod 2775 \$POOL_DIR\`) — see docs/deploy-cluster.md#running-without-sudo."
+then rerun. POOL_DIR must also be group-writable. One-time setup (substitute your POOL_DIR from cluster.local.conf — defaults to /var/lib/libvirt/images):
+  sudo chgrp libvirt /var/lib/libvirt/images
+  sudo chmod 2775 /var/lib/libvirt/images
+See docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305."
   fi
+  # Symmetric with update-cluster.sh's #272 log (round-2 review L8 — silent
+  # no-sudo path is an asymmetric regression vs the precedent we claim to
+  # mirror). Announce which branch ran so an operator debugging "why didn't
+  # this chown root:root?" sees the answer in the log.
+  log "running as ${USER:-$(id -un)} (libvirt group member); skipping chown root:root on qcow2 clones — libvirt dynamic_ownership chowns to qemu:qemu at VM start (#305)"
 fi
 # SUDO_USER was historically required so SSH to the freshly-booted CP picks up
 # the calling-user's known_hosts/key when invoked via `sudo`. The SSH calls
@@ -295,6 +303,29 @@ _image_source_was_unset=0
 : "${WORKER_VCPUS:=2}"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
 : "${RUN_VERIFY:=false}"
+
+# POOL_DIR preflight for the non-root path (#305 round-2 review L3). Silent
+# fail-late-at-virt-install was a real UX problem pre-round-2: an operator
+# who skipped the one-time chgrp/chmod would only see "could not resolve CP
+# IP" ~10 min later, never the actionable hint that POOL_DIR mode was wrong.
+# Fail loud now with the same chgrp/chmod recipe the EUID gate emits, so
+# the operator gets one consistent recovery path.
+#
+# Write-probe form: directly tests what we actually need (can the operator
+# create files here?) rather than parsing mode bits — robust against future
+# changes to the recipe (e.g. POSIX ACLs instead of chmod 2775).
+if [[ $EUID -ne 0 ]]; then
+  [[ -d "$POOL_DIR" ]] || fail "POOL_DIR not a directory: $POOL_DIR (create it or set POOL_DIR= in your cluster.local.conf)"
+  _pool_probe="${POOL_DIR}/.hbird-write-probe.$$"
+  if ! ( : > "$_pool_probe" ) 2>/dev/null; then
+    fail "POOL_DIR=$POOL_DIR not writable by $(id -un). One-time setup on the KVM host:
+  sudo chgrp libvirt $POOL_DIR
+  sudo chmod 2775 $POOL_DIR
+See docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305."
+  fi
+  rm -f "$_pool_probe"
+  unset _pool_probe
+fi
 : "${KVM_HOST:=}"
 # Optional bootc-semver-update overrides. Empty = use the image default
 # (timer schedule baked in containers/shared/, repo baked per-flavor at
@@ -451,15 +482,15 @@ fi
 
 log "cloning CP qcow2 -> $CP_QCOW"
 cp --reflink=auto "$CP_TEMPLATE_QCOW" "$CP_QCOW"
-# chown root:root only applies when running as root — a libvirt-group operator
-# can't change ownership and doesn't need to (libvirt's dynamic_ownership
-# chowns to qemu:qemu at VM start regardless). Setgid on POOL_DIR (chmod 2775
-# in the one-time host setup) ensures the file lands as <operator>:libvirt
-# either way. (#305)
+# chown root:root + chmod 0644 only apply when running as root — a
+# libvirt-group operator can't chown to root (EPERM) and the cloned file
+# already inherits sensible perms from cp + POOL_DIR's setgid. Libvirt's
+# dynamic_ownership chowns to qemu:qemu at VM start either way. (#305
+# round-2 review L7 — wrapping chmod in the same EUID guard as chown.)
 if [[ $EUID -eq 0 ]]; then
   chown root:root "$CP_QCOW"
+  chmod 0644 "$CP_QCOW"
 fi
-chmod 0644 "$CP_QCOW"
 
 log "virt-install ${CP_NAME} (memory=${CP_MEMORY} vcpus=${CP_VCPUS})"
 virt-install --connect qemu:///system \
@@ -532,11 +563,11 @@ for w in "${WORKER_NAMES[@]}"; do
 
   log "cloning worker qcow2 -> $w_qcow"
   cp --reflink=auto "$WORKER_TEMPLATE_QCOW" "$w_qcow"
-  # See CP qcow2 block above for the EUID-conditional chown rationale. (#305)
+  # See CP qcow2 block above for the EUID-conditional chown+chmod rationale.
   if [[ $EUID -eq 0 ]]; then
     chown root:root "$w_qcow"
+    chmod 0644 "$w_qcow"
   fi
-  chmod 0644 "$w_qcow"
 
   log "virt-install ${w} (memory=${WORKER_MEMORY} vcpus=${WORKER_VCPUS}) [bg]"
   virt-install --connect qemu:///system \

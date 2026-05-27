@@ -274,8 +274,11 @@ deploy/destroy). One-time operator setup on the KVM host:
 
 ```bash
 ssh $KVM_HOST 'sudo usermod -aG libvirt $USER && newgrp libvirt'
-# AND, for deploy/destroy (which write qcow2s + seed ISOs to POOL_DIR):
-ssh $KVM_HOST "sudo chgrp libvirt \$POOL_DIR && sudo chmod 2775 \$POOL_DIR"
+# AND, for deploy/destroy (which write qcow2s + seed ISOs to POOL_DIR).
+# Substitute the actual POOL_DIR from your cluster.local.conf for <POOL_DIR>
+# below — default is /var/lib/libvirt/images; this repo's cluster.example.conf
+# uses /mnt/mass2/vms.
+ssh $KVM_HOST 'sudo chgrp libvirt <POOL_DIR> && sudo chmod 2775 <POOL_DIR>'
 ```
 
 Then from a workstation:
@@ -292,7 +295,7 @@ KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 \
 `spawn-workers` is the last lifecycle target that still requires root
 on the KVM host — the remaining piece of #269's original scope. Full
 reference:
-[`docs/deploy-cluster.md#running-without-sudo`](docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305).
+[`docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305`](docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305).
 
 ### Rolling cluster updates
 
