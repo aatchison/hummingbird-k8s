@@ -26,7 +26,8 @@ subcommands land per the phasing table in
 | [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | clap command tree (`hbird` binary) | landed (PR #319) |
 | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | landed (PR #318) |
 | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | landed (PR #317) |
-| [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | `update-cluster` Phase 1 — dry-run parity + orchestration scaffold | this PR (live-execution slice deferred) |
+| [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | `update-cluster` Phase 1A — dry-run parity + orchestration scaffold | landed (PR #321) |
+| [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycle 1 (`cp_kubectl` + drain/uncordon) landed (PR #325); cycles 2–4 pending |
 
 ## Foundation crates landed so far
 
@@ -104,33 +105,59 @@ worker, `--start-from`, `--skip-drain`, `--skip-gates`,
 `--continue-on-error`) and were captured by running the bash twin
 against a synthetic config that names the live cluster's VMs.
 
-### Phase 1 (`update-cluster`) — live execution slice (follow-up)
+### Phase 1B (`update-cluster`) — live execution (in progress)
 
-The live (non-dry-run) execution slice is **deferred** to a follow-up
-issue. The orchestration scaffold is in place: lock acquisition,
-plan-from-args validation, k8s-node-name resolution, in-flight tracking,
-worker batches, and the bash-twin block-by-block helper layout
-(`timer_stop`, `bootc_upgrade_apply`, `wait_node_ready`, etc.) all
-exist as Rust functions. What's deferred:
+The live (non-dry-run) execution slice is tracked by [#322] and lands
+in cycles. Each cycle wires one or more bash-twin helpers and validates
+against the live geary cluster with a bash-vs-Rust diff captured under
+`rust/crates/hbird-cli/tests/update_cluster/fixtures/live/`.
 
-- Real SSH round-trips through `hbird-ssh::Client` (the helpers
-  currently surface a stable "live-mode not implemented" diagnostic
-  that names the bash equivalent for operator orientation).
-- Real virsh-domifaddr IP resolution through `hbird-virt::Connection`
-  (operators must set `CP_IP=`/`WORKER_IPS=()` in `cluster.local.conf`
-  to bypass that path in the live slice's interim).
-- True parallel-batch concurrency (the scaffold processes the batch
-  serially under the `[parallel:NAME]` log prefix, so the dry-run log
-  shape still matches the bash twin byte-for-byte).
-- `bootc rollback` + post-reboot live-validate harness (per-block
-  fixtures capturing real `kubectl get nodes -o yaml` deltas).
+| Cycle | Block | Helpers wired | Status |
+|-------|-------|---------------|--------|
+| 1 | #5 + part of update_worker | `cp_kubectl`, drain, uncordon | landed (PR #325) |
+| 2 | #6 | `capture_node_bootid`, `wait_node_bootid_changed`, `bootc_upgrade_apply`, `wait_ssh_drop`, `wait_ssh_back` | pending |
+| 3 | #9 | `wait_node_ready`, `wait_node_daemonsets_ready` | pending |
+| 4 | #7 | `wait_apiserver_back`, etcd-backup | pending |
 
-This deliberate scope-bound exists because Phase 1's live-validate
-contract requires `make destroy-cluster && make deploy-cluster` between
-each behavioral block — that destroys the only live cluster repeatedly
-and is best done by the operator-with-tmux rather than an autonomous
-agent. The deferred slice is tracked as a follow-up to #286.
+#### Live-validate methodology (template for cycles 2–4)
+
+The canonical pattern is `rust/crates/hbird-cli/tests/update_cluster/fixtures/live/cycle1_drain_uncordon.txt`:
+
+1. Capture the bash twin's behavior by running the equivalent
+   `ssh -J $KVM_HOST root@$CP_IP "kubectl ... <cmd>"` directly (the
+   operator-side `cp_kubectl` shape) — record stdout + stderr + exit
+   code.
+2. Restore the cluster to its baseline state (`bootc rollback` on the
+   target node for cycles 2+; cycle 1 drain+uncordon is non-destructive
+   so no rollback needed).
+3. Run the env-gated Rust live test
+   (`HBIRD_LIVE_TEST=1 cargo test -p hbird-cli --test <cycle>_live`)
+   that exercises the newly-wired helper through `hbird_ssh::Client`.
+4. Diff the two captures. Empty diff (modulo timestamps, node AGE
+   values, and bootID-after) = block validated. Commit the side-by-side
+   capture as the cycle's fixture file.
+
+#### Still scaffolded (12 of 13 `live_mode_not_implemented` sites)
+
+Cycles 2–4 each wire one or more of these stubs:
+
+- `timer_stop` / `timer_start` (block #4)
+- `capture_node_bootid` / `wait_node_bootid_changed` (block #6)
+- `bootc_upgrade_apply` (block #10)
+- `wait_ssh_drop` / `wait_ssh_back` (block #8)
+- `wait_node_ready` / `wait_node_daemonsets_ready` (block #9)
+- `wait_apiserver_back` (block #7)
+
+Real virsh-domifaddr IP resolution through `hbird-virt::Connection`
+also remains stubbed — operators set `CP_IP=`/`WORKER_IPS=()` in
+`cluster.local.conf` to bypass for now.
+
+True parallel-batch concurrency (the scaffold processes the batch
+serially under the `[parallel:NAME]` log prefix) is preserved so the
+dry-run log shape still matches the bash twin byte-for-byte; full
+concurrency lands when block #13 ships.
 
 [#279]: https://github.com/aatchison/hummingbird-k8s/issues/279
 [#286]: https://github.com/aatchison/hummingbird-k8s/issues/286
 [#291]: https://github.com/aatchison/hummingbird-k8s/issues/291
+[#322]: https://github.com/aatchison/hummingbird-k8s/issues/322

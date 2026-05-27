@@ -1,5 +1,10 @@
 # Phase 1B cycle 1: drain+uncordon parity vs bash twin
 #
+# Fixture naming convention (locked in this PR — applies to cycles 2-4):
+#   cycle<N>_<block>.txt  where <N> = cycle number, <block> = bash twin
+#                          function/block being validated.
+#   Future: cycle2_bootid.txt, cycle3_daemonset.txt, cycle4_etcd.txt
+#
 # Captured 2026-05-27 against the live geary cluster (hbird-cp1 +
 # hbird-w1 + hbird-w2). The bash and Rust sides ran the IDENTICAL
 # three kubectl invocations through the same SSH chain:
@@ -39,10 +44,11 @@ rust stderr:
 diff: bash interleaves Warning into stdout (TTY-attached ssh -t merges
       streams); Rust separates stdout vs stderr correctly. Same lines,
       same DaemonSet names, same kubectl exit code (0). ✓
-note: this stream-separation difference is expected — Rust's hbird-ssh
-      uses non-TTY exec (BatchMode=yes) which preserves the
-      stdout/stderr split. The bash twin emits via `ssh -t` only when
-      a TTY is attached; both behaviors are operationally equivalent.
+note: stream-separation difference is operationally equivalent for
+      log-grep operators: the Rust cp_kubectl shim emits the kubectl
+      Warning on stderr via log_err (round-2 lens L8 HIGH fix), so
+      operators grepping `[update-cluster]` stderr still see the
+      DaemonSet warnings the bash twin emits on terminal stdout.
 
 === uncordon hbird-w2 ===
 bash: node/hbird-w2 uncordoned
