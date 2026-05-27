@@ -1512,8 +1512,8 @@ fn run_one_worker(plan: &Plan, w: &str, results: &mut Results) -> Result<()> {
 
 /// Run a kubectl command via the CP. Mirrors `cp_kubectl`
 /// (`scripts/update-cluster.sh:425`). First live helper wired by #322
-/// cycle 1; [`cp_ssh_opts`] is the shared SSH-options builder reused by
-/// cycles 2–4 (`wait_apiserver_back`, `wait_node_ready`,
+/// cycle 1 (PR #325); [`cp_ssh_opts`] is the shared SSH-options builder
+/// reused by cycles 2–4 (`wait_apiserver_back`, `wait_node_ready`,
 /// `capture_node_bootid`).
 ///
 /// Live execution path (Phase 1B, #322): builds an `hbird_ssh::Client`
@@ -1523,18 +1523,25 @@ fn run_one_worker(plan: &Plan, w: &str, results: &mut Results) -> Result<()> {
 /// channel choice). On success, *also* emits any kubectl stderr via
 /// [`log_err`] so warnings like `Warning: ignoring DaemonSet-managed
 /// Pods: ...` from `drain` reach operators who grep stderr for `Warning:`
-/// (round-2 lens L8 HIGH + CodeRabbit comment on #325).
+/// (PR #325 round-2 lens L8 HIGH + CodeRabbit comment).
 ///
 /// Returns the captured kubectl stdout as a `String` so callers like
 /// `capture_node_bootid` / `wait_node_bootid_changed` /
 /// `wait_node_daemonsets_ready` (bash lines 894, 937, 1013, 1032, 1042)
-/// can parse jsonpath / pod-count output. Round-2 lens L2 HIGH —
+/// can parse jsonpath / pod-count output. PR #325 round-2 lens L2 HIGH —
 /// returning `Result<()>` would have blocked cycle 2 wait helpers.
 ///
 /// Drain/uncordon callers (block #5 + part of update_worker) discard
 /// the returned string; the same `Ok("")` shape works for them.
-// TODO(#323): #[tracing::instrument(skip(plan), fields(cp_ip = %plan.cp_ip, command = %command))]
-//             once tracing-subscriber lands.
+///
+/// The `#[tracing::instrument]` attribute opens a debug-level span per
+/// invocation tagged with the CP IP + command (#323). Spans are silent
+/// at the default `RUST_LOG=info` so the dry-run fixtures (PR #321) keep
+/// matching byte-for-byte — `log()` writes to stdout via `println!`,
+/// while tracing emits to stderr only when enabled. Flip on with
+/// `RUST_LOG=hbird_cli=debug` to surface which CP a given kubectl call
+/// targeted.
+#[tracing::instrument(level = "debug", skip(plan), fields(cp_ip = %plan.cp_ip, command = %command), err(Debug))]
 fn cp_kubectl(plan: &Plan, command: &str) -> Result<String> {
     if plan.dry_run {
         log(&format!("DRY-RUN cp_kubectl -- {command}"));

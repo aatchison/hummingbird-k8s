@@ -71,6 +71,30 @@ hbird-ssh = { path = "../hbird-ssh", version = "0.0.1" }
 # `unsafe_code = "forbid"` rules out raw `sigaction(2)` bindings.
 signal-hook = "0.3"
 
+# Structured logging. `tracing` is the de-facto standard in the Rust
+# ecosystem (async-aware spans, structured fields, level-based filtering)
+# and is what the workspace standardizes on for instrumentation across
+# `hbird-cli`, `hbird-ssh`, and `hbird-virt`. Adding it here at the
+# binary layer initializes a subscriber so spans / events from the
+# library crates have somewhere to land. (#323; the foundation crates'
+# `#[tracing::instrument]` attrs are no-ops without an initialized
+# subscriber in the binary.)
+tracing = "0.1"
+
+# Subscriber that turns `tracing` events into terminal output.
+# - `env-filter` lets operators tune log volume via `RUST_LOG`
+#   (the de-facto-standard env var; `RUST_LOG=hbird_ssh=debug` to
+#   surface per-host SSH spans, `RUST_LOG=info` is the default).
+# - `fmt` is the human-readable terminal formatter. We pin the
+#   formatter to stderr + no-timestamp + no-target + no-ansi so the
+#   output stays close to the bash twin's `[update-cluster] …`
+#   prefix lines (which the `update-cluster` body still emits via
+#   `println!`/`eprintln!` to stdout/stderr — the dry-run fixtures
+#   committed in PR #321 pin those byte-for-byte and must keep
+#   matching). The binary owns subscriber init; library crates only
+#   depend on `tracing` itself.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
 [dev-dependencies]
 # Integration tests (`tests/cli_smoke.rs`) parse the command tree without
 # running it — no extra deps beyond clap's built-in test surface needed.

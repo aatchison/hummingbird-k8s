@@ -21,6 +21,15 @@ publish = false
 [dependencies]
 thiserror = "2"
 
+# `tracing` for `#[tracing::instrument]` on the public verbs
+# (`domains`, `domifaddr`, `dominfo`). Library-only dep — subscriber
+# init lives in the `hbird` binary. Spans here nest under the SSH spans
+# from `hbird-ssh::Client::run_inner`, which nest under the root
+# `subcommand=…` span from `hbird-cli::main`, giving operators a
+# subcommand → libvirt-verb → ssh-call trace tree when they crank
+# `RUST_LOG=debug`. (#323.)
+tracing = "0.1"
+
 [dev-dependencies]
 # Integration tests use a StubSshClient defined in tests/common; no extra
 # deps needed.
