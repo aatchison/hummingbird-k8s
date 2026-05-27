@@ -44,6 +44,16 @@ exact GitHub Actions workflow on this repository. A failure means
 either the binary or signature was tampered with, or someone is
 serving a forgery from a look-alike URL.
 
+The `--certificate-identity-regexp` value is the *subject claim*
+Fulcio stamps onto the short-lived cert during keyless OIDC signing —
+it must match the workflow's full URI:
+`https://github.com/<owner>/<repo>/.github/workflows/<file>.yml@<git-ref>`.
+The trailing `@` is load-bearing: it anchors the regex so a forger
+can't craft a cert from a fork whose workflow file path happens to
+share the prefix. Adjust `<git-ref>` to `refs/tags/v0.0.1` if you
+want to pin verification to a specific tagged release rather than
+any signing event from this workflow.
+
 ### Verify + pull the OCI image
 
 ```sh
@@ -67,13 +77,20 @@ The release workflow accepts a `workflow_dispatch` trigger with a
 `dry_run` input (defaults to `true`). When `dry_run=true`, every
 step EXCEPT the final publish (GHCR push, cosign sign image, gh
 release create) runs — the binary is built, statically-linked,
-cosign-signed (the OIDC flow exercised end-to-end), and the OCI
-image is built locally. The job summary lists what was staged. Use
-this before a real `v*` tag push to confirm the workflow is healthy.
+cosign-signed (the OIDC flow exercised end-to-end, with
+`--tlog-upload=false` so no permanent Rekor record is created), and
+the OCI image is built locally. Use this before a real `v*` tag push
+to confirm the workflow is healthy.
 
 ```sh
 gh workflow run release.yml -f version=v0.0.0-dryrun -f dry_run=true
 ```
+
+Output lands in the workflow run's **Summary** tab in the Actions
+UI — staged binary path, signature paths, OCI image digest, and the
+explicit "what was skipped" list are all there. `gh run watch
+<run-id>` streams the logs; `gh run view <run-id>` jumps to the
+summary.
 
 [#290]: https://github.com/aatchison/hummingbird-k8s/issues/290
 
