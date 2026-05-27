@@ -57,12 +57,6 @@
 //!
 //! # TODO before consumer crates land
 //!
-//! - **`tracing` instrumentation**: every `run`/`run_with_stdin` call
-//!   is silent today. Once [#286] picks the project's logging crate,
-//!   wrap [`Client::run`] in a `#[tracing::instrument(skip(self),
-//!   fields(host = %self.options.host()))]` span and emit a
-//!   `tracing::debug!` at spawn + completion. (PR #317 round-2 review
-//!   L8 DISCUSS.)
 //! - **Wall-clock command timeout**: `ConnectTimeout=10` only covers
 //!   the TCP handshake. A hung remote command after auth still blocks
 //!   indefinitely. Tracked as a follow-up issue rather than landing
@@ -245,12 +239,27 @@ impl Client {
         self.run_inner(command, Some(stdin))
     }
 
+    // `#[tracing::instrument]` opens a span every time we shell out to
+    // `ssh`, with the operator-relevant fields (host + whether stdin is
+    // piped) tagged. `skip(self, stdin)` keeps the SshOptions struct
+    // and the (potentially-large, possibly-secret) stdin bytes out of
+    // the span's auto-recorded fields — operators don't want their
+    // cloud-init seed dumped to a log. The span fires at `debug`
+    // because per-command volume can be high (`update-cluster` makes
+    // dozens per worker); operators flip on `RUST_LOG=hbird_ssh=debug`
+    // when triaging a stuck remote command. (#323; PR #317 round-2
+    // review L8 DISCUSS originally surfaced this.)
+    #[tracing::instrument(
+        level = "debug",
+        skip(self, stdin),
+        fields(
+            host = %self.options.host(),
+            has_stdin = stdin.is_some(),
+            cmd_len = command.len(),
+        ),
+        err(Debug),
+    )]
     fn run_inner(&self, command: &str, stdin: Option<&[u8]>) -> Result<RunOutput> {
-        // TODO(#323): wrap this fn in #[tracing::instrument(skip(self),
-        // fields(host = %self.options.host(), has_stdin = stdin.is_some()))]
-        // once the workspace picks a logging crate. (Retargeted from #286
-        // to dedicated tracing follow-up #323 in PR #321 round-2 review.)
-
         if let Some(path) = self.options.identity_file()
             && !path.exists()
         {
@@ -274,6 +283,7 @@ impl Client {
             cmd.stdin(Stdio::null());
         }
 
+        tracing::debug!("ssh spawn");
         let mut child = cmd.spawn().map_err(|source| Error::Spawn {
             program: program.clone(),
             host: host.clone(),
@@ -307,6 +317,11 @@ impl Client {
         })?;
 
         if !output.status.success() {
+            tracing::debug!(
+                exit = ?output.status,
+                stderr_len = output.stderr.len(),
+                "ssh non-zero exit",
+            );
             return Err(Error::NonZeroExit {
                 host,
                 status: output.status,
@@ -315,6 +330,11 @@ impl Client {
             });
         }
 
+        tracing::debug!(
+            stdout_len = output.stdout.len(),
+            stderr_len = output.stderr.len(),
+            "ssh ok",
+        );
         Ok(RunOutput {
             status: output.status,
             stdout: output.stdout,

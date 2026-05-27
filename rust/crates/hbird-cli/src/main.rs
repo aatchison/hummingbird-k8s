@@ -40,6 +40,8 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tracing::info_span;
+use tracing_subscriber::EnvFilter;
 
 mod commands;
 
@@ -55,16 +57,61 @@ use commands::{
 /// `Display` impl on `anyhow::Error` produces operator-readable output
 /// without a stack trace by default (the bash twins are similarly
 /// quiet). Set `RUST_BACKTRACE=1` to opt into one.
+///
+/// # Logging
+///
+/// `tracing_subscriber` is initialized at the very top so spans /
+/// events emitted by `hbird-ssh`, `hbird-virt`, and the subcommand
+/// bodies have a destination. The default filter is `info`; operators
+/// can override via `RUST_LOG` (e.g. `RUST_LOG=hbird_ssh=debug` to see
+/// per-host SSH command spans). Output goes to stderr so the existing
+/// `update-cluster` log lines (`[update-cluster] …` via `println!` to
+/// stdout — pinned byte-for-byte by the dry-run fixtures from
+/// PR #321) keep flowing through stdout untouched. The formatter is
+/// configured without timestamps/target/ansi-color so any tracing
+/// output reads like the bash-twin prefix style.
 fn main() -> Result<()> {
-    // TODO(#323): wrap parse + dispatch in a `tracing_subscriber` init +
-    // top-level `tracing::info_span!("hbird", subcommand = …)` once the
-    // workspace picks a logging crate. The hbird-ssh / hbird-virt
-    // `tracing::instrument` seams already exist — main is the missing
-    // half. (PR #319 round-2 review L8 DISCUSS deferred to #286; PR #321
-    // round-2 review retargeted to dedicated tracing follow-up #323 so
-    // tracing scope doesn't leak into the update-cluster body.)
+    init_tracing();
     let cli = Cli::parse();
+    let _span = info_span!("hbird", subcommand = cli.command.name()).entered();
     cli.command.run()
+}
+
+/// Install the global `tracing_subscriber` for the lifetime of the
+/// process.
+///
+/// Done early in `main` (before clap parsing) so any panic / error
+/// emitted by argument parsing also has somewhere to surface its span
+/// events. The filter honors `RUST_LOG`; absent that, it defaults to
+/// `info`, which keeps the foundation crates quiet during normal runs
+/// (their `#[tracing::instrument]` spans are recorded at `info`+ but
+/// most events emitted inside them are at `debug`).
+///
+/// Writer is stderr to keep stdout dedicated to the bash-twin-shaped
+/// `[update-cluster] …` lines that `commands::update_cluster::log`
+/// still emits via `println!`. Switching subscribers to stdout would
+/// corrupt the dry-run fixtures from PR #321, which compare captured
+/// stdout byte-for-byte against pinned snapshots.
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // `try_init` instead of `init` so a future test or library that
+    // happens to install a subscriber doesn't panic the second caller
+    // with `SetGlobalDefaultError`. Round-2 lens L5 MEDIUM — binaries
+    // that may be re-entered under test should always use try_init.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_level(true)
+        // Emit a debug event when each `#[tracing::instrument]` span
+        // closes, carrying span duration. Round-2 lens L8 MEDIUM —
+        // operators chasing "drain took 47s" diagnostics now see the
+        // close events under `RUST_LOG=hbird_cli=debug` (silent at
+        // default `info`).
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .try_init();
 }
 
 /// `hbird` — operator CLI for hummingbird-k8s.
@@ -153,6 +200,26 @@ enum Command {
 }
 
 impl Command {
+    /// Bash-twin-style name of the top-level subcommand
+    /// (`deploy-cluster`, `update-cluster`, `verify`, …). Used as the
+    /// `subcommand=…` field on the root tracing span so structured-log
+    /// consumers can filter / group by operator action. The strings
+    /// mirror the `Makefile` target names rather than the Rust variant
+    /// names (`deploy-cluster` over `DeployCluster`) so an operator
+    /// reading logs sees the same word they typed.
+    fn name(&self) -> &'static str {
+        match self {
+            Command::DeployCluster(_) => "deploy-cluster",
+            Command::DestroyCluster(_) => "destroy-cluster",
+            Command::UpdateCluster(_) => "update-cluster",
+            Command::Verify(_) => "verify",
+            Command::GetKubeconfig(_) => "get-kubeconfig",
+            Command::ExportArgocd(_) => "export-argocd",
+            Command::Nodes(_) => "nodes",
+            Command::Kubectl(_) => "kubectl",
+        }
+    }
+
     /// Dispatch to the chosen subcommand. Each delegate currently returns
     /// `Err(anyhow!("not yet implemented — tracked by #XXX"))`.
     fn run(self) -> Result<()> {
@@ -165,6 +232,84 @@ impl Command {
             Command::ExportArgocd(args) => commands::export_argocd::run(args),
             Command::Nodes(args) => commands::nodes::run(args),
             Command::Kubectl(args) => commands::kubectl::run(args),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Smoke: the clap-derive command tree still parses after the tracing
+    /// init was wired in. Catches simple regressions like a missing
+    /// trait import dragging in a name collision on `Command`.
+    #[test]
+    fn cli_command_tree_builds() {
+        Cli::command().debug_assert();
+    }
+
+    /// Every top-level `Command` variant maps to a stable,
+    /// bash-twin-shaped name. The strings are what end up in the root
+    /// tracing span's `subcommand=…` field, so structured-log consumers
+    /// can filter / group by them — asserting each variant's mapping
+    /// here means a future variant that forgets to extend
+    /// `Command::name` (which would default to "" via Rust's `match`
+    /// non-exhaustiveness compile error) gets caught at test time
+    /// before it lands an empty-string subcommand in production logs.
+    #[test]
+    fn command_names_match_bash_twin() {
+        // Parsed via clap with the same minimal flags `cli_smoke` uses —
+        // every subcommand accepts `--config /dev/null` (or no flag at
+        // all, since `CONFIG` env is optional). Kubectl needs a `--`
+        // pass-through; verify needs a sub-sub.
+        let cases: &[(&[&str], &str)] = &[
+            (
+                &["hbird", "deploy-cluster", "--config", "/dev/null"],
+                "deploy-cluster",
+            ),
+            (
+                &["hbird", "destroy-cluster", "--config", "/dev/null"],
+                "destroy-cluster",
+            ),
+            (
+                &["hbird", "update-cluster", "--config", "/dev/null"],
+                "update-cluster",
+            ),
+            (
+                &["hbird", "verify", "all", "--config", "/dev/null"],
+                "verify",
+            ),
+            (
+                &["hbird", "get-kubeconfig", "--config", "/dev/null"],
+                "get-kubeconfig",
+            ),
+            (
+                &["hbird", "export-argocd", "--config", "/dev/null"],
+                "export-argocd",
+            ),
+            (&["hbird", "nodes", "--config", "/dev/null"], "nodes"),
+            (
+                &[
+                    "hbird",
+                    "kubectl",
+                    "--config",
+                    "/dev/null",
+                    "--",
+                    "get",
+                    "nodes",
+                ],
+                "kubectl",
+            ),
+        ];
+        for (argv, expected) in cases {
+            let cli = Cli::try_parse_from(*argv)
+                .unwrap_or_else(|e| panic!("parse failed for {expected}: {e}"));
+            assert_eq!(
+                cli.command.name(),
+                *expected,
+                "Command::name mismatch for argv {argv:?}",
+            );
         }
     }
 }

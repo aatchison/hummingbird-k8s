@@ -22,6 +22,13 @@ publish = false
 [dependencies]
 thiserror = "2"
 
+# `tracing` for the `#[tracing::instrument]` attribute on `run_inner`
+# (#323). Library-only: no subscriber init here — the `hbird` binary
+# owns `tracing-subscriber` setup. Without an initialized subscriber
+# the macros compile to near-no-ops, so this dep is safe for any
+# consumer that doesn't want logging too.
+tracing = "0.1"
+
 [dev-dependencies]
 # Integration tests pin the constructed argv against the bash twin's
 # `ssh_opts_array` shape (see tests/options_match_bash_twin.rs). They

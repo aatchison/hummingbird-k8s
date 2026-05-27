@@ -66,12 +66,27 @@ Every subcommand currently returns
 sub-issue link. The flag set + help text are stable; the Makefile will
 start dispatching to `hbird` per-target as each implementation lands.
 
-Tracing/logging crate choice — deferred. The other foundation crates
-left `// TODO(#283)` markers pointing here; this PR keeps the deferral
-explicit (the binary currently has nothing to log beyond the dispatch
-error) and pushes the decision to the first real subcommand body
-([#286] `update-cluster`), which is where a logging surface will
-actually be exercised.
+Tracing/logging — `tracing` + `tracing-subscriber` (chosen by [#323],
+PR #326). Library crates (`hbird-config`, `hbird-ssh`, `hbird-virt`)
+depend on `tracing` only and emit spans + events via
+`#[tracing::instrument]`. The `hbird` binary owns subscriber init in
+`main()`: default filter is `info` (configurable via `RUST_LOG`),
+writer is stderr (stdout is reserved for the bash-twin-style
+`[update-cluster] …` lines that PR #321's fixtures pin byte-for-byte),
+no ANSI, no timestamps, no targets, span CLOSE events at debug.
+
+Verbose-log recipes for operator triage:
+
+```sh
+RUST_LOG=hbird_cli=debug hbird update-cluster ...      # CLI + subcommand spans
+RUST_LOG=hbird_ssh=debug hbird update-cluster ...      # SSH spawn / completion / non-zero-exit events
+RUST_LOG=hbird_virt=debug hbird nodes                  # virsh wrapper spans
+RUST_LOG=hbird_cli=debug,hbird_ssh=debug ...           # multiple crates
+```
+
+Span `err(Debug)` directive records `error = ?err` automatically when
+an instrumented fn returns `Err`, so an operator running at default
+`info` still sees error context (just no debug spam on the happy path).
 
 ## When the Rust binary will appear in the `Makefile`
 
