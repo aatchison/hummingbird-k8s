@@ -121,12 +121,36 @@ impl QemuSshUri {
             });
         }
 
+        // Reject any `@` in the user component. `rsplit_once('@')` would
+        // otherwise let `user@inner@host` parse with `"user@inner"` as
+        // the user — that string would then be passed to `ssh` verbatim
+        // and could be misinterpreted as an option. (PR #318 round-2
+        // review L1 LOW.)
         let (user, host_port) = match authority.rsplit_once('@') {
-            Some((u, hp)) if !u.is_empty() => (Some(u.to_string()), hp),
-            Some((_, hp)) => (None, hp), // `@host` — ignore empty user
+            Some(("", hp)) => (None, hp), // `@host` — ignore empty user
+            Some((u, hp)) => {
+                if u.contains('@') {
+                    return Err(Error::InvalidUri {
+                        raw: raw.to_string(),
+                        reason: "user component must not contain '@'",
+                    });
+                }
+                (Some(u.to_string()), hp)
+            }
             None => (None, authority),
         };
 
+        // Validate user token: SSH wrappers concatenate `user@host` into
+        // argv. A leading `-` or shell metacharacters would let
+        // `qemu+ssh://-oProxyCommand=evil@host/system` smuggle SSH
+        // options through ssh_target(). Allowlist alphanumeric + `._-`,
+        // require non-`-` first char. (PR #318 round-2 review L1 HIGH —
+        // OpenSSH dash-option injection CVE family.)
+        if let Some(u) = user.as_deref() {
+            validate_safe_token(u, "user", raw)?;
+        }
+
+        let is_ipv6 = host_port.starts_with('[');
         let (host, port) = split_host_port(host_port, raw)?;
 
         if host.is_empty() {
@@ -134,6 +158,15 @@ impl QemuSshUri {
                 raw: raw.to_string(),
                 reason: "empty host",
             });
+        }
+
+        // Validate host token unless it came from a bracketed IPv6
+        // literal (whose charset is constrained by split_host_port's
+        // bracket parser already). For bare hostnames + IPv4 literals,
+        // enforce the same allowlist as user. (PR #318 round-2 review
+        // L1 HIGH.)
+        if !is_ipv6 {
+            validate_safe_token(host, "host", raw)?;
         }
 
         let instance = match path {
@@ -214,6 +247,10 @@ fn split_host_port<'a>(host_port: &'a str, raw: &str) -> Result<(&'a str, Option
                 reason: "garbage after IPv6 literal close bracket",
             });
         };
+        // IPv6 literal — the bracket parser above already constrained
+        // the charset to whatever appears between `[...]`. We don't
+        // re-validate here; the caller skips validate_safe_token for
+        // the bracketed case.
         Ok((host, port))
     } else if let Some((h, p)) = host_port.rsplit_once(':') {
         // Plain `host:port`. Only valid when the host part has no
@@ -232,6 +269,58 @@ fn split_host_port<'a>(host_port: &'a str, raw: &str) -> Result<(&'a str, Option
     } else {
         Ok((host_port, None))
     }
+}
+
+/// Validate that a URI token (user or non-bracketed host) is safe to
+/// concatenate into an `ssh` argv slot. Rejects:
+///
+/// - Empty strings (already caught upstream for host; defensive here).
+/// - Leading `-` — closes the OpenSSH dash-option-injection vulnerability
+///   class. A host or user starting with `-` would be parsed by `ssh` as
+///   a flag (e.g. `-oProxyCommand=evil`), bypassing the operator's
+///   intended target.
+/// - Anything outside the conservative `[A-Za-z0-9._-]` allowlist —
+///   shell metas, whitespace, control chars, and `@`/`:` (the latter
+///   would conflict with this crate's own URI grammar).
+///
+/// Bracketed IPv6 literals are exempt — they have their own constrained
+/// charset enforced by `split_host_port`'s bracket parser. (PR #318
+/// round-2 review L1 HIGH.)
+fn validate_safe_token(s: &str, field: &'static str, raw: &str) -> Result<()> {
+    if s.is_empty() {
+        return Err(Error::InvalidUri {
+            raw: raw.to_string(),
+            reason: match field {
+                "host" => "host token must not be empty",
+                "user" => "user token must not be empty",
+                _ => "token must not be empty",
+            },
+        });
+    }
+    if s.starts_with('-') {
+        return Err(Error::InvalidUri {
+            raw: raw.to_string(),
+            reason: match field {
+                "host" => "host must not start with '-' (would be parsed as an SSH option)",
+                "user" => "user must not start with '-' (would be parsed as an SSH option)",
+                _ => "token must not start with '-'",
+            },
+        });
+    }
+    for c in s.chars() {
+        let ok = c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+        if !ok {
+            return Err(Error::InvalidUri {
+                raw: raw.to_string(),
+                reason: match field {
+                    "host" => "host contains characters outside [A-Za-z0-9._-]",
+                    "user" => "user contains characters outside [A-Za-z0-9._-]",
+                    _ => "token contains disallowed characters",
+                },
+            });
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for QemuSshUri {
@@ -255,5 +344,74 @@ impl fmt::Display for QemuSshUri {
             write!(f, "?{q}")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn host_with_leading_dash_rejected() {
+        let err = QemuSshUri::parse("qemu+ssh://-oProxyCommand=evil/system")
+            .expect_err("host starting with '-' must be rejected");
+        match err {
+            Error::InvalidUri { reason, .. } => {
+                assert!(
+                    reason.contains("host") && reason.contains("'-'"),
+                    "diagnostic should name the host + the leading dash, got: {reason:?}"
+                );
+            }
+            other => panic!("expected InvalidUri, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_with_leading_dash_rejected() {
+        let err = QemuSshUri::parse("qemu+ssh://-oProxyCommand=evil@host/system")
+            .expect_err("user starting with '-' must be rejected");
+        assert!(matches!(err, Error::InvalidUri { .. }));
+    }
+
+    #[test]
+    fn user_containing_at_sign_rejected() {
+        let err = QemuSshUri::parse("qemu+ssh://user@inner@host/system")
+            .expect_err("user containing '@' must be rejected");
+        match err {
+            Error::InvalidUri { reason, .. } => {
+                assert!(reason.contains("'@'"), "got: {reason:?}");
+            }
+            other => panic!("expected InvalidUri, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_with_shell_metacharacter_rejected() {
+        // `;rm` would be a classic shell-injection payload if a downstream
+        // ssh wrapper concatenated host into a shell command. Even though
+        // our SshClient impls don't (they use Command::arg), defense in
+        // depth at the parser layer.
+        let err = QemuSshUri::parse("qemu+ssh://host;rm/system")
+            .expect_err("host with ';' must be rejected");
+        assert!(matches!(err, Error::InvalidUri { .. }));
+    }
+
+    #[test]
+    fn ipv6_literal_bypasses_token_validation() {
+        // IPv6 hosts contain ':' which would fail the allowlist — but
+        // bracket parsing already constrains the charset. Confirm
+        // bracketed IPv6 still parses.
+        let uri =
+            QemuSshUri::parse("qemu+ssh://[::1]/system").expect("bracketed IPv6 must still parse");
+        assert_eq!(uri.host, "::1");
+    }
+
+    #[test]
+    fn normal_hostnames_still_parse() {
+        // Sanity: don't break the happy path.
+        for ok in ["kvm-host", "host.example.com", "h_1", "192.168.1.10"] {
+            let uri = format!("qemu+ssh://{ok}/system");
+            QemuSshUri::parse(&uri).unwrap_or_else(|e| panic!("{ok} should parse, got {e:?}"));
+        }
     }
 }

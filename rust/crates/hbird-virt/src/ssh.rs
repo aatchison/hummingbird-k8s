@@ -1,13 +1,20 @@
 //! SSH transport trait.
 //!
-//! [`SshClient`] is the seam between [`crate::VirtConnection`] and a real
-//! SSH implementation. The crate intentionally does NOT depend on a
-//! concrete SSH library — that responsibility belongs to the sibling
-//! `hbird-openssh` crate ([#285]). Wiring is mechanical: implement
-//! [`SshClient::run`] on top of whatever SSH backend the caller wants
-//! (the real one is OpenSSH-via-subprocess for parity with the bash
-//! twin's `ssh "$KVM_HOST" "..."` pattern), and pass it to
-//! [`crate::VirtConnection::new`].
+//! [`SshClient`] is the seam between [`crate::Connection`] and a real
+//! SSH implementation. The trait is defined locally — NOT re-exported
+//! from `hbird-ssh` (the sibling crate per [#285]) — as a deliberate
+//! parallel-development choice: #284 and #285 land independently so
+//! neither blocks the other. The long-term home of this trait will be
+//! reconsidered when [#286] wires both together; the most likely
+//! resolution is moving it into `hbird-ssh` and re-exporting here, but
+//! that's a follow-up not a foundation decision. (PR #318 round-2
+//! review L4 HIGH.)
+//!
+//! Wiring is mechanical: implement [`SshClient::run`] on top of
+//! whatever SSH backend the caller wants (the real one is
+//! OpenSSH-via-subprocess for parity with the bash twin's
+//! `ssh "$KVM_HOST" "..."` pattern), and pass it to
+//! [`crate::Connection::new`].
 //!
 //! Tests in this crate use a stub implementation (see
 //! `tests/virsh_commands.rs`) that returns canned responses keyed by
@@ -22,7 +29,7 @@ use std::fmt;
 /// Implementations run a single command on a remote host and return the
 /// command's stdout (UTF-8) on success or an [`SshError`] carrying
 /// stderr + exit context on failure. Implementations are responsible
-/// for connection setup/teardown — [`crate::VirtConnection`] does not
+/// for connection setup/teardown — [`crate::Connection`] does not
 /// keep a persistent session.
 ///
 /// The trait is intentionally minimal so a future `hbird-openssh`

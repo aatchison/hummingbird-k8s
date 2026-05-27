@@ -1,4 +1,4 @@
-//! Integration tests for [`hbird_virt::VirtConnection`] using a stub
+//! Integration tests for [`hbird_virt::Connection`] using a stub
 //! [`SshClient`].
 //!
 //! The stub records each `(host, command)` call and returns a canned
@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use hbird_virt::{Error, QemuSshUri, SshClient, SshError, VirtConnection};
+use hbird_virt::{Connection, Error, QemuSshUri, SshClient, SshError};
 
 /// Canned response keyed by the full remote command string.
 #[derive(Clone)]
@@ -85,9 +85,9 @@ impl SshClient for StubSshClient {
     }
 }
 
-fn make_conn(stub: Arc<StubSshClient>) -> VirtConnection {
+fn make_conn(stub: Arc<StubSshClient>) -> Connection {
     let uri = QemuSshUri::parse("qemu+ssh://op@kvm.example/system").unwrap();
-    VirtConnection::new(uri, stub)
+    Connection::new(uri, stub)
 }
 
 #[test]
@@ -265,7 +265,7 @@ fn no_user_uri_skips_user_prefix_in_ssh_target() {
         Reply::Ok(String::new()),
     );
     let uri = QemuSshUri::parse("qemu+ssh://kvm.example/system").unwrap();
-    let conn = VirtConnection::new(uri, Arc::clone(&stub) as Arc<dyn SshClient>);
+    let conn = Connection::new(uri, Arc::clone(&stub) as Arc<dyn SshClient>);
     conn.domains().unwrap();
     let calls = stub.calls();
     assert_eq!(calls[0].0, "kvm.example");
@@ -280,6 +280,6 @@ fn session_instance_routes_to_qemu_session_uri() {
         Reply::Ok(String::new()),
     );
     let uri = QemuSshUri::parse("qemu+ssh://kvm.example/session").unwrap();
-    let conn = VirtConnection::new(uri, stub);
+    let conn = Connection::new(uri, stub);
     conn.domains().unwrap();
 }

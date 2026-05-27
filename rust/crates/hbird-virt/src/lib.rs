@@ -31,11 +31,11 @@
 //!   for `qemu+ssh://[user@]host[:port]/[system|session][?query]`. This
 //!   is the load-bearing piece for [#284]: every operator config
 //!   eventually becomes one of these URIs.
-//! - [`VirtConnection`] — open connection to a remote libvirt daemon.
+//! - [`Connection`] — open connection to a remote libvirt daemon.
 //!   Holds a [`QemuSshUri`] + an [`Arc<dyn SshClient>`](std::sync::Arc).
 //!   Exposes the minimal verb set the Phase-1 subcommands need:
-//!   [`VirtConnection::domains`], [`VirtConnection::domifaddr`],
-//!   [`VirtConnection::dominfo`].
+//!   [`Connection::domains`], [`Connection::domifaddr`],
+//!   [`Connection::dominfo`].
 //! - [`Error`] — flat enum carrying URI / SSH / virsh-output failures.
 //!
 //! Mutating libvirt operations (`start`, `destroy`, `undefine`, etc.)
@@ -109,23 +109,23 @@ pub struct DomainInfo {
 /// invocation via the SSH client and parses the captured stdout. Cheap
 /// to clone (the `Arc` shares the SSH client).
 #[derive(Clone)]
-pub struct VirtConnection {
+pub struct Connection {
     uri: QemuSshUri,
     ssh: Arc<dyn SshClient>,
 }
 
-impl std::fmt::Debug for VirtConnection {
+impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Don't try to render the SSH client — it's a trait object and
         // implementations don't have to be Debug. The URI is the
         // identity-bearing piece operators care about in logs.
-        f.debug_struct("VirtConnection")
+        f.debug_struct("Connection")
             .field("uri", &self.uri.to_string())
             .finish_non_exhaustive()
     }
 }
 
-impl VirtConnection {
+impl Connection {
     /// Open a new connection at `uri`, routing remote `virsh` commands
     /// through `ssh`.
     ///

@@ -14,6 +14,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hbird-ssh"
+version = "0.0.1"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "hbird-virt"
 version = "0.0.1"
 dependencies = [
