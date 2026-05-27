@@ -94,14 +94,24 @@ fn main() -> Result<()> {
 /// stdout byte-for-byte against pinned snapshots.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
+    // `try_init` instead of `init` so a future test or library that
+    // happens to install a subscriber doesn't panic the second caller
+    // with `SetGlobalDefaultError`. Round-2 lens L5 MEDIUM — binaries
+    // that may be re-entered under test should always use try_init.
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .without_time()
         .with_target(false)
         .with_level(true)
-        .init();
+        // Emit a debug event when each `#[tracing::instrument]` span
+        // closes, carrying span duration. Round-2 lens L8 MEDIUM —
+        // operators chasing "drain took 47s" diagnostics now see the
+        // close events under `RUST_LOG=hbird_cli=debug` (silent at
+        // default `info`).
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .try_init();
 }
 
 /// `hbird` — operator CLI for hummingbird-k8s.

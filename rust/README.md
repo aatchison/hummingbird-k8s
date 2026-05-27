@@ -62,6 +62,27 @@ rust/
 | Release — cosign + cargo-dist | [#290](https://github.com/aatchison/hummingbird-k8s/issues/290) | pending |
 | Migration guide | [#291](https://github.com/aatchison/hummingbird-k8s/issues/291) | pending |
 
+## Logging
+
+Workspace convention chosen by [#323](https://github.com/aatchison/hummingbird-k8s/issues/323) (PR #326):
+
+- **Library crates** (`hbird-config`, `hbird-ssh`, `hbird-virt`) depend
+  on `tracing = "0.1"` only. They emit spans + events via
+  `#[tracing::instrument]` — no subscriber init.
+- **Binary crate** (`hbird-cli`) owns subscriber init: `init_tracing()`
+  in `main.rs` installs `tracing-subscriber::fmt` with stderr writer,
+  default `info` filter, no ANSI / no timestamps / no targets, and
+  `FmtSpan::CLOSE` for per-span duration at debug.
+- Library crates **must not** depend on `tracing-subscriber` — only
+  the binary picks the subscriber, so downstream consumers (future
+  releases, integration tests) can pick their own.
+- `RUST_LOG` follows the standard `env_filter` syntax: `hbird_cli=debug`,
+  `hbird_ssh=debug,hbird_virt=info`, etc. See `docs/rust-cli.md` for
+  recipes.
+- Stdout is reserved for bash-twin-style log lines (`[update-cluster] …`)
+  that operator scripts grep against; tracing writes to stderr so the
+  two streams don't collide.
+
 ## Lint policy
 
 Workspace defaults (`Cargo.toml`):

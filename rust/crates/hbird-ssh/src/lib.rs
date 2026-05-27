@@ -257,6 +257,7 @@ impl Client {
             has_stdin = stdin.is_some(),
             cmd_len = command.len(),
         ),
+        err(Debug),
     )]
     fn run_inner(&self, command: &str, stdin: Option<&[u8]>) -> Result<RunOutput> {
         if let Some(path) = self.options.identity_file()

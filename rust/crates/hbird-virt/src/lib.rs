@@ -157,7 +157,7 @@ impl Connection {
     /// - [`Error::VirshFailed`] when `virsh` exits non-zero (e.g.
     ///   libvirt not running on the remote, no libvirt-group
     ///   membership).
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri), err(Debug))]
     pub fn domains(&self) -> Result<Vec<Domain>> {
         let cmd = format!("virsh -c {} list --all --name", self.uri.remote_uri());
         let stdout = self.run(&cmd)?;
@@ -196,7 +196,7 @@ impl Connection {
     /// - [`Error::UnparseableOutput`] when `virsh` returns 0 but the
     ///   `ipv4` row's CIDR field doesn't contain a parseable
     ///   [`Ipv4Addr`].
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain), err(Debug))]
     pub fn domifaddr(&self, domain: &str) -> Result<Option<Ipv4Addr>> {
         let cmd = format!(
             "virsh -c {} domifaddr {}",
@@ -225,7 +225,7 @@ impl Connection {
     ///   often "Domain not found").
     /// - [`Error::UnparseableOutput`] when the output is missing the
     ///   Name, State, Persistent, or OS Type rows.
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain), err(Debug))]
     pub fn dominfo(&self, domain: &str) -> Result<DomainInfo> {
         let cmd = format!(
             "virsh -c {} dominfo {}",
