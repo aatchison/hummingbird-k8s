@@ -127,4 +127,56 @@ pub enum Error {
         /// The raw line as it appeared in the file.
         raw: String,
     },
+
+    /// A field's RHS was the wrong shape for its declared type — e.g.
+    /// `WORKER_NAMES=foo` (scalar where an array is expected) or
+    /// `CP_MEMORY=(1 2)` (array where a scalar is expected). The
+    /// pre-#316 code silently coerced these to `None` / default, which
+    /// hid operator typos until the deploy reached `virsh`/`kubeadm`
+    /// and produced a confusing downstream failure. (#316.)
+    ///
+    /// The bash twin is also silent here (`source` doesn't validate
+    /// scalar-vs-array), but bash operators *expect* shell-style silence;
+    /// the Rust API gets to be tighter without breaking any *valid*
+    /// config because every shipping `cluster.example.conf` uses the
+    /// correct shape per field.
+    #[error("type mismatch for {field} at line {line_no}: expected {expected}, got {got}")]
+    TypeMismatch {
+        /// Field name whose declared type didn't match the assigned shape.
+        field: &'static str,
+        /// Human-readable expected shape (`"scalar"` / `"array"`).
+        expected: &'static str,
+        /// Human-readable observed shape (`"scalar"` / `"array"`).
+        got: &'static str,
+        /// 1-based line number where the offending assignment lives.
+        line_no: usize,
+    },
+}
+
+/// Non-fatal parser diagnostics returned alongside a successfully built
+/// [`crate::ClusterConfig`].
+///
+/// Today only [`Warning::UnknownKey`] is emitted — a key in the input that
+/// no field on `ClusterConfig` consumed. Bash silently ignores unknown
+/// `KEY=value` lines (`source` happily accepts them), so this stays a
+/// warning rather than an error to preserve operator-visible behavioral
+/// parity with the bash twin. Operators who want fail-on-typo behavior
+/// can opt in by treating a non-empty `warnings` vec as a hard failure.
+///
+/// (#316.)
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Warning {
+    /// The input contained an assignment whose key isn't consumed by any
+    /// [`crate::ClusterConfig`] field. Typically an operator typo
+    /// (`WROKER_NAMES=...` instead of `WORKER_NAMES=...`) — surfacing it
+    /// lets tooling print the typo near the source line rather than
+    /// silently building the wrong cluster.
+    #[error("unknown key {key:?} at line {line_no} (ignored)")]
+    UnknownKey {
+        /// The unrecognized key as it appeared in the input.
+        key: String,
+        /// 1-based line number where the assignment lives.
+        line_no: usize,
+    },
 }

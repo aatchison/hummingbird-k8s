@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::Error;
+use crate::error::{Error, Warning};
 use crate::{ClusterConfig, Result};
 
 /// Maximum field name length the parser will accept on a line. Anything
@@ -281,6 +281,11 @@ fn tokenize_array_body(body: &str, line_no: usize) -> Result<Vec<String>> {
 
 // ---- Field assembly --------------------------------------------------------
 
+/// Human-readable shape labels for [`Error::TypeMismatch`]. Kept as
+/// `&'static str` so the enum can stay `Copy`-friendly. (#316.)
+const SHAPE_SCALAR: &str = "scalar";
+const SHAPE_ARRAY: &str = "array";
+
 fn build_config(
     mut raw: HashMap<String, (usize, Value)>,
     source_path: &str,
@@ -288,28 +293,82 @@ fn build_config(
     let cp_name = take_required_scalar(&mut raw, "CP_NAME", source_path)?;
     let ssh_pubkey_file = take_required_scalar(&mut raw, "SSH_PUBKEY_FILE", source_path)?;
 
+    let kvm_host = take_optional_scalar(&mut raw, "KVM_HOST")?;
+    let image_source = take_scalar_or_default(&mut raw, "IMAGE_SOURCE", "ghcr")?;
+    let ghcr_tag = take_scalar_or_default(&mut raw, "GHCR_TAG", "latest")?;
+    let enable_cloud_init = take_u32_or_default(&mut raw, "ENABLE_CLOUD_INIT", 0)?;
+    let auto_update_cp = take_bool_strict_or_default(&mut raw, "AUTO_UPDATE_CP", true)?;
+    let switch_to_ghcr = take_bool_strict_or_default(&mut raw, "SWITCH_TO_GHCR", true)?;
+    let cp_memory = take_u32_or_default(&mut raw, "CP_MEMORY", 8192)?;
+    let cp_vcpus = take_u32_or_default(&mut raw, "CP_VCPUS", 4)?;
+    let worker_memory = take_u32_or_default(&mut raw, "WORKER_MEMORY", 4096)?;
+    let worker_vcpus = take_u32_or_default(&mut raw, "WORKER_VCPUS", 2)?;
+    let pool_dir = take_scalar_or_default(&mut raw, "POOL_DIR", "/var/lib/libvirt/images")?;
+    let run_verify = take_bool_or_default(&mut raw, "RUN_VERIFY", false)?;
+    let bootc_update_schedule = take_optional_scalar(&mut raw, "BOOTC_UPDATE_SCHEDULE")?;
+    let bootc_update_repo_k8s = take_optional_scalar(&mut raw, "BOOTC_UPDATE_REPO_K8S")?;
+    let bootc_update_repo_worker = take_optional_scalar(&mut raw, "BOOTC_UPDATE_REPO_WORKER")?;
+    let worker_names = take_optional_array(&mut raw, "WORKER_NAMES")?;
+    let cp_ip = take_optional_scalar(&mut raw, "CP_IP")?;
+    let worker_ips = take_optional_array(&mut raw, "WORKER_IPS")?;
+
+    // Any keys still sitting in `raw` are unknown — no field consumed
+    // them. Surface each as a `Warning::UnknownKey` so operator tooling
+    // can print the typo near its source line. Sort by line number so
+    // multi-warning output stays deterministic (bash silently ignores
+    // unknown keys, so we don't error — see Warning::UnknownKey docs).
+    let mut warnings: Vec<Warning> = raw
+        .into_iter()
+        .map(|(key, (line_no, _value))| Warning::UnknownKey { key, line_no })
+        .collect();
+    warnings.sort_by_key(|w| match w {
+        Warning::UnknownKey { line_no, .. } => *line_no,
+    });
+
     Ok(ClusterConfig {
         cp_name,
         ssh_pubkey_file,
-        kvm_host: take_optional_scalar(&mut raw, "KVM_HOST"),
-        image_source: take_scalar_or_default(&mut raw, "IMAGE_SOURCE", "ghcr"),
-        ghcr_tag: take_scalar_or_default(&mut raw, "GHCR_TAG", "latest"),
-        enable_cloud_init: take_u32_or_default(&mut raw, "ENABLE_CLOUD_INIT", 0)?,
-        auto_update_cp: take_bool_strict_or_default(&mut raw, "AUTO_UPDATE_CP", true)?,
-        switch_to_ghcr: take_bool_strict_or_default(&mut raw, "SWITCH_TO_GHCR", true)?,
-        cp_memory: take_u32_or_default(&mut raw, "CP_MEMORY", 8192)?,
-        cp_vcpus: take_u32_or_default(&mut raw, "CP_VCPUS", 4)?,
-        worker_memory: take_u32_or_default(&mut raw, "WORKER_MEMORY", 4096)?,
-        worker_vcpus: take_u32_or_default(&mut raw, "WORKER_VCPUS", 2)?,
-        pool_dir: take_scalar_or_default(&mut raw, "POOL_DIR", "/var/lib/libvirt/images"),
-        run_verify: take_bool_or_default(&mut raw, "RUN_VERIFY", false),
-        bootc_update_schedule: take_optional_scalar(&mut raw, "BOOTC_UPDATE_SCHEDULE"),
-        bootc_update_repo_k8s: take_optional_scalar(&mut raw, "BOOTC_UPDATE_REPO_K8S"),
-        bootc_update_repo_worker: take_optional_scalar(&mut raw, "BOOTC_UPDATE_REPO_WORKER"),
-        worker_names: take_optional_array(&mut raw, "WORKER_NAMES"),
-        cp_ip: take_optional_scalar(&mut raw, "CP_IP"),
-        worker_ips: take_optional_array(&mut raw, "WORKER_IPS"),
+        kvm_host,
+        image_source,
+        ghcr_tag,
+        enable_cloud_init,
+        auto_update_cp,
+        switch_to_ghcr,
+        cp_memory,
+        cp_vcpus,
+        worker_memory,
+        worker_vcpus,
+        pool_dir,
+        run_verify,
+        bootc_update_schedule,
+        bootc_update_repo_k8s,
+        bootc_update_repo_worker,
+        worker_names,
+        cp_ip,
+        worker_ips,
+        warnings,
     })
+}
+
+/// Build a [`Error::TypeMismatch`] given the observed `Value` shape.
+/// Centralizes the scalar-vs-array label mapping so each `take_*`
+/// helper stays a single-line `match`. (#316.)
+fn mismatch(
+    field: &'static str,
+    expected: &'static str,
+    observed: &Value,
+    line_no: usize,
+) -> Error {
+    let got = match observed {
+        Value::Scalar(_) => SHAPE_SCALAR,
+        Value::Array(_) => SHAPE_ARRAY,
+    };
+    Error::TypeMismatch {
+        field,
+        expected,
+        got,
+        line_no,
+    }
 }
 
 fn take_required_scalar(
@@ -319,23 +378,33 @@ fn take_required_scalar(
 ) -> Result<String> {
     match raw.remove(key) {
         Some((_, Value::Scalar(v))) if !v.is_empty() => Ok(v),
-        _ => Err(Error::MissingRequired {
+        // Required-but-empty scalar still maps to MissingRequired — empty
+        // string is operator-equivalent to "did not set" for required
+        // fields (matches the bash twin's `${VAR:?}` semantics).
+        Some((_, Value::Scalar(_))) | None => Err(Error::MissingRequired {
             field: key,
             path: source_path.to_string(),
         }),
+        // Array assigned to a scalar field — operator typo we now surface
+        // as TypeMismatch instead of silently treating it as missing. (#316.)
+        Some((line_no, ref other @ Value::Array(_))) => {
+            Err(mismatch(key, SHAPE_SCALAR, other, line_no))
+        }
     }
 }
 
 fn take_optional_scalar(
     raw: &mut HashMap<String, (usize, Value)>,
     key: &'static str,
-) -> Option<String> {
+) -> Result<Option<String>> {
     match raw.remove(key) {
-        Some((_, Value::Scalar(v))) => Some(v),
-        // Arrays here are silently dropped — none of the current optional
-        // scalar fields would ever sensibly be set as an array; if an
-        // operator does it, the bash twin would also misbehave.
-        _ => None,
+        Some((_, Value::Scalar(v))) => Ok(Some(v)),
+        // Pre-#316 silently dropped the array here. Surface it instead so
+        // an operator who wrote `CP_IP=(192.168.1.10)` sees the typo.
+        Some((line_no, ref other @ Value::Array(_))) => {
+            Err(mismatch(key, SHAPE_SCALAR, other, line_no))
+        }
+        None => Ok(None),
     }
 }
 
@@ -343,10 +412,14 @@ fn take_scalar_or_default(
     raw: &mut HashMap<String, (usize, Value)>,
     key: &'static str,
     default: &str,
-) -> String {
+) -> Result<String> {
     match raw.remove(key) {
-        Some((_, Value::Scalar(v))) if !v.is_empty() => v,
-        _ => default.to_string(),
+        Some((_, Value::Scalar(v))) if !v.is_empty() => Ok(v),
+        // Empty scalar → default (mirrors bash `${VAR:=default}`).
+        Some((_, Value::Scalar(_))) | None => Ok(default.to_string()),
+        Some((line_no, ref other @ Value::Array(_))) => {
+            Err(mismatch(key, SHAPE_SCALAR, other, line_no))
+        }
     }
 }
 
@@ -363,7 +436,10 @@ fn take_u32_or_default(
                 raw: v,
             })
         }
-        _ => Ok(default),
+        Some((_, Value::Scalar(_))) | None => Ok(default),
+        Some((line_no, ref other @ Value::Array(_))) => {
+            Err(mismatch(key, SHAPE_SCALAR, other, line_no))
+        }
     }
 }
 
@@ -378,13 +454,16 @@ fn take_u32_or_default(
 /// to `false` regardless of the caller's default, so `RUN_VERIFY=""` and
 /// `AUTO_UPDATE_CP=""` both returned `false` even when the default was
 /// `true`. Fixed by removing the `""` arm so it falls through to default.
+///
+/// #316: arrays now error via [`Error::TypeMismatch`] instead of
+/// silently being treated as "no value, use default".
 fn take_bool_or_default(
     raw: &mut HashMap<String, (usize, Value)>,
     key: &'static str,
     default: bool,
-) -> bool {
+) -> Result<bool> {
     match raw.remove(key) {
-        Some((_, Value::Scalar(v))) => match v.to_ascii_lowercase().as_str() {
+        Some((_, Value::Scalar(v))) => Ok(match v.to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => true,
             "false" | "0" | "no" | "off" => false,
             // Empty string AND unknown spellings fall through to the
@@ -392,8 +471,11 @@ fn take_bool_or_default(
             // empty to the default, and lenient truthy-string semantics
             // tolerate unknown spellings.
             _ => default,
-        },
-        _ => default,
+        }),
+        Some((line_no, ref other @ Value::Array(_))) => {
+            Err(mismatch(key, SHAPE_SCALAR, other, line_no))
+        }
+        None => Ok(default),
     }
 }
 
@@ -407,6 +489,9 @@ fn take_bool_or_default(
 /// PR #315 round-2 review Lens 2 HIGH. Case-sensitive (matches bash's
 /// case-sensitive comparison). Empty string falls through to the
 /// caller's default (matches bash `:=`).
+///
+/// #316: arrays now error via [`Error::TypeMismatch`] rather than
+/// silently using the default.
 fn take_bool_strict_or_default(
     raw: &mut HashMap<String, (usize, Value)>,
     key: &'static str,
@@ -423,16 +508,26 @@ fn take_bool_strict_or_default(
                 raw: v,
             }),
         },
-        _ => Ok(default),
+        Some((line_no, ref other @ Value::Array(_))) => {
+            Err(mismatch(key, SHAPE_SCALAR, other, line_no))
+        }
+        None => Ok(default),
     }
 }
 
 fn take_optional_array(
     raw: &mut HashMap<String, (usize, Value)>,
     key: &'static str,
-) -> Option<Vec<String>> {
+) -> Result<Option<Vec<String>>> {
     match raw.remove(key) {
-        Some((_, Value::Array(v))) => Some(v),
-        _ => None,
+        Some((_, Value::Array(v))) => Ok(Some(v)),
+        // Pre-#316 silently dropped the scalar here. Surface it so an
+        // operator who wrote `WORKER_NAMES=foo` (forgetting parens) sees
+        // the typo rather than getting the legacy 2-worker default and a
+        // confused cluster a half-hour later.
+        Some((line_no, ref other @ Value::Scalar(_))) => {
+            Err(mismatch(key, SHAPE_ARRAY, other, line_no))
+        }
+        None => Ok(None),
     }
 }
