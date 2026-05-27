@@ -50,12 +50,17 @@ order — the script:
 4. Captures the node's `.status.nodeInfo.bootID` (see
    [Reboot detection (bootID)](#reboot-detection-bootid) below).
 5. `ssh root@NODE_IP bootc upgrade --apply` — `--apply` auto-reboots.
-6. Waits for SSH to come back; then waits for `bootID` to differ from
-   the pre-reboot value (proves a real reboot happened — defeats the
-   stale-apiserver-cache hit on Ready); then for `kubectl get node NAME`
-   to report `Ready` (the regex covers `Ready,SchedulingDisabled` too —
-   workers come back cordoned-but-Ready until step 8 lands); then for
-   every kube-system DaemonSet pod on the node to be Ready (see
+6. Waits for SSH to **drop** (proves the reboot has actually started —
+   bootc's `--apply` queues the reboot via systemd-run with a small
+   delay, so without this gate the next step would false-success on
+   the still-up pre-reboot connection; see
+   [SSH-drop gate](#ssh-drop-gate)); then waits for SSH to come back;
+   then waits for `bootID` to differ from the pre-reboot value (proves
+   a real reboot happened — defeats the stale-apiserver-cache hit on
+   Ready); then for `kubectl get node NAME` to report `Ready` (the regex
+   covers `Ready,SchedulingDisabled` too — workers come back
+   cordoned-but-Ready until step 8 lands); then for every kube-system
+   DaemonSet pod on the node to be Ready (see
    [Daemonset readiness gate](#daemonset-readiness-gate)).
 7. For workers: `kubectl uncordon NODE`.
 8. Restarts the in-image auto-update timer on the node. The script
@@ -109,6 +114,7 @@ Environment variables the script honors:
 | `DAEMONSET_TIMEOUT` | `${READY_TIMEOUT}` | Seconds to wait for the [DaemonSet readiness gate](#daemonset-readiness-gate). Defaults to `READY_TIMEOUT` for compatibility; set independently when the DS gate needs more (or less) headroom than node-Ready. Must be > 0. |
 | `APISERVER_TIMEOUT` | `300` | Seconds to wait for the CP apiserver to answer `/readyz` after the CP reboots. |
 | `SSH_TIMEOUT` | `300` | Seconds to wait for `ssh root@<ip>` to come back post-reboot. |
+| `SSH_DROP_TIMEOUT` | `30` | Seconds to wait for `ssh root@<ip>` to become unreachable after `bootc upgrade --apply` queues the reboot. Diagnostic gate; a timeout logs WARN but does not fail the run (the bootID-changed gate is the source of truth when not skipped). See [SSH-drop gate](#ssh-drop-gate). Must be > 0. |
 | `INTER_NODE_SLEEP` | `5` | Seconds to pause after uncordoning a node before processing the next one (small settle window). |
 
 All knobs honor the standard `VAR=value make …` pattern. Env vars set
@@ -178,6 +184,7 @@ startup with strict regexes before any privileged call:
 | `DAEMONSET_TIMEOUT` | `^[1-9][0-9]*$` (strictly positive) |
 | `APISERVER_TIMEOUT` | `^[0-9]+$` |
 | `SSH_TIMEOUT` | `^[0-9]+$` |
+| `SSH_DROP_TIMEOUT` | `^[1-9][0-9]*$` (strictly positive — 0 would defeat the gate) |
 | `INTER_NODE_SLEEP` | `^[0-9]+$` (0 is allowed; it skips the inter-batch sleep) |
 
 Anything else exits the script with `rc=1` and a clear diagnostic
@@ -476,6 +483,57 @@ Today the script snapshots
 | (any) | (any) | no — ssh torn down by reboot | Expected `--apply` path. Poll `wait_ssh_back`, then `wait_node_ready`. |
 
 Added in commit `9dabcab` from PR #187 round-1 fixes.
+
+## SSH-drop gate
+
+`bootc upgrade --apply` does not reboot synchronously — it queues the
+reboot via `systemd-run` (or an equivalent unit) with a small delay,
+typically firing within ~5 seconds. Without a "wait for SSH to go DOWN"
+prelude, the next gate (`wait_ssh_back`) polls the still-up pre-reboot
+connection, finds SSH responding, and reports `SSH back on <ip> after
+~0s` — declaring success before the reboot has even started.
+
+The downstream effect: when `--skip-gates` is set (which skips the
+[bootID-changed gate](#reboot-detection-bootid)), the script would
+proceed with a false success and drain N+1 while N is still actually
+rebooting.
+
+To defeat this, after `bootc upgrade --apply` the script polls SSH on
+the target IP until the connection fails (sshd has gone down) or
+`SSH_DROP_TIMEOUT` seconds elapse:
+
+```text
+[update-cluster] ssh root@192.168.122.123 bootc upgrade --apply  (auto-reboots; ...)
+[update-cluster] waiting for SSH on 192.168.122.123 to drop (timeout 30s)
+[update-cluster]   SSH on 192.168.122.123 dropped after ~6s (reboot in progress)
+[update-cluster] waiting for SSH to come back on 192.168.122.123 (timeout 300s)
+[update-cluster] SSH back on 192.168.122.123 after ~72s
+```
+
+The gate is **diagnostic**, not fatal: if SSH stays up for the full
+`SSH_DROP_TIMEOUT` window the script logs a WARN and proceeds.
+
+```text
+[update-cluster]   WARN: SSH on 192.168.122.123 still up after 30s — bootc may have queued without rebooting
+```
+
+This is deliberate. The bootID-changed gate (when not skipped) is the
+source of truth for "did the reboot happen". The SSH-drop gate exists
+to surface the anomaly in the log — when running with `--skip-gates`,
+the WARN is now the only signal that bootc may have failed to reboot.
+Bounded by `SSH_DROP_TIMEOUT` (default 30s; 30 is generous for the
+typical ~5s systemd-run delay).
+
+Implementation: `wait_ssh_drop` in `scripts/update-cluster.sh`,
+inserted between `bootc_upgrade_apply` and `wait_ssh_back` in both
+`update_cp` and `update_worker`. The helper uses a fresh SSH probe
+(`-o ControlPath=none -o ConnectTimeout=3 -o BatchMode=yes`) so each
+poll iteration actually attempts a new TCP handshake — without this,
+the persistent ControlMaster session would short-circuit on the
+already-multiplexed connection and always succeed.
+
+Discovered live during the 2026-05-26 roll-forward to `k8s/v0.1.42` +
+`worker/v0.1.17` (issue #261).
 
 ## Reboot detection (bootID)
 
@@ -776,6 +834,7 @@ small homelab cluster with fast SSDs, the actual times are typically:
 | Step | Typical | Default timeout |
 | --- | --- | --- |
 | drain | 5-30s | `DRAIN_TIMEOUT=5m` |
+| SSH drop post-`--apply` | 2-10s | `SSH_DROP_TIMEOUT=30` |
 | SSH back post-reboot | 30-60s | `SSH_TIMEOUT=300` |
 | apiserver back (CP only) | 60-120s | `APISERVER_TIMEOUT=300` |
 | bootID changed | 30-90s | `READY_TIMEOUT=300` |
@@ -874,6 +933,16 @@ the CP causes it, and it happens exactly once per run.
   blocking. Investigate first — `kubectl get poddisruptionbudgets -A`
   and `kubectl describe pod <stuck>`. Last-resort override:
   `--skip-drain`.
+
+- **`WARN: SSH on <ip> still up after Ns — bootc may have queued without rebooting`.**
+  The SSH-drop diagnostic gate timed out; bootc returned cleanly from
+  `bootc upgrade --apply` but sshd never went away in the
+  `SSH_DROP_TIMEOUT` window. The run continues (the bootID gate is the
+  authoritative reboot check) — but if you're running with
+  `--skip-gates`, this WARN is the only reboot-didn't-start signal
+  you'll get. Investigate on the node: `journalctl -u bootc-fetch-apply-updates`
+  and `bootc status` to see whether the deployment was actually staged.
+  See [SSH-drop gate](#ssh-drop-gate).
 
 - **`worker … did not come back over SSH within 5min`.** The node
   rebooted into a broken state. `virsh console <name>` to see early
