@@ -448,19 +448,49 @@ resolve_k8s_node_name() {
     printf '%s' "$domain"
     return 0
   fi
-  # Hit the apiserver via the CP. The JSONPath filters the node list to
-  # entries whose .status.addresses contains the IP, then emits the
-  # metadata.name. We single-quote the entire jsonpath on the local side so
-  # the remote shell receives it verbatim; only $ip interpolates locally.
-  # Empty stdout = no match.
+  # Hit the apiserver via the CP. kubectl's JSONPath implementation does
+  # NOT support nested filters — i.e.
+  #   {range .items[?(@.status.addresses[?(@.address=="X")])]}{.metadata.name}{end}
+  # is rejected at parse time with "unterminated filter" (#267). The
+  # previous version of this resolver used that shape and the kubectl
+  # error was swallowed by `2>/dev/null || true`, so the empty result
+  # always fell through to the "node may not be joined" diagnostic. The
+  # net effect was that `update-cluster` failed at the CP-resolve step on
+  # EVERY cluster post-#263.
+  #
+  # The working pattern: filter addresses by `.type=="InternalIP"` (a
+  # single-level filter, which kubectl supports), emit one row per node
+  # as `<name>=<internal-ip>`, then grep client-side. We deliberately
+  # filter on InternalIP because nodes can have multiple addresses
+  # (Hostname, ExternalIP, etc.) and InternalIP is the one
+  # `virsh domifaddr` returns for our NAT'd VMs.
+  #
+  # Note `2>&1` (was `2>/dev/null`): if a future jsonpath bug lands, we
+  # want the kubectl stderr in the WARN log instead of silently producing
+  # the misleading "node may not be joined" diagnostic.
+  # Declare separately from the command-substitution assignment so the
+  # caller's exit status is preserved — `local rows="$(...)"` would mask
+  # the rc with `local`'s rc (always 0). Classic bash trap.
+  local rows=""
+  local _kc_rc=0
+  rows="$(cp_kubectl "get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\"=\"}{.status.addresses[?(@.type==\"InternalIP\")].address}{\"\\n\"}{end}'" 2>&1)" \
+    || _kc_rc=$?
+  if (( _kc_rc != 0 )); then
+    log "WARN: kubectl call failed during k8s node resolution for libvirt domain ${domain} (ip=${ip}): ${rows}"
+    return 1
+  fi
   local resolved=""
-  resolved="$(cp_kubectl "get nodes -o jsonpath='{range .items[?(@.status.addresses[?(@.address==\"${ip}\")])]}{.metadata.name}{end}'" 2>/dev/null || true)"
-  # Trim any stray whitespace (kubectl jsonpath has been observed to emit a
-  # trailing newline on some apiserver versions).
+  resolved="$(printf '%s' "$rows" | awk -F= -v ip="$ip" '$2 == ip { print $1; exit }')"
+  # Trim any stray whitespace.
   resolved="${resolved//[$'\t\r\n ']/}"
   if [[ -z "$resolved" ]]; then
     log "ERROR: could not resolve k8s node for libvirt domain ${domain} (ip=${ip}) — node may not be joined, or apiserver unreachable"
     log "       (use --node-name-override ${domain}=NAME to force a specific k8s node name)"
+    # Dump what kubectl reported so the operator can see at a glance what
+    # IPs the apiserver thinks the nodes have — usually pinpoints the
+    # mismatch (multi-NIC VM, stale node, etc.).
+    log "       kubectl rows seen:"
+    printf '%s\n' "$rows" | sed 's/^/         /' >&2
     return 1
   fi
   printf '%s' "$resolved"

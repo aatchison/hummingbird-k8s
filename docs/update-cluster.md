@@ -510,22 +510,55 @@ call. The resolution path:
 
 1. If the operator passed `--node-name-override DOMAIN=NODE` for this
    domain, use that value verbatim — the escape hatch.
-2. Otherwise, look up the k8s node whose `.status.addresses[].address`
-   matches the IP `virsh domifaddr` returned for the domain:
+2. Otherwise, look up the k8s node whose `InternalIP` address matches
+   the IP `virsh domifaddr` returned for the domain. We use a
+   list-and-grep pattern (one round-trip to the apiserver, awk filter
+   client-side):
 
    ```bash
    kubectl get nodes -o jsonpath=\
-     '{range .items[?(@.status.addresses[?(@.address=="<ip>")])]}{.metadata.name}{end}'
+     '{range .items[*]}{.metadata.name}{"="}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
+     | awk -F= -v ip="$ip" '$2 == ip { print $1; exit }'
    ```
+
+   The kubectl call emits one `<name>=<internal-ip>` row per node, awk
+   matches the row whose IP equals the libvirt-resolved one and prints
+   the name. We deliberately filter on `type=InternalIP` because nodes
+   can carry multiple addresses (Hostname, ExternalIP, etc.) and
+   `virsh domifaddr` returns the NAT'd-VM InternalIP.
+
+   **Why not a nested filter?** PR #263 originally used
+   `{range .items[?(@.status.addresses[?(@.address=="X")])]}{.metadata.name}{end}`,
+   which is conceptually cleaner but kubectl's JSONPath implementation
+   does NOT support a `[?(...)]` filter inside another `[?(...)]` —
+   it rejects the expression at parse time with `unterminated filter`.
+   The previous code swallowed that error with `2>/dev/null || true`,
+   so the resolver always returned empty and `update-cluster` failed at
+   the CP-resolve step on every cluster. PR #267 replaced the nested
+   filter with the list-and-grep pattern above and a bats drift fence
+   (`#267 resolve_k8s_node_name uses list-and-grep, not nested-filter
+   jsonpath`) now blocks the bad pattern from re-landing.
 
 3. On a lookup miss, fail loudly with a diagnostic that names the
    libvirt domain, the IP that was searched against, and the override
-   flag to use as the escape hatch:
+   flag to use as the escape hatch — plus the raw `name=ip` rows the
+   apiserver returned so the operator can see at a glance which IP
+   the apiserver thinks each node has:
 
    ```text
    ERROR: could not resolve k8s node for libvirt domain hbird-w1 (ip=192.168.122.11) — node may not be joined, or apiserver unreachable
           (use --node-name-override hbird-w1=NAME to force a specific k8s node name)
+          kubectl rows seen:
+            hbird-cp1=192.168.122.206
+            hbird-w2=192.168.122.178
    ```
+
+   If kubectl itself fails (e.g. a future jsonpath bug, apiserver
+   unreachable), the resolver now logs a `WARN: kubectl call failed
+   during k8s node resolution …` with the captured stderr — so a
+   parse error like #267's `unterminated filter` is visible in the
+   logs instead of presenting as the misleading "node may not be
+   joined" diagnostic.
 
 When the resolved k8s node name differs from the libvirt domain, the
 startup banner surfaces the mapping so the operator can confirm the
