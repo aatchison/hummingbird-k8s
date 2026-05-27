@@ -118,6 +118,7 @@ HBIRD_SSH_WRAP_ALLOWED_ENV=(
   VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS
   HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_REMOTE_REPO
   HBIRD_OPERATOR_PUBKEY_FILE
+  HBIRD_REMOTE_NO_SUDO
 )
 
 # hbird_ssh_wrap_maybe_reexec "$0" "$@"
@@ -292,15 +293,25 @@ hbird_ssh_wrap_maybe_reexec() {
     quoted_env+="$(printf '%q=%q ' "$name" "$val")"
   done
 
+  # HBIRD_REMOTE_NO_SUDO=1 opts out of `sudo` on the remote: appropriate
+  # when the operator is already in the `libvirt` group on the KVM host
+  # and the wrapped script (e.g. update-cluster.sh) doesn't otherwise
+  # need root. Default keeps `sudo` for safety — deploy/destroy/spawn
+  # still need root for POOL_DIR writes (Phase 3, separate issue). (#269)
+  local sudo_prefix="sudo "
+  if [[ "${HBIRD_REMOTE_NO_SUDO:-0}" == "1" ]]; then
+    sudo_prefix=""
+  fi
+
   # Test hook: print the would-be command and exit. Lets bats assert the
   # exact env-var allowlist + quoting behavior without spawning real ssh.
   if [[ "${HBIRD_SSH_WRAP_DRY_RUN:-0}" = 1 ]]; then
-    printf 'SSH_WRAP_CMD: ssh -t %s cd %s && sudo env HBIRD_REMOTE_REEXEC=1 %sbash %s %s\n' \
-      "$KVM_HOST" "$HBIRD_REMOTE_REPO" "$quoted_env" "$remote_script" "$quoted_args"
+    printf 'SSH_WRAP_CMD: ssh -t %s cd %s && %senv HBIRD_REMOTE_REEXEC=1 %sbash %s %s\n' \
+      "$KVM_HOST" "$HBIRD_REMOTE_REPO" "$sudo_prefix" "$quoted_env" "$remote_script" "$quoted_args"
     exit 0
   fi
 
-  # cd into the remote checkout, then sudo env=... bash <script> from
+  # cd into the remote checkout, then (sudo) env=... bash <script> from
   # disk. HBIRD_REMOTE_REEXEC=1 prevents infinite re-exec.
-  exec ssh -t "$KVM_HOST" "cd ${HBIRD_REMOTE_REPO} && sudo env HBIRD_REMOTE_REEXEC=1 ${quoted_env}bash ${remote_script} ${quoted_args}"
+  exec ssh -t "$KVM_HOST" "cd ${HBIRD_REMOTE_REPO} && ${sudo_prefix}env HBIRD_REMOTE_REEXEC=1 ${quoted_env}bash ${remote_script} ${quoted_args}"
 }
