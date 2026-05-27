@@ -246,9 +246,10 @@ impl Client {
     }
 
     fn run_inner(&self, command: &str, stdin: Option<&[u8]>) -> Result<RunOutput> {
-        // TODO(#286): wrap this fn in #[tracing::instrument(skip(self),
+        // TODO(#323): wrap this fn in #[tracing::instrument(skip(self),
         // fields(host = %self.options.host(), has_stdin = stdin.is_some()))]
-        // once the workspace picks a logging crate.
+        // once the workspace picks a logging crate. (Retargeted from #286
+        // to dedicated tracing follow-up #323 in PR #321 round-2 review.)
 
         if let Some(path) = self.options.identity_file()
             && !path.exists()

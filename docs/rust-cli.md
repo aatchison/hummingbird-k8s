@@ -23,9 +23,10 @@ subcommands land per the phasing table in
 | [#280](https://github.com/aatchison/hummingbird-k8s/issues/280) | Devcontainer + cargo workspace skeleton | landed (PR #313) |
 | [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | CI workflow (fmt / clippy / test / deny / pre-commit / devcontainer smoke / lint inheritance) | landed (PR #314) |
 | [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | `ClusterConfig` parser (first real crate) | landed (PR #315) |
-| [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | clap command tree (`hbird` binary) | this PR |
+| [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | clap command tree (`hbird` binary) | landed (PR #319) |
 | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | landed (PR #318) |
 | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | landed (PR #317) |
+| [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | `update-cluster` Phase 1 — dry-run parity + orchestration scaffold | this PR (live-execution slice deferred) |
 
 ## Foundation crates landed so far
 
@@ -86,8 +87,49 @@ switched dispatch.
 ## How to verify behavioral parity (Phase 1 onward)
 
 The contract: run both the Rust binary and the bash script against the
-same cluster + diff `kubectl`/`virsh` state at each step. The harness for
-that lives outside this doc until [#286] formalizes it.
+same cluster + diff `kubectl`/`virsh` state at each step.
+
+### Phase 1 (`update-cluster`) — dry-run parity (this PR, #286)
+
+The first slice that landed is the **dry-run** path. `hbird
+update-cluster --config cluster.local.conf --dry-run` emits a log line
+sequence byte-for-byte identical to `make update-cluster
+CONFIG=cluster.local.conf FLAGS=--dry-run`. This is pinned in CI by
+`rust/crates/hbird-cli/tests/update_cluster_dry_run.rs`, which compares
+the Rust output to **eleven** fixtures under
+`rust/crates/hbird-cli/tests/update_cluster/fixtures/`. The fixtures
+cover every flag combination (`--workers-only`, `--node` for both CP and
+worker, `--start-from`, `--skip-drain`, `--skip-gates`,
+`--no-delete-emptydir-data`, `--parallel=2`, `--node-name-override`,
+`--continue-on-error`) and were captured by running the bash twin
+against a synthetic config that names the live cluster's VMs.
+
+### Phase 1 (`update-cluster`) — live execution slice (follow-up)
+
+The live (non-dry-run) execution slice is **deferred** to a follow-up
+issue. The orchestration scaffold is in place: lock acquisition,
+plan-from-args validation, k8s-node-name resolution, in-flight tracking,
+worker batches, and the bash-twin block-by-block helper layout
+(`timer_stop`, `bootc_upgrade_apply`, `wait_node_ready`, etc.) all
+exist as Rust functions. What's deferred:
+
+- Real SSH round-trips through `hbird-ssh::Client` (the helpers
+  currently surface a stable "live-mode not implemented" diagnostic
+  that names the bash equivalent for operator orientation).
+- Real virsh-domifaddr IP resolution through `hbird-virt::Connection`
+  (operators must set `CP_IP=`/`WORKER_IPS=()` in `cluster.local.conf`
+  to bypass that path in the live slice's interim).
+- True parallel-batch concurrency (the scaffold processes the batch
+  serially under the `[parallel:NAME]` log prefix, so the dry-run log
+  shape still matches the bash twin byte-for-byte).
+- `bootc rollback` + post-reboot live-validate harness (per-block
+  fixtures capturing real `kubectl get nodes -o yaml` deltas).
+
+This deliberate scope-bound exists because Phase 1's live-validate
+contract requires `make destroy-cluster && make deploy-cluster` between
+each behavioral block — that destroys the only live cluster repeatedly
+and is best done by the operator-with-tmux rather than an autonomous
+agent. The deferred slice is tracked as a follow-up to #286.
 
 [#279]: https://github.com/aatchison/hummingbird-k8s/issues/279
 [#286]: https://github.com/aatchison/hummingbird-k8s/issues/286

@@ -115,12 +115,42 @@ fn destroy_cluster_returns_not_yet_implemented() {
 }
 
 #[test]
-fn update_cluster_returns_not_yet_implemented() {
+fn update_cluster_dry_run_against_empty_config_fails_at_config_parse() {
+    // #286 landed the real update-cluster body. `/dev/null` is no longer
+    // a valid stand-in; the config parser will reject it. We pin that
+    // the failure mode is "missing required fields" rather than the
+    // pre-#286 "not yet implemented" stub.
+    //
+    // Round-2 CodeRabbit: tighten the assertion. The previous
+    // `!contains("not yet implemented") || !contains("#286")` could
+    // still pass if only ONE stub marker remained (the OR short-circuits).
+    // Require BOTH the absence of a stub error AND the presence of a
+    // config-parse failure signature.
     let (status, _stdout, stderr) = run(&["update-cluster", "--config", "/dev/null", "--dry-run"]);
-    assert!(!status.success());
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#286"),
-        "update-cluster stub error missing tracker. stderr:\n{stderr}"
+        !status.success(),
+        "update-cluster --dry-run with /dev/null exited 0"
+    );
+    // Stub error format from PR #319 was:
+    //   "update-cluster not yet implemented — tracked by #286"
+    // Both halves must be absent for the stub to be truly gone.
+    let stub_marker = stderr.contains("not yet implemented") && stderr.contains("#286");
+    assert!(
+        !stub_marker,
+        "update-cluster should not be a stub anymore — stderr still carries the pre-#286 stub \
+         markers. stderr:\n{stderr}"
+    );
+    // Positive signal: the error should mention either the missing
+    // required-field name (config parser) or the path that didn't
+    // produce a valid config. `/dev/null` lacks CP_NAME, so the
+    // hbird-config error chain will name it.
+    assert!(
+        stderr.contains("CP_NAME")
+            || stderr.contains("SSH_PUBKEY_FILE")
+            || stderr.contains("required")
+            || stderr.contains("missing"),
+        "update-cluster --dry-run with /dev/null should fail at config-parse with a \
+         missing-required-field diagnostic; stderr:\n{stderr}"
     );
 }
 
