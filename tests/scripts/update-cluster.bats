@@ -1150,3 +1150,108 @@ EOF
   echo "$output" | grep -q "LOG: WARN: kubectl call failed"
   echo "$output" | grep -q "unterminated filter"
 }
+
+# ---------------------------------------------------------------------------
+# #275 — LOCK_FILE lives under XDG_RUNTIME_DIR, not /run.
+#
+# /run is root:root 0755 on Fedora — a libvirt-group member without root
+# CANNOT open /run/hbird-update-cluster.lock for write, which used to fail
+# the script outright (post-#272 the EUID check passes but the flock line
+# died with "Permission denied"). The fix moves the lock under
+# $XDG_RUNTIME_DIR (typically /run/user/$UID, per-user, always writable),
+# with a /tmp fallback for cron / non-interactive sessions where
+# XDG_RUNTIME_DIR is unset.
+#
+# These tests extract the LOCK_FILE-derivation block from update-cluster.sh
+# and source it in a controlled shell — we can't exercise the live block
+# directly because it's guarded by `(( DRY_RUN == 0 ))` and dry-run is
+# how every other test in this file avoids needing root.
+# ---------------------------------------------------------------------------
+
+# _extract_lockfile_snippet — copy the two-line LOCK_FILE derivation out
+# of scripts/update-cluster.sh. We grep on the literal XDG_RUNTIME_DIR
+# default assignment and the LOCK_FILE= line that follows it, so a future
+# refactor that renames or removes either yields an empty snippet and
+# fails the test loudly.
+_extract_lockfile_snippet() {
+  local out="$1"
+  awk '
+    /^[[:space:]]*: "\$\{XDG_RUNTIME_DIR:=\/tmp\}"/ {capture=1}
+    capture {print}
+    capture && /^[[:space:]]*LOCK_FILE=/ {exit}
+  ' "$SCRIPT" > "$out"
+  [ -s "$out" ] || {
+    echo "FATAL: failed to extract LOCK_FILE block from $SCRIPT" >&2
+    return 1
+  }
+}
+
+@test "#275 LOCK_FILE expands from XDG_RUNTIME_DIR when set" {
+  _extract_lockfile_snippet "${BATS_TEST_TMPDIR}/lockfile.snippet"
+  fake_rundir="${BATS_TEST_TMPDIR}/run-user-1000"
+  mkdir -p "$fake_rundir"
+  run bash -c '
+    set -euo pipefail
+    export XDG_RUNTIME_DIR="'"$fake_rundir"'"
+    # shellcheck disable=SC1090
+    source "'"${BATS_TEST_TMPDIR}/lockfile.snippet"'"
+    printf "LOCK_FILE=%s\n" "$LOCK_FILE"
+  '
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  echo "$output" | grep -q "LOCK_FILE=${fake_rundir}/hbird-update-cluster.lock"
+  # Defense: the old root-owned /run path must NOT appear.
+  ! echo "$output" | grep -q "^LOCK_FILE=/run/hbird-update-cluster.lock\$"
+}
+
+@test "#275 LOCK_FILE falls back to /tmp when XDG_RUNTIME_DIR is unset" {
+  _extract_lockfile_snippet "${BATS_TEST_TMPDIR}/lockfile.snippet"
+  # `unset` inside the subshell ensures the parent env (which often has
+  # XDG_RUNTIME_DIR=/run/user/$UID under systemd) doesn't leak in.
+  run bash -c '
+    set -euo pipefail
+    unset XDG_RUNTIME_DIR
+    # shellcheck disable=SC1090
+    source "'"${BATS_TEST_TMPDIR}/lockfile.snippet"'"
+    printf "LOCK_FILE=%s\n" "$LOCK_FILE"
+  '
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  echo "$output" | grep -q "LOCK_FILE=/tmp/hbird-update-cluster.lock"
+}
+
+@test "#275 LOCK_FILE block respects a pre-set XDG_RUNTIME_DIR (no clobber)" {
+  # The `:` parameter expansion `${VAR:=default}` MUST NOT overwrite an
+  # already-set value. This is the per-user-isolation invariant: each
+  # operator's $XDG_RUNTIME_DIR (set by systemd-logind, distinct per UID)
+  # picks their own lock file.
+  _extract_lockfile_snippet "${BATS_TEST_TMPDIR}/lockfile.snippet"
+  alice_dir="${BATS_TEST_TMPDIR}/run-user-1000"
+  bob_dir="${BATS_TEST_TMPDIR}/run-user-1001"
+  mkdir -p "$alice_dir" "$bob_dir"
+  run bash -c '
+    set -euo pipefail
+    export XDG_RUNTIME_DIR="'"$alice_dir"'"
+    # shellcheck disable=SC1090
+    source "'"${BATS_TEST_TMPDIR}/lockfile.snippet"'"
+    printf "ALICE=%s\n" "$LOCK_FILE"
+  '
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "ALICE=${alice_dir}/hbird-update-cluster.lock"
+  run bash -c '
+    set -euo pipefail
+    export XDG_RUNTIME_DIR="'"$bob_dir"'"
+    # shellcheck disable=SC1090
+    source "'"${BATS_TEST_TMPDIR}/lockfile.snippet"'"
+    printf "BOB=%s\n" "$LOCK_FILE"
+  '
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "BOB=${bob_dir}/hbird-update-cluster.lock"
+}
+
+@test "#275 update-cluster.sh source no longer assigns LOCK_FILE=/run/..." {
+  # Belt-and-suspenders: a future refactor that re-introduces the
+  # root-owned path (e.g. someone "cleaning up" the XDG fallback) breaks
+  # non-root operation again. The only acceptable mention of
+  # /run/hbird-update-cluster.lock is in the explanatory comment near
+  # the lock-file header. Assert no LOCK_FILE assignment binds that path.
+  ! grep -E '^[[:space:]]*LOCK_FILE=.*/run/hbird-update-cluster\.lock' "$SCRIPT"
+}

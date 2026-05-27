@@ -529,21 +529,36 @@ see #11).
 
 ## Lock file
 
-A single `flock`-held lock at `/run/hbird-update-cluster.lock` prevents
-two `make update-cluster` runs from racing each other into a
-mass-cordon. `/run` is tmpfs on systemd hosts, so the lock dies with
-the kernel — no stale-lock cleanup is needed across reboots.
+A single `flock`-held lock at `$XDG_RUNTIME_DIR/hbird-update-cluster.lock`
+prevents the same operator from racing themselves into a mass-cordon.
+On systemd hosts `XDG_RUNTIME_DIR` resolves to `/run/user/$UID` — a
+per-user tmpfs that's always writable by the owning user, so this
+works for non-root libvirt-group members without any `/run` write
+access or system-tmpfiles configuration (#275).
+
+When `XDG_RUNTIME_DIR` is unset (cron / non-interactive sessions
+sometimes lack it) the script falls back to `/tmp/hbird-update-cluster.lock`.
+
+The lock is **per-user**: two operators on the same host get distinct
+lock files and therefore don't block each other. flock here serializes
+a given user's own concurrent invocations, not cross-user runs. If you
+need to coordinate across operators on one host, agree out-of-band
+before running.
+
+`/run/user/$UID` is tmpfs, so the lock dies with the user session —
+no stale-lock cleanup is needed across reboots.
 
 If a run dies hard (kill -9, host crash mid-run, etc.) and the lock
 shows held for a process that no longer exists, `flock -n` releases it
-when the holding fd closes; clearing the file by hand is safe:
+when the holding fd closes; clearing the file by hand is safe (no
+sudo required — it's in your own runtime dir):
 
 ```bash
-sudo rm -f /run/hbird-update-cluster.lock
+rm -f "${XDG_RUNTIME_DIR:-/tmp}/hbird-update-cluster.lock"
 ```
 
-Dry-run mode skips the lock entirely so it can run without `/run`
-write access (CI, unprivileged previews).
+Dry-run mode skips the lock entirely so it can run without any
+runtime-dir write access (CI, unprivileged previews).
 
 ## k8s node name resolution (#260)
 
@@ -1113,10 +1128,12 @@ the CP causes it, and it happens exactly once per run.
 
 ## Troubleshooting
 
-- **`another update-cluster run is in progress (lock … held)`.** Either
-  another operator is rolling the cluster, or a previous run died hard
-  and the file is stale. Verify nothing is in flight (`ps`, `tmux ls`),
-  then `sudo rm -f /run/hbird-update-cluster.lock`.
+- **`another update-cluster run is in progress (lock … held)`.** YOU
+  (this operator) have another roll in flight — the lock is per-user
+  in `$XDG_RUNTIME_DIR/hbird-update-cluster.lock`, so a different user
+  on the host could never trigger this for you. Verify nothing is in
+  flight (`ps`, `tmux ls`), then `rm -f "${XDG_RUNTIME_DIR:-/tmp}/hbird-update-cluster.lock"`
+  (no sudo needed).
 
 - **`could not resolve CP IP for domain … via virsh domifaddr`.** The
   VM doesn't have an active lease. Confirm it's running
