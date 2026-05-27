@@ -206,8 +206,13 @@ route.
   `Network is unreachable`) from `make verify-hardening` /
   `make verify-encryption` when invoked off-host.
 - Fix: set `KVM_HOST=<ssh-alias-of-kvm-host>` in the environment. The
-  verifier scripts use `-J "$KVM_HOST"` to ProxyJump through the host.
-- Reference: [PR #63](https://github.com/aatchison/hummingbird-k8s/pull/63).
+  verifier scripts use `-o ProxyJump=$KVM_HOST` to tunnel through the
+  host. `verify-encryption.sh` additionally resolves CP_IP through
+  `lib/build-common.sh::resolve_cp_ip` (via #271 F2 / #276), so a
+  workstation without local libvirt does not need to set CP_IP
+  explicitly — `CP_NAME` (default `hummingbird-k8s`) is enough.
+- Reference: [PR #63](https://github.com/aatchison/hummingbird-k8s/pull/63),
+  issue #271 F2.
 
 ## Internal / agent-host
 

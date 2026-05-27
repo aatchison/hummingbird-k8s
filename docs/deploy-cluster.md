@@ -321,14 +321,21 @@ for `SWITCH_TO_GHCR=false`.
 
 ## Verifying the deploy
 
-The standard verifiers all work against a deploy-cluster cluster:
+The standard verifiers all work against a deploy-cluster cluster.
+From a workstation, set `KVM_HOST` so the scripts tunnel through the
+KVM host (`verify-encryption.sh` resolves CP_IP via `resolve_cp_ip`
+from `lib/build-common.sh`; the others use ProxyJump for SSH and
+`scripts/kubectl-k8s.sh` for kubectl):
 
 ```bash
-bash scripts/verify-hardening.sh
-bash scripts/verify-app-deploy.sh
-bash scripts/verify-encryption.sh
-make verify-all
+KVM_HOST=geary bash scripts/verify-hardening.sh
+KVM_HOST=geary bash scripts/verify-app-deploy.sh
+KVM_HOST=geary bash scripts/verify-encryption.sh
+KVM_HOST=geary make verify-all
 ```
+
+On the KVM host itself, drop `KVM_HOST=` and the scripts use local
+libvirt directly.
 
 Set `RUN_VERIFY=true` in `cluster.local.conf` to have
 `verify-app-deploy.sh` run automatically once the cluster reaches Ready.

@@ -1,19 +1,54 @@
 #!/bin/bash
 # verify-encryption.sh — Verify that etcd at-rest encryption is active.
 #
-# Strategy:
-#   1. Create a probe Secret with a distinctive value via kubectl.
-#   2. Read it raw from etcd, in this order:
-#        a. `etcdctl` on PATH (rare on bootc CP), OR
-#        b. host-side `crictl exec` into the etcd container (k8s 1.31's
-#           etcd static pod is distroless, so `kubectl exec ... -- sh` is
-#           never available — must go through crictl on the host).
-#   3. Assert the stored blob starts with the expected envelope prefix
-#      (`k8s:enc:aesgcm:` for AESGCM).
-#   4. Clean up the probe Secret either way.
+# Two operating modes:
 #
-# Run as root on the control-plane VM:
+#   1. REMOTE (workstation operation, via KVM_HOST) — closes #271 F2.
+#      When `KVM_HOST` is set (or `CP_IP` is provided), the script ssh's
+#      to root@<CP_IP> and runs the baked-in copy at
+#      `/usr/libexec/verify-encryption.sh` on the CP. This is the path
+#      the Makefile target `make verify-encryption` exercises from a
+#      workstation that has no local libvirt or kubectl wiring. CP_IP
+#      is resolved by the shared `resolve_cp_ip` helper in
+#      `lib/build-common.sh` (added in #276): explicit CP_IP wins,
+#      otherwise ssh through KVM_HOST runs `virsh -c qemu:///system
+#      domifaddr`, otherwise local virsh, otherwise a clear failure.
+#
+#   2. LOCAL (on the CP node) — original flow.
+#      When neither KVM_HOST nor CP_IP is set AND a local `kubectl` can
+#      reach `https://127.0.0.1` via the kubeadm admin.conf, we assume
+#      we're running on the CP itself (the image's
+#      /usr/libexec/verify-encryption.sh re-invokes this same script
+#      body, and `rotate-etcd-encryption-key.sh` ssh's it onto the CP).
+#      Strategy on the CP:
+#        a. Create a probe Secret with a distinctive value via kubectl.
+#        b. Read it raw from etcd, in this order:
+#             i. `etcdctl` on PATH (rare on bootc CP), OR
+#            ii. host-side `crictl exec` into the etcd container (k8s
+#                1.31's etcd static pod is distroless, so
+#                `kubectl exec ... -- sh` is never available — must go
+#                through crictl on the host).
+#        c. Assert the stored blob starts with the expected envelope
+#           prefix (`k8s:enc:aesgcm:` for AESGCM).
+#        d. Clean up the probe Secret either way.
+#
+# Examples:
+#   # From a workstation, tunneling via the KVM host:
+#   KVM_HOST=geary CP_NAME=hbird-cp1 ./scripts/verify-encryption.sh
+#
+#   # From a workstation, with CP_IP explicit (no libvirt query needed):
+#   CP_IP=192.168.122.42 ./scripts/verify-encryption.sh
+#
+#   # On the CP itself (used by /usr/libexec/verify-encryption.sh and by
+#   # rotate-etcd-encryption-key.sh's Stage 4):
 #   sudo ./scripts/verify-encryption.sh
+#
+# Override the keyname check by setting EXPECTED_PREFIX (useful in
+# rotation tests, e.g. EXPECTED_PREFIX='k8s:enc:aesgcm:v1:key-...:').
+#
+# Path-anchoring: the remote-mode branch sources lib/build-common.sh
+# from this script's location, so it works no matter what cwd the
+# operator runs it from. See issue #271 F6.
 
 set -euo pipefail
 
@@ -28,6 +63,50 @@ PROBE_VALUE="${PROBE_VALUE:-hummingbird-encryption-probe-value}"
 # callers (e.g. CI gating on the specific keyname).
 EXPECTED_PREFIX="${EXPECTED_PREFIX:-k8s:enc:aesgcm:}"
 
+# ──────────────────────────────────────────────────────────────────────
+# Mode selection: remote (workstation, via KVM_HOST / CP_IP) vs local
+# (running on the CP itself, e.g. the image's /usr/libexec copy).
+#
+# We pick "remote" whenever the operator has provided ANY plumbing that
+# only makes sense from a workstation — KVM_HOST (ProxyJump alias) OR
+# CP_IP (explicit target). On the CP node itself /usr/libexec invokes
+# us without those vars, so we fall through to the local flow there.
+# ──────────────────────────────────────────────────────────────────────
+if [[ -n "${KVM_HOST:-}" || -n "${CP_IP:-}" ]]; then
+  REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+  # shellcheck source=../lib/build-common.sh
+  source "${REPO_ROOT}/lib/build-common.sh"
+
+  log() { printf '[verify-encryption] %s\n' "$*" >&2; }
+
+  CP_NAME="${CP_NAME:-hummingbird-k8s}"
+  cp_ip="$(resolve_cp_ip "$CP_NAME" "${CP_IP:-}")" || {
+    log "could not resolve control-plane IP; set CP_IP=<ip> or KVM_HOST=<ssh-alias>"
+    exit 2
+  }
+
+  # ssh options: no SSH_PRIVKEY_FILE in scope — rely on agent / ssh_config,
+  # matching the verify-hardening.sh pattern. ProxyJump=$KVM_HOST so the
+  # libvirt NAT subnet (192.168.122.0/24 by default) doesn't have to be
+  # routable from the workstation.
+  if [[ -n "${KVM_HOST:-}" ]]; then
+    ssh_opts_array_no_identity SSH_OPTS --proxy-jump="${KVM_HOST}"
+  else
+    ssh_opts_array_no_identity SSH_OPTS
+  fi
+
+  log "remote mode: ssh root@${cp_ip}${KVM_HOST:+ via ${KVM_HOST}}"
+  # Forward EXPECTED_PREFIX so rotation-time callers can keep their
+  # stricter `aesgcm:v1:<new-key>:` assertion. The remote
+  # /usr/libexec/verify-encryption.sh is this same script body baked
+  # into the image at build time (see containers/k8s/Containerfile).
+  exec ssh "${SSH_OPTS[@]}" "root@${cp_ip}" \
+    "EXPECTED_PREFIX='${EXPECTED_PREFIX}' /usr/libexec/verify-encryption.sh"
+fi
+
+# ──────────────────────────────────────────────────────────────────────
+# Local mode: we're on the CP. Run kubectl/crictl/etcdctl directly.
+# ──────────────────────────────────────────────────────────────────────
 KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
 export KUBECONFIG
 
@@ -45,12 +124,13 @@ cleanup() {
 trap cleanup EXIT
 
 if ! command -v kubectl >/dev/null 2>&1; then
-  log "kubectl not on PATH"
+  log "kubectl not on PATH (run on the CP, or set KVM_HOST=<ssh-alias> to ssh to one)"
   exit 2
 fi
 
 if ! kubectl get --raw=/healthz >/dev/null 2>&1; then
   log "kubectl can't reach the API server (KUBECONFIG=$KUBECONFIG)"
+  log "  hint: set KVM_HOST=<ssh-alias> so the script ssh's to root@<CP_IP> and runs /usr/libexec/verify-encryption.sh"
   exit 2
 fi
 

@@ -35,6 +35,21 @@ The verifier is baked into the k8s control-plane image at
 ssh root@<cp> /usr/libexec/verify-encryption.sh
 ```
 
+Or, from a workstation that doesn't have local libvirt / kubectl wiring,
+the repo copy will ssh through `$KVM_HOST` for you (see #271 F2):
+
+```
+KVM_HOST=geary make verify-encryption
+# equivalent to: KVM_HOST=geary bash scripts/verify-encryption.sh
+```
+
+In workstation mode the script sources `lib/build-common.sh`, resolves
+the CP IP via `resolve_cp_ip` (explicit `CP_IP=…` wins, otherwise ssh
+to `$KVM_HOST` for `virsh -c qemu:///system domifaddr $CP_NAME`), then
+ssh-execs `/usr/libexec/verify-encryption.sh` on the CP with
+ProxyJump=$KVM_HOST. On the CP itself it falls through to the local
+flow below.
+
 No `scp` from the host repo is needed — the script ships with every
 redeploy. The source of truth still lives at `scripts/verify-encryption.sh`
 in this repo; `containers/k8s/Containerfile` copies it into the image at build time.
@@ -53,7 +68,8 @@ on-disk envelope. It tries, in order:
    intermediate shell.
 
 Both paths must run as root on the CP VM (crictl needs the CRI socket
-and etcdctl needs the etcd PKI). Expected output:
+and etcdctl needs the etcd PKI) — the workstation mode above arranges
+that automatically by ssh'ing as `root@$CP_IP`. Expected output:
 
 ```
 [verify-encryption] OK: secret in etcd is encrypted (prefix=k8s:enc:aesgcm:)
