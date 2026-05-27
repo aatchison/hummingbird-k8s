@@ -69,8 +69,8 @@ Subcommand status:
 - `update-cluster` — Phase 1A (dry-run) landed (#286 / PR #321); Phase 1B
   cycle 1 (cp_kubectl + drain/uncordon) landed (#322 / PR #325); cycle 2
   (bootID + bootc upgrade + SSH drop/back) landed (#327 / PR #344);
-  cycle 3 (DaemonSet-ready gate) landed (#328); remaining cycle 4
-  carved out as #329 (independently dispatchable).
+  cycle 3 (DaemonSet-ready gate) landed (#328 / PR #346); remaining
+  cycle 4 carved out as #329 (independently dispatchable).
 - `verify {encryption,hardening,app-deploy,all}` — Phase 2 landed
   (#287 / PR #330). Live-validated against the geary cluster
   2026-05-27.
@@ -256,12 +256,12 @@ to root@CP_IP and pipe stdin), so kubectl sees the manifest and the
 apiserver correctly rejects it — Rust observes PSA enforcement that
 bash misses. Documented in `cycle_verify_hardening.txt`.
 
-#### Still scaffolded (5 of 13 `live_mode_not_implemented` sites)
+#### Still scaffolded (3 of 13 `live_mode_not_implemented` sites)
 
-Cycles 3–4 each wire one or more of these remaining stubs:
+Cycle 4 (#329) wires `wait_apiserver_back`; `timer_stop` / `timer_start`
+deferred to a follow-up beyond cycle 4:
 
 - `timer_stop` / `timer_start` (block #4)
-- `wait_node_ready` / `wait_node_daemonsets_ready` (block #9)
 - `wait_apiserver_back` (block #7)
 
 Cycle 2 (#327) wired the bootID gate (`capture_node_bootid`,

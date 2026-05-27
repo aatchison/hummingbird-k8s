@@ -87,7 +87,7 @@ fn stdout_has_ready_status(stdout: &str) -> bool {
 /// Local copy of the `_collect_unready_names` parser — same rationale
 /// as `stdout_has_ready_status` above. See the in-tree helper for the
 /// full bash-twin parity notes.
-fn collect_unready_names(raw: &str) -> Vec<String> {
+fn _collect_unready_names(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in raw.lines() {
         if line.is_empty() {
@@ -154,7 +154,7 @@ fn live_wait_node_ready_and_daemonsets_drives_full_post_reboot_gate() {
         .expect("pre-reboot DS jsonpath: ssh-run failed");
     let baseline_raw = pre_raw_out.stdout_lossy();
     let baseline_unready: std::collections::BTreeSet<String> =
-        collect_unready_names(&baseline_raw).into_iter().collect();
+        _collect_unready_names(&baseline_raw).into_iter().collect();
     eprintln!(
         "--- pre-reboot baseline-unready on {node}: {:?} ---",
         baseline_unready
@@ -212,7 +212,10 @@ fn live_wait_node_ready_and_daemonsets_drives_full_post_reboot_gate() {
         std::thread::sleep(Duration::from_secs(interval_ready.into()));
         elapsed = elapsed.saturating_add(interval_ready);
     }
-    let ready_at = ready_at.expect("node {node} did not reach Ready within 5 minutes of reboot");
+    // Round-2 lens L4/L5 LOW: use format! so {node} interpolates; expect
+    // takes &str and won't expand placeholders on its own.
+    let ready_at = ready_at
+        .unwrap_or_else(|| panic!("node {node} did not reach Ready within 5 minutes of reboot"));
 
     // ---- (e) wait_node_daemonsets_ready: two-phase gate. Phase 1
     // waits up to 60s for at least one kube-system pod to appear on
@@ -263,7 +266,7 @@ fn live_wait_node_ready_and_daemonsets_drives_full_post_reboot_gate() {
             .map(|o| o.stdout_lossy())
             .unwrap_or_default();
         let current: std::collections::BTreeSet<String> =
-            collect_unready_names(&raw).into_iter().collect();
+            _collect_unready_names(&raw).into_iter().collect();
         let new_unready: Vec<String> = current.difference(&baseline_unready).cloned().collect();
         if new_unready.is_empty() {
             ds_ready_at = Some(elapsed);

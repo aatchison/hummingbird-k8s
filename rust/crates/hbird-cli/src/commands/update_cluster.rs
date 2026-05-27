@@ -1481,7 +1481,7 @@ fn wait_node_daemonsets_ready(plan: &Plan, node: &str) -> Result<()> {
     );
     let baseline_raw = cp_kubectl(plan, &raw_command).unwrap_or_default();
     let baseline_unready: std::collections::BTreeSet<String> =
-        collect_unready_names(&baseline_raw).into_iter().collect();
+        _collect_unready_names(&baseline_raw).into_iter().collect();
     if !baseline_unready.is_empty() {
         let joined: Vec<&str> = baseline_unready.iter().map(String::as_str).collect();
         // Bash twin emits this via `tr '\n' ' '` which leaves a trailing
@@ -1504,7 +1504,7 @@ fn wait_node_daemonsets_ready(plan: &Plan, node: &str) -> Result<()> {
     while elapsed < timeout {
         let raw = cp_kubectl(plan, &raw_command).unwrap_or_default();
         let current: std::collections::BTreeSet<String> =
-            collect_unready_names(&raw).into_iter().collect();
+            _collect_unready_names(&raw).into_iter().collect();
         // Set difference: current MINUS baseline.
         let new_unready: Vec<&str> = current
             .difference(&baseline_unready)
@@ -1559,9 +1559,10 @@ fn wait_node_daemonsets_ready(plan: &Plan, node: &str) -> Result<()> {
 /// Bash twin grep-anchor preserved: function name retains the
 /// underscore-prefix convention `_collect_unready_names` even though
 /// Rust would normally drop the underscore. Bash `_collect_unready_names`
-/// is the operator-mental-model symbol; renaming to `collect_unready_names`
-/// would break grep parity. (Per cycle 3 spec.)
-pub(crate) fn collect_unready_names(raw: &str) -> Vec<String> {
+/// is the operator-mental-model symbol. (Per cycle 3 spec; round-2
+/// renamed from `collect_unready_names` to honor the docstring.)
+#[allow(non_snake_case)]
+pub(crate) fn _collect_unready_names(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in raw.lines() {
         if line.is_empty() {
@@ -2670,46 +2671,46 @@ mod tests {
         assert!(!stdout_has_ready_status("hbird-w1\n"));
     }
 
-    // collect_unready_names mirrors bash `_collect_unready_names`
+    // _collect_unready_names mirrors bash `_collect_unready_names`
     // (line 1066). Tests cover the parity surface that the gate
     // decision keys off: false-in-rhs, empty-rhs, all-true, multi-line.
 
     #[test]
-    fn collect_unready_names_picks_pod_with_false_ready() {
+    fn _collect_unready_names_picks_pod_with_false_ready() {
         // One pod with a single container reporting false.
         let raw = "cilium-abc=true,false,\n";
-        assert_eq!(collect_unready_names(raw), vec!["cilium-abc"]);
+        assert_eq!(_collect_unready_names(raw), vec!["cilium-abc"]);
     }
 
     #[test]
-    fn collect_unready_names_picks_pod_with_empty_rhs() {
+    fn _collect_unready_names_picks_pod_with_empty_rhs() {
         // Pending pod with no containerStatuses yet → rhs is empty.
         // Bash twin line 1071: `[[ -z "$rhs" || "$rhs" == *false* ]]`.
         let raw = "kube-proxy-xyz=\n";
-        assert_eq!(collect_unready_names(raw), vec!["kube-proxy-xyz"]);
+        assert_eq!(_collect_unready_names(raw), vec!["kube-proxy-xyz"]);
     }
 
     #[test]
-    fn collect_unready_names_skips_all_true() {
+    fn _collect_unready_names_skips_all_true() {
         let raw = "cilium-abc=true,true,\nkube-proxy-xyz=true,\n";
-        let r = collect_unready_names(raw);
+        let r = _collect_unready_names(raw);
         assert!(r.is_empty(), "expected empty, got: {r:?}");
     }
 
     #[test]
-    fn collect_unready_names_handles_mixed_lines() {
+    fn _collect_unready_names_handles_mixed_lines() {
         let raw = "cilium-abc=true,false,\n\
                    kube-proxy-xyz=true,\n\
                    coredns-pending=\n";
-        let r = collect_unready_names(raw);
+        let r = _collect_unready_names(raw);
         assert_eq!(r, vec!["cilium-abc", "coredns-pending"]);
     }
 
     #[test]
-    fn collect_unready_names_skips_blank_lines() {
+    fn _collect_unready_names_skips_blank_lines() {
         // Bash: `[[ -z "$line" ]] && continue`.
         let raw = "\n\ncilium-abc=true,false,\n\n";
-        assert_eq!(collect_unready_names(raw), vec!["cilium-abc"]);
+        assert_eq!(_collect_unready_names(raw), vec!["cilium-abc"]);
     }
 
     /// Regression: the helper-name field in the live-mode-not-implemented
