@@ -249,6 +249,44 @@ Use sparingly — `kubectl drain` is the only thing keeping workloads
 from being killed mid-flight. Reserve this for stuck drains where you
 have already accepted the workload disruption.
 
+### `--node-name-override DOMAIN=NODE`
+
+Pin the k8s node name for a libvirt domain, bypassing the auto-resolution
+described in [k8s node name resolution](#k8s-node-name-resolution-260).
+Repeatable; also accepts comma-separated `DOMAIN=NODE` pairs in a single
+flag value.
+
+```bash
+# Single override:
+sudo -E bash scripts/update-cluster.sh \
+  --node-name-override=hbird-w1=humbird-worker-748f4cf5
+
+# Multiple overrides via repeated flag:
+sudo -E bash scripts/update-cluster.sh \
+  --node-name-override=hbird-w1=humbird-worker-748f4cf5 \
+  --node-name-override=hbird-w2=humbird-worker-baef476c
+
+# Equivalent via comma-separated value:
+sudo -E bash scripts/update-cluster.sh \
+  --node-name-override=hbird-w1=humbird-worker-748f4cf5,hbird-w2=humbird-worker-baef476c
+```
+
+Use when:
+
+- The apiserver isn't reachable for the auto-resolution step (e.g. you're
+  rolling forward FROM a known-broken CP and the resolver can't query
+  `kubectl get nodes`).
+- You're mid-migration to renamed nodes and want to pin a specific target
+  without waiting for the IP-based lookup to find them.
+- The resolver finds the wrong node (multi-NIC VMs where the address
+  kubelet registered with isn't the one `virsh domifaddr` returns).
+
+`DOMAIN` must match `CP_NAME` or one of `WORKER_NAMES`; an unknown
+`DOMAIN` is rejected up front so a typo can't silently misroute kubectl.
+The override path takes precedence over the kubectl-based resolver, so a
+mistaken `NODE` value will be issued to kubectl verbatim — double-check
+against `kubectl get nodes` before pinning.
+
 ### `--skip-gates`
 
 Operator escape hatch — skip the bootID-changed and DaemonSet-readiness
@@ -449,6 +487,77 @@ sudo rm -f /run/hbird-update-cluster.lock
 
 Dry-run mode skips the lock entirely so it can run without `/run`
 write access (CI, unprivileged previews).
+
+## k8s node name resolution (#260)
+
+The libvirt domain names in `WORKER_NAMES` / `CP_NAME` are **not
+necessarily** the same as the k8s node names that `kubectl get nodes`
+reports. On clusters deployed before PR #255, the worker's k8s node
+name fell back to a machine-id-derived value like
+`humbird-worker-748f4cf5` while the libvirt domain stayed `hbird-w1`.
+Pre-#260, `update-cluster.sh` issued `kubectl drain $libvirt_domain`
+against those clusters and saw:
+
+```text
+[update-cluster] kubectl drain hbird-w1 --ignore-daemonsets --timeout=5m
+Error from server (NotFound): nodes "hbird-w1" not found
+[update-cluster] ERROR: hbird-w1: drain failed (use --skip-drain to override)
+```
+
+Today the script resolves each libvirt domain to a k8s node name
+**before** any `kubectl drain` / `kubectl wait` / `kubectl uncordon`
+call. The resolution path:
+
+1. If the operator passed `--node-name-override DOMAIN=NODE` for this
+   domain, use that value verbatim — the escape hatch.
+2. Otherwise, look up the k8s node whose `.status.addresses[].address`
+   matches the IP `virsh domifaddr` returned for the domain:
+
+   ```bash
+   kubectl get nodes -o jsonpath=\
+     '{range .items[?(@.status.addresses[?(@.address=="<ip>")])]}{.metadata.name}{end}'
+   ```
+
+3. On a lookup miss, fail loudly with a diagnostic that names the
+   libvirt domain, the IP that was searched against, and the override
+   flag to use as the escape hatch:
+
+   ```text
+   ERROR: could not resolve k8s node for libvirt domain hbird-w1 (ip=192.168.122.11) — node may not be joined, or apiserver unreachable
+          (use --node-name-override hbird-w1=NAME to force a specific k8s node name)
+   ```
+
+When the resolved k8s node name differs from the libvirt domain, the
+startup banner surfaces the mapping so the operator can confirm the
+resolver picked the right targets:
+
+```text
+[update-cluster] CP=hbird-cp1 (192.168.122.10) k8s-node=hbird-cp1, workers=(hbird-w1 hbird-w2)
+[update-cluster]   resolved libvirt domain hbird-w1 -> k8s node humbird-worker-748f4cf5
+[update-cluster]   resolved libvirt domain hbird-w2 -> k8s node humbird-worker-baef476c
+```
+
+Logs continue to use the libvirt domain as the human-readable identifier
+(`WORKER: hbird-w1`) — that's what the operator wrote in
+`cluster.local.conf` and what `virsh list` shows. Only the kubectl-side
+calls (`drain`, `wait_node_ready`, `wait_node_bootid_changed`,
+`wait_node_daemonsets_ready`, `uncordon`) target the resolved k8s name.
+
+The cordoned-recovery hint emitted by the EXIT trap uses the **k8s** name
+so the operator can paste the suggested `kubectl uncordon …` command
+without translating between libvirt and k8s namespaces.
+
+CP resolution is the same shape (`CP_NAME` → `CP_IP` → CP k8s node
+name). PR #255's emit-hostname-in-user-data fix means the CP path
+usually keeps the names in sync, but we resolve defensively anyway —
+the resolver is cheap (one `kubectl get nodes` round-trip per node, at
+startup) and protects against the same divergence sneaking back in via
+a different cloud-init regression.
+
+Dry-run skips the apiserver call entirely (no kubectl to invoke) and
+returns the libvirt domain verbatim — so dry-run output and the
+integration-update-cluster `assert-dry-run-sequence` patterns continue
+to hold.
 
 ## bootc no-update detection
 
@@ -927,6 +1036,16 @@ the CP causes it, and it happens exactly once per run.
 - **`could not resolve IP for worker …`.** Same as above for a
   worker. Override with `WORKER_IPS=(ip1 ip2 …)` in
   `cluster.local.conf`, parallel-indexed to `WORKER_NAMES`.
+
+- **`could not resolve k8s node for libvirt domain … (ip=…)`.** The
+  libvirt domain resolved to an IP but no k8s node has that IP in its
+  `.status.addresses`. Either the node hasn't joined yet
+  (`kubectl get nodes` to check), the apiserver is unreachable from the
+  CP at the moment, or the kubelet registered with a different address
+  (e.g. multi-NIC VM where libvirt sees the management NIC but kubelet
+  registered with a pod-network NIC). Force the right k8s name with
+  `--node-name-override DOMAIN=NODE` once you've identified it. See
+  [k8s node name resolution](#k8s-node-name-resolution-260).
 
 - **`drain failed for … ; refusing to continue`.** A workload has a
   PodDisruptionBudget that can't be satisfied, or a Job pod is
