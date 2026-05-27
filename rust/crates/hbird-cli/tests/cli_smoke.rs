@@ -444,13 +444,59 @@ fn deploy_cluster_kvm_host_env_binding_present_in_help() {
     );
 }
 
+/// Regression for #331: at the default tracing level (no `RUST_LOG`
+/// override), an SSH-layer failure must NOT emit an `ERROR` span event.
+/// Pre-#331 `hbird_ssh::Client::run_inner` carried `#[instrument(...
+/// err(Debug))]` which auto-fired an ERROR event on every Err return —
+/// even when the caller deliberately expected a non-zero exit (the
+/// `verify-hardening` PSA-PASS condition). The demotion to a manual
+/// `tracing::debug!` event means a passing verify run now leaves a
+/// quiet stderr.
+#[test]
+fn verify_at_default_log_level_does_not_emit_error_span_on_ssh_failure() {
+    let out = Command::new(hbird_bin())
+        .args(["verify", "encryption"])
+        .env("KVM_HOST", "geary-via-env")
+        // No RUST_LOG → INFO+ only; debug event from run_inner stays
+        // suppressed.
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("failed to spawn hbird binary");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success());
+    // The bash-twin `resolve_cp_ip:` error line is expected (operators
+    // grep for it). What MUST NOT appear is a tracing `ERROR` event from
+    // the SSH layer.
+    assert!(
+        !stderr.contains("ERROR run_inner"),
+        "demoted err(Debug) regressed — ERROR run_inner span event fired \
+         at default level. stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("ERROR hbird_ssh"),
+        "demoted err(Debug) regressed — ERROR hbird_ssh event fired at \
+         default level. stderr:\n{stderr}"
+    );
+}
+
 /// Same env-var fallback check for the verify-* family, which reads
 /// `KVM_HOST` *and* `CONFIG` from the env (matches the bash twins).
+///
+/// `RUST_LOG=hbird_ssh=debug` is set so the demoted `tracing::debug!`
+/// event in `hbird_ssh::Client::run_inner` (#331) surfaces the `host`
+/// field. Before #331 the wrapper carried `err(Debug)` which fired an
+/// auto ERROR span event at the default INFO+ level — that was the
+/// cosmetic bug #331 fixed (operators saw an ERROR on a passing
+/// `verify-hardening` PSA check). The demotion means we now have to
+/// opt into the debug stream to observe the host field; the test's
+/// original intent — pinning that `KVM_HOST` env binding reaches the
+/// SSH layer's `host=…` field — is preserved.
 #[test]
 fn verify_encryption_reads_kvm_host_from_env() {
     let out = Command::new(hbird_bin())
         .args(["verify", "encryption"])
         .env("KVM_HOST", "geary-via-env")
+        .env("RUST_LOG", "hbird_ssh=debug")
         .output()
         .expect("failed to spawn hbird binary");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

@@ -141,13 +141,22 @@ fn reject_shell_metachars(context: &str, command: &str) -> Result<()> {
 ///   [`hbird_ssh::Error`] including [`hbird_ssh::Error::NonZeroExit`].
 ///   Callers that need to inspect non-zero exits (e.g. PSA admission)
 ///   should call [`cp_kubectl_with_stdin_lenient`] instead.
+// `err(Debug)` directive demoted to a manual `tracing::debug!` event in
+// the Err branch so callers (not this wrapper) decide ERROR-vs-debug
+// policy per call site. `verify-hardening`'s PSA enforcement expects
+// `kubectl apply` to exit non-zero — the auto ERROR event was noise.
+// (#331; original wiring #326.)
 #[tracing::instrument(
     level = "debug",
     skip(target),
     fields(cp_ip = %target.cp_ip, command = %command),
-    err(Debug),
 )]
 pub(crate) fn cp_kubectl_raw(target: &CpTarget, command: &str) -> Result<hbird_ssh::RunOutput> {
+    cp_kubectl_raw_inner(target, command)
+        .inspect_err(|err| tracing::debug!(error = ?err, "cp_kubectl_raw failed"))
+}
+
+fn cp_kubectl_raw_inner(target: &CpTarget, command: &str) -> Result<hbird_ssh::RunOutput> {
     reject_shell_metachars("cp_kubectl_raw", command)?;
     let client = hbird_ssh::Client::new(target.cp_ssh_opts());
     let remote = format!("kubectl --kubeconfig=/etc/kubernetes/admin.conf {command}");
@@ -179,9 +188,17 @@ pub(crate) fn cp_kubectl_raw(target: &CpTarget, command: &str) -> Result<hbird_s
     level = "debug",
     skip(target, stdin),
     fields(cp_ip = %target.cp_ip, command = %command, stdin_bytes = stdin.len()),
-    err(Debug),
 )]
 pub(crate) fn cp_kubectl_with_stdin_lenient(
+    target: &CpTarget,
+    command: &str,
+    stdin: &[u8],
+) -> Result<CpExecOutput> {
+    cp_kubectl_with_stdin_lenient_inner(target, command, stdin)
+        .inspect_err(|err| tracing::debug!(error = ?err, "cp_kubectl_with_stdin_lenient failed"))
+}
+
+fn cp_kubectl_with_stdin_lenient_inner(
     target: &CpTarget,
     command: &str,
     stdin: &[u8],
@@ -234,9 +251,13 @@ pub(crate) fn cp_kubectl_with_stdin_lenient(
     level = "debug",
     skip(target),
     fields(cp_ip = %target.cp_ip, command = %command),
-    err(Debug),
 )]
 pub(crate) fn cp_ssh_lenient(target: &CpTarget, command: &str) -> Result<CpExecOutput> {
+    cp_ssh_lenient_inner(target, command)
+        .inspect_err(|err| tracing::debug!(error = ?err, "cp_ssh_lenient failed"))
+}
+
+fn cp_ssh_lenient_inner(target: &CpTarget, command: &str) -> Result<CpExecOutput> {
     let client = hbird_ssh::Client::new(target.cp_ssh_opts());
     match client.run(command) {
         Ok(out) => Ok(CpExecOutput {
@@ -285,16 +306,18 @@ pub(crate) fn cp_ssh_lenient(target: &CpTarget, command: &str) -> Result<CpExecO
     level = "debug",
     skip(target),
     fields(cp_ip = %target.cp_ip, command = %command),
-    err(Debug),
 )]
 pub(crate) fn cp_ssh_capture(target: &CpTarget, command: &str) -> Result<hbird_ssh::RunOutput> {
     let client = hbird_ssh::Client::new(target.cp_ssh_opts());
-    client.run(command).with_context(|| {
-        format!(
-            "cp_ssh_capture: ssh-run failed for `{command}` against {}",
-            target.cp_ip
-        )
-    })
+    client
+        .run(command)
+        .with_context(|| {
+            format!(
+                "cp_ssh_capture: ssh-run failed for `{command}` against {}",
+                target.cp_ip
+            )
+        })
+        .inspect_err(|err| tracing::debug!(error = ?err, "cp_ssh_capture failed"))
 }
 
 /// Lenient exec output — returned by [`cp_kubectl_with_stdin_lenient`]

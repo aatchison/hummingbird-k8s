@@ -1541,8 +1541,18 @@ fn run_one_worker(plan: &Plan, w: &str, results: &mut Results) -> Result<()> {
 /// while tracing emits to stderr only when enabled. Flip on with
 /// `RUST_LOG=hbird_cli=debug` to surface which CP a given kubectl call
 /// targeted.
-#[tracing::instrument(level = "debug", skip(plan), fields(cp_ip = %plan.cp_ip, command = %command), err(Debug))]
+// `err(Debug)` directive demoted to a manual `tracing::debug!` event in
+// the Err branch so callers (not this wrapper) decide ERROR-vs-debug
+// policy per call site. Some update-cluster callers deliberately tolerate
+// non-zero kubectl exits (e.g. probing for a not-yet-present node) — the
+// auto ERROR event was misleading. (#331; original wiring #326.)
+#[tracing::instrument(level = "debug", skip(plan), fields(cp_ip = %plan.cp_ip, command = %command))]
 fn cp_kubectl(plan: &Plan, command: &str) -> Result<String> {
+    cp_kubectl_inner(plan, command)
+        .inspect_err(|err| tracing::debug!(error = ?err, "cp_kubectl failed"))
+}
+
+fn cp_kubectl_inner(plan: &Plan, command: &str) -> Result<String> {
     if plan.dry_run {
         log(&format!("DRY-RUN cp_kubectl -- {command}"));
         return Ok(String::new());

@@ -162,8 +162,18 @@ impl Connection {
     /// - [`Error::VirshFailed`] when `virsh` exits non-zero (e.g.
     ///   libvirt not running on the remote, no libvirt-group
     ///   membership).
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri), err(Debug))]
+    // `err(Debug)` directive demoted to a manual `tracing::debug!` event in
+    // the Err branch so callers (not this wrapper) decide ERROR-vs-debug
+    // policy per call site. The original `err(Debug)` auto-fired an ERROR
+    // span event for benign non-zero virsh exits (e.g. "Domain not found"
+    // as a probe). (#331; original wiring #326.)
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri))]
     pub fn domains(&self) -> Result<Vec<Domain>> {
+        self.domains_inner()
+            .inspect_err(|err| tracing::debug!(error = ?err, "virsh domains failed"))
+    }
+
+    fn domains_inner(&self) -> Result<Vec<Domain>> {
         let cmd = format!("virsh -c {} list --all --name", self.uri.remote_uri());
         let stdout = self.run(&cmd)?;
         Ok(stdout
@@ -201,8 +211,13 @@ impl Connection {
     /// - [`Error::UnparseableOutput`] when `virsh` returns 0 but the
     ///   `ipv4` row's CIDR field doesn't contain a parseable
     ///   [`Ipv4Addr`].
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain), err(Debug))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
     pub fn domifaddr(&self, domain: &str) -> Result<Option<Ipv4Addr>> {
+        self.domifaddr_inner(domain)
+            .inspect_err(|err| tracing::debug!(error = ?err, "virsh domifaddr failed"))
+    }
+
+    fn domifaddr_inner(&self, domain: &str) -> Result<Option<Ipv4Addr>> {
         let cmd = format!(
             "virsh -c {} domifaddr {}",
             self.uri.remote_uri(),
@@ -230,8 +245,13 @@ impl Connection {
     ///   often "Domain not found").
     /// - [`Error::UnparseableOutput`] when the output is missing the
     ///   Name, State, Persistent, or OS Type rows.
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain), err(Debug))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
     pub fn dominfo(&self, domain: &str) -> Result<DomainInfo> {
+        self.dominfo_inner(domain)
+            .inspect_err(|err| tracing::debug!(error = ?err, "virsh dominfo failed"))
+    }
+
+    fn dominfo_inner(&self, domain: &str) -> Result<DomainInfo> {
         let cmd = format!(
             "virsh -c {} dominfo {}",
             self.uri.remote_uri(),
@@ -258,14 +278,16 @@ impl Connection {
     /// - [`Error::VirshFailed`] when `virsh` exits non-zero for reasons
     ///   other than "domain not running" (which the bash twin already
     ///   silences via `|| true`; we surface it so callers can choose).
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain), err(Debug))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
     pub fn destroy_domain(&self, domain: &str) -> Result<()> {
         let cmd = format!(
             "virsh -c {} destroy {}",
             self.uri.remote_uri(),
             shell_quote(domain),
         );
-        self.run(&cmd).map(|_| ())
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "virsh destroy failed"))
     }
 
     /// Undefine a domain, removing the libvirt definition + NVRAM
@@ -282,14 +304,16 @@ impl Connection {
     /// - [`Error::Ssh`] for SSH transport failures.
     /// - [`Error::VirshFailed`] when `virsh` exits non-zero (e.g.
     ///   domain not defined).
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain), err(Debug))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
     pub fn undefine_domain(&self, domain: &str) -> Result<()> {
         let cmd = format!(
             "virsh -c {} undefine --nvram {}",
             self.uri.remote_uri(),
             shell_quote(domain),
         );
-        self.run(&cmd).map(|_| ())
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "virsh undefine failed"))
     }
 
     /// Remove a file on the remote (or local) KVM host via the SSH
@@ -309,10 +333,12 @@ impl Connection {
     ///   `WARN:` log line and continues; callers here are expected to
     ///   do the same (the destroy-cluster command runs each remove
     ///   independently and aggregates warnings).
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path), err(Debug))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path))]
     pub fn remote_rm_f(&self, path: &str) -> Result<()> {
         let cmd = format!("rm -f -- {}", shell_quote(path));
-        self.run(&cmd).map(|_| ())
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "remote rm -f failed"))
     }
 
     /// **DESTRUCTIVE**: recursively remove a directory on the remote
@@ -333,8 +359,13 @@ impl Connection {
     /// - [`Error::VirshFailed`] (overloaded — captures `rm`'s stderr)
     ///   when `rm` exits non-zero or when the destructive-path guard
     ///   refuses the request.
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path), err(Debug))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path))]
     pub fn remote_rm_rf(&self, path: &str) -> Result<()> {
+        self.remote_rm_rf_inner(path)
+            .inspect_err(|err| tracing::debug!(error = ?err, "remote rm -rf failed"))
+    }
+
+    fn remote_rm_rf_inner(&self, path: &str) -> Result<()> {
         // Round-2 lens L5#H2 + L1 MED (convergent): pre-flight guard
         // against catastrophic paths. `rm -rf -- '/'` on a root SSH
         // session would wipe the KVM host. Bash twin gets away with
@@ -356,7 +387,7 @@ impl Connection {
     /// # Errors
     ///
     /// - [`Error::Ssh`] for SSH transport failures.
-    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path), err(Debug))]
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path))]
     pub fn remote_path_exists(&self, path: &str) -> Result<bool> {
         // `test -e` exits 0 when present, 1 when absent. The SshClient
         // trait surfaces exit-1 as RemoteExit; we translate the binary
@@ -367,7 +398,11 @@ impl Connection {
             Err(SshError::RemoteExit {
                 exit_code: Some(1), ..
             }) => Ok(false),
-            Err(other) => Err(Error::from(other)),
+            Err(other) => {
+                let err = Error::from(other);
+                tracing::debug!(error = ?err, "remote path-exists probe failed");
+                Err(err)
+            }
         }
     }
 
