@@ -107,6 +107,14 @@
 #                       Threaded through to `podman build` as a build-arg
 #                       by each containers/*/Containerfile's conditional
 #                       dnf install + preset block.
+#   FORCE_REBUILD     — When unset/empty/0, build_qcow2() short-circuits with
+#                       a "skipping rebuild" log line if ${POOL_DIR}/${name}.qcow2
+#                       already exists as a non-empty file. Set to "1" to force
+#                       bib to run anyway (the historical pre-#311 behavior).
+#                       Pairs with HBIRD_REMOTE_NO_SUDO=1 on deploy-cluster: bib
+#                       hard-requires rootful podman, so a libvirt-group operator
+#                       can only no-sudo redeploy when the qcow2 templates
+#                       already exist. See docs/deploy-cluster.md and #311.
 
 set -euo pipefail
 
@@ -281,6 +289,19 @@ build_qcow2() {
     echo "build_qcow2: bib config not readable: ${cfg}" >&2
     echo "build_qcow2: render one first via 'render_bib_config > bib-config.toml' (see lib/build-common.sh)." >&2
     return 2
+  fi
+
+  # Skip-if-exists shortcut (#311 candidate d). bib hard-requires rootful
+  # podman; a libvirt-group operator running deploy-cluster with
+  # HBIRD_REMOTE_NO_SUDO=1 cannot invoke bib. When the qcow2 template
+  # already exists in POOL_DIR (from a prior root deploy or a hand-staged
+  # copy), reuse it instead of attempting the bib rebuild. Operator opts
+  # out with FORCE_REBUILD=1 to force a fresh build (still requires
+  # rootful podman for bib itself). The "skipping rebuild" log line is
+  # an operator-grepped string — keep it stable across versions.
+  if [[ -s "$qcow" && "${FORCE_REBUILD:-}" != "1" ]]; then
+    echo "[build_qcow2] skipping rebuild: $qcow already exists (set FORCE_REBUILD=1 to force)" >&2
+    return 0
   fi
 
   # Pre-flight for isolated storage: PODMAN_ROOT must exist and be
