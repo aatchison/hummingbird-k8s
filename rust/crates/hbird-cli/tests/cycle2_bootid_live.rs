@@ -134,7 +134,7 @@ fn live_bootid_and_bootc_upgrade_drives_full_reboot_cycle() {
     let node_cli = hbird_ssh::Client::new(node_opts.clone());
 
     let digest_cmd = "bootc status --json 2>/dev/null | \
-                      jq -r '.status.booted.image.imageDigest // .status.booted.imageDigest // empty' \
+                      jq -r '.status.booted.image.imageDigest // .status.booted.image.digest // empty' \
                       2>/dev/null || true";
     let pre_digest_out = node_cli
         .run(digest_cmd)

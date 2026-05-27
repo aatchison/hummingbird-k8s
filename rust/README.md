@@ -55,7 +55,7 @@ rust/
 | Foundation — virt + qemu+ssh URI | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | landed (PR #318) |
 | Foundation — openssh | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | landed (PR #317) |
 | Phase 1A — `update-cluster` (dry-run parity + orchestration scaffold) | [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | landed (PR #321) |
-| Phase 1B — `update-cluster` (live-execution slice; cycle 1 = `cp_kubectl` + drain/uncordon) | [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | cycle 1 landed (PR #325); cycles 2–4 pending |
+| Phase 1B — `update-cluster` (live-execution slice; cycle 1 = `cp_kubectl` + drain/uncordon; cycle 2 = bootID gate) | [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | cycles 1 (PR #325) + 2 (PR #344) landed; cycles 3 ([#328](https://github.com/aatchison/hummingbird-k8s/issues/328)) + 4 ([#329](https://github.com/aatchison/hummingbird-k8s/issues/329)) pending |
 | Phase 2 — `verify-*` | [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | landed (PR #330) — live-validated on geary cluster |
 | Phase 3 — `export-argocd` / `get-kubeconfig` / `nodes` / `kubectl` | [#288](https://github.com/aatchison/hummingbird-k8s/issues/288) | landed (PR #334) — live-validated on geary cluster |
 | Phase 4 — `deploy-/destroy-/spawn-` (dry-run parity) | [#289](https://github.com/aatchison/hummingbird-k8s/issues/289) | landed — dry-run planner for deploy/destroy/spawn, live execution for destroy-cluster; live for deploy + spawn deferred to [#335](https://github.com/aatchison/hummingbird-k8s/issues/335) |

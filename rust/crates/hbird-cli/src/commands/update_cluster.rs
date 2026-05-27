@@ -943,7 +943,7 @@ fn bootc_has_apply(plan: &Plan, ip: &str) -> Result<bool> {
 /// `<dry-run-digest>` the bash twin uses.
 ///
 /// Live path (#327 cycle 2): runs `bootc status --json | jq -r
-/// '.status.booted.image.imageDigest // .status.booted.imageDigest // empty'`
+/// '.status.booted.image.imageDigest // .status.booted.image.digest // empty'`
 /// over SSH. An empty string is a legitimate return (jq's `// empty`
 /// when neither path is populated) — the caller in
 /// [`bootc_upgrade_apply`] treats `pre == post == ""` as "couldn't
@@ -957,8 +957,13 @@ fn bootc_booted_digest(plan: &Plan, ip: &str) -> Result<String> {
     let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
     // Bash line 543 uses the same jq expression. We replicate verbatim so
     // operators grepping both sides find a matching call shape.
+    // Round-2 lens L2 MED: fallback path matches bash twin literally
+    // (line 544: `.image.imageDigest // .image.digest // empty`). The
+    // earlier shape `// .status.booted.imageDigest` was missing the
+    // `.image.` prefix on the fallback — same-looking but diverges on
+    // any bootc schema where the alternate key is `.image.digest`.
     let cmd = "bootc status --json 2>/dev/null | \
-               jq -r '.status.booted.image.imageDigest // .status.booted.imageDigest // empty' \
+               jq -r '.status.booted.image.imageDigest // .status.booted.image.digest // empty' \
                2>/dev/null || true";
     // `|| true` keeps a transient jq error from blowing up the digest
     // snapshot — bash twin does the same; empty string falls through to
@@ -1104,13 +1109,16 @@ fn wait_ssh_drop(plan: &Plan, ip: &str) -> Result<()> {
         std::thread::sleep(Duration::from_secs(1));
         elapsed = elapsed.saturating_add(1);
     }
-    // Bash line 821: WARN + return non-zero. The caller treats this with
-    // `|| true` (line 1235, 1391) — a timeout here is diagnostic, not
-    // fatal; the bootID gate downstream is source of truth.
+    // Bash line 821: WARN + return non-zero. Both callers
+    // (`update_worker` line 1640, `update_cp` line 1751) swallow the
+    // Err with `let _ =`, so any `bail!` here is dead — the WARN line
+    // is the only signal the operator sees. Round-2 lens L3 MED:
+    // return Ok(()) instead of bail!ing into a void. Downstream bootID
+    // gate is the actual source of truth for "did this reboot land?"
     log(&format!(
         "  WARN: SSH on {ip} still up after {max}s — bootc may have queued without rebooting"
     ));
-    bail!("wait_ssh_drop: SSH on {ip} still up after {max}s");
+    Ok(())
 }
 
 /// Poll the apiserver via the CP. Mirrors `wait_apiserver_back`
@@ -1417,12 +1425,14 @@ fn bootc_upgrade_apply(plan: &Plan, ip: &str, name: &str) -> Result<BootcUpgrade
                     }
                 }
                 // Two-step fallback: now issue the reboot. The reboot
-                // kills sshd so we EXPECT NonZeroExit{255}. Run in a
-                // detached subshell on the remote so the SSH session
-                // shutdown doesn't race the reboot signal — bash twin
-                // does the same at line 1144 (`>/dev/null 2>&1` plus
-                // the natural rc=255 after the session dies).
-                client.run("systemctl reboot >/dev/null 2>&1 || true")
+                // kills sshd so we EXPECT NonZeroExit{255}. Bash twin
+                // line 1144 runs `systemctl reboot >/dev/null 2>&1` —
+                // no `|| true`; it relies on rc=255 falling into the
+                // 255 case. Round-2 lens L2 LOW: drop the dead `||
+                // true` (the remote bash would die before the OR could
+                // fire anyway) so the remote command matches bash
+                // verbatim.
+                client.run("systemctl reboot >/dev/null 2>&1")
             }
             Err(e) => Err(e),
         }
@@ -1621,7 +1631,10 @@ fn update_cp(plan: &Plan) -> Result<()> {
         "ssh root@{} bootc upgrade --apply  (auto-reboots; digest pre/post compared)",
         plan.cp_ip
     ));
-    let outcome = bootc_upgrade_apply(plan, &plan.cp_ip, &plan.cp_name)?;
+    // Round-2 lens L3 MED: wrap with worker context so the anyhow chain
+    // reads "update_cp(<name>) → bootc upgrade phase → <inner>".
+    let outcome = bootc_upgrade_apply(plan, &plan.cp_ip, &plan.cp_name)
+        .with_context(|| format!("update_cp({}): bootc upgrade phase", plan.cp_name))?;
     if outcome == BootcUpgradeOutcome::AlreadyCurrent {
         log(&format!(
             "CP {}: no update available; restoring timer and continuing.",
@@ -1732,7 +1745,10 @@ fn update_worker(plan: &Plan, name: &str, ip: &str, k8s_name: &str) -> Result<()
     log(&format!(
         "ssh root@{ip} bootc upgrade --apply  (auto-reboots; digest pre/post compared)"
     ));
-    let outcome = bootc_upgrade_apply(plan, ip, name)?;
+    // Round-2 lens L3 MED: wrap with worker context so the anyhow chain
+    // reads "update_worker(<name>) → bootc upgrade phase → <inner>".
+    let outcome = bootc_upgrade_apply(plan, ip, name)
+        .with_context(|| format!("update_worker({name}): bootc upgrade phase"))?;
     if outcome == BootcUpgradeOutcome::UpgradeFailed {
         bail!("{name}: bootc upgrade --apply failed (see log above)");
     }
