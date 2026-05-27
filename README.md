@@ -245,15 +245,21 @@ sudo make clean-vms
 # timer (docs/auto-updates.md) has a remote ref to pull from. Without
 # this, VMs that booted from a local qcow2 still track localhost:latest
 # and the timer can't resolve a remote tag list.
-sudo make switch-to-ghcr
+#
+# Two paths: on the KVM host (legacy, sudo); or from a workstation with
+# KVM_HOST set, in which case the script C3-wraps to the KVM host
+# (no local sudo / libvirt needed). See docs/auto-updates.md.
+sudo make switch-to-ghcr                  # on the KVM host
+KVM_HOST=geary make switch-to-ghcr        # from a workstation (#271 F1)
 ```
 
 Note: legacy + non-lifecycle targets above (`clean-vms`,
-`switch-to-ghcr`, `backup-etcd`, `restore-etcd`, `rotate-etcd-key`)
-still need `sudo` — only the five cluster-lifecycle targets
-(`deploy-cluster`, `destroy-cluster`, `update-cluster`,
-`update-workers`, `update-node`) dropped client-side `sudo` in PR
-#237.
+`backup-etcd`, `restore-etcd`, `rotate-etcd-key`) still need `sudo` —
+only the five cluster-lifecycle targets (`deploy-cluster`,
+`destroy-cluster`, `update-cluster`, `update-workers`, `update-node`)
+dropped client-side `sudo` in PR #237. As of #271 F1, `switch-to-ghcr`
+joins them when `KVM_HOST` is set (sudo happens on the remote, not
+locally).
 
 Going one step further: `update-cluster` now accepts a `libvirt`-group
 member on the KVM host (no root needed), and the C3 shim drops `sudo`

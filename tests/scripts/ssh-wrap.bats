@@ -45,7 +45,8 @@ setup() {
         HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT HBIRD_REMOTE_REPO
   unset CONFIG FLAGS AUTO_UPDATE_CP SWITCH_TO_GHCR \
         BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER \
-        IMAGE_SOURCE GHCR_TAG DRY_RUN SKIP_DRAIN WORKERS_ONLY NODE \
+        IMAGE_SOURCE GHCR_ORG GHCR_TAG BOOTC_SWITCH_TO_GHCR \
+        DRY_RUN SKIP_DRAIN WORKERS_ONLY NODE \
         START_FROM PARALLEL READY_TIMEOUT DRAIN_TIMEOUT APISERVER_TIMEOUT \
         SSH_TIMEOUT INTER_NODE_SLEEP DAEMONSET_TIMEOUT CP_NAME \
         WORKER_NAMES POOL_DIR \
@@ -525,7 +526,7 @@ EOF
     CONFIG FLAGS
     AUTO_UPDATE_CP SWITCH_TO_GHCR
     BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER
-    IMAGE_SOURCE GHCR_TAG
+    IMAGE_SOURCE GHCR_ORG GHCR_TAG BOOTC_SWITCH_TO_GHCR
     DRY_RUN SKIP_DRAIN WORKERS_ONLY NODE START_FROM PARALLEL
     READY_TIMEOUT DRAIN_TIMEOUT APISERVER_TIMEOUT SSH_TIMEOUT
     INTER_NODE_SLEEP DAEMONSET_TIMEOUT
@@ -570,6 +571,11 @@ EOF
 @test "ssh-wrap: spawn-workers.sh sources lib/ssh-wrap.sh + invokes the shim" {
   grep -q 'source "${SCRIPT_DIR}/lib/ssh-wrap.sh"' "${REPO_ROOT}/scripts/spawn-workers.sh"
   grep -q 'hbird_ssh_wrap_maybe_reexec "$0" "$@"' "${REPO_ROOT}/scripts/spawn-workers.sh"
+}
+
+@test "ssh-wrap: switch-to-ghcr.sh sources lib/ssh-wrap.sh + invokes the shim (#271 F1)" {
+  grep -q 'source "${SCRIPT_DIR}/lib/ssh-wrap.sh"' "${REPO_ROOT}/scripts/switch-to-ghcr.sh"
+  grep -q 'hbird_ssh_wrap_maybe_reexec "$0" "$@"' "${REPO_ROOT}/scripts/switch-to-ghcr.sh"
 }
 
 # ---------------------------------------------------------------------------
