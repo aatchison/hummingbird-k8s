@@ -27,7 +27,7 @@ subcommands land per the phasing table in
 | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | landed (PR #318) |
 | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | landed (PR #317) |
 | [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | `update-cluster` Phase 1A — dry-run parity + orchestration scaffold | landed (PR #321) |
-| [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycles 1 (`cp_kubectl` + drain/uncordon, PR #325) + 2 (bootID + bootc upgrade + SSH drop/back, PR #344) + 3 (DaemonSet-ready gate, [#328](https://github.com/aatchison/hummingbird-k8s/issues/328)) landed; cycle 4 ([#329](https://github.com/aatchison/hummingbird-k8s/issues/329)) pending |
+| [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycles 1 (`cp_kubectl` + drain/uncordon, PR #325) + 2 (bootID + bootc upgrade + SSH drop/back, PR #344) + 3 (DaemonSet-ready gate, [#328](https://github.com/aatchison/hummingbird-k8s/issues/328)) + 4 (`wait_apiserver_back`, [#329](https://github.com/aatchison/hummingbird-k8s/issues/329)) landed. Remaining `live_mode_not_implemented` sites: `timer_stop` / `timer_start` (block #4) — cluster doesn't run scheduled-update timers per bash twin, deferred outside Phase 1B cycle scope. |
 | [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | `verify-*` Phase 2 — encryption / hardening / app-deploy / all | landed (PR #330) — live-validated 2026-05-27 |
 | [#288](https://github.com/aatchison/hummingbird-k8s/issues/288) | Phase 3 — `export-argocd` / `get-kubeconfig` / `nodes` / `kubectl` | landed (PR #334) — live-validated 2026-05-27 |
 
@@ -69,8 +69,11 @@ Subcommand status:
 - `update-cluster` — Phase 1A (dry-run) landed (#286 / PR #321); Phase 1B
   cycle 1 (cp_kubectl + drain/uncordon) landed (#322 / PR #325); cycle 2
   (bootID + bootc upgrade + SSH drop/back) landed (#327 / PR #344);
-  cycle 3 (DaemonSet-ready gate) landed (#328 / PR #346); remaining
-  cycle 4 carved out as #329 (independently dispatchable).
+  cycle 3 (DaemonSet-ready gate) landed (#328 / PR #346); cycle 4
+  (`wait_apiserver_back`) landed (#329). Phase 1B is now complete for
+  the cluster-rotation paths; `timer_stop`/`timer_start` (block #4)
+  remain stubbed but the geary cluster doesn't run scheduled-update
+  timers so they sit outside the Phase 1B cycle scope.
 - `verify {encryption,hardening,app-deploy,all}` — Phase 2 landed
   (#287 / PR #330). Live-validated against the geary cluster
   2026-05-27.
@@ -162,7 +165,7 @@ against the live geary cluster with a bash-vs-Rust diff captured under
 | 1 | #5 + part of update_worker | `cp_kubectl`, drain, uncordon | landed (PR #325) |
 | 2 | #6 + #8 + #10 | `capture_node_bootid`, `wait_node_bootid_changed`, `bootc_upgrade_apply` (+ `bootc_has_apply` + `bootc_booted_digest`), `wait_ssh_drop`, `wait_ssh_back` | landed (#327) |
 | 3 | #9 | `wait_node_ready`, `wait_node_daemonsets_ready` (+ `_collect_unready_names` parser) | landed (#328) |
-| 4 | #7 | `wait_apiserver_back`, etcd-backup | pending |
+| 4 | #7 | `wait_apiserver_back` (etcd-backup not invoked inline by bash twin — separate `make backup-etcd` target out of scope) | landed (#329) |
 
 ### Phase 3 (`export-argocd` / `get-kubeconfig` / `nodes` / `kubectl`)
 
@@ -256,13 +259,14 @@ to root@CP_IP and pipe stdin), so kubectl sees the manifest and the
 apiserver correctly rejects it — Rust observes PSA enforcement that
 bash misses. Documented in `cycle_verify_hardening.txt`.
 
-#### Still scaffolded (3 of 13 `live_mode_not_implemented` sites)
+#### Still scaffolded (2 of 13 `live_mode_not_implemented` sites)
 
-Cycle 4 (#329) wires `wait_apiserver_back`; `timer_stop` / `timer_start`
-deferred to a follow-up beyond cycle 4:
+Phase 1B cycles 1–4 are now complete. Only the scheduled-update timer
+helpers remain stubbed; they sit outside the Phase 1B cycle scope
+because the geary cluster doesn't run the systemd `hbird-bootc-update`
+timer the bash twin's `timer_stop`/`timer_start` pause and resume.
 
 - `timer_stop` / `timer_start` (block #4)
-- `wait_apiserver_back` (block #7)
 
 Cycle 2 (#327) wired the bootID gate (`capture_node_bootid`,
 `wait_node_bootid_changed`), the bootc upgrade life-cycle
