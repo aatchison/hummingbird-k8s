@@ -130,8 +130,26 @@ make kubectl ARGS='get pods -A'
 Tear it all down:
 
 ```bash
-sudo make clean               # destroys + undefines VMs and removes local images
+make clean                    # destroys + undefines VMs and removes local images
+KVM_HOST=geary make clean-vms # workstation -> KVM host via C3 SSH-wrap (#271 F5)
 ```
+
+`make clean-vms` delegates to `scripts/clean-vms.sh`, which:
+
+1. Sources `scripts/lib/ssh-wrap.sh` and re-execs on `$KVM_HOST` when
+   set (workstation case — no local libvirt required).
+2. Destroys + undefines every `hummingbird-*` libvirt domain on the
+   target host.
+3. Sweeps stale `hummingbird-*.qcow2`, `*-seed.iso`, and
+   `*-cloud-init.iso` files under `POOL_DIR` (closes #221).
+4. Runs `virsh pool-refresh "$POOL_NAME"` (default pool name
+   `default`) so libvirt drops the rm'd files from the volumes
+   catalog.
+
+The script self-elevates via `sudo` when run directly on the KVM host
+(operator types `make clean-vms`, NOT `sudo make clean-vms`). Override
+`POOL_DIR` or `POOL_NAME` from the environment for non-standard
+libvirt setups.
 
 Rolling update of an existing deploy-cluster cluster (CP first, no
 drain; each worker drained → `bootc upgrade --apply` → uncordoned):
@@ -168,8 +186,9 @@ test surface.
 | `NODE`              | (required for `update-node`)  | `update-node`                 |
 | `FLAGS`             | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to scripts/update-cluster.sh) |
 | `ARGS`              | empty                         | `kubectl`                     |
-| `POOL_DIR`          | `/var/lib/libvirt/images`     | `clean-vms`                   |
-| `KVM_HOST`          | unset                         | `kubectl` / `nodes` — and since C3 (#232) also `deploy-cluster`, `destroy-cluster`, `update-cluster`, `spawn-workers` (re-exec on the KVM host via SSH; client needs only `ssh`, no local `sudo`). Since #271 F1 also `switch-to-ghcr`. See [`docs/deploy-cluster.md`](deploy-cluster.md#remote-kvm-host-operation-kvm_host). |
+| `POOL_DIR`          | `/var/lib/libvirt/images`     | `clean-vms` (sweep target dir) |
+| `POOL_NAME`         | `default`                     | `clean-vms` (libvirt pool name for `pool-refresh`) |
+| `KVM_HOST`          | unset                         | `kubectl` / `nodes` / `clean-vms` (#271 F5) — and since C3 (#232) also `deploy-cluster`, `destroy-cluster`, `update-cluster`, `spawn-workers` (re-exec on the KVM host via SSH; client needs only `ssh`, no local `sudo`). Since #271 F1 also `switch-to-ghcr`. See [`docs/deploy-cluster.md`](deploy-cluster.md#remote-kvm-host-operation-kvm_host). |
 | `HBIRD_REMOTE_REPO` | `~/hummingbird-k8s`           | Path on `$KVM_HOST` to the remote git checkout of hummingbird-k8s. Used by the C3 SSH-wrap shim — when the shim fires it `cd`s here and execs `bash scripts/<name>.sh` from disk. Override when the checkout lives somewhere other than `$HOME/hummingbird-k8s`. See [`docs/deploy-cluster.md`](deploy-cluster.md#hbird_remote_repo-override). |
 | `HBIRD_REMOTE_NO_SUDO` | unset                       | When `=1`, the C3 SSH-wrap shim emits the remote command WITHOUT the `sudo` prefix. Use with `update-cluster` when the operator is in the `libvirt` group on `$KVM_HOST` (the script doesn't otherwise need root). Default keeps `sudo` for `deploy-cluster` / `destroy-cluster` / `spawn-workers`, which still write to root-owned `POOL_DIR`. See [`docs/update-cluster.md`](update-cluster.md#running-without-sudo-libvirt-group-operator-269). (#269) |
 | `IMAGE_TAG`         | `latest`                      | `push-image-k8s`, `push-image-worker`, `push-image-all` |

@@ -390,13 +390,8 @@ test-all: test-lib test-scripts ## Run all bats unit suites (lib + scripts)
 
 # ---- cleanup -----------------------------------------------------------
 
-clean-vms: ## Destroy + undefine all hummingbird-* VMs (sudo)
-	@for d in $$(virsh -c qemu:///system list --all --name 2>/dev/null \
-	             | grep '^hummingbird-'); do \
-	  echo "Destroying $$d"; \
-	  virsh -c qemu:///system destroy "$$d" 2>/dev/null || true; \
-	  virsh -c qemu:///system undefine "$$d" 2>/dev/null || true; \
-	done
+clean-vms: ## Destroy hummingbird-* VMs + sweep stale qcow2/seed-ISO from POOL_DIR (honors KVM_HOST)
+	bash scripts/clean-vms.sh
 
 clean-images: ## Remove the local OCI build outputs
 	-podman image rm $(IMAGE_K8S) $(IMAGE_WORKER) 2>/dev/null || true

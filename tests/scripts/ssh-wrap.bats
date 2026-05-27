@@ -2,11 +2,11 @@
 #
 # tests/scripts/ssh-wrap.bats — C3 (#232) SSH-wrap shim contract.
 #
-# The four libvirt-touching scripts (deploy-cluster, destroy-cluster,
-# update-cluster, spawn-workers) share scripts/lib/ssh-wrap.sh, which
-# re-execs them on the KVM host via SSH when KVM_HOST is set and we're
-# not already on that host. The client never needs sudo or libvirt;
-# only ssh + the operator's SSH key.
+# The libvirt-touching scripts (deploy-cluster, destroy-cluster,
+# update-cluster, spawn-workers, and clean-vms — #271 F5) share
+# scripts/lib/ssh-wrap.sh, which re-execs them on the KVM host via SSH
+# when KVM_HOST is set and we're not already on that host. The client
+# never needs sudo or libvirt; only ssh + the operator's SSH key.
 #
 # What we pin here:
 #
@@ -49,7 +49,7 @@ setup() {
         DRY_RUN SKIP_DRAIN WORKERS_ONLY NODE \
         START_FROM PARALLEL READY_TIMEOUT DRAIN_TIMEOUT APISERVER_TIMEOUT \
         SSH_TIMEOUT INTER_NODE_SLEEP DAEMONSET_TIMEOUT CP_NAME \
-        WORKER_NAMES POOL_DIR \
+        WORKER_NAMES POOL_DIR POOL_NAME \
         VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS \
         HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_OPERATOR_PUBKEY_FILE \
         HBIRD_SSH_WRAP_DRY_RUN_SCP HBIRD_REMOTE_NO_SUDO
@@ -530,7 +530,7 @@ EOF
     DRY_RUN SKIP_DRAIN WORKERS_ONLY NODE START_FROM PARALLEL
     READY_TIMEOUT DRAIN_TIMEOUT APISERVER_TIMEOUT SSH_TIMEOUT
     INTER_NODE_SLEEP DAEMONSET_TIMEOUT
-    CP_NAME WORKER_NAMES POOL_DIR
+    CP_NAME WORKER_NAMES POOL_DIR POOL_NAME
     VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS
     HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_REMOTE_REPO
     HBIRD_OPERATOR_PUBKEY_FILE
@@ -576,6 +576,11 @@ EOF
 @test "ssh-wrap: switch-to-ghcr.sh sources lib/ssh-wrap.sh + invokes the shim (#271 F1)" {
   grep -q 'source "${SCRIPT_DIR}/lib/ssh-wrap.sh"' "${REPO_ROOT}/scripts/switch-to-ghcr.sh"
   grep -q 'hbird_ssh_wrap_maybe_reexec "$0" "$@"' "${REPO_ROOT}/scripts/switch-to-ghcr.sh"
+}
+
+@test "ssh-wrap: clean-vms.sh sources lib/ssh-wrap.sh + invokes the shim (#271 F5)" {
+  grep -q 'source "${SCRIPT_DIR}/lib/ssh-wrap.sh"' "${REPO_ROOT}/scripts/clean-vms.sh"
+  grep -q 'hbird_ssh_wrap_maybe_reexec "$0" "$@"' "${REPO_ROOT}/scripts/clean-vms.sh"
 }
 
 # ---------------------------------------------------------------------------
