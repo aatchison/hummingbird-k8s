@@ -20,21 +20,67 @@ README is the operator-facing entry point.
 > for the canonical bootc, BIB, cri-o, Cilium, and K8s upstream project links +
 > what-they're-for cheatsheet ([#312](https://github.com/aatchison/hummingbird-k8s/issues/312)).
 
-> **Rust rewrite in progress** — the client-side bash tooling under
-> [`scripts/`](scripts/) is being rewritten in Rust over several phases per
-> epic [#279](https://github.com/aatchison/hummingbird-k8s/issues/279). The
-> workspace lives at [`rust/`](rust/) and holds the foundation crates,
-> `update-cluster` dry-run parity (PR #321), the first live helper
-> (`cp_kubectl`, PR #325), Phase 2 `hbird verify
-> {encryption,hardening,app-deploy,all}` (PR #330), Phase 3 `hbird
-> {export-argocd,get-kubeconfig,nodes,kubectl}` (PR #334), and Phase 4
-> dry-run parity for `hbird {deploy-cluster,destroy-cluster,spawn-workers}`
-> (PR #337; destroy-cluster also has live execution, deploy + spawn
-> live tracked by #335). **No operator-facing change yet** — every `make`
-> target still invokes the bash scripts; the Rust `hbird update-cluster`
-> binary builds but still surfaces a stable diagnostic for live blocks
-> not yet wired. See [`docs/rust-cli.md`](docs/rust-cli.md) for the
-> per-phase status table.
+> **Rust rewrite — all phases landed.** The client-side bash tooling
+> under [`scripts/`](scripts/) has a Rust counterpart in the `hbird`
+> binary per epic
+> [#279](https://github.com/aatchison/hummingbird-k8s/issues/279).
+> Foundation crates + Phase 1A/1B/2/3/4 + tracing all landed
+> (PRs [#321](https://github.com/aatchison/hummingbird-k8s/pull/321)
+> [#325](https://github.com/aatchison/hummingbird-k8s/pull/325)
+> [#326](https://github.com/aatchison/hummingbird-k8s/pull/326)
+> [#330](https://github.com/aatchison/hummingbird-k8s/pull/330)
+> [#334](https://github.com/aatchison/hummingbird-k8s/pull/334)
+> [#337](https://github.com/aatchison/hummingbird-k8s/pull/337)
+> [#344](https://github.com/aatchison/hummingbird-k8s/pull/344)
+> [#346](https://github.com/aatchison/hummingbird-k8s/pull/346)
+> [#347](https://github.com/aatchison/hummingbird-k8s/pull/347)).
+> Bash scripts remain canonical until per-target Makefile dispatch flips;
+> both surfaces work today. See
+> [`docs/rust-cli-migration.md`](docs/rust-cli-migration.md) for the
+> operator-facing `make → hbird` lookup table and
+> [`docs/rust-cli.md`](docs/rust-cli.md) for the per-phase tracking
+> table. Live execution for `hbird deploy-cluster` + `hbird
+> spawn-workers` is deferred to
+> [#335](https://github.com/aatchison/hummingbird-k8s/issues/335);
+> stay on the `make` targets for real deploys today.
+
+## Install the `hbird` binary
+
+`hbird` is the Rust CLI counterpart to the `scripts/*.sh` driver scripts
+— every operator-facing `make` target has an `hbird` equivalent (see
+[`docs/rust-cli-migration.md`](docs/rust-cli-migration.md)).
+
+**Release pipeline (cosign-signed musl binary + OCI image via
+`cargo-dist`) — tracked by
+[#290](https://github.com/aatchison/hummingbird-k8s/issues/290) (pending).**
+Until that lands, build from source:
+
+```bash
+# Devcontainer build (host stays free of Rust toolchain — see rust/README.md).
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . bash -c 'cd rust && cargo build --release -p hbird-cli'
+cp rust/target/release/hbird ~/.local/bin/hbird
+hbird --version
+```
+
+`hbird` follows the operator-mental-model contract from
+[#279](https://github.com/aatchison/hummingbird-k8s/issues/279) —
+flag names, log shape, and exit codes match the bash twins where
+practical. Side-by-side cheatsheet:
+
+| Operator workflow | `make` (canonical) | `hbird` (Rust) |
+|-------------------|-----------------|----------------|
+| Deploy a cluster | `make deploy-cluster CONFIG=cluster.local.conf` | `hbird deploy-cluster --config cluster.local.conf` (dry-run; live tracked by [#335](https://github.com/aatchison/hummingbird-k8s/issues/335)) |
+| Tear down | `make destroy-cluster CONFIG=cluster.local.conf` | `hbird destroy-cluster --config cluster.local.conf` |
+| Rolling upgrade | `make update-cluster CONFIG=cluster.local.conf` | `hbird update-cluster --config cluster.local.conf` |
+| Verify all | `make verify-all CONFIG=cluster.local.conf` | `hbird verify all --config cluster.local.conf` |
+| Fetch kubeconfig | `make get-kubeconfig CONFIG=cluster.local.conf` | `hbird get-kubeconfig --config cluster.local.conf` |
+| `kubectl get nodes` via tunnel | `make nodes` | `hbird nodes --config cluster.local.conf` |
+| Arbitrary kubectl | `make kubectl ARGS='get pods -A'` | `hbird kubectl --config cluster.local.conf -- get pods -A` |
+
+Full per-target reference + flag-spelling deltas:
+[`docs/rust-cli-migration.md`](docs/rust-cli-migration.md). Per-phase
+status table: [`docs/rust-cli.md`](docs/rust-cli.md).
 
 ## Topology
 
@@ -586,6 +632,8 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/cloud-init.md`](docs/cloud-init.md) — opt-in cloud-init support (`ENABLE_CLOUD_INIT=1`) for per-VM user-data injection via libvirt seed ISO.
 - [`docs/multi-arch.md`](docs/multi-arch.md) — multi-arch (linux/amd64 + linux/arm64) manifest index, cosign verification, and CI boot-test coverage.
 - [`docs/orchestrator.md`](docs/orchestrator.md) — weekly verify orchestrator (encryption + hardening + app-deploy against the live cluster).
+- [`docs/rust-cli.md`](docs/rust-cli.md) — Rust rewrite per-phase status table (epic [#279](https://github.com/aatchison/hummingbird-k8s/issues/279)).
+- [`docs/rust-cli-migration.md`](docs/rust-cli-migration.md) — operator-facing `make → hbird` lookup table, install instructions, and per-target flag map.
 
 Workflows that need real KVM (orchestrator integration, bootc upgrade e2e)
 run on a self-hosted runner on the operator's KVM host.
