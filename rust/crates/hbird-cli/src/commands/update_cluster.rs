@@ -1510,17 +1510,48 @@ fn run_one_worker(plan: &Plan, w: &str, results: &mut Results) -> Result<()> {
 
 // ---- cp_kubectl shim -------------------------------------------------------
 
-/// Run a kubectl command via the CP. Mirrors `cp_kubectl` (line 425).
-/// Dry-run emits the bash log shape.
+/// Run a kubectl command via the CP. Mirrors `cp_kubectl`
+/// (`scripts/update-cluster.sh:425`).
+///
+/// Live execution path (Phase 1B, #322): builds an `hbird_ssh::Client` per
+/// call against `root@plan.cp_ip` with `--proxy-jump` set to `plan.kvm_host`
+/// when present. Emits the `kubectl` stdout to operator stderr so output
+/// from `kubectl drain ...` (multi-line, evicts node-by-node) is visible
+/// in real time. Returns `Err` on non-zero kubectl exit, preserving the
+/// stderr in the anyhow chain.
 fn cp_kubectl(plan: &Plan, command: &str) -> Result<()> {
     if plan.dry_run {
         log(&format!("DRY-RUN cp_kubectl -- {command}"));
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "cp_kubectl",
-        &format!("ssh root@{} kubectl ... {command}", plan.cp_ip),
-    ))
+    let opts = build_cp_ssh_options(plan);
+    let client = hbird_ssh::Client::new(opts);
+    let remote = format!("kubectl --kubeconfig=/etc/kubernetes/admin.conf {command}");
+    let output = client
+        .run(&remote)
+        .with_context(|| format!("cp_kubectl: ssh-run failed: {command}"))?;
+    // Mirror bash twin: emit kubectl's stdout so operators see the
+    // per-pod eviction log; stderr is folded into the anyhow chain on
+    // non-zero exit.
+    let stdout = output.stdout_lossy();
+    if !stdout.trim().is_empty() {
+        for line in stdout.lines() {
+            log(line);
+        }
+    }
+    Ok(())
+}
+
+/// Build the SSH options for a CP-targeted call. Pulls `cp_ip` from the
+/// plan and ProxyJump from `kvm_host` when set. Strict-host-key-checking
+/// stays off (default) — VM IPs rotate per deploy; pinning is left to
+/// `~/.ssh/config` if the operator opts in (see issue #320).
+fn build_cp_ssh_options(plan: &Plan) -> hbird_ssh::SshOptions {
+    let mut opts = hbird_ssh::SshOptions::new(plan.cp_ip.clone()).with_user("root");
+    if let Some(jump) = plan.kvm_host.as_deref() {
+        opts = opts.with_proxy_jump(jump.to_string());
+    }
+    opts
 }
 
 // ---- block #15 + dispatch: run() ------------------------------------------

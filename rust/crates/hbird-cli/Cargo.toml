@@ -54,6 +54,14 @@ anyhow = "1"
 # (#290) wires cargo-dist.
 hbird-config = { path = "../hbird-config", version = "0.0.1" }
 
+# Phase 1B (#322): SSH transport used by `cp_kubectl` to wire the live
+# execution path. The shim takes a `Plan` (carries cp_ip + kvm_host)
+# and constructs a `Client` per call — connection caching is left to
+# `with_controlmaster` for now (no async runtime required). Bash twin's
+# `cp_kubectl` (scripts/update-cluster.sh:425) is the operator-mental-model
+# contract this wraps.
+hbird-ssh = { path = "../hbird-ssh", version = "0.0.1" }
+
 # Signal handling for the SIGINT/SIGTERM lock-release path (round-2
 # review of #321, lens L3#1). `LockGuard::Drop` doesn't fire when the
 # process is killed by a signal we don't trap, so `acquire_lock`
