@@ -58,7 +58,7 @@ rust/
 | Phase 1B — `update-cluster` (live-execution slice; cycle 1 = `cp_kubectl` + drain/uncordon) | [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | cycle 1 landed (PR #325); cycles 2–4 pending |
 | Phase 2 — `verify-*` | [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | landed (PR #330) — live-validated on geary cluster |
 | Phase 3 — `export-argocd` / `get-kubeconfig` / `nodes` / `kubectl` | [#288](https://github.com/aatchison/hummingbird-k8s/issues/288) | landed (PR #334) — live-validated on geary cluster |
-| Phase 4 — `deploy-/destroy-/spawn-` | [#289](https://github.com/aatchison/hummingbird-k8s/issues/289) | pending (gated on #311(d)) |
+| Phase 4 — `deploy-/destroy-/spawn-` (dry-run parity) | [#289](https://github.com/aatchison/hummingbird-k8s/issues/289) | landed — dry-run planner for deploy/destroy/spawn, live execution for destroy-cluster; live for deploy + spawn deferred to [#335](https://github.com/aatchison/hummingbird-k8s/issues/335) |
 | Release — cosign + cargo-dist | [#290](https://github.com/aatchison/hummingbird-k8s/issues/290) | pending |
 | Migration guide | [#291](https://github.com/aatchison/hummingbird-k8s/issues/291) | pending |
 

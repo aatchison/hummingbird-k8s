@@ -144,6 +144,7 @@ dependencies = [
  "clap",
  "hbird-config",
  "hbird-ssh",
+ "hbird-virt",
  "signal-hook",
  "tracing",
  "tracing-subscriber",

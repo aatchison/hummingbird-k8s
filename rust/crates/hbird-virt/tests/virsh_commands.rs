@@ -283,3 +283,225 @@ fn session_instance_routes_to_qemu_session_uri() {
     let conn = Connection::new(uri, stub);
     conn.domains().unwrap();
 }
+
+// =============================================================================
+// PR #337 round-2 — coverage for the 5 new Connection methods + the
+// `reject_destructive_path` safety guard. Round-2 lens L5 HIGH flagged
+// that these landed without StubSshClient-pinned tests.
+// =============================================================================
+
+#[test]
+fn destroy_domain_emits_virsh_destroy_with_quoted_name() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system destroy hbird-cp1",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.destroy_domain("hbird-cp1").expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, "virsh -c qemu:///system destroy hbird-cp1");
+}
+
+#[test]
+fn destroy_domain_quotes_hostile_domain_name() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system destroy 'evil; rm -rf /'",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.destroy_domain("evil; rm -rf /").expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    // Verify the metachar payload was single-quoted (no bare ;)
+    assert!(
+        calls[0].1.contains("'evil; rm -rf /'"),
+        "expected single-quoted payload. cmd: {}",
+        calls[0].1
+    );
+}
+
+#[test]
+fn undefine_domain_emits_virsh_undefine_with_nvram() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system undefine --nvram hbird-w1",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.undefine_domain("hbird-w1").expect("ok");
+    let calls = stub.calls();
+    assert_eq!(
+        calls[0].1,
+        "virsh -c qemu:///system undefine --nvram hbird-w1"
+    );
+}
+
+#[test]
+fn remote_rm_f_emits_rm_f_with_quoted_path() {
+    let stub = Arc::new(StubSshClient::new());
+    // Paths contain `/` which shell_quote's allowlist (`[A-Za-z0-9-_.]`)
+    // doesn't include, so they get single-quoted defensively.
+    stub.expect(
+        "op@kvm.example",
+        "rm -f -- '/mnt/mass2/vms/hbird-cp1.qcow2'",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.remote_rm_f("/mnt/mass2/vms/hbird-cp1.qcow2")
+        .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls[0].1, "rm -f -- '/mnt/mass2/vms/hbird-cp1.qcow2'");
+}
+
+#[test]
+fn remote_rm_rf_emits_rm_rf_with_quoted_path() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "rm -rf -- '/mnt/mass2/vms/deploy-cluster'",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.remote_rm_rf("/mnt/mass2/vms/deploy-cluster")
+        .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls[0].1, "rm -rf -- '/mnt/mass2/vms/deploy-cluster'");
+}
+
+// ---- reject_destructive_path guard tests (round-2 lens L5#H2 + L1 MED) ----
+
+#[test]
+fn remote_rm_rf_refuses_root_slash() {
+    let stub = Arc::new(StubSshClient::new());
+    let conn = make_conn(Arc::clone(&stub));
+    let err = conn.remote_rm_rf("/").expect_err("should refuse /");
+    assert!(
+        err.to_string().contains("top-level system directory")
+            || err.to_string().contains("destructive"),
+        "expected destructive-path refusal. err: {err}"
+    );
+    // CRITICAL: no SSH call should have been made.
+    assert_eq!(stub.calls().len(), 0, "remote_rm_rf('/') must not call ssh");
+}
+
+#[test]
+fn remote_rm_rf_refuses_top_level_dirs() {
+    let stub = Arc::new(StubSshClient::new());
+    let conn = make_conn(Arc::clone(&stub));
+    for banned in ["/etc", "/home", "/var", "/usr", "/root", "/boot"] {
+        let err = conn.remote_rm_rf(banned).expect_err(banned);
+        assert!(
+            err.to_string().contains("top-level system directory"),
+            "expected refusal for {banned}. err: {err}"
+        );
+    }
+    assert_eq!(stub.calls().len(), 0);
+}
+
+#[test]
+fn remote_rm_rf_refuses_empty_path() {
+    let stub = Arc::new(StubSshClient::new());
+    let conn = make_conn(Arc::clone(&stub));
+    let err = conn.remote_rm_rf("").expect_err("should refuse empty");
+    assert!(err.to_string().contains("empty path"), "err: {err}");
+    assert_eq!(stub.calls().len(), 0);
+}
+
+#[test]
+fn remote_rm_rf_refuses_relative_path() {
+    let stub = Arc::new(StubSshClient::new());
+    let conn = make_conn(Arc::clone(&stub));
+    let err = conn
+        .remote_rm_rf("relative/path")
+        .expect_err("should refuse relative");
+    assert!(
+        err.to_string().contains("non-absolute") || err.to_string().contains("must start with /"),
+        "err: {err}"
+    );
+    assert_eq!(stub.calls().len(), 0);
+}
+
+#[test]
+fn remote_rm_rf_refuses_dotdot_segments() {
+    let stub = Arc::new(StubSshClient::new());
+    let conn = make_conn(Arc::clone(&stub));
+    let err = conn
+        .remote_rm_rf("/mnt/mass2/../../../../etc")
+        .expect_err("should refuse ..");
+    assert!(err.to_string().contains(".."), "err: {err}");
+    assert_eq!(stub.calls().len(), 0);
+}
+
+#[test]
+fn remote_rm_rf_allows_pool_dir_subdir() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "rm -rf -- '/mnt/mass2/vms/deploy-cluster'",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    // Legitimate caller path — guard must NOT trip.
+    conn.remote_rm_rf("/mnt/mass2/vms/deploy-cluster")
+        .expect("legitimate POOL_DIR subdir should be allowed");
+}
+
+// ---- remote_path_exists exit-code translation (round-2 lens L5 HIGH) ----
+
+#[test]
+fn remote_path_exists_returns_true_on_exit_0() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "test -e '/mnt/mass2/vms/hbird-cp1.qcow2'",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    assert!(
+        conn.remote_path_exists("/mnt/mass2/vms/hbird-cp1.qcow2")
+            .unwrap()
+    );
+}
+
+#[test]
+fn remote_path_exists_returns_false_on_exit_1() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "test -e '/mnt/mass2/vms/missing.qcow2'",
+        Reply::NonZero {
+            stderr: String::new(),
+            exit_code: 1,
+        },
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    assert!(
+        !conn
+            .remote_path_exists("/mnt/mass2/vms/missing.qcow2")
+            .unwrap()
+    );
+}
+
+#[test]
+fn remote_path_exists_propagates_transport_error() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "test -e '/some/path'",
+        Reply::Transport("connection refused".to_string()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    let err = conn
+        .remote_path_exists("/some/path")
+        .expect_err("transport failures must propagate, not collapse to Ok(false)");
+    assert!(
+        err.to_string().contains("connection refused") || err.to_string().contains("transport"),
+        "expected transport error chain preserved. err: {err}"
+    );
+}

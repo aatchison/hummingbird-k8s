@@ -11,5 +11,6 @@ pub mod export_argocd;
 pub mod get_kubeconfig;
 pub mod kubectl;
 pub mod nodes;
+pub mod spawn_workers;
 pub mod update_cluster;
 pub mod verify;

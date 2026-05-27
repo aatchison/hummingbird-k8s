@@ -1,0 +1,19 @@
+[destroy-cluster] config: cluster.local.conf
+[destroy-cluster] DRY-RUN tearing down cluster defined in cluster.local.conf
+[destroy-cluster] DRY-RUN would virsh dominfo hbird-cp1 (existence probe)
+[destroy-cluster] DRY-RUN if defined: would virsh destroy + undefine --nvram hbird-cp1
+[destroy-cluster] DRY-RUN would rm -f /mnt/pool/hbird-cp1.qcow2 (if present)
+[destroy-cluster] DRY-RUN would rm -f /mnt/pool/hbird-cp1-seed.iso (if present)
+[destroy-cluster] DRY-RUN would rm -f /mnt/pool/hbird-cp1-cloud-init.iso (if present)
+[destroy-cluster] DRY-RUN would virsh dominfo hbird-w1 (existence probe)
+[destroy-cluster] DRY-RUN if defined: would virsh destroy + undefine --nvram hbird-w1
+[destroy-cluster] DRY-RUN would rm -f /mnt/pool/hbird-w1.qcow2 (if present)
+[destroy-cluster] DRY-RUN would rm -f /mnt/pool/hbird-w1-seed.iso (if present)
+[destroy-cluster] DRY-RUN would rm -f /mnt/pool/hbird-w1-cloud-init.iso (if present)
+[destroy-cluster] DRY-RUN would virsh dominfo hbird-w2 (existence probe)
+[destroy-cluster] DRY-RUN if defined: would virsh destroy + undefine --nvram hbird-w2
+[destroy-cluster] DRY-RUN would rm -f /mnt/pool/hbird-w2.qcow2 (if present)
+[destroy-cluster] DRY-RUN would rm -f /mnt/pool/hbird-w2-seed.iso (if present)
+[destroy-cluster] DRY-RUN would rm -f /mnt/pool/hbird-w2-cloud-init.iso (if present)
+[destroy-cluster] DRY-RUN would rm -rf /mnt/pool/deploy-cluster (if present)
+[destroy-cluster] DRY-RUN done.

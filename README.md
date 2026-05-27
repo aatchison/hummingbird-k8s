@@ -25,9 +25,12 @@ README is the operator-facing entry point.
 > epic [#279](https://github.com/aatchison/hummingbird-k8s/issues/279). The
 > workspace lives at [`rust/`](rust/) and holds the foundation crates,
 > `update-cluster` dry-run parity (PR #321), the first live helper
-> (`cp_kubectl`, PR #325), and Phase 2 `hbird verify
-> {encryption,hardening,app-deploy,all}` (PR #330). **No operator-facing
-> change yet** — every `make`
+> (`cp_kubectl`, PR #325), Phase 2 `hbird verify
+> {encryption,hardening,app-deploy,all}` (PR #330), Phase 3 `hbird
+> {export-argocd,get-kubeconfig,nodes,kubectl}` (PR #334), and Phase 4
+> dry-run parity for `hbird {deploy-cluster,destroy-cluster,spawn-workers}`
+> (PR #337; destroy-cluster also has live execution, deploy + spawn
+> live tracked by #335). **No operator-facing change yet** — every `make`
 > target still invokes the bash scripts; the Rust `hbird update-cluster`
 > binary builds but still surfaces a stable diagnostic for live blocks
 > not yet wired. See [`docs/rust-cli.md`](docs/rust-cli.md) for the
