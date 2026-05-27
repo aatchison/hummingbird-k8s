@@ -171,6 +171,7 @@ test surface.
 | `POOL_DIR`          | `/var/lib/libvirt/images`     | `clean-vms`                   |
 | `KVM_HOST`          | unset                         | `kubectl` / `nodes` — and since C3 (#232) also `deploy-cluster`, `destroy-cluster`, `update-cluster`, `spawn-workers` (re-exec on the KVM host via SSH; client needs only `ssh`, no local `sudo`). See [`docs/deploy-cluster.md`](deploy-cluster.md#remote-kvm-host-operation-kvm_host). |
 | `HBIRD_REMOTE_REPO` | `~/hummingbird-k8s`           | Path on `$KVM_HOST` to the remote git checkout of hummingbird-k8s. Used by the C3 SSH-wrap shim — when the shim fires it `cd`s here and execs `bash scripts/<name>.sh` from disk. Override when the checkout lives somewhere other than `$HOME/hummingbird-k8s`. See [`docs/deploy-cluster.md`](deploy-cluster.md#hbird_remote_repo-override). |
+| `HBIRD_REMOTE_NO_SUDO` | unset                       | When `=1`, the C3 SSH-wrap shim emits the remote command WITHOUT the `sudo` prefix. Use with `update-cluster` when the operator is in the `libvirt` group on `$KVM_HOST` (the script doesn't otherwise need root). Default keeps `sudo` for `deploy-cluster` / `destroy-cluster` / `spawn-workers`, which still write to root-owned `POOL_DIR`. See [`docs/update-cluster.md`](update-cluster.md#running-without-sudo-libvirt-group-operator-269). (#269) |
 | `IMAGE_TAG`         | `latest`                      | `push-image-k8s`, `push-image-worker`, `push-image-all` |
 | `GHCR_REGISTRY`     | `ghcr.io/aatchison`           | `push-image-*` (override for forks/mirrors) |
 

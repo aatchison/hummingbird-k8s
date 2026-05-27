@@ -11,9 +11,16 @@ cluster one node at a time:
 # "Remote KVM-host operation" below for the full picture.
 KVM_HOST=geary make update-cluster CONFIG=cluster.local.conf
 
-# On the KVM host (post-#233: the Makefile recipe no longer prefixes
-# sudo, so on-host operators either run as root or prepend it themselves):
-sudo make update-cluster CONFIG=cluster.local.conf
+# Same invocation, but ALSO drop sudo on the KVM host (operator is in
+# the libvirt group there). Default keeps sudo for the other lifecycle
+# scripts pending Phase 3 of #269. See "Running without sudo" below.
+KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 make update-cluster CONFIG=cluster.local.conf
+
+# On the KVM host: either root OR a member of the `libvirt` group
+# (post-#269). Operators in the libvirt group don't need sudo at all
+# for update-cluster.
+make update-cluster CONFIG=cluster.local.conf      # libvirt-group member
+sudo make update-cluster CONFIG=cluster.local.conf # root
 ```
 
 It complements — does not replace — the per-VM
@@ -108,7 +115,8 @@ Environment variables the script honors:
 | Var | Default | Effect |
 | --- | --- | --- |
 | `CONFIG` | `./cluster.local.conf` | Path to the cluster config. |
-| `DRY_RUN=1` | unset | Same as `--dry-run` — print actions, don't ssh/kubectl. Useful for unprivileged previews; bypasses the root-required check. |
+| `DRY_RUN=1` | unset | Same as `--dry-run` — print actions, don't ssh/kubectl. Useful for unprivileged previews; bypasses the root-or-libvirt-group check (see [Running without sudo](#running-without-sudo-libvirt-group-operator-269)). |
+| `HBIRD_REMOTE_NO_SUDO=1` | unset | When the C3 shim re-execs on `$KVM_HOST`, drop the `sudo` prefix from the remote command. Appropriate when the operator is in the `libvirt` group on the KVM host. See [Running without sudo](#running-without-sudo-libvirt-group-operator-269). Default keeps `sudo` so the other lifecycle scripts (which need POOL_DIR root) stay correct. |
 | `DRAIN_TIMEOUT` | `5m` | `kubectl drain --timeout=` value (Go duration string). Tune up for workloads with slow graceful-shutdown. |
 | `READY_TIMEOUT` | `300` | Seconds to wait for `kubectl get node` to report `Ready` post-reboot. Also bounds the [bootID-changed gate](#reboot-detection-bootid). Must be > 0. |
 | `DAEMONSET_TIMEOUT` | `${READY_TIMEOUT}` | Seconds to wait for the [DaemonSet readiness gate](#daemonset-readiness-gate). Defaults to `READY_TIMEOUT` for compatibility; set independently when the DS gate needs more (or less) headroom than node-Ready. Must be > 0. |
@@ -167,6 +175,53 @@ Local `CONFIG=` files are `scp`'d to the remote before re-exec. See
 for the full allowlist, the `HBIRD_REMOTE_REPO` override, and the
 remediation hints emitted on pre-flight failure (unreachable KVM host
 or missing remote checkout).
+
+### Running without sudo (libvirt-group operator, #269)
+
+`update-cluster.sh`'s local libvirt footprint is small: `virsh
+domifaddr` for IP resolution + ssh known_hosts handling. Both are
+reachable to any user in the `libvirt` group on the KVM host —
+libvirt authorizes `qemu:///system` via the unix-socket group, not
+via sudo. Remote ops (ssh + kubectl on the CP) run as
+`root@<node-ip>` via the operator's SSH key and are unaffected by
+the local EUID.
+
+One-time setup on the KVM host:
+
+```bash
+ssh $KVM_HOST 'sudo usermod -aG libvirt $USER && newgrp libvirt'
+# (or just log out + back in to pick up the new group)
+```
+
+Then run `update-cluster` without sudo on either side:
+
+```bash
+# From a client laptop — the shim re-execs over SSH WITHOUT prefixing
+# sudo on the remote when HBIRD_REMOTE_NO_SUDO=1 is set.
+KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 \
+  make update-cluster CONFIG=cluster.local.conf
+
+# On the KVM host directly, as a libvirt-group user:
+make update-cluster CONFIG=cluster.local.conf
+```
+
+Defaults are conservative: `HBIRD_REMOTE_NO_SUDO` is **off** by
+default, and the other lifecycle scripts (`deploy-cluster`,
+`destroy-cluster`, `spawn-workers`) still require root locally + sudo
+on the remote because they write to the root-owned `POOL_DIR`. That
+deferred work is tracked as Phase 3 of #269.
+
+Diagnostic when neither condition holds (non-root + not in the
+`libvirt` group):
+
+```text
+[update-cluster] FAIL: must be root or a member of the libvirt group on this host. Add yourself with:
+  sudo usermod -aG libvirt $USER && newgrp libvirt
+then rerun. (Dry-run does not require either: rerun with --dry-run to preview.)
+```
+
+Dry-run (`--dry-run` / `DRY_RUN=1`) skips the EUID/group check
+entirely so previews work for any user.
 
 ### Env-var validation (security)
 
@@ -314,9 +369,11 @@ log line, not to leave `--skip-gates` on permanently.
 ### `--dry-run`
 
 Print the intended actions without ssh-ing or running kubectl. Doesn't
-require root, doesn't acquire the lock, doesn't touch any VM. The
-script substitutes `<resolved-at-runtime>` for IPs it would otherwise
-look up via `virsh domifaddr`.
+require root or `libvirt`-group membership, doesn't acquire the lock,
+doesn't touch any VM. The script substitutes `<resolved-at-runtime>`
+for IPs it would otherwise look up via `virsh domifaddr`. See
+[Running without sudo](#running-without-sudo-libvirt-group-operator-269)
+for the non-dry-run unprivileged path.
 
 ```bash
 DRY_RUN=1 bash scripts/update-cluster.sh
