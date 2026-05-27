@@ -1,0 +1,32 @@
+[package]
+name = "hbird-ssh"
+version = "0.0.1"
+description = "SSH transport for hummingbird-k8s (Rust rewrite of scripts/lib/ssh-wrap.sh + ssh_opts_array helpers)."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Bash twin: scripts/lib/ssh-wrap.sh + lib/build-common.sh::ssh_opts_array{,_no_identity}.
+# This crate reproduces those helpers' canonical option set + ProxyJump
+# behavior as a typed Rust API. The implementation shells out to the
+# system `ssh` binary (already a hard dependency of the project — every
+# bash script does the same) rather than embedding an SSH protocol stack
+# or pulling in an async runtime, keeping the dependency footprint
+# minimal and matching the bash twin's behavior exactly.
+#
+# (#285, epic #279.)
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+# Integration tests pin the constructed argv against the bash twin's
+# `ssh_opts_array` shape (see tests/options_match_bash_twin.rs). They
+# don't actually open SSH connections — those tests are gated behind
+# `#[ignore]` so they only run when an operator has a reachable host.
+
+[lints]
+workspace = true
