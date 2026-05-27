@@ -21,9 +21,9 @@ Total for a 1 CP + 2 worker lab: 16 GB RAM, 8 vCPU, ~70 GB disk.
 ## Tunables
 
 Memory and vCPU are env-driven (closes #91). Override via
-`cluster.local.conf` (the canonical knob set for `make deploy-cluster`)
-or `config.local.sh` for image-build-only flows; defaults match the
-pre-knob hardcoded values so unset == unchanged behavior. See
+`cluster.local.conf` — the canonical knob set for `make deploy-cluster`
+and `make spawn-workers CONFIG=…`. Defaults match the pre-knob hardcoded
+values so unset == unchanged behavior. See
 [`cluster.example.conf`](../cluster.example.conf) for the canonical list.
 
 | Variable | Default | Applies to |

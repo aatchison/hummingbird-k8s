@@ -36,8 +36,9 @@ fi
 : "${SUDO_USER:?must be invoked via sudo so ssh uses the calling user known_hosts/key}"
 
 cd "${SCRIPT_DIR}/.."
-# Opt into autoloading config.local.sh — spawn-workers has always relied
-# on it for WORKER_MEMORY / WORKER_VCPUS / POOL_DIR overrides. See
+# Opt into autoloading config.local.sh for POOL_DIR / image-build inputs.
+# VM-sizing knobs (WORKER_MEMORY / WORKER_VCPUS) come from cluster.local.conf
+# via the CONFIG= path below (see cluster.example.conf). See
 # docs/development.md for the HBIRD_AUTOLOAD_CONFIG_LOCAL flag rationale.
 export HBIRD_AUTOLOAD_CONFIG_LOCAL=1
 # shellcheck source=../lib/build-common.sh
@@ -66,9 +67,9 @@ fi
 : "${CP_NAME:=${CP_VM_NAME:-hummingbird-k8s}}"
 : "${TOKEN_TTL:=2h}"
 
-# Per-worker resource knobs (override via config.local.sh or environment).
-# Defaults match the pre-knob hardcoded values so behavior is unchanged
-# when unset. See config.example.sh for the full list.
+# Per-worker resource knobs (override via cluster.local.conf — see
+# cluster.example.conf — or environment). Defaults match the pre-knob
+# hardcoded values so behavior is unchanged when unset.
 : "${WORKER_MEMORY:=4096}"
 : "${WORKER_VCPUS:=2}"
 
