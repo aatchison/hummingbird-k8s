@@ -316,8 +316,11 @@ _image_source_was_unset=0
 # changes to the recipe (e.g. POSIX ACLs instead of chmod 2775).
 if [[ $EUID -ne 0 ]]; then
   [[ -d "$POOL_DIR" ]] || fail "POOL_DIR not a directory: $POOL_DIR (create it or set POOL_DIR= in your cluster.local.conf)"
-  _pool_probe="${POOL_DIR}/.hbird-write-probe.$$"
-  if ! ( : > "$_pool_probe" ) 2>/dev/null; then
+  # mktemp -p (not $$) avoids the PID-reuse collision two reviewers
+  # flagged: parallel operator invocations on a wrapped PID would
+  # race on the same probe filename. mktemp also fails closed if the
+  # dir isn't writable, which is the exact condition we're testing.
+  if ! _pool_probe=$(mktemp -p "$POOL_DIR" .hbird-write-probe.XXXXXX 2>/dev/null); then
     fail "POOL_DIR=$POOL_DIR not writable by $(id -un). One-time setup on the KVM host:
   sudo chgrp libvirt $POOL_DIR
   sudo chmod 2775 $POOL_DIR
