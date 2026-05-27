@@ -77,6 +77,15 @@
 #                              other means; gates exist to prevent dataplane
 #                              outages during the roll. wait_node_ready
 #                              alone will be the post-reboot signal.
+#   --node-name-override DOMAIN=NODE
+#                              Pin the k8s node name for a libvirt domain,
+#                              bypassing the IP-based auto-resolution.
+#                              Repeatable; also accepts comma-separated
+#                              DOMAIN=NODE pairs in a single flag value.
+#                              Use when the resolver can't find the node
+#                              (e.g. mid-migration to renamed nodes, or a
+#                              private apiserver) and you want to force a
+#                              specific kubectl target. (#260)
 #   --dry-run                  Print the intended actions without
 #                              ssh/kubectl.
 #
@@ -138,6 +147,13 @@ CONTINUE_ON_ERROR=0
 NO_DELETE_EMPTYDIR_DATA=0
 PARALLEL=1
 
+# Operator-supplied DOMAIN=NODE overrides, populated below as we walk
+# `--node-name-override` flags. Each value is "DOMAIN=NODE" (or a comma-
+# separated list of such pairs); they're parsed into NODE_NAME_OVERRIDE_MAP
+# AFTER the config is sourced so we can validate DOMAIN against the actual
+# CP_NAME / WORKER_NAMES set.
+NODE_NAME_OVERRIDE_INPUTS=()
+
 for arg in "$@"; do
   case "$arg" in
     --workers-only)              WORKERS_ONLY=1 ;;
@@ -159,8 +175,16 @@ for arg in "$@"; do
     --start-from)                fail "--start-from requires a value: --start-from=NAME" ;;
     --parallel=*)                PARALLEL="${arg#--parallel=}" ;;
     --parallel)                  fail "--parallel requires a value: --parallel=N" ;;
+    --node-name-override=*)
+      # Repeatable + comma-separated; defer parsing until after config sourcing
+      # so DOMAIN names can be validated against CP_NAME / WORKER_NAMES.
+      _v="${arg#--node-name-override=}"
+      [[ -n "$_v" ]] || fail "--node-name-override= requires a non-empty value: --node-name-override=DOMAIN=NODE"
+      NODE_NAME_OVERRIDE_INPUTS+=("$_v")
+      ;;
+    --node-name-override)        fail "--node-name-override requires a value: --node-name-override=DOMAIN=NODE" ;;
     -h|--help)
-      sed -n '2,103p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,112p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) fail "unknown argument: $arg (try --help)" ;;
@@ -339,6 +363,42 @@ if [[ -n "$START_FROM" ]]; then
   (( start_from_found == 1 )) || fail "--start-from=${START_FROM} did not match any WORKER_NAMES entry"
 fi
 
+# ---- node-name override map ------------------------------------------------
+# Parse all --node-name-override=DOMAIN=NODE flag values into a single
+# associative map. Repeatable flag, AND each value may be a comma-separated
+# list of DOMAIN=NODE pairs. DOMAIN must be either CP_NAME or a WORKER_NAMES
+# entry; an unknown DOMAIN is rejected up front. (#260)
+declare -A NODE_NAME_OVERRIDE_MAP=()
+for _entry in "${NODE_NAME_OVERRIDE_INPUTS[@]}"; do
+  # Split on comma; each token is a DOMAIN=NODE pair.
+  IFS=',' read -r -a _pairs <<< "$_entry"
+  for _pair in "${_pairs[@]}"; do
+    [[ -n "$_pair" ]] || continue
+    if [[ "$_pair" != *=* ]]; then
+      fail "--node-name-override expects DOMAIN=NODE (got: '${_pair}')"
+    fi
+    _dom="${_pair%%=*}"
+    _node="${_pair#*=}"
+    [[ -n "$_dom"  ]] || fail "--node-name-override DOMAIN cannot be empty (got: '${_pair}')"
+    [[ -n "$_node" ]] || fail "--node-name-override NODE cannot be empty (got: '${_pair}')"
+    # Validate DOMAIN against CP_NAME / WORKER_NAMES so a typo doesn't
+    # silently misroute kubectl.
+    _ok=0
+    if [[ "$_dom" == "$CP_NAME" ]]; then
+      _ok=1
+    else
+      for _w in "${WORKER_NAMES[@]}"; do
+        if [[ "$_w" == "$_dom" ]]; then
+          _ok=1
+          break
+        fi
+      done
+    fi
+    (( _ok == 1 )) || fail "--node-name-override DOMAIN '${_dom}' does not match CP_NAME or any WORKER_NAMES entry"
+    NODE_NAME_OVERRIDE_MAP["$_dom"]="$_node"
+  done
+done
+
 # ---- runner abstraction (dry-run aware) ------------------------------------
 
 # kubectl is always issued by ssh-ing to the CP and running kubectl there.
@@ -354,6 +414,56 @@ cp_kubectl() {
   # shellcheck disable=SC2029
   ssh "${SSH_OPTS[@]}" "root@${CP_IP}" \
     "kubectl --kubeconfig=/etc/kubernetes/admin.conf $*"
+}
+
+# ---- k8s node name resolution (#260) ---------------------------------------
+#
+# k8s node names do NOT necessarily match the libvirt domain names in
+# WORKER_NAMES / CP_NAME. On clusters deployed before PR #255, k8s names
+# were derived from the worker's machine-id (e.g.
+# `humbird-worker-748f4cf5`) while the libvirt domain stayed `hbird-w1`.
+# Earlier versions of this script issued `kubectl drain $domain`, which
+# silently failed against any such cluster.
+#
+# resolve_k8s_node_name DOMAIN IP
+#   1. If the operator passed `--node-name-override DOMAIN=...`, return
+#      that value verbatim (escape hatch — operator owns correctness).
+#   2. Else, look up the k8s node whose .status.addresses[*].address
+#      matches IP and return that node's metadata.name.
+#   3. On lookup miss, emit a clear diagnostic and return non-zero. The
+#      caller decides how to surface that (fail-fast or worker_fail).
+#
+# Empty stdout + rc!=0 is the failure signal; callers must check.
+resolve_k8s_node_name() {
+  local domain="$1" ip="$2"
+  # Override path — operator-supplied, no kubectl call needed.
+  if [[ -n "${NODE_NAME_OVERRIDE_MAP[$domain]:-}" ]]; then
+    printf '%s' "${NODE_NAME_OVERRIDE_MAP[$domain]}"
+    return 0
+  fi
+  if (( DRY_RUN == 1 )); then
+    # Dry-run can't talk to the apiserver. Keep the legacy "name == domain"
+    # convention so dry-run output stays operator-readable AND existing
+    # bats assertions on drain/uncordon line text continue to hold.
+    printf '%s' "$domain"
+    return 0
+  fi
+  # Hit the apiserver via the CP. The JSONPath filters the node list to
+  # entries whose .status.addresses contains the IP, then emits the
+  # metadata.name. We single-quote the entire jsonpath on the local side so
+  # the remote shell receives it verbatim; only $ip interpolates locally.
+  # Empty stdout = no match.
+  local resolved=""
+  resolved="$(cp_kubectl "get nodes -o jsonpath='{range .items[?(@.status.addresses[?(@.address==\"${ip}\")])]}{.metadata.name}{end}'" 2>/dev/null || true)"
+  # Trim any stray whitespace (kubectl jsonpath has been observed to emit a
+  # trailing newline on some apiserver versions).
+  resolved="${resolved//[$'\t\r\n ']/}"
+  if [[ -z "$resolved" ]]; then
+    log "ERROR: could not resolve k8s node for libvirt domain ${domain} (ip=${ip}) — node may not be joined, or apiserver unreachable"
+    log "       (use --node-name-override ${domain}=NAME to force a specific k8s node name)"
+    return 1
+  fi
+  printf '%s' "$resolved"
 }
 
 # ---- bootc capability + state helpers --------------------------------------
@@ -1009,13 +1119,20 @@ bootc_upgrade_apply() {
 
 update_cp() {
   local rc=0
+  # CP_NAME is the libvirt domain; CP_K8S_NAME is the resolved k8s node
+  # (usually equal — PR #255's emit-hostname-in-user-data keeps them in
+  # sync for the CP path — but we resolve defensively, see #260).
   log "============================================================"
-  log "CP: ${CP_NAME} (${CP_IP})"
+  if [[ "$CP_K8S_NAME" == "$CP_NAME" ]]; then
+    log "CP: ${CP_NAME} (${CP_IP})"
+  else
+    log "CP: ${CP_NAME} (${CP_IP}) k8s-node=${CP_K8S_NAME}"
+  fi
   log "  single-CP topology: skipping drain (no peers to evict to)"
   log "  apiserver will be unavailable for ~60-120s during reboot"
   log "============================================================"
 
-  IN_FLIGHT_NODE="$CP_NAME"
+  IN_FLIGHT_NODE="$CP_K8S_NAME"
   IN_FLIGHT_IP="$CP_IP"
   IN_FLIGHT_DRAINED=0
   IN_FLIGHT_UNCORDONED=0
@@ -1028,7 +1145,7 @@ update_cp() {
   # stale-apiserver-cache race that wait_node_ready alone can't catch.
   # See docs/update-cluster.md "Reboot detection (bootID)".
   local pre_bootid
-  pre_bootid="$(capture_node_bootid "$CP_NAME")"
+  pre_bootid="$(capture_node_bootid "$CP_K8S_NAME")"
   log "  pre-reboot bootID: ${pre_bootid:0:8}..."
 
   log "ssh root@${CP_IP} bootc upgrade --apply  (auto-reboots; digest pre/post compared)"
@@ -1064,16 +1181,16 @@ update_cp() {
   # cache race (apiserver may report Ready=True from the pre-reboot lease
   # before kubelet has actually re-registered).
   IN_FLIGHT_PHASE="post-apiserver-pre-bootID"
-  wait_node_bootid_changed "$CP_NAME" "$pre_bootid" \
+  wait_node_bootid_changed "$CP_K8S_NAME" "$pre_bootid" \
     || fail "CP node ${CP_NAME} bootID did not change after ${READY_TIMEOUT}s (apiserver may be serving stale state)"
   IN_FLIGHT_PHASE="post-bootID-pre-Ready"
-  wait_node_ready "$CP_NAME" "$READY_TIMEOUT" || fail "CP node ${CP_NAME} did not reach Ready within ${READY_TIMEOUT}s"
+  wait_node_ready "$CP_K8S_NAME" "$READY_TIMEOUT" || fail "CP node ${CP_NAME} did not reach Ready within ${READY_TIMEOUT}s"
   # DaemonSet gate: Node Ready means kubelet+CNI binary present, NOT that
   # the Cilium/kube-proxy/coredns pods are forwarding traffic. Block here
   # so we don't proceed to workers while the CP's networking is still
   # CrashLooping. See docs/update-cluster.md "Daemonset readiness gate".
   IN_FLIGHT_PHASE="post-Ready-pre-DaemonSet"
-  wait_node_daemonsets_ready "$CP_NAME" \
+  wait_node_daemonsets_ready "$CP_K8S_NAME" \
     || fail "CP ${CP_NAME}: kube-system DaemonSet pods not Ready after ${DAEMONSET_TIMEOUT}s"
 
   timer_start "$CP_IP"
@@ -1084,19 +1201,32 @@ update_cp() {
   IN_FLIGHT_PHASE=""
 }
 
-# update_worker NAME IP
+# update_worker NAME IP K8S_NAME
+#
+# NAME is the libvirt domain name (operator-friendly identifier, used in
+# logs + worker_fail / SUCCEEDED_NODES / FAILED_NODES). K8S_NAME is the
+# k8s node name resolved via resolve_k8s_node_name (may equal NAME on
+# clusters deployed post-PR #255, OR differ on pre-#255 clusters whose
+# kubelets fell back to machine-id-derived hostnames). All
+# `kubectl drain/wait/uncordon` calls target K8S_NAME so the script
+# survives the divergence — see #260. IN_FLIGHT_NODE tracks K8S_NAME
+# because the cordoned-recovery hint is `kubectl uncordon <k8s-name>`.
 #
 # Returns 0 on success, non-zero on failure. With --continue-on-error, the
 # caller catches non-zero and records the failure; without it, the inner
 # `fail` calls terminate the script.
 update_worker() {
-  local name="$1" ip="$2"
+  local name="$1" ip="$2" k8s_name="${3:-$1}"
   local rc=0
   log "============================================================"
-  log "WORKER: ${name} (${ip})"
+  if [[ "$k8s_name" == "$name" ]]; then
+    log "WORKER: ${name} (${ip})"
+  else
+    log "WORKER: ${name} (${ip}) k8s-node=${k8s_name}"
+  fi
   log "============================================================"
 
-  IN_FLIGHT_NODE="$name"
+  IN_FLIGHT_NODE="$k8s_name"
   IN_FLIGHT_IP="$ip"
   IN_FLIGHT_DRAINED=0
   IN_FLIGHT_UNCORDONED=0
@@ -1106,7 +1236,7 @@ update_worker() {
   timer_stop "$ip"
 
   if (( SKIP_DRAIN == 1 )); then
-    log "  --skip-drain set: skipping kubectl drain for ${name}"
+    log "  --skip-drain set: skipping kubectl drain for ${k8s_name}"
   else
     # Compose the drain flags. --delete-emptydir-data is included by default
     # so cache-only pods (Prometheus WAL, scratch volumes) don't block
@@ -1116,8 +1246,8 @@ update_worker() {
     if (( NO_DELETE_EMPTYDIR_DATA == 0 )); then
       drain_flags+=" --delete-emptydir-data"
     fi
-    log "kubectl drain ${name} ${drain_flags}"
-    cp_kubectl "drain ${name} ${drain_flags}" \
+    log "kubectl drain ${k8s_name} ${drain_flags}"
+    cp_kubectl "drain ${k8s_name} ${drain_flags}" \
       || { worker_fail "$name" "drain failed (use --skip-drain to override)"; return 1; }
     IN_FLIGHT_DRAINED=1
     IN_FLIGHT_PHASE="post-drain-pre-upgrade"
@@ -1129,7 +1259,7 @@ update_worker() {
   # the stale-apiserver-cache race that wait_node_ready alone can't catch.
   # See docs/update-cluster.md "Reboot detection (bootID)".
   local pre_bootid
-  pre_bootid="$(capture_node_bootid "$name")"
+  pre_bootid="$(capture_node_bootid "$k8s_name")"
   log "  pre-reboot bootID: ${pre_bootid:0:8}..."
 
   log "ssh root@${ip} bootc upgrade --apply  (auto-reboots; digest pre/post compared)"
@@ -1149,8 +1279,8 @@ update_worker() {
   if (( rc == 2 )); then
     log "worker ${name}: no update available; uncordoning and continuing."
     if (( SKIP_DRAIN == 0 )); then
-      log "kubectl uncordon ${name}"
-      cp_kubectl "uncordon ${name}" || { worker_fail "$name" "uncordon failed after no-op upgrade"; return 1; }
+      log "kubectl uncordon ${k8s_name}"
+      cp_kubectl "uncordon ${k8s_name}" || { worker_fail "$name" "uncordon failed after no-op upgrade"; return 1; }
       IN_FLIGHT_UNCORDONED=1
     fi
     clear_in_flight
@@ -1174,14 +1304,14 @@ update_worker() {
   # lease before kubelet has actually re-registered post-reboot).
   IN_FLIGHT_PHASE="post-ssh-pre-bootID"
   mark_in_flight
-  wait_node_bootid_changed "$name" "$pre_bootid" \
+  wait_node_bootid_changed "$k8s_name" "$pre_bootid" \
     || { worker_fail "$name" "node bootID did not change after ${READY_TIMEOUT}s (apiserver may be serving stale state)"; return 1; }
   # wait_node_ready before uncordon: kubelet has to rejoin (which may
   # report Ready,SchedulingDisabled while still cordoned) — the regex
   # in wait_node_ready handles both forms.
   IN_FLIGHT_PHASE="post-bootID-pre-Ready"
   mark_in_flight
-  wait_node_ready "$name" "$READY_TIMEOUT" || { worker_fail "$name" "did not reach Ready within ${READY_TIMEOUT}s"; return 1; }
+  wait_node_ready "$k8s_name" "$READY_TIMEOUT" || { worker_fail "$name" "did not reach Ready within ${READY_TIMEOUT}s"; return 1; }
   # DaemonSet gate: Node Ready means kubelet+CNI binary present, NOT that
   # the Cilium/kube-proxy/coredns pods are forwarding traffic on this
   # node. Block here so we don't move to draining N+1 while the CNI on N
@@ -1189,13 +1319,13 @@ update_worker() {
   # readiness gate".
   IN_FLIGHT_PHASE="post-Ready-pre-DaemonSet"
   mark_in_flight
-  wait_node_daemonsets_ready "$name" \
+  wait_node_daemonsets_ready "$k8s_name" \
     || { worker_fail "$name" "kube-system DaemonSet pods not Ready on this node after ${DAEMONSET_TIMEOUT}s"; return 1; }
 
   IN_FLIGHT_PHASE="post-DaemonSet-pre-uncordon"
   mark_in_flight
-  log "kubectl uncordon ${name}"
-  cp_kubectl "uncordon ${name}" || { worker_fail "$name" "uncordon failed"; return 1; }
+  log "kubectl uncordon ${k8s_name}"
+  cp_kubectl "uncordon ${k8s_name}" || { worker_fail "$name" "uncordon failed"; return 1; }
   IN_FLIGHT_UNCORDONED=1
   clear_in_flight
 
@@ -1232,8 +1362,35 @@ worker_fail() {
 
 # ---- main ------------------------------------------------------------------
 
+# Resolve every libvirt domain to its k8s node name BEFORE any update_* call
+# starts issuing kubectl commands. This avoids per-node retry storms when the
+# resolver fails (e.g. the worker hasn't joined) — the operator sees the
+# diagnostic up front and can re-run with --node-name-override.
+#
+# In dry-run resolve_k8s_node_name returns the libvirt domain verbatim, so
+# the existing dry-run log assertions continue to hold.
+CP_K8S_NAME="$(resolve_k8s_node_name "$CP_NAME" "$CP_IP")" \
+  || fail "could not resolve k8s node for CP (libvirt domain '$CP_NAME', ip=$CP_IP). Pass --node-name-override ${CP_NAME}=NODE to override."
+
+declare -A WORKER_K8S_NAME_MAP=()
+for _w in "${WORKER_NAMES[@]}"; do
+  _wip="${WORKER_IP_MAP[$_w]:-}"
+  _wk8s="$(resolve_k8s_node_name "$_w" "$_wip" || true)"
+  if [[ -z "$_wk8s" ]]; then
+    fail "could not resolve k8s node for worker libvirt domain '$_w' (ip=${_wip}). Pass --node-name-override ${_w}=NODE to override."
+  fi
+  WORKER_K8S_NAME_MAP["$_w"]="$_wk8s"
+done
+
 log "config: $CONFIG_PATH"
-log "CP=${CP_NAME} (${CP_IP}), workers=(${WORKER_NAMES[*]:-})"
+log "CP=${CP_NAME} (${CP_IP}) k8s-node=${CP_K8S_NAME}, workers=(${WORKER_NAMES[*]:-})"
+# Surface the libvirt→k8s mapping when at least one diverges so an operator
+# tailing the log can confirm the resolver picked the right targets.
+for _w in "${WORKER_NAMES[@]}"; do
+  if [[ "${WORKER_K8S_NAME_MAP[$_w]}" != "$_w" ]]; then
+    log "  resolved libvirt domain ${_w} -> k8s node ${WORKER_K8S_NAME_MAP[$_w]}"
+  fi
+done
 log "flags: workers-only=${WORKERS_ONLY} skip-drain=${SKIP_DRAIN} skip-gates=${SKIP_GATES} dry-run=${DRY_RUN}"
 log "       node-filter=${NODE_FILTER:-<none>} start-from=${START_FROM:-<none>}"
 log "       continue-on-error=${CONTINUE_ON_ERROR} no-delete-emptydir-data=${NO_DELETE_EMPTYDIR_DATA} parallel=${PARALLEL}"
@@ -1281,7 +1438,7 @@ run_worker_batch() {
   if (( n == 1 )) || (( PARALLEL == 1 )); then
     # Serial fast path — no need for the tmpdir/subshell dance.
     local rc=0
-    update_worker "${batch[0]}" "${WORKER_IP_MAP[${batch[0]}]}" || rc=$?
+    update_worker "${batch[0]}" "${WORKER_IP_MAP[${batch[0]}]}" "${WORKER_K8S_NAME_MAP[${batch[0]}]}" || rc=$?
     return "$rc"
   fi
 
@@ -1309,7 +1466,7 @@ run_worker_batch() {
     (
       # Capture per-worker stdout/stderr to a log file so concurrent logs
       # don't interleave at the byte level.
-      if update_worker "$w" "${WORKER_IP_MAP[$w]}" \
+      if update_worker "$w" "${WORKER_IP_MAP[$w]}" "${WORKER_K8S_NAME_MAP[$w]}" \
             >"${BATCH_TMPDIR}/${w}.log" 2>&1; then
         echo "0" >"${BATCH_TMPDIR}/${w}.rc"
       else
@@ -1371,7 +1528,7 @@ if [[ -n "$NODE_FILTER" ]]; then
     found=0
     for w in "${WORKER_NAMES[@]}"; do
       if [[ "$w" == "$NODE_FILTER" ]]; then
-        update_worker "$w" "${WORKER_IP_MAP[$w]}" || true
+        update_worker "$w" "${WORKER_IP_MAP[$w]}" "${WORKER_K8S_NAME_MAP[$w]}" || true
         found=1
         break
       fi
