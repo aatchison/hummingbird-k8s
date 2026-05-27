@@ -63,10 +63,6 @@ Override the token TTL or the CP VM name if needed:
 sudo TOKEN_TTL=30m CP_NAME=hummingbird-k8s bash scripts/spawn-workers.sh 1
 ```
 
-(`CP_VM_NAME=` is also honored as a backward-compat alias, with a
-deprecation warning to stderr — see PR #219. New scripts and docs
-should use `CP_NAME=` to match `cluster.local.conf`.)
-
 ## How injection works
 
 `scripts/spawn-workers.sh` prefers `guestfish` and falls back to `virt-customize`

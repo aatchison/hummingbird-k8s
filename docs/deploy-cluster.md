@@ -9,8 +9,7 @@ $EDITOR cluster.local.conf
 make deploy-cluster CONFIG=cluster.local.conf
 ```
 
-This is the only supported way to stand up a cluster after #216 retired
-the legacy single-VM `make k8s` / `make workers` / `make spawn` targets.
+This is the only supported way to stand up a cluster.
 
 ## The hybrid model
 
