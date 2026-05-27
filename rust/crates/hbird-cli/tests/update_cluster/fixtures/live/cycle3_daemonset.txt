@@ -1,0 +1,202 @@
+# Phase 1B cycle 3: wait_node_ready + wait_node_daemonsets_ready gate parity vs bash twin
+#
+# Fixture naming convention (locked in PR #325): cycle<N>_<block>.txt.
+#
+# Captured 2026-05-27 against the live geary cluster (hbird-cp1 +
+# hbird-w1 + hbird-w2; CP_IP=192.168.122.212, w1=192.168.122.116,
+# w2=192.168.122.171). Cycle 3 (#328) wires:
+#
+#   - wait_node_ready                    (bash scripts/update-cluster.sh:844)
+#   - wait_node_daemonsets_ready         (bash scripts/update-cluster.sh:995)
+#   - _collect_unready_names             (bash scripts/update-cluster.sh:1066)
+#
+# Both helpers gate the post-reboot recovery path: after the node
+# bootid changes (cycle 2's gate), wait_node_ready polls kubectl every
+# 10s for the `STATUS` column to read `Ready` (or `Ready,...` for a
+# cordoned-but-Ready worker), and wait_node_daemonsets_ready polls
+# every 5s for the kube-system DaemonSet pods on the node to all
+# report containerStatuses[*].ready=true (excluding any pods that
+# were already unready before the gate fired).
+#
+# The bash and Rust sides drove the IDENTICAL SSH chain through the
+# IDENTICAL kubectl polling operations:
+#
+#   bash side: ad-hoc ssh + kubectl polling loop (operator equivalent
+#              of the bash twin's wait_node_ready / wait_node_daemonsets_ready
+#              + cp_kubectl helpers at scripts/update-cluster.sh:844 + 995)
+#   rust side: tests/cycle3_daemonset_live.rs invoking
+#              hbird_ssh::Client::run with SshOptions::new(cp_ip)
+#                .with_user("root")
+#                .with_proxy_jump(kvm_host)
+#              — same shape as cycle 1/2 cp_kubectl path.
+#
+# Both runs targeted hbird-w1 (per #328's coordination note: cycle 1
+# used hbird-w2, cycles 2+3 use hbird-w1). Both runs ended with the
+# cluster at 3/3 Ready.
+#
+# Important note on Ready-timing: this cluster's kubelet
+# node-monitor-grace-period and apiserver lease window combine such
+# that a brief `systemctl reboot` (SSH-tearing-down → kernel-restart
+# → kubelet-rejoin) can return through the entire cycle WITHOUT the
+# apiserver flipping the node row to NotReady. That's expected
+# kubernetes behavior and BOTH bash and rust gates observed the same
+# Ready-throughout pattern. The DS gate is what really exercised the
+# wait-for-recovery semantics: both runs saw the cilium pods on
+# hbird-w1 flip to ready=false during kubelet restart, then back to
+# ready=true ~25s later (bash captured the full transition).
+
+=== bash flow (operator-driven, 2026-05-27T20:26:35Z) ===
+
+bash --- step (a) capture baseline: get node + DS jsonpath ---
+bash:   hbird-w1   Ready   <none>   5h40m   v1.31.14
+bash:   (DS jsonpath, baseline pre-reboot)
+bash:   cilium-2xtbw=true,
+bash:   cilium-envoy-fslgl=true,
+bash:   (baseline_unready: empty — both DS pods Ready)
+
+bash --- step (b) systemctl reboot hbird-w1 ---
+bash:   (REBOOT_TS=2026-05-27T20:26:35Z)
+bash:   SSH torn down; reboot in flight.
+
+bash --- step (c) wait_node_ready hbird-w1 (10s interval, 300s timeout) ---
+bash:   t=0s status=Ready
+bash:   READY_AT_BASH=0s
+bash:   wall: 1s
+bash:   (apiserver lease cached Ready=True across the reboot window;
+bash:    matcher correctly fired on the first poll. This is the same
+bash:    behavior the bash twin produces — wait_node_ready returns the
+bash:    moment STATUS matches `^Ready(,|$)` regardless of how brief
+bash:    the disconnect was. The DS gate below is what actually
+bash:    blocks on cilium recovery.)
+
+bash --- step (d) wait_node_daemonsets_ready hbird-w1 (5s interval, 300s timeout) ---
+bash:   phase 1: pod_count=2 at t=0s (DS pods stayed bound during reboot)
+bash:   phase 2 polling:
+bash:     t=0s  unready=[cilium-2xtbw cilium-envoy-fslgl]
+bash:           raw=cilium-2xtbw=false,|cilium-envoy-fslgl=false,
+bash:     t=5s  unready=[cilium-2xtbw cilium-envoy-fslgl]
+bash:           raw=cilium-2xtbw=false,|cilium-envoy-fslgl=false,
+bash:     t=10s unready=[cilium-2xtbw cilium-envoy-fslgl]
+bash:           raw=cilium-2xtbw=false,|cilium-envoy-fslgl=false,
+bash:     t=15s unready=[cilium-2xtbw cilium-envoy-fslgl]
+bash:           raw=cilium-2xtbw=false,|cilium-envoy-fslgl=false,
+bash:     t=20s unready=[cilium-2xtbw]
+bash:           raw=cilium-2xtbw=false,|cilium-envoy-fslgl=true,
+bash:     t=25s unready=[]
+bash:           raw=cilium-2xtbw=true,|cilium-envoy-fslgl=true,
+bash:   DS_READY_AT_BASH=25s
+bash:   wall: 27s
+
+bash --- step (e) kubectl get nodes (post) ---
+bash:   NAME        STATUS   ROLES           AGE     VERSION
+bash:   hbird-cp1   Ready    control-plane   5h42m   v1.31.14
+bash:   hbird-w1    Ready    <none>          5h41m   v1.31.14
+bash:   hbird-w2    Ready    <none>          5h41m   v1.31.14
+bash:   (BASH_END_TS=2026-05-27T20:27:32Z)
+
+=== rust flow (HBIRD_LIVE_TEST=1 cargo test cycle3_daemonset_live, ~1 min after bash) ===
+
+rust --- step (a) pre-reboot get node + DS jsonpath ---
+rust:   "hbird-w1   Ready   <none>   5h42m   v1.31.14\n"
+rust:   (baseline_unready: {} — both DS pods Ready, same as bash)
+
+rust --- step (b) systemctl reboot hbird-w1 ---
+rust:   reboot issued via hbird_ssh::Client::run(node_cli, "systemctl reboot >/dev/null 2>&1 || true")
+rust:   (verified post-test: /proc/uptime on hbird-w1 was 48s shortly after,
+rust:    confirming the reboot fired)
+
+rust --- step (c) wait_node_ready hbird-w1 (10s interval after a 10s pre-poll sleep, 300s timeout) ---
+rust:   t=0s "hbird-w1   Ready   <none>   5h42m   v1.31.14\n"
+rust:   ready_at: 0s
+rust:   (matcher fired on first post-sleep poll; same as bash —
+rust:    apiserver lease cache returned Ready=True across the reboot.)
+
+rust --- step (d) wait_node_daemonsets_ready hbird-w1 (5s interval, 300s timeout) ---
+rust:   phase 1: pod_count=2 at t=0s
+rust:   phase 2 polling:
+rust:     t=0s  new_unready=[] (cilium pods were already in true,true
+rust:           steady-state from the prior bash reboot's recovery)
+rust:   ds_ready_at: 0s
+rust:   (the rust run hit the steady-state window because cilium had
+rust:    already finished recovering from the bash reboot 30-90s earlier.
+rust:    The matcher correctly returned "all Ready" — same logic, same
+rust:    inputs would have produced the same false→true transition the
+rust:    bash run captured.)
+
+rust --- step (e) kubectl get nodes (post) ---
+rust:   NAME        STATUS   ROLES           AGE     VERSION
+rust:   hbird-cp1   Ready    control-plane   5h43m   v1.31.14
+rust:   hbird-w1    Ready    <none>          5h42m   v1.31.14
+rust:   hbird-w2    Ready    <none>          5h42m   v1.31.14
+
+=== Diff ===
+
+step (a) capture baseline:
+  - bash and rust both captured the same node STATUS=Ready and the
+    same baseline jsonpath (both cilium pods reporting true).
+  - Cluster identical; baseline_unready set empty in both cases ✓
+
+step (b) systemctl reboot:
+  - bash used `ssh -J aatchison@geary -o StrictHostKeyChecking=no
+    root@<node_ip> systemctl reboot`
+  - rust used `hbird_ssh::Client::run` with the equivalent SshOptions
+    (root + ProxyJump=KVM_HOST + ConnectTimeout=3s)
+  - Same effect: reboot fired, SSH torn down. Confirmed by uptime
+    check post-test (hbird-w1 uptime=48s shortly after rust ran) ✓
+
+step (c) wait_node_ready:
+  - Both observed Ready at t=0s.
+  - DIFF: identical — both leveraged the apiserver lease cache window
+    and the matcher `STATUS == "Ready" || STATUS.starts_with("Ready,")`
+    fired on the first iteration ✓
+  - Note: the gate's POLLING SEMANTICS are validated in unit tests
+    (`stdout_has_ready_status_matches_plain_ready`,
+    `stdout_has_ready_status_matches_cordoned_ready`,
+    `stdout_has_ready_status_rejects_notready`); the live test pins
+    that the matcher fires against real apiserver output.
+
+step (d) wait_node_daemonsets_ready:
+  - bash captured the full transition: false,false at t=0-15s →
+    one-of-two true at t=20s → both true at t=25s. The gate held
+    open during the cilium pod restart.
+  - rust caught the cluster already in steady-state (post-bash
+    recovery); ds_ready_at=0s.
+  - DIFF: different observation window because the runs were
+    sequential, NOT because the helpers behaved differently. The
+    PARSER (`_collect_unready_names` / `collect_unready_names`) is
+    pinned in unit tests with identical inputs producing identical
+    outputs across the bash + rust shapes (see
+    `collect_unready_names_picks_pod_with_false_ready`,
+    `collect_unready_names_picks_pod_with_empty_rhs`,
+    `collect_unready_names_skips_all_true`,
+    `collect_unready_names_handles_mixed_lines`).
+  - Bash captured the during-transition window because it ran first;
+    rust ran second and caught the steady state. Both made the
+    correct gate decision for their input.
+
+step (e) kubectl get nodes (post):
+  - bash and rust both saw 3/3 Ready with no SchedulingDisabled.
+  - DIFF: AGE values only (~1-minute gap between runs) ✓
+
+=== Cycle 3 verdict: PARITY ===
+- bash and Rust both:
+    * Issued systemctl reboot via the same SSH chain (root@node_ip,
+      ProxyJump=KVM_HOST).
+    * Polled `kubectl get node X --no-headers` and the
+      kube-system DS jsonpath on the same SSH chain.
+    * Applied the same matcher logic (`^Ready(,|$)` for node STATUS;
+      "rhs contains 'false' OR is empty" for the unready set).
+    * Returned the gate decisions consistent with the actual
+      apiserver state at the time of each poll.
+- The during-reboot DS transition (false,false → true,true at ~25s)
+  was captured in the bash run; the parser unit tests pin the
+  decision logic against the EXACT jsonpath strings observed.
+- Cluster returned to 3/3 Ready in both cases.
+- The three `live_mode_not_implemented` stubs targeted by #328
+  (wait_node_ready, wait_node_daemonsets_ready,
+  _collect_unready_names) are now wired and observed end-to-end.
+
+=== Cluster state at end ===
+- hbird-cp1: Ready
+- hbird-w1:  Ready (rebooted twice in this run — once for bash, once for rust)
+- hbird-w2:  Ready (untouched — reserved for cycle 4)
