@@ -334,7 +334,10 @@ directly to the script: `--start-from=NAME` (resume after an interrupted
 roll), `--parallel=N` (process workers in batches of N concurrently),
 `--continue-on-error` (record per-node failures, summarize at the end),
 `--no-delete-emptydir-data` (preserve emptyDir caches during drain),
-`--skip-gates` (escape hatch for misfiring bootID/DS gates).
+`--skip-gates` (escape hatch for misfiring bootID/DS gates),
+`--node-name-override DOMAIN=NODE` (pin the k8s node name for a libvirt
+domain when the auto-resolution can't find it; see
+[#260](docs/update-cluster.md#k8s-node-name-resolution-260)).
 Per-step timeouts are tunable via `DRAIN_TIMEOUT`, `READY_TIMEOUT`,
 `DAEMONSET_TIMEOUT`, `APISERVER_TIMEOUT`, `SSH_TIMEOUT`, and
 `INTER_NODE_SLEEP` env vars.

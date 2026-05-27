@@ -709,4 +709,254 @@ _load_example_workers() {
   run bash "$SCRIPT" --help
   [ "$status" -eq 0 ]
   echo "$output" | grep -q "SSH_DROP_TIMEOUT"
+# #260 — k8s node name resolution + --node-name-override
+#
+# scripts/update-cluster.sh used to issue `kubectl drain $libvirt_domain`,
+# silently failing against pre-PR-#255 clusters where k8s node names
+# diverged from libvirt domain names. Now the script resolves
+# libvirt-domain -> IP -> k8s-node-name before any kubectl call. The
+# --node-name-override flag is the operator escape hatch when auto-
+# resolution can't reach the apiserver or returns the wrong node.
+#
+# In --dry-run mode resolve_k8s_node_name short-circuits to the libvirt
+# domain name (no apiserver to call); the resolver itself is exercised
+# via a stubbed `cp_kubectl` in source-only mode further below.
+# ---------------------------------------------------------------------------
+
+@test "#260 --node-name-override appears in --help output" {
+  run bash "$SCRIPT" --help
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q -- "--node-name-override"
+  echo "$output" | grep -q "DOMAIN=NODE"
+}
+
+@test "#260 --node-name-override hbird-w1=hbird-w1-renamed redirects drain target" {
+  # With the override in place, the dry-run drain line for hbird-w1's
+  # libvirt domain MUST target the renamed k8s node, not the libvirt name.
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run \
+      --node-name-override=hbird-w1=hbird-w1-renamed
+  [ "$status" -eq 0 ]
+  # Drain targets the renamed k8s node.
+  echo "$output" | grep -qE "DRY-RUN cp_kubectl -- drain hbird-w1-renamed --ignore-daemonsets"
+  # Uncordon targets the renamed k8s node.
+  echo "$output" | grep -qE "DRY-RUN cp_kubectl -- uncordon hbird-w1-renamed$"
+  # NEGATIVE: no drain or uncordon line should target the bare libvirt
+  # domain hbird-w1 (otherwise we'd be back to the pre-#260 bug). We
+  # anchor with a word boundary so hbird-w1-renamed doesn't match.
+  ! echo "$output" | grep -qE "DRY-RUN cp_kubectl -- drain hbird-w1 "
+  ! echo "$output" | grep -qE "DRY-RUN cp_kubectl -- uncordon hbird-w1$"
+  # The startup banner surfaces the libvirt->k8s mapping when they diverge.
+  echo "$output" | grep -q "resolved libvirt domain hbird-w1 -> k8s node hbird-w1-renamed"
+}
+
+@test "#260 --node-name-override supports comma-separated DOMAIN=NODE pairs" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run \
+      --node-name-override=hbird-w1=k8s-w1,hbird-w2=k8s-w2
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -qE "DRY-RUN cp_kubectl -- drain k8s-w1 --ignore-daemonsets"
+  echo "$output" | grep -qE "DRY-RUN cp_kubectl -- drain k8s-w2 --ignore-daemonsets"
+}
+
+@test "#260 --node-name-override accepts repeated flags" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run \
+      --node-name-override=hbird-w1=k8s-w1 \
+      --node-name-override=hbird-w2=k8s-w2
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -qE "DRY-RUN cp_kubectl -- drain k8s-w1 --ignore-daemonsets"
+  echo "$output" | grep -qE "DRY-RUN cp_kubectl -- drain k8s-w2 --ignore-daemonsets"
+}
+
+@test "#260 --node-name-override rejects unknown DOMAIN" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run \
+      --node-name-override=nonexistent=foo
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "nonexistent"
+  echo "$output" | grep -q "does not match CP_NAME or any WORKER_NAMES"
+}
+
+@test "#260 --node-name-override rejects malformed value (missing =)" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run \
+      --node-name-override=hbird-w1
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "DOMAIN=NODE"
+}
+
+@test "#260 --node-name-override rejects empty NODE side" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run \
+      --node-name-override=hbird-w1=
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "NODE cannot be empty"
+}
+
+@test "#260 --node-name-override rejects empty value entirely" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run \
+      --node-name-override=
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q -- "--node-name-override="
+}
+
+@test "#260 bare --node-name-override (no =) exits non-zero with diagnostic" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run --node-name-override
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q -- "--node-name-override requires a value"
+}
+
+@test "#260 --node-name-override CP redirects bootID + Ready gates" {
+  # Same divergence story for the CP path. PR #255 normally keeps the CP
+  # libvirt/k8s names in sync, but we resolve defensively. With the
+  # override we must see the renamed k8s name in the CP gate logs.
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run \
+      --node-name-override=hbird-cp1=hbird-cp1-k8s
+  [ "$status" -eq 0 ]
+  # Capture/gate log lines now refer to the renamed CP k8s node.
+  echo "$output" | grep -q "DRY-RUN would capture pre-reboot bootID for hbird-cp1-k8s"
+  echo "$output" | grep -q "waiting for node hbird-cp1-k8s bootID to change"
+  echo "$output" | grep -q "waiting for node hbird-cp1-k8s to report Ready"
+  # The CP libvirt-name header (operator-readable) still shows the libvirt
+  # domain so the abort-recovery hint is greppable.
+  echo "$output" | grep -q "CP: hbird-cp1 .* k8s-node=hbird-cp1-k8s"
+}
+
+@test "#260 dry-run without override resolves k8s name == libvirt name (legacy compat)" {
+  # In dry-run resolve_k8s_node_name returns the libvirt domain so existing
+  # bats / integration assertions keep working. NO "resolved libvirt
+  # domain -> k8s node" banner line should appear because there's no
+  # divergence in this case.
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  ! echo "$output" | grep -q "resolved libvirt domain"
+  # Drain still targets the libvirt name (which equals the k8s name here).
+  echo "$output" | grep -q "DRY-RUN cp_kubectl -- drain hbird-w1 --ignore-daemonsets"
+}
+
+# ---------------------------------------------------------------------------
+# resolve_k8s_node_name extracted via awk + stubbed cp_kubectl.
+#
+# The source-only mode (HBIRD_UPDATE_CLUSTER_SOURCE_ONLY=1) returns BEFORE
+# the helper functions are defined, so we can't load resolve_k8s_node_name
+# that way. Instead we extract the function definition block with awk —
+# the same pattern tests/scripts/cp-name-alias.bats uses — and drive it
+# with a stub cp_kubectl that emulates a real apiserver response.
+# ---------------------------------------------------------------------------
+
+# _extract_resolver_snippet — copy the resolve_k8s_node_name function body
+# out of scripts/update-cluster.sh into a sourceable snippet. We anchor on
+# the function header line and stop at the closing brace at column 0. If
+# a future refactor renames the function, the resulting empty snippet
+# makes every dependent test fail loudly.
+_extract_resolver_snippet() {
+  local out="$1"
+  awk '
+    /^resolve_k8s_node_name\(\) \{/ {capture=1}
+    capture {print}
+    capture && /^\}$/ {exit}
+  ' "$SCRIPT" > "$out"
+  [ -s "$out" ] || {
+    echo "FATAL: failed to extract resolve_k8s_node_name from $SCRIPT" >&2
+    return 1
+  }
+}
+
+@test "#260 resolve_k8s_node_name returns the kubectl-reported name on match" {
+  _extract_resolver_snippet "${BATS_TEST_TMPDIR}/resolver.snippet"
+  driver="${BATS_TEST_TMPDIR}/resolve-match.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+DRY_RUN=0
+declare -A NODE_NAME_OVERRIDE_MAP=()
+log() { :; }
+# Stub cp_kubectl: return what an apiserver would return when an address
+# matches. We don't care about the exact request shape — just that the
+# helper passes the stdout through.
+cp_kubectl() { echo "humbird-worker-748f4cf5"; }
+# shellcheck disable=SC1090
+source "${BATS_TEST_TMPDIR}/resolver.snippet"
+out="\$(resolve_k8s_node_name hbird-w1 192.168.122.11)"
+echo "RESOLVED=\$out"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  echo "$output" | grep -q "RESOLVED=humbird-worker-748f4cf5"
+}
+
+@test "#260 resolve_k8s_node_name uses override before kubectl" {
+  _extract_resolver_snippet "${BATS_TEST_TMPDIR}/resolver.snippet"
+  driver="${BATS_TEST_TMPDIR}/resolve-override.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+DRY_RUN=0
+declare -A NODE_NAME_OVERRIDE_MAP=([hbird-w1]=hbird-w1-renamed)
+log() { :; }
+# cp_kubectl must NOT be reached on the override path.
+cp_kubectl() { echo "should-not-be-used"; }
+# shellcheck disable=SC1090
+source "${BATS_TEST_TMPDIR}/resolver.snippet"
+out="\$(resolve_k8s_node_name hbird-w1 192.168.122.11)"
+echo "RESOLVED=\$out"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  echo "$output" | grep -q "RESOLVED=hbird-w1-renamed"
+}
+
+@test "#260 resolve_k8s_node_name emits diagnostic + non-zero rc when kubectl returns empty" {
+  _extract_resolver_snippet "${BATS_TEST_TMPDIR}/resolver.snippet"
+  driver="${BATS_TEST_TMPDIR}/resolve-empty.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+DRY_RUN=0
+declare -A NODE_NAME_OVERRIDE_MAP=()
+# Capture the log-line argument so the test can grep for it.
+log() { printf 'LOG: %s\n' "\$*" >&2; }
+# Empty apiserver response = no node has that IP.
+cp_kubectl() { printf ''; }
+# shellcheck disable=SC1090
+source "${BATS_TEST_TMPDIR}/resolver.snippet"
+set +e
+out="\$(resolve_k8s_node_name hbird-w1 192.168.122.11)"
+rc=\$?
+set -e
+echo "RC=\$rc"
+echo "OUT=[\${out}]"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  echo "$output" | grep -q "RC=1"
+  echo "$output" | grep -q "OUT=\[\]"
+  # Diagnostic surfaces both the libvirt domain AND the IP so an operator
+  # can find the failing node at a glance.
+  echo "$output" | grep -q "could not resolve k8s node for libvirt domain hbird-w1"
+  echo "$output" | grep -q "ip=192.168.122.11"
+  echo "$output" | grep -q -- "--node-name-override"
+}
+
+@test "#260 resolve_k8s_node_name trims whitespace from kubectl jsonpath output" {
+  # kubectl jsonpath has been observed to append a trailing newline on
+  # some apiserver versions; the resolver must strip it so callers don't
+  # compose `kubectl drain $name\n`.
+  _extract_resolver_snippet "${BATS_TEST_TMPDIR}/resolver.snippet"
+  driver="${BATS_TEST_TMPDIR}/resolve-trim.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+DRY_RUN=0
+declare -A NODE_NAME_OVERRIDE_MAP=()
+log() { :; }
+# Trailing newline + leading whitespace.
+cp_kubectl() { printf '  humbird-worker-abc\n'; }
+# shellcheck disable=SC1090
+source "${BATS_TEST_TMPDIR}/resolver.snippet"
+out="\$(resolve_k8s_node_name hbird-w1 192.168.122.11)"
+printf 'RESOLVED=[%s]\n' "\$out"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  echo "$output" | grep -q "RESOLVED=\\[humbird-worker-abc\\]"
 }
