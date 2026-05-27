@@ -90,6 +90,9 @@
 #                       the node-Ready gate.
 #   APISERVER_TIMEOUT   wait_apiserver_back seconds (default 300)
 #   SSH_TIMEOUT         wait_ssh_back seconds (default 300)
+#   SSH_DROP_TIMEOUT    wait_ssh_drop seconds (default 30) — how long to
+#                       poll for SSH to go DOWN after `bootc upgrade --apply`
+#                       before logging WARN and proceeding. (#261)
 #   INTER_NODE_SLEEP    seconds to pause between nodes (default 5)
 #
 # Usage:
@@ -157,7 +160,7 @@ for arg in "$@"; do
     --parallel=*)                PARALLEL="${arg#--parallel=}" ;;
     --parallel)                  fail "--parallel requires a value: --parallel=N" ;;
     -h|--help)
-      sed -n '2,95p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,103p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) fail "unknown argument: $arg (try --help)" ;;
@@ -191,6 +194,13 @@ READY_TIMEOUT="${READY_TIMEOUT:-300}"
 DAEMONSET_TIMEOUT="${DAEMONSET_TIMEOUT:-${READY_TIMEOUT}}"
 APISERVER_TIMEOUT="${APISERVER_TIMEOUT:-300}"
 SSH_TIMEOUT="${SSH_TIMEOUT:-300}"
+# SSH_DROP_TIMEOUT bounds wait_ssh_drop — how long we poll for SSH on the
+# target IP to become unreachable after `bootc upgrade --apply` queues the
+# reboot via systemd-run (#261). 30s is generous; bootc's --apply typically
+# fires the reboot within ~5s. The gate is DIAGNOSTIC: a timeout logs WARN
+# but does NOT fail the run — the bootID-changed gate (when not skipped)
+# remains the source of truth for "did the reboot happen".
+SSH_DROP_TIMEOUT="${SSH_DROP_TIMEOUT:-30}"
 INTER_NODE_SLEEP="${INTER_NODE_SLEEP:-5}"
 
 # ---- Env-knob validation (SECURITY) ----------------------------------------
@@ -224,6 +234,11 @@ INTER_NODE_SLEEP="${INTER_NODE_SLEEP:-5}"
   || fail "APISERVER_TIMEOUT must be a positive integer of seconds (got: ${APISERVER_TIMEOUT})"
 [[ "$SSH_TIMEOUT" =~ ^[0-9]+$ ]] \
   || fail "SSH_TIMEOUT must be a positive integer of seconds (got: ${SSH_TIMEOUT})"
+# SSH_DROP_TIMEOUT must be a STRICTLY positive integer — a value of 0
+# would defeat the gate entirely (the while-loop short-circuits and the
+# WARN fires immediately, defeating the diagnostic value).
+[[ "$SSH_DROP_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
+  || fail "SSH_DROP_TIMEOUT must be a positive integer of seconds, >0 (got: ${SSH_DROP_TIMEOUT})"
 [[ "$INTER_NODE_SLEEP" =~ ^[0-9]+$ ]] \
   || fail "INTER_NODE_SLEEP must be a non-negative integer of seconds (got: ${INTER_NODE_SLEEP})"
 
@@ -595,6 +610,48 @@ if (( DRY_RUN == 0 )); then
 fi
 
 # ---- readiness helpers -----------------------------------------------------
+
+# wait_ssh_drop IP [MAX]
+#
+# Wait for SSH on $ip to become unreachable, indicating the node is
+# actually rebooting. Bootc's --apply queues the reboot via systemd —
+# usually starts within ~5s — so without this gate, wait_ssh_back fires
+# immediately on the pre-reboot SSH connection and declares success
+# before the reboot has begun. (#261)
+#
+# This is a DIAGNOSTIC gate: a timeout logs WARN but does NOT fail the
+# run. The bootID-changed gate (when not skipped) remains the source of
+# truth for "did the reboot actually happen". When --skip-gates is set
+# (bootID gate skipped), this gate is still useful as the only signal
+# that the reboot started — operators chasing a regression can grep the
+# log for "still up after" to find nodes that bootc queued but did not
+# actually reboot.
+#
+# IMPORTANT: this helper deliberately does NOT reuse the ControlMaster
+# socket. The persistent multiplexed session is what `wait_ssh_back`
+# uses to short-circuit on the pre-reboot connection (returning ~0s);
+# we need a FRESH probe so each iteration actually attempts a new TCP
+# handshake to the (possibly-already-down) sshd. -o ControlPath=none
+# and BatchMode=yes force the fresh connection.
+wait_ssh_drop() {
+  local ip="$1" max="${2:-${SSH_DROP_TIMEOUT}}" i=0
+  if (( DRY_RUN == 1 )); then
+    log "DRY-RUN wait_ssh_drop ${ip} (would poll up to ${max}s)"
+    return 0
+  fi
+  log "waiting for SSH on ${ip} to drop (timeout ${max}s)"
+  while (( i < max )); do
+    if ! ssh "${SSH_OPTS[@]}" -o ControlPath=none -o ConnectTimeout=3 \
+         -o BatchMode=yes "root@${ip}" true >/dev/null 2>&1; then
+      log "  SSH on ${ip} dropped after ~${i}s (reboot in progress)"
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  log "  WARN: SSH on ${ip} still up after ${max}s — bootc may have queued without rebooting"
+  return 1
+}
 
 wait_ssh_back() {
   # wait until `ssh root@<ip> true` works again (post-reboot).
@@ -995,6 +1052,11 @@ update_cp() {
     fail "bootc upgrade on CP ${CP_NAME} failed (see log above)"
   fi
 
+  # Diagnostic SSH-drop gate (#261): poll for SSH to actually go down
+  # before polling for it to come back, so we don't false-success on the
+  # pre-reboot connection. A timeout here is logged but NOT fatal — the
+  # bootID gate downstream is the source of truth for "rebooted".
+  wait_ssh_drop "$CP_IP" "$SSH_DROP_TIMEOUT" || true
   wait_ssh_back "$CP_IP" "$SSH_TIMEOUT" || fail "CP ${CP_NAME} did not come back over SSH within ${SSH_TIMEOUT}s"
   IN_FLIGHT_PHASE="post-reboot-pre-apiserver"
   wait_apiserver_back "$APISERVER_TIMEOUT"   || fail "CP ${CP_NAME} apiserver did not return within ${APISERVER_TIMEOUT}s"
@@ -1101,6 +1163,11 @@ update_worker() {
 
   IN_FLIGHT_PHASE="post-upgrade-pre-ssh"
   mark_in_flight
+  # Diagnostic SSH-drop gate (#261): poll for SSH to actually go down
+  # before polling for it to come back, so we don't false-success on the
+  # pre-reboot connection. A timeout here is logged but NOT fatal — the
+  # bootID gate downstream is the source of truth for "rebooted".
+  wait_ssh_drop "$ip" "$SSH_DROP_TIMEOUT" || true
   wait_ssh_back "$ip" "$SSH_TIMEOUT"       || { worker_fail "$name" "did not come back over SSH within ${SSH_TIMEOUT}s"; return 1; }
   # bootID gate runs BEFORE wait_node_ready to defeat the stale-apiserver-
   # cache race (apiserver may still serve Ready=True from the pre-reboot
@@ -1170,7 +1237,7 @@ log "CP=${CP_NAME} (${CP_IP}), workers=(${WORKER_NAMES[*]:-})"
 log "flags: workers-only=${WORKERS_ONLY} skip-drain=${SKIP_DRAIN} skip-gates=${SKIP_GATES} dry-run=${DRY_RUN}"
 log "       node-filter=${NODE_FILTER:-<none>} start-from=${START_FROM:-<none>}"
 log "       continue-on-error=${CONTINUE_ON_ERROR} no-delete-emptydir-data=${NO_DELETE_EMPTYDIR_DATA} parallel=${PARALLEL}"
-log "timeouts: drain=${DRAIN_TIMEOUT} ready=${READY_TIMEOUT}s daemonset=${DAEMONSET_TIMEOUT}s apiserver=${APISERVER_TIMEOUT}s ssh=${SSH_TIMEOUT}s inter-node-sleep=${INTER_NODE_SLEEP}s"
+log "timeouts: drain=${DRAIN_TIMEOUT} ready=${READY_TIMEOUT}s daemonset=${DAEMONSET_TIMEOUT}s apiserver=${APISERVER_TIMEOUT}s ssh=${SSH_TIMEOUT}s ssh-drop=${SSH_DROP_TIMEOUT}s inter-node-sleep=${INTER_NODE_SLEEP}s"
 # Per-node time budget pre-announcement: worst-case ceiling for an operator
 # computing "when will this finish?" off the cluster size. Adds the new
 # DaemonSet gate into the published budget (post-#208).
