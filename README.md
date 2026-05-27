@@ -16,6 +16,10 @@ Both derive from `quay.io/hummingbird-community/bootc-os`, are built with
 under libvirt. Design notes and gotchas live in [`NOTES.md`](NOTES.md); this
 README is the operator-facing entry point.
 
+> **New contributors**: see [`docs/upstream-references.md`](docs/upstream-references.md)
+> for the canonical bootc, BIB, cri-o, Cilium, and K8s upstream project links +
+> what-they're-for cheatsheet ([#312](https://github.com/aatchison/hummingbird-k8s/issues/312)).
+
 > **Rust rewrite in progress** — the client-side bash tooling under
 > [`scripts/`](scripts/) is being rewritten in Rust over several phases per
 > epic [#279](https://github.com/aatchison/hummingbird-k8s/issues/279). The

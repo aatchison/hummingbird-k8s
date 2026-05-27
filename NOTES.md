@@ -108,6 +108,8 @@ The exact KubeCon India 2025 demo repo isn't public. Two adjacent demos from the
 
 Both base on `quay.io/fedora/fedora-bootc:43` rather than Hummingbird, since Hummingbird was announced after these were authored.
 
+- Upstream project entry points (bootc, BIB, bootc-os base, cri-o, Cilium, `pkgs.k8s.io`) consolidated in [`docs/upstream-references.md`](docs/upstream-references.md) — file there when you find yourself re-grepping an upstream URL.
+
 ## SSH access summary
 
 - Default config: key-only auth (`PasswordAuthentication no`), no sudo (user is not in wheel, no password set), but `root` SSH is allowed *with the same pubkeys* via `PermitRootLogin prohibit-password`. Admin tasks happen as root.
