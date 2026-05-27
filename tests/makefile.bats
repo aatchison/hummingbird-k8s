@@ -390,6 +390,67 @@ make_dry() {
   done
 }
 
+@test "21. verify-encryption forwards CONFIG + KVM_HOST to scripts/verify-encryption.sh (#333)" {
+  # Regression for #333: `make verify-encryption CONFIG=… KVM_HOST=…` must
+  # propagate BOTH env vars to the wrapped script. Pre-fix, the recipe
+  # was a bare `bash scripts/verify-encryption.sh` with no env prefix,
+  # so operator-supplied CONFIG/KVM_HOST were silently dropped and the
+  # script bailed with "CP_NAME unset / CONFIG not sourced". Dry-run
+  # rendering must show both vars exported on the script invocation.
+  #
+  # Match-pattern note: the Makefile recipe renders CONFIG="…" / KVM_HOST="…"
+  # with the operator-supplied value double-quoted (so values with shell
+  # metacharacters are passed safely). Tests use a regex that tolerates
+  # both quoted and unquoted forms so a future un-quoting (or env-prefix
+  # refactor) doesn't false-fail.
+  make_dry verify-encryption CONFIG=cluster.example.conf KVM_HOST=geary
+  [[ "$output" == *"bash scripts/verify-encryption.sh"* ]]
+  printf '%s\n' "$output" | grep -qE 'CONFIG="?cluster\.example\.conf"?'
+  printf '%s\n' "$output" | grep -qE 'KVM_HOST="?geary"?'
+}
+
+@test "22. verify-hardening forwards CONFIG + KVM_HOST to scripts/verify-hardening.sh (#333)" {
+  make_dry verify-hardening CONFIG=cluster.example.conf KVM_HOST=geary
+  [[ "$output" == *"bash scripts/verify-hardening.sh"* ]]
+  printf '%s\n' "$output" | grep -qE 'CONFIG="?cluster\.example\.conf"?'
+  printf '%s\n' "$output" | grep -qE 'KVM_HOST="?geary"?'
+}
+
+@test "23. verify-app-deploy forwards CONFIG + KVM_HOST to scripts/verify-app-deploy.sh (#333)" {
+  make_dry verify-app-deploy CONFIG=cluster.example.conf KVM_HOST=geary
+  [[ "$output" == *"bash scripts/verify-app-deploy.sh"* ]]
+  printf '%s\n' "$output" | grep -qE 'CONFIG="?cluster\.example\.conf"?'
+  printf '%s\n' "$output" | grep -qE 'KVM_HOST="?geary"?'
+}
+
+@test "24. verify-all forwards CONFIG + KVM_HOST to all three sub-verifiers (#333)" {
+  # verify-all is the aggregate target operators invoke for a full
+  # post-deploy validation pass. Forwarding must reach every leg, not
+  # just the first one — so we assert each script's invocation carries
+  # both env vars in the rendered dry-run.
+  #
+  # `make -n` preserves recipe `\`-continuations as separate lines, so
+  # multi-line recipes (e.g. verify-hardening, which also sets KUBECTL)
+  # render across several stdout lines. We grab a 3-line preceding-context
+  # window for each script invocation and assert both env vars appear in
+  # that block — covering both single-line and continuation-line recipes.
+  make_dry verify-all CONFIG=cluster.example.conf KVM_HOST=geary
+  for script in verify-encryption.sh verify-hardening.sh verify-app-deploy.sh; do
+    block=$(printf '%s\n' "$output" | grep -B3 -E "bash scripts/${script}" | head -20)
+    [ -n "$block" ] || { echo "no invocation line for $script in dry-run output" >&2; echo "$output" >&2; return 1; }
+    printf '%s\n' "$block" | grep -qE 'CONFIG="?cluster\.example\.conf"?' || {
+      echo "verify-all leg for $script missing CONFIG forwarding:" >&2
+      echo "$block" >&2
+      return 1
+    }
+    printf '%s\n' "$block" | grep -qE 'KVM_HOST="?geary"?' || {
+      echo "verify-all leg for $script missing KVM_HOST forwarding:" >&2
+      echo "$block" >&2
+      return 1
+    }
+  done
+}
+
 @test "20. every Makefile ?= default has a row in docs/makefile.md Variables table (#271 F7)" {
   # Drift fence: each `VAR ?= default` line in the top-level Makefile
   # MUST have a backticked `\`VAR\`` row in docs/makefile.md. Anyone

@@ -322,19 +322,25 @@ kubectl: ## kubectl pass-through; ARGS='get pods -A' (CONFIG=<path> to read CP_N
 	@CONFIG="$(CONFIG)" bash scripts/kubectl-k8s.sh $(ARGS)
 
 # ---- verification ------------------------------------------------------
+# Every verify-* recipe forwards BOTH CONFIG and KVM_HOST so workstation
+# operators can run `make verify-XXX CONFIG=cluster.local.conf KVM_HOST=geary`
+# and have the scripts source the topology file + ProxyJump through the
+# KVM host. Dropping either one strands the scripts in a "CP_NAME unset"
+# / "no SSH route" failure mode (#333). Mirrors the update-cluster /
+# get-kubeconfig pattern that already does this.
 
-verify-encryption: ## Verify etcd encryption-at-rest on the control plane
-	bash scripts/verify-encryption.sh
+verify-encryption: ## Verify etcd encryption-at-rest on the control plane (CONFIG=<path>, KVM_HOST=<alias>)
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" bash scripts/verify-encryption.sh
 
-verify-hardening: ## Verify PSA + audit + kubelet protect-kernel-defaults (CONFIG=<path> to read CP_NAME/KVM_HOST; honors KUBECTL=)
-	@CONFIG="$(CONFIG)" \
+verify-hardening: ## Verify PSA + audit + kubelet protect-kernel-defaults (CONFIG=<path>, KVM_HOST=<alias>; honors KUBECTL=)
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" \
 	  KUBECTL="$${KUBECTL:-$(CURDIR)/scripts/kubectl-k8s.sh}" \
 	  bash scripts/verify-hardening.sh
 
-verify-app-deploy: ## End-to-end PSA-restricted nginx + pod-to-pod test (set KVM_HOST for workstation operation; CONFIG=<path> to read CP_NAME/KVM_HOST from cluster.local.conf)
-	@CONFIG="$(CONFIG)" bash scripts/verify-app-deploy.sh
+verify-app-deploy: ## End-to-end PSA-restricted nginx + pod-to-pod test (CONFIG=<path>, KVM_HOST=<alias> for workstation operation)
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" bash scripts/verify-app-deploy.sh
 
-verify-all: verify-encryption verify-hardening verify-app-deploy ## All three verifiers in sequence
+verify-all: verify-encryption verify-hardening verify-app-deploy ## All three verifiers in sequence (CONFIG=<path>, KVM_HOST=<alias>)
 
 kube-bench: ## Run CIS Kubernetes Benchmark (kube-bench) against the cluster
 	bash scripts/run-kube-bench.sh
