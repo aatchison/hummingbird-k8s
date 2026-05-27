@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 mod error;
 mod parser;
 
-pub use error::Error;
+pub use error::{Error, Warning};
 
 /// Result alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -127,6 +127,31 @@ pub struct ClusterConfig {
     /// Optional static worker IP overrides. When set, must be parallel to
     /// `resolved_worker_names()`.
     pub worker_ips: Option<Vec<String>>,
+
+    // ---- Non-fatal parser diagnostics --------------------------------------
+    /// Warnings emitted while parsing — keys present in the input that
+    /// no `ClusterConfig` field consumed. Empty on a clean parse.
+    ///
+    /// Bash silently ignores unknown `KEY=value` lines (`source` accepts
+    /// them), so the Rust parser stays a warning rather than an error to
+    /// preserve the bash-twin parity contract. Operator tooling that
+    /// wants fail-on-typo behavior can opt in:
+    ///
+    /// ```no_run
+    /// let cfg = hbird_config::parse("cluster.local.conf")?;
+    /// if !cfg.warnings.is_empty() {
+    ///     for w in &cfg.warnings { eprintln!("warning: {w}"); }
+    ///     std::process::exit(1);
+    /// }
+    /// # Ok::<(), hbird_config::Error>(())
+    /// ```
+    ///
+    /// # Ordering invariant
+    ///
+    /// Sorted by `(line_no, key)` — operator tooling can print warnings
+    /// top-to-bottom without re-sorting, and tie-breaking is total
+    /// (HashMap iteration order does not leak into the public API).
+    pub warnings: Vec<Warning>,
 }
 
 impl ClusterConfig {
@@ -684,5 +709,280 @@ mod tests {
         let cfg = parse_str("CP_NAME=\"hbird\"   \nSSH_PUBKEY_FILE=/k\n")
             .expect("trailing whitespace after close quote is legal");
         assert_eq!(cfg.cp_name, "hbird");
+    }
+
+    // ---- #316: type mismatches surface as errors --------------------------
+
+    /// `WORKER_NAMES=foo` — scalar where an array is expected. Pre-#316
+    /// silently fell through to `None` and applied the legacy 2-worker
+    /// default, building a wrong cluster from a typo. Now errors.
+    #[test]
+    fn type_mismatch_scalar_for_array_field_errors() {
+        let err = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            WORKER_NAMES=foo
+            ",
+        )
+        .expect_err("scalar assigned to array field must error");
+        match err {
+            Error::TypeMismatch {
+                field,
+                expected,
+                got,
+                line_no,
+            } => {
+                assert_eq!(field, "WORKER_NAMES");
+                assert_eq!(expected, "array");
+                assert_eq!(got, "scalar");
+                assert!(line_no > 0, "line_no must be 1-based, got {line_no}");
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    /// `WORKER_IPS=192.168.1.10` — same pattern as WORKER_NAMES, but for
+    /// the optional array. Ensures the helper covers both array fields
+    /// rather than just the first one we wired.
+    #[test]
+    fn type_mismatch_scalar_for_worker_ips_errors() {
+        let err = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            WORKER_IPS=192.168.1.10
+            ",
+        )
+        .expect_err("scalar assigned to WORKER_IPS must error");
+        assert!(matches!(
+            err,
+            Error::TypeMismatch {
+                field: "WORKER_IPS",
+                expected: "array",
+                got: "scalar",
+                ..
+            }
+        ));
+    }
+
+    /// `CP_MEMORY=(1 2)` — array where a scalar is expected. Pre-#316
+    /// silently fell through to the default 8192, hiding the typo.
+    #[test]
+    fn type_mismatch_array_for_scalar_int_field_errors() {
+        let err = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            CP_MEMORY=(1 2)
+            ",
+        )
+        .expect_err("array assigned to scalar int field must error");
+        match err {
+            Error::TypeMismatch {
+                field,
+                expected,
+                got,
+                ..
+            } => {
+                assert_eq!(field, "CP_MEMORY");
+                assert_eq!(expected, "scalar");
+                assert_eq!(got, "array");
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    /// Required scalar field (`CP_NAME`) assigned an array must error
+    /// with `TypeMismatch`, NOT `MissingRequired` — the operator clearly
+    /// intended to set the value, just got the shape wrong, and the
+    /// "field is missing" diagnostic would mislead them.
+    #[test]
+    fn type_mismatch_array_for_required_scalar_errors() {
+        let err = parse_str("CP_NAME=(a b)\nSSH_PUBKEY_FILE=/k\n")
+            .expect_err("array assigned to CP_NAME must error");
+        assert!(
+            matches!(
+                err,
+                Error::TypeMismatch {
+                    field: "CP_NAME",
+                    expected: "scalar",
+                    got: "array",
+                    ..
+                }
+            ),
+            "expected TypeMismatch CP_NAME, got {err:?}"
+        );
+    }
+
+    /// Optional scalar field assigned an array must error (not silently
+    /// drop the value). `CP_IP` is the natural target since the bash
+    /// twin's `virsh net-update` path would also get confused.
+    #[test]
+    fn type_mismatch_array_for_optional_scalar_errors() {
+        let err = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            CP_IP=(192.168.1.10 192.168.1.11)
+            ",
+        )
+        .expect_err("array assigned to CP_IP must error");
+        assert!(matches!(
+            err,
+            Error::TypeMismatch {
+                field: "CP_IP",
+                expected: "scalar",
+                got: "array",
+                ..
+            }
+        ));
+    }
+
+    /// Strict-bool field assigned an array must error with
+    /// `TypeMismatch`, not `InvalidBool` (the shape is wrong, not the
+    /// value — keeping the diagnostics specific helps the operator).
+    #[test]
+    fn type_mismatch_array_for_strict_bool_errors() {
+        let err = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            AUTO_UPDATE_CP=(true)
+            ",
+        )
+        .expect_err("array assigned to AUTO_UPDATE_CP must error");
+        assert!(matches!(
+            err,
+            Error::TypeMismatch {
+                field: "AUTO_UPDATE_CP",
+                expected: "scalar",
+                got: "array",
+                ..
+            }
+        ));
+    }
+
+    /// Lenient-bool field (`RUN_VERIFY`) assigned an array must also
+    /// error, not silently fall through to the default. Same bug class
+    /// as the strict-bool variant; covered separately because the
+    /// lenient parser path is structurally different.
+    #[test]
+    fn type_mismatch_array_for_lenient_bool_errors() {
+        let err = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            RUN_VERIFY=(1)
+            ",
+        )
+        .expect_err("array assigned to RUN_VERIFY must error");
+        assert!(matches!(
+            err,
+            Error::TypeMismatch {
+                field: "RUN_VERIFY",
+                expected: "scalar",
+                got: "array",
+                ..
+            }
+        ));
+    }
+
+    // ---- #316: unknown keys surface as warnings ---------------------------
+
+    /// A typo like `WROKER_NAMES=` should not be silently ignored.
+    /// Bash's `source` would happily accept it (and never read it back),
+    /// but the Rust parser collects it as `Warning::UnknownKey` so
+    /// operator tooling can flag it near the source line.
+    #[test]
+    fn unknown_key_surfaces_as_warning() {
+        let cfg = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            WROKER_NAMES=(w1 w2)
+            ",
+        )
+        .expect("parse succeeds — unknown keys are warnings, not errors");
+        // Config still builds with the legacy 2-worker default — the
+        // typo'd assignment doesn't influence the cluster shape.
+        assert_eq!(cfg.worker_names, None);
+        // But the warning IS surfaced.
+        assert_eq!(cfg.warnings.len(), 1);
+        match &cfg.warnings[0] {
+            Warning::UnknownKey { key, line_no } => {
+                assert_eq!(key, "WROKER_NAMES");
+                assert!(*line_no > 0, "line_no must be 1-based");
+            }
+        }
+    }
+
+    /// Multiple unknown keys must all surface, in source-order (by
+    /// line_no) so operator tooling can print them top-to-bottom.
+    #[test]
+    fn multiple_unknown_keys_surface_in_line_order() {
+        let cfg = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            ZZZ_UNKNOWN_A=1
+            AAA_UNKNOWN_B=2
+            MIDDLE_UNKNOWN_C=3
+            ",
+        )
+        .expect("parse succeeds with multiple unknowns");
+        let keys: Vec<&str> = cfg
+            .warnings
+            .iter()
+            .map(|w| match w {
+                Warning::UnknownKey { key, .. } => key.as_str(),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["ZZZ_UNKNOWN_A", "AAA_UNKNOWN_B", "MIDDLE_UNKNOWN_C"]
+        );
+    }
+
+    /// A clean config (no unknown keys) must produce an empty `warnings`
+    /// vec — operator tooling that checks `warnings.is_empty()` as a
+    /// gate relies on this invariant.
+    #[test]
+    fn clean_config_has_no_warnings() {
+        let cfg = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            WORKER_NAMES=(w1 w2)
+            CP_MEMORY=8192
+            AUTO_UPDATE_CP=true
+            ",
+        )
+        .expect("clean config parses");
+        assert!(
+            cfg.warnings.is_empty(),
+            "expected zero warnings, got: {:?}",
+            cfg.warnings
+        );
+    }
+
+    /// Unknown keys with array values must still warn (not error). The
+    /// shape of the offending value is irrelevant — it's unknown either
+    /// way, so the diagnostic is the same.
+    #[test]
+    fn unknown_key_with_array_value_still_warns() {
+        let cfg = parse_str(
+            r"
+            CP_NAME=cp
+            SSH_PUBKEY_FILE=/k
+            UNKNOWN_ARRAY=(a b c)
+            ",
+        )
+        .expect("unknown key with array value parses (warning only)");
+        assert_eq!(cfg.warnings.len(), 1);
+        assert!(matches!(
+            &cfg.warnings[0],
+            Warning::UnknownKey { key, .. } if key == "UNKNOWN_ARRAY"
+        ));
     }
 }

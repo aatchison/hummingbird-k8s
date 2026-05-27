@@ -127,4 +127,67 @@ pub enum Error {
         /// The raw line as it appeared in the file.
         raw: String,
     },
+
+    /// A field's RHS was the wrong shape for its declared type — e.g.
+    /// `WORKER_NAMES=foo` (scalar where an array is expected) or
+    /// `CP_MEMORY=(1 2)` (array where a scalar is expected).
+    ///
+    /// # Bool-field asymmetry (intentional)
+    ///
+    /// For bool fields, shape and value validation are split between two
+    /// variants — be deliberate about which one fires:
+    ///
+    /// - **Shape mismatch** (`RUN_VERIFY=(a b)` — array assigned to a
+    ///   bool field) → `TypeMismatch` (loud, hard error). #316.
+    /// - **Invalid scalar value** (`RUN_VERIFY=banana` — lenient bool
+    ///   gets an unknown spelling) → silently uses default. #315 design.
+    ///
+    /// Strict bools (`AUTO_UPDATE_CP`, `SWITCH_TO_GHCR`) error on bad
+    /// values via `Error::InvalidBool`; lenient bools (`RUN_VERIFY`)
+    /// do not. See `take_bool_or_default` in `parser.rs` for the
+    /// per-field rationale.
+    #[error("type mismatch for {field} at line {line_no}: expected {expected}, got {got}")]
+    TypeMismatch {
+        /// Field name whose declared type didn't match the assigned shape.
+        field: &'static str,
+        /// Human-readable expected shape (`"scalar"` / `"array"`).
+        expected: &'static str,
+        /// Human-readable observed shape (`"scalar"` / `"array"`).
+        got: &'static str,
+        /// 1-based line number where the offending assignment lives.
+        line_no: usize,
+    },
+}
+
+/// Non-fatal parser diagnostics returned alongside a successfully built
+/// [`crate::ClusterConfig`].
+///
+/// Today only [`Warning::UnknownKey`] is emitted — a key in the input that
+/// no field on `ClusterConfig` consumed. Bash silently ignores unknown
+/// `KEY=value` lines (`source` happily accepts them), so this stays a
+/// warning rather than an error to preserve operator-visible behavioral
+/// parity with the bash twin. Operators who want fail-on-typo behavior
+/// can opt in by treating a non-empty `warnings` vec as a hard failure.
+///
+/// # Derive invariant
+///
+/// All variants must remain `Clone + PartialEq + Eq`. Operator-tooling
+/// callers compare and clone `Warning` values when grouping diagnostics
+/// (e.g. dedup across a multi-file batch); adding a variant that breaks
+/// these bounds is a SemVer-major change.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Warning {
+    /// The input contained an assignment whose key isn't consumed by any
+    /// [`crate::ClusterConfig`] field. Typically an operator typo
+    /// (`WROKER_NAMES=...` instead of `WORKER_NAMES=...`) — surfacing it
+    /// lets tooling print the typo near the source line rather than
+    /// silently building the wrong cluster.
+    #[error("unknown key {key:?} at line {line_no} (ignored)")]
+    UnknownKey {
+        /// The unrecognized key as it appeared in the input.
+        key: String,
+        /// 1-based line number where the assignment lives.
+        line_no: usize,
+    },
 }

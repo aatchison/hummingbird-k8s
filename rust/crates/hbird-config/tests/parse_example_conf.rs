@@ -66,6 +66,16 @@ fn parses_repo_root_cluster_example_conf() {
     assert_eq!(cfg.bootc_update_schedule, None);
     assert_eq!(cfg.bootc_update_repo_k8s, None);
     assert_eq!(cfg.bootc_update_repo_worker, None);
+
+    // #316: the canonical example file MUST parse with zero warnings.
+    // If a future PR adds a new knob to cluster.example.conf without
+    // teaching ClusterConfig about it, this test catches the drift
+    // (unknown-key warning fires) before the divergence ships.
+    assert!(
+        cfg.warnings.is_empty(),
+        "cluster.example.conf must parse with zero warnings — got: {:?}",
+        cfg.warnings
+    );
 }
 
 #[test]
