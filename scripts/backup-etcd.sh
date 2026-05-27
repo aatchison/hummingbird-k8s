@@ -34,7 +34,17 @@
 #   $outdir/etcd-snapshot-<UTC-timestamp>[-<label>].db
 #
 # See docs/backup-restore.md for cadence / restore guidance.
+#
+# Path-anchoring: this script resolves the sibling kubectl-k8s.sh via
+# $REPO_ROOT derived from its own location, so it works no matter what
+# cwd the operator runs it from (e.g. `cd /tmp && bash
+# /path/to/repo/scripts/backup-etcd.sh`). See issue #271 F6.
 set -euo pipefail
+
+# Resolve repo root from this script's location so relative siblings
+# (notably scripts/kubectl-k8s.sh) work from any cwd. Matches the
+# pattern established by scripts/run-kube-bench.sh.
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
 OUTDIR=""
 LABEL=""
@@ -86,7 +96,7 @@ if [[ -n "$LABEL" ]]; then
 fi
 DST="$OUTDIR/etcd-snapshot-$TS$SUFFIX.db"
 
-CP_IP="${CP_IP:-$(./scripts/kubectl-k8s.sh get nodes \
+CP_IP="${CP_IP:-$("${REPO_ROOT}/scripts/kubectl-k8s.sh" get nodes \
   -l node-role.kubernetes.io/control-plane \
   -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')}"
 [[ -n "$CP_IP" ]] || { echo "Could not resolve control-plane IP" >&2; exit 1; }

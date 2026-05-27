@@ -50,7 +50,16 @@
 # Usage:
 #   scripts/rotate-etcd-encryption-key.sh
 #   # or: make rotate-etcd-key
+#
+# Path-anchoring: this script resolves the sibling kubectl-k8s.sh via
+# $REPO_ROOT derived from its own location, so it works no matter what
+# cwd the operator runs it from. See issue #271 F6.
 set -euo pipefail
+
+# Resolve repo root from this script's location so relative siblings
+# (notably scripts/kubectl-k8s.sh) work from any cwd. Matches the
+# pattern established by scripts/run-kube-bench.sh.
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
 log() { printf '[rotate-etcd-key] %s\n' "$*" >&2; }
 
@@ -61,7 +70,7 @@ confirm() {
   [[ "$ans" =~ ^[Yy]$ ]] || { log "aborted by operator"; exit 1; }
 }
 
-CP_IP="${CP_IP:-$(./scripts/kubectl-k8s.sh get nodes \
+CP_IP="${CP_IP:-$("${REPO_ROOT}/scripts/kubectl-k8s.sh" get nodes \
   -l node-role.kubernetes.io/control-plane \
   -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')}"
 [[ -n "$CP_IP" ]] || { log "could not resolve control-plane IP"; exit 1; }
