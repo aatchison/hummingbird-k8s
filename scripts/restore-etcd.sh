@@ -28,12 +28,21 @@
 #     and needs the SAME encryption key. The key lives at
 #     /etc/kubernetes/encryption-config.yaml on the CP and is NOT part of
 #     the snapshot — back it up separately.
+#
+# Path-anchoring: this script resolves the sibling kubectl-k8s.sh via
+# $REPO_ROOT derived from its own location, so it works no matter what
+# cwd the operator runs it from. See issue #271 F6.
 set -euo pipefail
+
+# Resolve repo root from this script's location so relative siblings
+# (notably scripts/kubectl-k8s.sh) work from any cwd. Matches the
+# pattern established by scripts/run-kube-bench.sh.
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
 SNAP="${1:?Usage: $0 <snapshot.db>}"
 [[ -f "$SNAP" ]] || { echo "Snapshot not found: $SNAP" >&2; exit 1; }
 
-CP_IP="${CP_IP:-$(./scripts/kubectl-k8s.sh get nodes \
+CP_IP="${CP_IP:-$("${REPO_ROOT}/scripts/kubectl-k8s.sh" get nodes \
   -l node-role.kubernetes.io/control-plane \
   -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')}"
 [[ -n "$CP_IP" ]] || { echo "Could not resolve control-plane IP" >&2; exit 1; }
@@ -90,4 +99,4 @@ REMOTE
 
 echo "Verifying cluster (after a 30s warm-up)..."
 sleep 30
-./scripts/kubectl-k8s.sh get nodes
+"${REPO_ROOT}/scripts/kubectl-k8s.sh" get nodes

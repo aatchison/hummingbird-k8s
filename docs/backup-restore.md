@@ -8,6 +8,11 @@ The scripts live at `scripts/backup-etcd.sh` and
 `scripts/restore-etcd.sh`; the `make backup-etcd` and `make
 restore-etcd` targets are thin wrappers around them.
 
+Both scripts (and `scripts/rotate-etcd-encryption-key.sh`) anchor their
+internal references to `scripts/kubectl-k8s.sh` via the script's own
+on-disk location, so invocation from any cwd works — including the
+absolute-path cron example below.
+
 ## What an etcd snapshot covers
 
 An etcd snapshot is a point-in-time dump of the entire Kubernetes
