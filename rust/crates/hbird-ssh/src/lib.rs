@@ -58,7 +58,7 @@
 //! # TODO before consumer crates land
 //!
 //! - **`tracing` instrumentation**: every `run`/`run_with_stdin` call
-//!   is silent today. Once [#283] picks the project's logging crate,
+//!   is silent today. Once [#286] picks the project's logging crate,
 //!   wrap [`Client::run`] in a `#[tracing::instrument(skip(self),
 //!   fields(host = %self.options.host()))]` span and emit a
 //!   `tracing::debug!` at spawn + completion. (PR #317 round-2 review
@@ -67,7 +67,7 @@
 //!   the TCP handshake. A hung remote command after auth still blocks
 //!   indefinitely. Tracked as a follow-up issue rather than landing
 //!   round-2 because it needs an API design call (`wait-timeout` crate
-//!   vs. stdlib watchdog thread vs. tokio if [#283] picks async).
+//!   vs. stdlib watchdog thread vs. tokio if [#286] picks async).
 //! - **`run_checked` variant**: today [`Client::run`] returns
 //!   `Err(Error::NonZeroExit { .. })` on remote-command non-zero exit.
 //!   Idiomatic Rust would split into `run() -> Result<RunOutput>`
@@ -85,7 +85,6 @@
 //! - Async / streaming output — consumer crates can wrap [`Client`]
 //!   if they need it.
 //!
-//! [#283]: https://github.com/aatchison/hummingbird-k8s/issues/283
 //! [#286]: https://github.com/aatchison/hummingbird-k8s/issues/286
 //! [#287]: https://github.com/aatchison/hummingbird-k8s/issues/287
 //! [#288]: https://github.com/aatchison/hummingbird-k8s/issues/288
@@ -247,7 +246,7 @@ impl Client {
     }
 
     fn run_inner(&self, command: &str, stdin: Option<&[u8]>) -> Result<RunOutput> {
-        // TODO(#283): wrap this fn in #[tracing::instrument(skip(self),
+        // TODO(#286): wrap this fn in #[tracing::instrument(skip(self),
         // fields(host = %self.options.host(), has_stdin = stdin.is_some()))]
         // once the workspace picks a logging crate.
 

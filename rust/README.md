@@ -40,7 +40,8 @@ rust/
     ├── hbird-common/      # placeholder (#280); future crates land per phasing
     ├── hbird-config/      # cluster.local.conf parser (#282)
     ├── hbird-ssh/         # SSH transport — `ssh_opts_array` Rust twin (#285)
-    └── hbird-virt/        # libvirt CLI wrapper + qemu+ssh URI (#284)
+    ├── hbird-virt/        # libvirt CLI wrapper + qemu+ssh URI (#284)
+    └── hbird-cli/         # `hbird` binary — clap command tree (#283)
 ```
 
 ## Phasing (per [epic #279])
@@ -50,9 +51,9 @@ rust/
 | Foundation — devcontainer + workspace | [#280](https://github.com/aatchison/hummingbird-k8s/issues/280) | landed (PR #313) |
 | Foundation — CI workflow | [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | landed (PR #314) |
 | Foundation — ClusterConfig parser | [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | landed (PR #315) |
-| Transport — clap command tree | [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | pending |
-| Transport — virt + qemu+ssh URI | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | this PR |
-| Transport — openssh | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | landed (PR #317) |
+| Foundation — clap command tree (`hbird` binary) | [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | this PR |
+| Foundation — virt + qemu+ssh URI | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | landed (PR #318) |
+| Foundation — openssh | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | landed (PR #317) |
 | Phase 1 — `update-cluster` | [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | pending |
 | Phase 2 — `verify-*` | [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | pending |
 | Phase 3 — `export-argocd` / `get-kubeconfig` | [#288](https://github.com/aatchison/hummingbird-k8s/issues/288) | pending |
