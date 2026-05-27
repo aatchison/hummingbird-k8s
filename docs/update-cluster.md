@@ -218,7 +218,7 @@ Diagnostic when neither condition holds (non-root + not in the
 `libvirt` group):
 
 ```text
-[update-cluster] FAIL: must be root or a member of the libvirt group on this host. Add yourself with:
+[update-cluster] ERROR: must be root or a member of the libvirt group on this host. Add yourself with:
   sudo usermod -aG libvirt $USER && newgrp libvirt
 then rerun. (Dry-run does not require either: rerun with --dry-run to preview.)
 ```

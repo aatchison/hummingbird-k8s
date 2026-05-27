@@ -220,7 +220,7 @@ setup_logging "[deploy-cluster]"
 # libvirt authorizes qemu:///system via the unix-socket group, not sudo;
 # bootc-image-builder runs rootless under podman; POOL_DIR writes work for
 # libvirt-group operators when the dir is chgrp'd to libvirt + chmod 2775
-# (one-time host setup, see docs/deploy-cluster.md#running-without-sudo).
+# (one-time host setup, see docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305).
 # Non-root + not in libvirt group is still a fail with an actionable hint.
 if [[ $EUID -ne 0 ]]; then
   if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx libvirt; then
