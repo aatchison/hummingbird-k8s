@@ -112,9 +112,6 @@ still prefix `sudo make …` and it'll work; the recipes are plain
 `bash scripts/…sh` invocations now. See
 [`docs/makefile.md`](docs/makefile.md) for the full mechanism.
 
-Coming from `make k3s` / `make k8s` / `make workers`? See
-[Migration from pre-#216](#migration-from-pre-216).
-
 `make deploy-cluster` is the only supported way to stand up a cluster. It
 drives the full `image -> qcow2 -> virt-install -> kubeadm join` flow from a
 single config file (`cluster.local.conf`), with cloud-init carrying per-VM
@@ -148,37 +145,6 @@ make kubectl ARGS='get pods -A'
 `scripts/kubectl-k8s.sh` opens an SSH tunnel to the CP's apiserver on
 `127.0.0.1:6443` and runs `kubectl` in a container against the fetched
 admin kubeconfig.
-
-## Migration from pre-#216
-
-PR #216 retired the k3s flavor entirely and removed the legacy single-VM
-Makefile targets in favor of a single `make deploy-cluster` entry point.
-If you have muscle-memory or scripts that invoke the older targets, here
-is the mapping:
-
-| Old command | Replacement |
-| --- | --- |
-| `make k3s` | No replacement. The k3s flavor is retired. Existing k3s VMs keep running, but the `ghcr.io/aatchison/hummingbird-k3s` registry is now **frozen** — pin a specific tag, or rebase the VM to `hummingbird-k8s`. |
-| `make k8s` | `make deploy-cluster CONFIG=cluster.local.conf` (CP-only: set `WORKER_NAMES=()` in the config). |
-| `make workers COUNT=2` | Set `WORKER_NAMES=(worker-1 worker-2)` in `cluster.local.conf`, then `make deploy-cluster CONFIG=cluster.local.conf`. |
-| `make spawn` / `sudo bash scripts/redo-*.sh` | Removed. Use `make deploy-cluster` (initial deploy) and `make update-cluster` (rolling image bump). |
-| `CP_VM_NAME=` / `VM_NAME=` env var | Replaced by `CP_NAME=` (legacy names still honored as deprecated aliases, with a stderr warning — see PR #219). |
-
-`config.local.sh` still tunes **image-build inputs** (default user, SSH
-keys, build-time knobs); **cluster-topology** knobs (`CP_NAME`,
-`WORKER_NAMES`, per-VM RAM/vCPU sizing) moved to `cluster.local.conf`.
-The two files have non-overlapping responsibilities — operators usually
-maintain both.
-
-### Deprecated images
-
-`ghcr.io/aatchison/hummingbird-k3s` and
-`ghcr.io/aatchison/hummingbird-k3s-worker` are **frozen** as of #216.
-No further tags will be cut. Existing tags remain pullable so live
-deploys keep working, but the registry is no longer receiving security
-updates or bootc-base bumps. Operators on k3s should rebase their VMs
-to `hummingbird-k8s` via `bootc switch` plus a fresh deploy through
-`make deploy-cluster`.
 
 ## Useful commands
 
