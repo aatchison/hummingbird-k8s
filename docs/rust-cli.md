@@ -29,7 +29,7 @@ foundation; subcommands land per the phasing table in
 |-------|---------|-----------|
 | `hbird-common` | Workspace bootstrap placeholder (project constants). | [#280] |
 | `hbird-config` | Typed parser for `cluster.local.conf`. | [#282] |
-| `hbird-openssh` | SSH transport — Rust twin of `scripts/lib/ssh-wrap.sh` + `ssh_opts_array{,_no_identity}`. | [#285] |
+| `hbird-ssh` | SSH transport — Rust twin of `scripts/lib/ssh-wrap.sh` + `ssh_opts_array{,_no_identity}`. | [#285] |
 
 [#280]: https://github.com/aatchison/hummingbird-k8s/issues/280
 [#282]: https://github.com/aatchison/hummingbird-k8s/issues/282

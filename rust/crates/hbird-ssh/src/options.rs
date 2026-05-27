@@ -101,7 +101,7 @@ impl SshOptions {
 
     /// Set the identity file (`-i <path>`). Mirrors `ssh_opts_array`'s
     /// `-i $SSH_PRIVKEY_FILE`. The file's existence is checked at
-    /// [`crate::OpenSshClient::run`] time, not here.
+    /// [`crate::Client::run`] time, not here.
     #[must_use]
     pub fn with_identity_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.identity_file = Some(path.into());
@@ -186,7 +186,7 @@ impl SshOptions {
     /// 10. `-p <port>`                     (when port)
     /// 11. `<user@host>` or `<host>`
     ///
-    /// The command-to-run is *not* included — [`crate::OpenSshClient`]
+    /// The command-to-run is *not* included — [`crate::Client`]
     /// appends it via `Command::arg`.
     #[must_use]
     pub fn to_argv(&self) -> Vec<String> {
@@ -259,10 +259,19 @@ impl SshOptions {
         argv
     }
 
-    /// Borrowed accessor for the identity file (so [`crate::OpenSshClient::run`]
+    /// Borrowed accessor for the identity file (so [`crate::Client::run`]
     /// can pre-check existence without re-reading the whole struct).
     pub(crate) fn identity_file(&self) -> Option<&Path> {
         self.identity_file.as_deref()
+    }
+
+    /// Borrowed accessor for the configured host. Used by error variants
+    /// that need to surface the connection target so a multi-host parallel
+    /// run can map an error back to its connection. (PR #317 round-2
+    /// review L3 + L8 HIGH.)
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
     }
 }
 
@@ -271,7 +280,7 @@ fn current_uid_string() -> String {
     // SAFETY: getuid(2) is always safe — no preconditions, no side
     // effects, returns the real UID. The `unsafe_code = "forbid"`
     // workspace lint requires a per-crate override; we deliberately
-    // *don't* override it for hbird-openssh and instead route the UID
+    // *don't* override it for hbird-ssh and instead route the UID
     // read through std::os::unix::fs::MetadataExt by way of
     // /proc/self/status. That keeps the crate `unsafe`-free.
     //

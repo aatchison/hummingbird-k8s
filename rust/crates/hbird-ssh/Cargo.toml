@@ -1,5 +1,5 @@
 [package]
-name = "hbird-openssh"
+name = "hbird-ssh"
 version = "0.0.1"
 description = "SSH transport for hummingbird-k8s (Rust rewrite of scripts/lib/ssh-wrap.sh + ssh_opts_array helpers)."
 edition.workspace = true

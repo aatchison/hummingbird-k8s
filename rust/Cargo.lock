@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hbird-openssh"
+name = "hbird-ssh"
 version = "0.0.1"
 dependencies = [
  "thiserror",

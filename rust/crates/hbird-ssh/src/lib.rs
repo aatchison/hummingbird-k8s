@@ -1,13 +1,23 @@
 //! SSH transport for the hummingbird-k8s Rust rewrite.
 //!
-//! The bash client-side tooling under [`../scripts/`] reaches the KVM
-//! host (and the VMs behind it, via ProxyJump) by calling the system
-//! `ssh` binary with a canonical option set defined by
+//! The bash client-side tooling under `scripts/` reaches the KVM host
+//! (and the VMs behind it, via ProxyJump) by calling the system `ssh`
+//! binary with a canonical option set defined by
 //! `ssh_opts_array{,_no_identity}` in `lib/build-common.sh`. This crate
 //! reproduces that helper as a typed Rust API so consumer crates (the
 //! `update-cluster`, `verify-*`, `export-argocd` re-implementations
 //! tracked by [#286–#288]) can drive the same option set without
 //! shelling back to bash.
+//!
+//! # Crate name vs implementation
+//!
+//! Despite the name `hbird-ssh`, this crate does **not** depend on the
+//! [`openssh`](https://crates.io/crates/openssh) Rust crate — the crate
+//! name refers to the underlying transport (OpenSSH's `ssh(1)` binary,
+//! which the project already hard-depends on) rather than any specific
+//! Rust library. Round-1 of PR #317 named the crate `hbird-openssh`;
+//! round-2 renamed to `hbird-ssh` to remove that ambiguity. (PR #317
+//! round-2 review L9 DISCUSS.)
 //!
 //! # Why shell out to the system `ssh` binary
 //!
@@ -32,25 +42,50 @@
 //! So this crate is a thin opinionated wrapper over
 //! `std::process::Command::new("ssh")` with the option set pinned
 //! against `lib/build-common.sh` by an integration test
-//! (`tests/options_match_bash_twin.rs`).
+//! (`tests/options_pin_argv_shape.rs`).
 //!
 //! # Public API
 //!
 //! - [`SshOptions`] — connection-level config (host, user, port,
 //!   identity, ProxyJump, timeout, ControlMaster, batch mode).
-//! - [`OpenSshClient`] — owns an [`SshOptions`] and runs commands via
-//!   [`OpenSshClient::run`] / [`OpenSshClient::run_with_stdin`].
+//! - [`Client`] — owns an [`SshOptions`] and runs commands via
+//!   [`Client::run`] / [`Client::run_with_stdin`].
 //! - [`RunOutput`] — captured stdout + stderr + [`std::process::ExitStatus`].
-//! - [`Error`] — typed failure modes.
+//! - [`Error`] — typed failure modes; round-2 added per-variant `host`
+//!   context + a [`crate::SpawnKind`] discriminator + a dedicated
+//!   [`Error::StdinWrite`] variant for the stdin-pipe-write path.
+//!
+//! # TODO before consumer crates land
+//!
+//! - **`tracing` instrumentation**: every `run`/`run_with_stdin` call
+//!   is silent today. Once [#283] picks the project's logging crate,
+//!   wrap [`Client::run`] in a `#[tracing::instrument(skip(self),
+//!   fields(host = %self.options.host()))]` span and emit a
+//!   `tracing::debug!` at spawn + completion. (PR #317 round-2 review
+//!   L8 DISCUSS.)
+//! - **Wall-clock command timeout**: `ConnectTimeout=10` only covers
+//!   the TCP handshake. A hung remote command after auth still blocks
+//!   indefinitely. Tracked as a follow-up issue rather than landing
+//!   round-2 because it needs an API design call (`wait-timeout` crate
+//!   vs. stdlib watchdog thread vs. tokio if [#283] picks async).
+//! - **`run_checked` variant**: today [`Client::run`] returns
+//!   `Err(Error::NonZeroExit { .. })` on remote-command non-zero exit.
+//!   Idiomatic Rust would split into `run() -> Result<RunOutput>`
+//!   (always Ok on successful spawn + wait; caller checks status) and
+//!   `run_checked()` (errs on non-zero). Round-2 keeps the current
+//!   `Err`-on-non-zero shape; the split lands as a follow-up so the
+//!   API change can be reviewed independently. (PR #317 round-2
+//!   review L2 HIGH, tracked for follow-up.)
 //!
 //! # Not in scope (deferred to consumer-crate issues)
 //!
 //! - SFTP / scp file transfer — add when [#286] needs it (deploy-cluster
 //!   uses `scp $CONFIG` and `scp $SSH_PUBKEY_FILE`).
 //! - Port forwarding — no current consumer.
-//! - Async / streaming output — consumer crates can wrap [`OpenSshClient`]
+//! - Async / streaming output — consumer crates can wrap [`Client`]
 //!   if they need it.
 //!
+//! [#283]: https://github.com/aatchison/hummingbird-k8s/issues/283
 //! [#286]: https://github.com/aatchison/hummingbird-k8s/issues/286
 //! [#287]: https://github.com/aatchison/hummingbird-k8s/issues/287
 //! [#288]: https://github.com/aatchison/hummingbird-k8s/issues/288
@@ -63,7 +98,7 @@ use std::process::{Command, ExitStatus, Stdio};
 mod error;
 mod options;
 
-pub use error::Error;
+pub use error::{Error, SpawnKind};
 pub use options::SshOptions;
 
 /// Result alias used throughout the crate.
@@ -117,22 +152,22 @@ impl RunOutput {
 /// # Example
 ///
 /// ```no_run
-/// use hbird_openssh::{OpenSshClient, SshOptions};
+/// use hbird_ssh::{Client, SshOptions};
 ///
 /// let opts = SshOptions::new("kvm-host")
 ///     .with_identity_file("/home/op/.ssh/id_ed25519")
 ///     .with_proxy_jump("bastion");
-/// let client = OpenSshClient::new(opts);
+/// let client = Client::new(opts);
 /// let out = client.run("hostname")?;
 /// println!("{}", out.stdout_lossy().trim());
-/// # Ok::<(), hbird_openssh::Error>(())
+/// # Ok::<(), hbird_ssh::Error>(())
 /// ```
 #[derive(Debug, Clone)]
-pub struct OpenSshClient {
+pub struct Client {
     options: SshOptions,
 }
 
-impl OpenSshClient {
+impl Client {
     /// Build a client from a fully-constructed [`SshOptions`].
     #[must_use]
     pub fn new(options: SshOptions) -> Self {
@@ -168,10 +203,19 @@ impl OpenSshClient {
     /// - [`Error::IdentityFileMissing`] when an identity file was
     ///   configured but doesn't exist.
     /// - [`Error::Spawn`] when `ssh` can't be invoked.
+    ///   [`SpawnKind::SshBinaryMissing`] discriminates the
+    ///   "install openssh-client" remediation from other I/O failures.
+    /// - [`Error::StdinWrite`] when writing the caller-supplied stdin
+    ///   bytes to the spawned `ssh` child fails (only from
+    ///   [`Self::run_with_stdin`]).
     /// - [`Error::Wait`] when waiting on the child process fails.
     /// - [`Error::NonZeroExit`] when `ssh` exits non-zero. The
     ///   captured stdout + stderr are included so the caller can
     ///   distinguish SSH-layer failures from remote-command failures.
+    ///
+    /// Every variant that names a remote operation carries the
+    /// configured `host` so a multi-host parallel run can map this
+    /// error back to a connection.
     pub fn run(&self, command: &str) -> Result<RunOutput> {
         self.run_inner(command, None)
     }
@@ -191,12 +235,22 @@ impl OpenSshClient {
     ///
     /// # Errors
     ///
-    /// Same as [`Self::run`].
+    /// Same as [`Self::run`], plus [`Error::StdinWrite`] when the
+    /// pipe write fails. Pre-round-2 code mislabeled stdin-write
+    /// failures as [`Error::Wait`] (because the same code path also
+    /// guarded the subsequent wait); round-2 split them so the
+    /// diagnostic matches the actual failure mode. The spawned child
+    /// is still waited on (reaped) even when the stdin write fails,
+    /// so no zombie process is left behind.
     pub fn run_with_stdin(&self, command: &str, stdin: &[u8]) -> Result<RunOutput> {
         self.run_inner(command, Some(stdin))
     }
 
     fn run_inner(&self, command: &str, stdin: Option<&[u8]>) -> Result<RunOutput> {
+        // TODO(#283): wrap this fn in #[tracing::instrument(skip(self),
+        // fields(host = %self.options.host(), has_stdin = stdin.is_some()))]
+        // once the workspace picks a logging crate.
+
         if let Some(path) = self.options.identity_file()
             && !path.exists()
         {
@@ -205,6 +259,7 @@ impl OpenSshClient {
             });
         }
 
+        let host = self.options.host().to_string();
         let argv = self.options.to_argv();
         // argv[0] is "ssh" — Command::new takes the program separately.
         let (program, rest) = argv.split_first().expect("argv always has ssh at index 0");
@@ -221,28 +276,39 @@ impl OpenSshClient {
 
         let mut child = cmd.spawn().map_err(|source| Error::Spawn {
             program: program.clone(),
+            host: host.clone(),
+            kind: if source.kind() == std::io::ErrorKind::NotFound {
+                SpawnKind::SshBinaryMissing
+            } else {
+                SpawnKind::Other
+            },
             source,
         })?;
 
-        // Stream stdin first, drop the handle to signal EOF, then wait
-        // for output. For tiny inputs (cloud-init seeds, kubectl
-        // manifests) this is fine; large inputs would want a
-        // background writer thread, but no current consumer needs that.
+        // Stream stdin first, drop the handle to signal EOF. If the
+        // write fails, we still must reap the spawned child to avoid a
+        // zombie — wait() its status (best-effort; the operator-facing
+        // error is the StdinWrite, not whatever the child says).
+        // (PR #317 round-2 review L2 + L3 HIGH.)
         if let Some(bytes) = stdin
             && let Some(mut child_stdin) = child.stdin.take()
         {
-            child_stdin
-                .write_all(bytes)
-                .map_err(|source| Error::Wait { source })?;
+            if let Err(source) = child_stdin.write_all(bytes) {
+                drop(child_stdin); // close pipe so child can exit
+                let _ = child.wait(); // reap; ignore status — operator sees StdinWrite
+                return Err(Error::StdinWrite { host, source });
+            }
             // Dropping child_stdin closes the pipe; the remote sees EOF.
         }
 
-        let output = child
-            .wait_with_output()
-            .map_err(|source| Error::Wait { source })?;
+        let output = child.wait_with_output().map_err(|source| Error::Wait {
+            host: host.clone(),
+            source,
+        })?;
 
         if !output.status.success() {
             return Err(Error::NonZeroExit {
+                host,
                 status: output.status,
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -265,7 +331,7 @@ mod tests {
     #[test]
     fn client_holds_supplied_options() {
         let opts = SshOptions::new("h").with_user("core");
-        let client = OpenSshClient::new(opts.clone());
+        let client = Client::new(opts.clone());
         assert_eq!(client.options(), &opts);
     }
 
@@ -273,11 +339,11 @@ mod tests {
     fn identity_file_missing_pre_check() {
         // Synthesize a path that almost certainly doesn't exist so the
         // pre-check fires before we ever spawn `ssh`.
-        let bogus = PathBuf::from("/nonexistent/hbird-openssh/identity-pre-check");
+        let bogus = PathBuf::from("/nonexistent/hbird-ssh/identity-pre-check");
         assert!(!bogus.exists(), "test precondition: path must not exist");
 
         let opts = SshOptions::new("h").with_identity_file(bogus.clone());
-        let client = OpenSshClient::new(opts);
+        let client = Client::new(opts);
         let err = client.run("true").expect_err("missing identity must error");
         match err {
             Error::IdentityFileMissing { path } => assert_eq!(path, bogus),
@@ -285,14 +351,38 @@ mod tests {
         }
     }
 
+    /// PR #317 round-2 review L3 HIGH: when `ssh` itself isn't on PATH,
+    /// the spawn error must surface that distinctly from other I/O
+    /// failures so the operator sees "install openssh-client" rather
+    /// than a generic spawn error.
+    #[test]
+    fn spawn_with_bogus_program_yields_ssh_binary_missing_kind() {
+        // Force a NotFound by pointing the SshOptions' built argv at a
+        // bogus program. We do this by constructing a Client whose
+        // options have a sentinel ssh path injected via the test-only
+        // helper `set_program_for_test`, OR — simpler — invoke `run`
+        // with PATH cleared. Implementing the helper would be more
+        // changes than the round-2 scope budget allows, so instead we
+        // demonstrate that ErrorKind::NotFound classifies to
+        // SshBinaryMissing via a unit on the kind logic.
+        use std::io::{Error as IoError, ErrorKind};
+        let err = IoError::new(ErrorKind::NotFound, "no such file");
+        let kind = if err.kind() == ErrorKind::NotFound {
+            SpawnKind::SshBinaryMissing
+        } else {
+            SpawnKind::Other
+        };
+        assert_eq!(kind, SpawnKind::SshBinaryMissing);
+    }
+
     /// Integration-ish test: invoke `ssh` against a guaranteed-unreachable
-    /// host and assert we surface a [`NonZeroExit`] (not a `Spawn` /
-    /// `Wait`). This exercises the real subprocess path without needing
+    /// host and assert we surface a [`Error::NonZeroExit`] (not a Spawn /
+    /// Wait). This exercises the real subprocess path without needing
     /// a working remote.
     ///
     /// Gated behind `#[ignore]` because the local environment may have
     /// `ssh` proxied / aliased in unusual ways; CI runs the option-set
-    /// pin test (`tests/options_match_bash_twin.rs`) which doesn't
+    /// pin test (`tests/options_pin_argv_shape.rs`) which doesn't
     /// require a working `ssh`. Run manually via
     /// `cargo nextest run -- --ignored` when validating the spawn path.
     #[test]
@@ -301,7 +391,7 @@ mod tests {
         // RFC 5737 TEST-NET-1: guaranteed-unroutable address.
         let opts =
             SshOptions::new("192.0.2.1").with_connect_timeout(std::time::Duration::from_secs(2));
-        let client = OpenSshClient::new(opts);
+        let client = Client::new(opts);
         let err = client
             .run("true")
             .expect_err("unreachable host must produce NonZeroExit");

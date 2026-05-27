@@ -34,7 +34,7 @@
 //! [[ -n "$_proxy_jump" ]] && _opts+=( -o "ProxyJump=${_proxy_jump}" )
 //! ```
 
-use hbird_openssh::SshOptions;
+use hbird_ssh::SshOptions;
 
 /// `ssh_opts_array` (with identity) — no controlmaster, no proxy-jump.
 /// Bash output:

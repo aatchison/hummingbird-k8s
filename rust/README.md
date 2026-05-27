@@ -39,7 +39,7 @@ rust/
 └── crates/
     ├── hbird-common/      # placeholder (#280); future crates land per phasing
     ├── hbird-config/      # cluster.local.conf parser (#282)
-    └── hbird-openssh/     # SSH transport — `ssh_opts_array` Rust twin (#285)
+    └── hbird-ssh/         # SSH transport — `ssh_opts_array` Rust twin (#285)
 ```
 
 ## Phasing (per [epic #279])
