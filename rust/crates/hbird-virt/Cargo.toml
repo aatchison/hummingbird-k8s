@@ -1,0 +1,29 @@
+[package]
+name = "hbird-virt"
+version = "0.0.1"
+description = "libvirt CLI (virsh) wrapper over SSH, plus a typed qemu+ssh:// URI parser. Used by hummingbird-k8s Rust subcommands to talk to a remote KVM host."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Bash twin: `virsh -c qemu:///system <verb>` invoked locally or over SSH
+# (see scripts/kubectl-k8s.sh, scripts/spawn-workers.sh, scripts/clean-vms.sh).
+# This crate does NOT link libvirt-client (no `virt` C-binding crate as a
+# dep) — the project has always driven libvirt via the `virsh` CLI over SSH
+# so the Rust rewrite stays binary-compatible with the same KVM hosts the
+# bash scripts already deploy to. The qemu+ssh URI parser is the load-
+# bearing piece: every operator config eventually becomes one of these
+# URIs. (#284, epic #279.)
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+# Integration tests use a StubSshClient defined in tests/common; no extra
+# deps needed.
+
+[lints]
+workspace = true
