@@ -1,0 +1,34 @@
+[update-cluster] config: cluster.local.conf
+[update-cluster] CP=hbird-cp1 (<resolved-at-runtime>) k8s-node=hbird-cp1, workers=(hbird-w1 hbird-w2)
+[update-cluster] flags: workers-only=0 skip-drain=0 skip-gates=0 dry-run=1
+[update-cluster]        node-filter=hbird-w1 start-from=<none>
+[update-cluster]        continue-on-error=0 no-delete-emptydir-data=0 parallel=1
+[update-cluster] timeouts: drain=5m ready=300s daemonset=300s apiserver=300s ssh=300s ssh-drop=30s inter-node-sleep=5s
+[update-cluster] per-node worst-case budget: drain 5m + ssh-back 300s + bootID 300s + ready 300s + daemonsets 300s
+[update-cluster] ============================================================
+[update-cluster] WORKER: hbird-w1 (<resolved-at-runtime>)
+[update-cluster] ============================================================
+[update-cluster] DRY-RUN ssh root@<resolved-at-runtime> systemctl stop bootc-semver-update.timer bootc-fetch-apply-updates.timer
+[update-cluster] kubectl drain hbird-w1 --ignore-daemonsets --timeout=5m --delete-emptydir-data
+[update-cluster] DRY-RUN cp_kubectl -- drain hbird-w1 --ignore-daemonsets --timeout=5m --delete-emptydir-data
+[update-cluster] DRY-RUN would capture pre-reboot bootID for hbird-w1
+[update-cluster]   pre-reboot bootID: <dry-run...
+[update-cluster] ssh root@<resolved-at-runtime> bootc upgrade --apply  (auto-reboots; digest pre/post compared)
+[update-cluster] DRY-RUN ssh root@<resolved-at-runtime> bootc upgrade --apply (with pre/post digest compare)
+[update-cluster] DRY-RUN wait_ssh_drop <resolved-at-runtime> (would poll up to 30s)
+[update-cluster] waiting for SSH to come back on <resolved-at-runtime> (timeout 300s)
+[update-cluster] DRY-RUN would poll ssh root@<resolved-at-runtime>
+[update-cluster] waiting for node hbird-w1 bootID to change from pre-reboot value (timeout 300s)
+[update-cluster] DRY-RUN would poll bootID for hbird-w1
+[update-cluster] waiting for node hbird-w1 to report Ready (timeout 300s)
+[update-cluster] DRY-RUN would poll kubectl get node hbird-w1
+[update-cluster] waiting for kube-system DaemonSet pods on hbird-w1 to be Ready (timeout 300s)
+[update-cluster] DRY-RUN would poll kube-system pods on hbird-w1 for Ready
+[update-cluster] kubectl uncordon hbird-w1
+[update-cluster] DRY-RUN cp_kubectl -- uncordon hbird-w1
+[update-cluster] DRY-RUN ssh root@<resolved-at-runtime> systemctl start bootc-semver-update.timer
+[update-cluster] node hbird-w1 updated
+[update-cluster] ============================================================
+[update-cluster] Rolling update complete.
+[update-cluster]   succeeded (1): hbird-w1
+[update-cluster] ============================================================

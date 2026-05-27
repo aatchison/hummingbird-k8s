@@ -46,6 +46,13 @@ clap = { version = "4", features = ["derive", "wrap_help", "cargo", "env"] }
 # `main() -> Result<()>` shape stays one line per subcommand.
 anyhow = "1"
 
+# Foundation crates the update-cluster body builds on. `hbird-config`
+# parses `cluster.local.conf`; the SSH transport + libvirt wrapper land
+# as the live-execution slice follows (deferred per #286 module docs).
+# Path deps stay path-only — no version bumps until release engineering
+# (#290) wires cargo-dist.
+hbird-config = { path = "../hbird-config", version = "0.0.1" }
+
 [dev-dependencies]
 # Integration tests (`tests/cli_smoke.rs`) parse the command tree without
 # running it — no extra deps beyond clap's built-in test surface needed.

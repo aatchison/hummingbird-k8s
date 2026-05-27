@@ -115,12 +115,21 @@ fn destroy_cluster_returns_not_yet_implemented() {
 }
 
 #[test]
-fn update_cluster_returns_not_yet_implemented() {
+fn update_cluster_dry_run_against_empty_config_fails_at_config_parse() {
+    // #286 landed the real update-cluster body. `/dev/null` is no longer
+    // a valid stand-in; the config parser will reject it. We pin that
+    // the failure mode is "missing required fields" rather than the
+    // pre-#286 "not yet implemented" stub.
     let (status, _stdout, stderr) = run(&["update-cluster", "--config", "/dev/null", "--dry-run"]);
-    assert!(!status.success());
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#286"),
-        "update-cluster stub error missing tracker. stderr:\n{stderr}"
+        !status.success(),
+        "update-cluster --dry-run with /dev/null exited 0"
+    );
+    // The error should surface as a config-parse failure
+    // (CP_NAME / SSH_PUBKEY_FILE missing) rather than the stub message.
+    assert!(
+        !stderr.contains("not yet implemented") || !stderr.contains("#286"),
+        "update-cluster should not be a stub anymore. stderr:\n{stderr}"
     );
 }
 
