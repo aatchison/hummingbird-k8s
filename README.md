@@ -238,8 +238,13 @@ cp cluster.example.conf cluster.local.conf            # edit it
 make deploy-cluster       CONFIG=cluster.local.conf
 make destroy-cluster      CONFIG=cluster.local.conf
 
-# Tear down stragglers (any hummingbird-* libvirt domain on this host)
-sudo make clean-vms
+# Tear down stragglers (any hummingbird-* libvirt domain on this host,
+# plus stale hummingbird-*.qcow2 / *-seed.iso under POOL_DIR — see #221).
+# Honors KVM_HOST: from a workstation with no local libvirt,
+#   KVM_HOST=geary make clean-vms
+# re-execs on geary via the C3 SSH-wrap shim (#271 F5). On the KVM host
+# directly, `make clean-vms` self-elevates via sudo — no `sudo make` needed.
+make clean-vms
 
 # Point already-deployed VMs at GHCR so the semver-aware auto-update
 # timer (docs/auto-updates.md) has a remote ref to pull from. Without
@@ -257,8 +262,7 @@ Note: legacy + non-lifecycle targets above (`clean-vms`,
 `backup-etcd`, `restore-etcd`, `rotate-etcd-key`) still need `sudo` —
 only the five cluster-lifecycle targets (`deploy-cluster`,
 `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`)
-dropped client-side `sudo` in PR #237. As of #271 F1, `switch-to-ghcr`
-joins them when `KVM_HOST` is set (sudo happens on the remote, not
+dropped client-side `sudo` in PR #237. As of #271 F1+F5, `switch-to-ghcr` and `clean-vms` join them when `KVM_HOST` is set (sudo happens on the remote, not
 locally).
 
 Going one step further: `update-cluster` now accepts a `libvirt`-group

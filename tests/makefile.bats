@@ -13,7 +13,7 @@
 #   5.  `make -n verify-all`     -> all three verify-* scripts in sequence
 #   6.  `make -n backup-etcd`    -> bash scripts/backup-etcd.sh (no LABEL)
 #   7.  `make -n switch-to-ghcr` -> bash scripts/switch-to-ghcr.sh
-#   8.  `make -n clean`          -> includes both clean-vms and clean-images
+#   8.  `make -n clean`          -> includes clean-vms (scripts/clean-vms.sh) + clean-images
 #   9.  Every `.PHONY:` target is also a defined target (and vice versa).
 #   10. Every target referenced from `make -n <t>` actually exists.
 #   11. `make image-*` recipes contain no `sudo` (rootless contract, #230).
@@ -115,8 +115,9 @@ make_dry() {
 @test "8. make -n clean includes both clean-vms and clean-images recipes" {
   # `clean` depends on clean-vms + clean-images; dry-run should expand both.
   make_dry clean
-  # clean-vms recipe: `virsh ... destroy` loop over hummingbird-* domains.
-  [[ "$output" == *"virsh"* ]] && [[ "$output" == *"hummingbird-"* ]]
+  # clean-vms recipe: invokes scripts/clean-vms.sh (which sources the C3
+  # SSH-wrap shim + sweeps qcow2/seed-ISO stragglers — see #271 F5 + #221).
+  [[ "$output" == *"bash scripts/clean-vms.sh"* ]]
   # clean-images recipe: `podman image rm` on the two local images.
   [[ "$output" == *"podman image rm"* ]]
   [[ "$output" == *"localhost/hummingbird-k8s:latest"* ]]

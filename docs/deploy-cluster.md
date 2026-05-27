@@ -336,8 +336,12 @@ Set `RUN_VERIFY=true` in `cluster.local.conf` to have
 ## Tear-down
 
 ```bash
-# All hummingbird-* VMs at once:
-sudo make clean-vms
+# All hummingbird-* VMs at once. Honors KVM_HOST — from a workstation
+# with no local libvirt, set KVM_HOST and the C3 SSH-wrap shim
+# (scripts/lib/ssh-wrap.sh) re-execs scripts/clean-vms.sh on the KVM
+# host. On the KVM host directly the script self-elevates via sudo.
+make clean-vms
+KVM_HOST=geary make clean-vms          # from a workstation
 
 # Or a specific VM:
 sudo virsh -c qemu:///system destroy hbird-cp1
@@ -346,9 +350,13 @@ sudo rm -f /var/lib/libvirt/images/hbird-cp1.qcow2\
            /var/lib/libvirt/images/hbird-cp1-seed.iso
 ```
 
-The seed ISOs live next to the qcow2s in `POOL_DIR`. They're not picked
-up by `make clean-vms` because they're not VMs — clean them by hand if
-you want a fully fresh deploy with no NoCloud datasources lying around.
+`make clean-vms` also sweeps stale `hummingbird-*.qcow2`, `*-seed.iso`,
+and `*-cloud-init.iso` files under `POOL_DIR` (default
+`/var/lib/libvirt/images`; override with `POOL_DIR=`). Pre-#216
+layouts (k3s, legacy single-VM names) and any seed ISO left behind by
+a prior deploy are removed in the same pass, then
+`virsh pool-refresh default` is run so libvirt drops the rm'd files
+from the volumes catalog. Idempotent on a clean host. See issue #221.
 
 ## Updating a deployed cluster
 
@@ -499,7 +507,7 @@ path:
   is unusual unless the deploy stalled in the middle.
 - **`worker VM 'X' is already defined`.** The script refuses to
   overwrite. Either pick different `WORKER_NAMES` or
-  `sudo make clean-vms` first.
+  `make clean-vms` first (self-elevates / honors `KVM_HOST`).
 - **Seed ISOs left behind after a failed deploy.** The script's exit
   trap removes seed ISOs it created when the deploy fails before
   completion. A successful deploy keeps them so `virsh start` after a
