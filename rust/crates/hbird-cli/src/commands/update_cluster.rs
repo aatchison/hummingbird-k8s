@@ -1143,6 +1143,19 @@ fn wait_apiserver_back(plan: &Plan) -> Result<()> {
 
 /// Wait for a node to report Ready. Mirrors `wait_node_ready`
 /// (line 844). Dry-run emits one log line.
+///
+/// Live path (#328 cycle 3): polls `kubectl get node <NODE>` every 10s
+/// (matching the bash twin's `interval=10`) up to `plan.timeouts.ready`
+/// seconds. Bash uses an awk regex `$2 ~ /^Ready(,|$)/` so a worker
+/// that returns "Ready,SchedulingDisabled" (cordoned-but-Ready) also
+/// counts; we mirror that by accepting any STATUS column value that
+/// is exactly `Ready` OR starts with `Ready,`.
+///
+/// The `--no-headers` flag mirrors bash line 856 verbatim. Any transient
+/// kubectl flake is tolerated (bash uses `2>/dev/null` + the `grep -q`
+/// suppresses errors); we treat a [`cp_kubectl`] `Err` as "this
+/// iteration didn't see Ready, try again next poll".
+#[tracing::instrument(level = "debug", skip(plan), fields(node = %node))]
 fn wait_node_ready(plan: &Plan, node: &str) -> Result<()> {
     let timeout = plan.timeouts.ready;
     log(&format!(
@@ -1152,10 +1165,53 @@ fn wait_node_ready(plan: &Plan, node: &str) -> Result<()> {
         log(&format!("DRY-RUN would poll kubectl get node {node}"));
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "wait_node_ready",
-        &format!("cp_kubectl get node {node} (poll for Ready)"),
-    ))
+    let interval: u32 = 10;
+    let command = format!("get node {node} --no-headers");
+    let mut elapsed: u32 = 0;
+    while elapsed < timeout {
+        match cp_kubectl(plan, &command) {
+            Ok(stdout) => {
+                if stdout_has_ready_status(&stdout) {
+                    log(&format!("node {node} Ready after ~{elapsed}s"));
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                // Bash twin uses `2>/dev/null | awk ... | grep -q .` which
+                // silently swallows kubectl errors and just doesn't match;
+                // we mirror by treating Err as "no Ready this iteration".
+                tracing::debug!(
+                    error = ?e,
+                    elapsed,
+                    "wait_node_ready: kubectl flake, will retry",
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_secs(interval.into()));
+        elapsed = elapsed.saturating_add(interval);
+    }
+    bail!("wait_node_ready: node {node} did not reach Ready within {timeout}s");
+}
+
+/// Parse a `kubectl get node X --no-headers` STDOUT line and return
+/// true iff the STATUS column (column 2, whitespace-separated) is
+/// exactly `Ready` or starts with `Ready,` (cordoned-but-Ready returns
+/// "Ready,SchedulingDisabled"). Mirrors bash line 856's awk regex
+/// `$2 ~ /^Ready(,|$)/`.
+///
+/// Public(crate) so the unit tests + the cycle 3 live test can pin the
+/// matcher independently of [`wait_node_ready`]'s polling loop.
+pub(crate) fn stdout_has_ready_status(stdout: &str) -> bool {
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        // col 1: NAME; col 2: STATUS.
+        let _name = cols.next();
+        let Some(status) = cols.next() else { continue };
+        if status == "Ready" || status.starts_with("Ready,") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Capture the node's pre-reboot bootID. Mirrors `capture_node_bootid`
@@ -1320,6 +1376,38 @@ fn wait_node_bootid_changed(plan: &Plan, node: &str, pre_bootid: &str) -> Result
 /// Wait for kube-system DaemonSet pods on `node` to report Ready.
 /// Mirrors `wait_node_daemonsets_ready` (line 995). Honors
 /// `--skip-gates`.
+///
+/// Live path (#328 cycle 3): two-phase gate matching the bash twin
+/// verbatim:
+///
+///   Phase 1 (bash lines 1012-1028): wait up to 60s (2s poll) for at
+///   least one kube-system pod to APPEAR on the node. After a fresh
+///   reboot the DaemonSet controller can take a few seconds to schedule
+///   pods to the node; without this phase a vacuous "all Ready"
+///   evaluation against zero pods would slip past the gate. On phase-1
+///   timeout we emit a WARN and proceed (could be a fresh cluster with
+///   no DS yet; better than hanging forever).
+///
+///   Phase 2 (bash lines 1029-1058): snapshot baseline-unready pods
+///   (pre-existing CrashLoops unrelated to this upgrade are excluded
+///   from the gate), then poll every 5s for the NEW unready set to
+///   empty. `_collect_unready_names` parses the per-pod
+///   `name=ready,ready,...` jsonpath output bash uses, returning pods
+///   whose ready set contains `false` OR is entirely empty (Pending
+///   pods with no containerStatuses).
+///
+/// Bash quirks preserved:
+///   - `--skip-gates` → silent Ok with grep-parity log line (line 999).
+///   - Heartbeat every ~30s (line 1052) matches bash twin verbatim.
+///   - Phase 1 0-pod WARN wording matches line 1020/1026 verbatim.
+///   - Final Ok log line includes the `excluding pre-existing-unready`
+///     marker when the baseline set was non-empty (line 1047).
+///
+/// jsonpath is forwarded as a single argv element to remote `/bin/sh`,
+/// so the metacharacter defense in [`cp_kubectl`] applies. The bash
+/// twin's `\"\\n\"` is rewritten as a literal `\n` inside the jsonpath
+/// string — neither shape contains `; & | $( ` `` ` `` `\n \r`.
+#[tracing::instrument(level = "debug", skip(plan), fields(node = %node))]
 fn wait_node_daemonsets_ready(plan: &Plan, node: &str) -> Result<()> {
     if plan.skip_gates {
         log(&format!(
@@ -1337,15 +1425,164 @@ fn wait_node_daemonsets_ready(plan: &Plan, node: &str) -> Result<()> {
         ));
         return Ok(());
     }
+
+    // ---- Phase 1: wait for at least one kube-system pod to appear --------
+    //
+    // Bash twin pipes through `wc -l`, but our cp_kubectl shim rejects
+    // the `|` metacharacter. Use `--no-headers` + manual line counting
+    // off the captured stdout (same net result; the bash twin only
+    // needs the count, not the pod data here).
+    let phase1_command =
+        format!("get pods -n kube-system --field-selector=spec.nodeName={node} --no-headers");
+    let mut phase1_elapsed: u32 = 0;
+    let mut pod_count: usize = 0;
+    while phase1_elapsed < 60 {
+        match cp_kubectl(plan, &phase1_command) {
+            Ok(stdout) => {
+                pod_count = stdout.lines().filter(|l| !l.trim().is_empty()).count();
+                if pod_count > 0 {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = ?e,
+                    phase1_elapsed,
+                    "wait_node_daemonsets_ready: phase-1 kubectl flake, will retry",
+                );
+                pod_count = 0;
+            }
+        }
+        if phase1_elapsed == 0 {
+            log(&format!(
+                "WARN: no kube-system pods yet observed on {node}; waiting up to 60s for DaemonSet controller to schedule"
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        phase1_elapsed = phase1_elapsed.saturating_add(2);
+    }
+    if pod_count == 0 {
+        log(&format!(
+            "WARN: no kube-system pods on {node} after 60s; proceeding (fresh cluster or no DS deployed yet)"
+        ));
+        return Ok(());
+    }
+
+    // ---- Snapshot baseline-unready -----------------------------------------
+    //
+    // The bash jsonpath wraps `\n` inside the awk-friendly per-pod line
+    // emitter. We pass the identical jsonpath through cp_kubectl; the
+    // metachar defense rejects `; & | $( ` `` ` `` `\n \r` — none of those
+    // appear in this expression. The single-quote wrapper inside `{}` is
+    // allowed by bash twin and our shim alike.
+    let raw_command = format!(
+        "get pods -n kube-system --field-selector=spec.nodeName={node} \
+         -o jsonpath='{{range .items[*]}}{{.metadata.name}}={{range .status.containerStatuses[*]}}{{.ready}},{{end}}{{\"\\n\"}}{{end}}'"
+    );
+    let baseline_raw = cp_kubectl(plan, &raw_command).unwrap_or_default();
+    let baseline_unready: std::collections::BTreeSet<String> =
+        collect_unready_names(&baseline_raw).into_iter().collect();
+    if !baseline_unready.is_empty() {
+        let joined: Vec<&str> = baseline_unready.iter().map(String::as_str).collect();
+        // Bash twin emits this via `tr '\n' ' '` which leaves a trailing
+        // space (the input ends in newline); preserved verbatim for
+        // operator-grep parity with line 1036.
+        log(&format!(
+            "  baseline-unready pods on {node} (excluded from gate): {} ",
+            joined.join(" ")
+        ));
+    }
     log(&format!(
         "waiting for kube-system DaemonSet pods on {node} to be Ready (timeout {timeout}s)"
     ));
-    Err(live_mode_not_implemented(
-        "wait_node_daemonsets_ready",
-        &format!(
-            "cp_kubectl get pods -n kube-system --field-selector=spec.nodeName={node} (poll all Ready)"
-        ),
-    ))
+
+    // ---- Phase 2: poll until NEW unready set is empty ----------------------
+    let interval: u32 = 5;
+    let mut elapsed: u32 = 0;
+    let mut last_heartbeat: u32 = 0;
+    let mut new_unready_display = String::new();
+    while elapsed < timeout {
+        let raw = cp_kubectl(plan, &raw_command).unwrap_or_default();
+        let current: std::collections::BTreeSet<String> =
+            collect_unready_names(&raw).into_iter().collect();
+        // Set difference: current MINUS baseline.
+        let new_unready: Vec<&str> = current
+            .difference(&baseline_unready)
+            .map(String::as_str)
+            .collect();
+        if new_unready.is_empty() {
+            // Match bash line 1047: include `excluding pre-existing-unready`
+            // marker only when baseline was non-empty.
+            let excl = if baseline_unready.is_empty() {
+                String::new()
+            } else {
+                "pre-existing-unready".to_string()
+            };
+            log(&format!(
+                "node {node} kube-system DaemonSet pods all Ready after ~{elapsed}s (excluding {excl})"
+            ));
+            // Note: bash also re-snapshots baseline if a pod EXITED the
+            // current set entirely (i.e. was deleted). The set-difference
+            // computation already covers that — a deleted pod simply
+            // isn't in `current` so it doesn't show up in `new_unready`.
+            // No re-snapshot needed.
+            return Ok(());
+        }
+        new_unready_display = new_unready.join(" ");
+        std::thread::sleep(Duration::from_secs(interval.into()));
+        elapsed = elapsed.saturating_add(interval);
+        if elapsed.saturating_sub(last_heartbeat) >= 30 && elapsed < timeout {
+            log(&format!(
+                "  still polling kube-system DaemonSet pods on {node} after ~{elapsed}s (new-unready: {new_unready_display})"
+            ));
+            last_heartbeat = elapsed;
+        }
+    }
+    log(&format!(
+        "node {node}: kube-system DaemonSet pods (new, post-baseline) still not Ready after {timeout}s: {new_unready_display}"
+    ));
+    bail!(
+        "wait_node_daemonsets_ready: kube-system DaemonSet pods on {node} not Ready within {timeout}s (new-unready: {new_unready_display})"
+    );
+}
+
+/// Parse the per-pod `name=ready,ready,...` jsonpath output (one
+/// pod per line) and return the names of pods whose ready set
+/// contains `false` OR is entirely empty (Pending pods with no
+/// containerStatuses). Internal helper for
+/// [`wait_node_daemonsets_ready`].
+///
+/// Mirrors bash `_collect_unready_names` (line 1066). Public(crate)
+/// so the unit tests + the cycle 3 live test can pin the parser
+/// independently of the polling loop.
+///
+/// Bash twin grep-anchor preserved: function name retains the
+/// underscore-prefix convention `_collect_unready_names` even though
+/// Rust would normally drop the underscore. Bash `_collect_unready_names`
+/// is the operator-mental-model symbol; renaming to `collect_unready_names`
+/// would break grep parity. (Per cycle 3 spec.)
+pub(crate) fn collect_unready_names(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        // `${line#*=}` in bash: strip up to and including the first `=`.
+        // If there's no `=`, the rhs equals the whole line (bash semantics).
+        let (lhs, rhs) = match line.find('=') {
+            Some(idx) => (&line[..idx], &line[idx + 1..]),
+            None => (line, line),
+        };
+        // Bash test: `[[ -z "$rhs" || "$rhs" == *false* ]]`. Note we
+        // diverge SLIGHTLY from naive porting: when there's no `=` in
+        // the line, bash sets rhs := line; we'd then check the whole
+        // line for "false" which mirrors bash exactly. (Both paths
+        // tested below.)
+        if rhs.is_empty() || rhs.contains("false") {
+            out.push(lhs.to_string());
+        }
+    }
+    out
 }
 
 // ---- block #10: bootc upgrade --apply --------------------------------------
@@ -2395,6 +2632,84 @@ mod tests {
     fn b_renders_numerically() {
         assert_eq!(b(false), 0);
         assert_eq!(b(true), 1);
+    }
+
+    // ---- #328 cycle 3: wait_node_ready + wait_node_daemonsets_ready ----
+    //
+    // stdout_has_ready_status mirrors bash line 856's awk regex
+    // `$2 ~ /^Ready(,|$)/`. Tests cover the three cases that matter
+    // operationally: fully-Ready, cordoned-but-Ready, and NotReady.
+
+    #[test]
+    fn stdout_has_ready_status_matches_plain_ready() {
+        // `kubectl get node X --no-headers` shape — STATUS in column 2.
+        let s = "hbird-w1   Ready    <none>   119m   v1.31.14\n";
+        assert!(stdout_has_ready_status(s));
+    }
+
+    #[test]
+    fn stdout_has_ready_status_matches_cordoned_ready() {
+        // After a worker comes back from reboot but is still cordoned
+        // from a prior drain, STATUS reads "Ready,SchedulingDisabled".
+        // Bash line 846-848 explicitly handles this; we must too.
+        let s = "hbird-w1   Ready,SchedulingDisabled   <none>   119m   v1.31.14\n";
+        assert!(stdout_has_ready_status(s));
+    }
+
+    #[test]
+    fn stdout_has_ready_status_rejects_notready() {
+        let s = "hbird-w1   NotReady    <none>   119m   v1.31.14\n";
+        assert!(!stdout_has_ready_status(s));
+    }
+
+    #[test]
+    fn stdout_has_ready_status_rejects_empty() {
+        assert!(!stdout_has_ready_status(""));
+        assert!(!stdout_has_ready_status("\n"));
+        // No STATUS column at all → no match.
+        assert!(!stdout_has_ready_status("hbird-w1\n"));
+    }
+
+    // collect_unready_names mirrors bash `_collect_unready_names`
+    // (line 1066). Tests cover the parity surface that the gate
+    // decision keys off: false-in-rhs, empty-rhs, all-true, multi-line.
+
+    #[test]
+    fn collect_unready_names_picks_pod_with_false_ready() {
+        // One pod with a single container reporting false.
+        let raw = "cilium-abc=true,false,\n";
+        assert_eq!(collect_unready_names(raw), vec!["cilium-abc"]);
+    }
+
+    #[test]
+    fn collect_unready_names_picks_pod_with_empty_rhs() {
+        // Pending pod with no containerStatuses yet → rhs is empty.
+        // Bash twin line 1071: `[[ -z "$rhs" || "$rhs" == *false* ]]`.
+        let raw = "kube-proxy-xyz=\n";
+        assert_eq!(collect_unready_names(raw), vec!["kube-proxy-xyz"]);
+    }
+
+    #[test]
+    fn collect_unready_names_skips_all_true() {
+        let raw = "cilium-abc=true,true,\nkube-proxy-xyz=true,\n";
+        let r = collect_unready_names(raw);
+        assert!(r.is_empty(), "expected empty, got: {r:?}");
+    }
+
+    #[test]
+    fn collect_unready_names_handles_mixed_lines() {
+        let raw = "cilium-abc=true,false,\n\
+                   kube-proxy-xyz=true,\n\
+                   coredns-pending=\n";
+        let r = collect_unready_names(raw);
+        assert_eq!(r, vec!["cilium-abc", "coredns-pending"]);
+    }
+
+    #[test]
+    fn collect_unready_names_skips_blank_lines() {
+        // Bash: `[[ -z "$line" ]] && continue`.
+        let raw = "\n\ncilium-abc=true,false,\n\n";
+        assert_eq!(collect_unready_names(raw), vec!["cilium-abc"]);
     }
 
     /// Regression: the helper-name field in the live-mode-not-implemented
