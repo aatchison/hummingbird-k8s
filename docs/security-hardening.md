@@ -133,22 +133,39 @@ apiserver static pod mounts them via `extraVolumes` in
 ## Verifying each control
 
 All three controls can be checked in one shot with
-[`scripts/verify-hardening.sh`](../scripts/verify-hardening.sh):
+[`scripts/verify-hardening.sh`](../scripts/verify-hardening.sh) — the
+recommended invocation is through `make verify-hardening`, which wires
+`KUBECTL=` through to the SSH-tunnel wrapper for free:
 
 ```bash
-KVM_HOST=thegeary bash scripts/verify-hardening.sh
+KVM_HOST=thegeary make verify-hardening CONFIG=cluster.local.conf
 ```
 
-If `$KVM_HOST` is set, the script tunnels SSH through that host using
-`ssh -J $KVM_HOST`. This lets you run the verifier from your dev
-machine (judah) without setting up a route to the libvirt NAT subnet.
-When run from the KVM host itself, omit `KVM_HOST` and the script
-falls back to direct SSH.
+If `$KVM_HOST` is set, the script tunnels SSH through that host two
+ways: (1) `ssh -o ProxyJump=$KVM_HOST root@$CP_IP` for the on-CP audit
+log + kubelet checks, and (2) `KUBECTL=scripts/kubectl-k8s.sh` for the
+PodSecurity apply + node lookup (`kubectl-k8s.sh` opens a local-port
+tunnel through `$KVM_HOST` to the apiserver). This lets you run the
+verifier from your dev machine without setting up a route to the
+libvirt NAT subnet. (#271 F4)
 
-The script requires `kubectl` access to the cluster and SSH-as-root to the
-CP host. It exits 0 only if PodSecurity rejects a privileged pod, the
-apiserver audit log is non-empty, and the kubelet is running with
-`--protect-kernel-defaults=true`. Run it after every redeploy.
+CP_IP resolution order (when CP_IP is not set in the environment):
+
+1. `resolve_cp_ip "$CP_NAME"` — uses `ssh $KVM_HOST virsh domifaddr` on
+   the KVM host (no local libvirt required on the workstation).
+2. `$KUBECTL get nodes -l node-role.kubernetes.io/control-plane` —
+   falls back to asking the apiserver via the tunneled kubectl wrapper.
+
+Run from the KVM host itself, omit `KVM_HOST` and the script falls back
+to direct SSH + the local `virsh` for resolution. Override with
+`KUBECTL=kubectl` if you have a native kubectl already pointed at the
+right cluster.
+
+The script requires SSH-as-root to the CP host. It exits 0 only if
+PodSecurity rejects a privileged pod, the apiserver audit log is
+non-empty, the kubelet is running with `--protect-kernel-defaults=true`,
+and the kubelet is running with `--rotate-certificates=true`. Run it
+after every redeploy.
 
 The individual checks below are the same controls, broken out for manual
 debugging.

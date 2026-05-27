@@ -13,8 +13,10 @@
 #
 #   CP_IP=192.168.122.42 ./scripts/verify-hardening.sh
 #
-# If CP_IP is unset the script tries to auto-detect the first control-plane
-# node's InternalIP via `kubectl get nodes`.
+# If CP_IP is unset the script tries `resolve_cp_ip "$CP_NAME"` first
+# (workstation-aware — uses `ssh $KVM_HOST virsh ...` when set), then
+# falls back to auto-detecting the first control-plane node's
+# InternalIP via `kubectl get nodes`. See issue #271 (F4).
 #
 # SSH transport:
 #   The CP normally lives on the libvirt default NAT subnet
@@ -28,13 +30,59 @@
 #   unset the script falls back to direct SSH (works when run from the
 #   KVM host itself or from any host with a route to the CP).
 #
-# Exits 0 only if all three checks pass. Prints a summary either way.
+# kubectl transport:
+#   The PSA / apply / delete / get-nodes calls go through `$KUBECTL`
+#   (default: scripts/kubectl-k8s.sh, the SSH-tunnel-through-KVM-host
+#   wrapper). Operators on the workstation get a tunneled kubectl for
+#   free; operators on the CP itself can pass `KUBECTL=kubectl` to use
+#   the native binary. Matches the run-kube-bench.sh pattern. (#271 F4)
+#
+# Env:
+#   CONFIG    — Optional path to cluster.local.conf. When set, sourced
+#               so CP_NAME / KVM_HOST come from the topology file (the
+#               same pattern `make kubectl` uses).
+#   CP_NAME   — libvirt domain of the control plane. Default: hummingbird-k8s.
+#               Used by resolve_cp_ip when CP_IP is not set.
+#   CP_IP     — Explicit override; bypasses resolution.
+#   KVM_HOST  — SSH alias of the KVM host (workstation case).
+#   KUBECTL   — kubectl command. Default: scripts/kubectl-k8s.sh.
+#
+# Exits 0 only if all four checks pass. Prints a summary either way.
 
 set -euo pipefail
 
+_VH_REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # shellcheck source=../lib/build-common.sh
-source "$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/lib/build-common.sh"
+source "${_VH_REPO_ROOT}/lib/build-common.sh"
 setup_logging "[verify-hardening]"
+
+# Pull CP_NAME / KVM_HOST from a CONFIG file when provided (matches the
+# `make get-kubeconfig` / `make update-cluster` pattern). Falls through
+# to config.local.sh + defaults if unset.
+if [[ -n "${CONFIG:-}" ]]; then
+  [[ -r "$CONFIG" ]] || { log "FAIL: CONFIG not readable: $CONFIG"; exit 2; }
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+elif [[ -r "${_VH_REPO_ROOT}/config.local.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${_VH_REPO_ROOT}/config.local.sh"
+fi
+
+: "${CP_NAME:=hummingbird-k8s}"
+: "${KUBECTL:=${_VH_REPO_ROOT}/scripts/kubectl-k8s.sh}"
+
+# kc() — invoke kubectl. If KUBECTL is the repo's SSH-tunnel wrapper,
+# call it directly (it manages its own podman/SSH plumbing); otherwise
+# word-split so KUBECTL='kubectl --kubeconfig ...' still works. Mirrors
+# the wrapper in scripts/run-kube-bench.sh.
+kc() {
+  if [[ -x "$KUBECTL" && "$KUBECTL" == *"/kubectl-k8s.sh" ]]; then
+    "$KUBECTL" "$@"
+  else
+    # shellcheck disable=SC2086
+    $KUBECTL "$@"
+  fi
+}
 
 # SSH options: this script does not have an SSH_PUBKEY_FILE in scope — it
 # expects the operator's ssh-agent or ~/.ssh/config to surface the right
@@ -51,6 +99,12 @@ fi
 # Helper: run a command "on the CP host". If CP_IP looks like localhost (the
 # script is itself executing on the CP, e.g. driven by integration-boot.sh
 # via scp+ssh), run locally to avoid an SSH-back-to-self that needs a key.
+#
+# We log in as root over SSH, so no remote `sudo` is needed for any of
+# the on_cp commands below (audit-log read, ps grep). That means we do
+# NOT need `ssh -t` here — TTY-on-SSH triggers \r line endings and we'd
+# have to strip them downstream. See scripts/kubectl-k8s.sh (issue #247)
+# for the inverse case (sudo on the KVM host needs -t, and we strip \r).
 on_cp() {
   if [[ "${CP_IP}" == "127.0.0.1" || "${CP_IP}" == "localhost" ]]; then
     bash -c "$1"
@@ -65,18 +119,30 @@ audit_ok=0
 kubelet_ok=0
 
 # --- resolve CP IP ----------------------------------------------------------
-
+#
+# Resolution order (issue #271 F4):
+#   1. CP_IP env var explicit override (unchanged).
+#   2. resolve_cp_ip "$CP_NAME" — workstation-aware libvirt query. Goes
+#      through `ssh $KVM_HOST virsh ...` when KVM_HOST is set, or falls
+#      back to local virsh on the KVM host itself. No kubectl needed.
+#   3. `$KUBECTL get nodes` — last resort. Uses the wrapper (which
+#      already tunnels through KVM_HOST), so workstation operators
+#      don't need a hand-wired local kubectl context.
 if [[ -z "${CP_IP:-}" ]]; then
-  log "CP_IP not set, auto-detecting via kubectl"
-  if ! command -v kubectl >/dev/null 2>&1; then
-    log "FAIL: kubectl not on PATH and CP_IP not set"
-    exit 2
+  log "CP_IP not set, trying resolve_cp_ip ${CP_NAME}"
+  if CP_IP_TRY="$(resolve_cp_ip "$CP_NAME" 2>/dev/null)" \
+     && [[ -n "$CP_IP_TRY" ]]; then
+    CP_IP="$CP_IP_TRY"
+  else
+    log "resolve_cp_ip failed, falling back to ${KUBECTL} get nodes"
+    CP_IP="$(kc get nodes -l node-role.kubernetes.io/control-plane \
+      -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' \
+      2>/dev/null || true)"
   fi
-  CP_IP="$(kubectl get nodes -l node-role.kubernetes.io/control-plane \
-    -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' \
-    2>/dev/null || true)"
   if [[ -z "$CP_IP" ]]; then
-    log "FAIL: could not auto-detect CP InternalIP; set CP_IP=<ip> explicitly"
+    log "FAIL: could not resolve CP IP. Set CP_IP=<ip> explicitly, or set"
+    log "      KVM_HOST=<ssh-alias> so resolve_cp_ip can query libvirt"
+    log "      remotely. CP_NAME=${CP_NAME}"
     exit 2
   fi
 fi
@@ -85,7 +151,7 @@ log "CP_IP=$CP_IP"
 # --- 1. PodSecurity restricted ---------------------------------------------
 
 log "check 1/3: PodSecurity restricted rejects a privileged pod"
-ps_out="$(kubectl apply -f - <<'EOF' 2>&1 || true
+ps_out="$(kc apply -f - <<'EOF' 2>&1 || true
 apiVersion: v1
 kind: Pod
 metadata:
@@ -101,7 +167,7 @@ spec:
 EOF
 )"
 # Best-effort cleanup in case it somehow got admitted (it shouldn't).
-kubectl -n default delete pod verify-hardening-privileged-probe \
+kc -n default delete pod verify-hardening-privileged-probe \
   --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
 
 if printf '%s' "$ps_out" | grep -q 'violates PodSecurity'; then

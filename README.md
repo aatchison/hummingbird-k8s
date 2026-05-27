@@ -180,7 +180,8 @@ KVM_HOST=geary make kubectl ARGS='get pods -A'
 KVM_HOST=geary make kubectl ARGS='-n kube-system logs ds/cilium'
 
 # Verify suite (PSA + audit + kubelet protect-kernel + rotate-certs)
-KVM_HOST=geary make verify-hardening
+# verify-hardening tunnels SSH + kubectl through $KVM_HOST (#271 F4).
+KVM_HOST=geary make verify-hardening CONFIG=cluster.local.conf
 KVM_HOST=geary make verify-encryption
 KVM_HOST=geary make verify-app-deploy   # PSA-restricted nginx smoke test
 KVM_HOST=geary make verify-all          # all three in sequence

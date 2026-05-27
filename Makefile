@@ -326,8 +326,10 @@ kubectl: ## kubectl pass-through; ARGS='get pods -A' (CONFIG=<path> to read CP_N
 verify-encryption: ## Verify etcd encryption-at-rest on the control plane
 	bash scripts/verify-encryption.sh
 
-verify-hardening: ## Verify PSA + audit + kubelet protect-kernel-defaults
-	bash scripts/verify-hardening.sh
+verify-hardening: ## Verify PSA + audit + kubelet protect-kernel-defaults (CONFIG=<path> to read CP_NAME/KVM_HOST; honors KUBECTL=)
+	@CONFIG="$(CONFIG)" \
+	  KUBECTL="$${KUBECTL:-$(CURDIR)/scripts/kubectl-k8s.sh}" \
+	  bash scripts/verify-hardening.sh
 
 verify-app-deploy: ## End-to-end PSA-restricted nginx + pod-to-pod test (set KVM_HOST for workstation operation; CONFIG=<path> to read CP_NAME/KVM_HOST from cluster.local.conf)
 	@CONFIG="$(CONFIG)" bash scripts/verify-app-deploy.sh
