@@ -1,0 +1,54 @@
+[package]
+name = "hbird-cli"
+version = "0.0.1"
+description = "hummingbird-k8s operator CLI — `hbird` binary. Mirrors the operator-facing Makefile targets (deploy-cluster, destroy-cluster, update-cluster, verify-*, get-kubeconfig, export-argocd, nodes, kubectl) as clap subcommands."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Bash twin: top-level `Makefile` operator-facing targets — `deploy-cluster`,
+# `destroy-cluster`, `update-cluster`, `verify-encryption`, `verify-hardening`,
+# `verify-app-deploy`, `verify-all`, `get-kubeconfig`, `export-argocd`,
+# `nodes`, `kubectl` — each delegating to a `scripts/*.sh` twin.
+#
+# This crate is the BINARY entry point for the Rust rewrite. It defines the
+# clap-derive command tree so the operator-facing surface is locked in before
+# any subcommand body lands. Real implementations follow in #286 (update),
+# #287 (verify-*), #288 (kubeconfig + export-argocd), and #289 (deploy / destroy /
+# spawn). For now every subcommand returns
+# `Err(anyhow!("not yet implemented — tracked by #XXX"))`.
+#
+# Binary name is `hbird` (short, operator-typeable, matches the crate prefix).
+# (#283, epic #279.)
+
+[[bin]]
+name = "hbird"
+path = "src/main.rs"
+
+[dependencies]
+# clap-derive is the de-facto Rust standard for nested subcommand trees
+# (structopt is legacy / merged into clap; argh has weaker subcommand
+# ergonomics). `derive` gates the `#[derive(Parser)]` proc macros;
+# `wrap_help` reflows long help to the terminal width which matters when
+# the help text mirrors a multi-line bash help block. `cargo` enables
+# the `cargo`-style help formatting used by the rest of the Rust
+# ecosystem operators are likely already familiar with.
+clap = { version = "4", features = ["derive", "wrap_help", "cargo", "env"] }
+
+# Binary uses `anyhow` for top-level error handling — the convention in
+# the Rust ecosystem (and reaffirmed by the epic's
+# "library = thiserror, binary = anyhow" split). Library crates in the
+# workspace still use `thiserror` for typed errors; this binary collapses
+# them all into `anyhow::Error` at the dispatch boundary so the eventual
+# `main() -> Result<()>` shape stays one line per subcommand.
+anyhow = "1"
+
+[dev-dependencies]
+# Integration tests (`tests/cli_smoke.rs`) parse the command tree without
+# running it — no extra deps beyond clap's built-in test surface needed.
+
+[lints]
+workspace = true

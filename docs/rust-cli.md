@@ -19,8 +19,8 @@ foundation; subcommands land per the phasing table in
 | [#280](https://github.com/aatchison/hummingbird-k8s/issues/280) | Devcontainer + cargo workspace skeleton | landed (PR #313) |
 | [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | CI workflow (fmt / clippy / test / deny / pre-commit / devcontainer smoke / lint inheritance) | landed (PR #314) |
 | [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | `ClusterConfig` parser (first real crate) | landed (PR #315) |
-| [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | clap command tree (binary crate) | pending (gated on foundation) |
-| [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | this PR |
+| [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | clap command tree (`hbird` binary) | this PR |
+| [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | landed (PR #318) |
 | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | landed (PR #317) |
 
 ## Foundation crates landed so far
@@ -31,11 +31,41 @@ foundation; subcommands land per the phasing table in
 | `hbird-config` | Typed parser for `cluster.local.conf`. | [#282] |
 | `hbird-ssh` | SSH transport — Rust twin of `scripts/lib/ssh-wrap.sh` + `ssh_opts_array{,_no_identity}`. | [#285] |
 | `hbird-virt` | libvirt CLI wrapper + typed `qemu+ssh://` URI parser. Talks to a remote KVM host via a `SshClient` trait object (real impl lands in [#285] / [#286]). | [#284] |
+| `hbird-cli` | `hbird` binary — clap-derive command tree mirroring the operator-facing `Makefile` targets. Subcommand bodies arrive in [#286]–[#289]. | [#283] |
 
 [#280]: https://github.com/aatchison/hummingbird-k8s/issues/280
 [#282]: https://github.com/aatchison/hummingbird-k8s/issues/282
+[#283]: https://github.com/aatchison/hummingbird-k8s/issues/283
 [#284]: https://github.com/aatchison/hummingbird-k8s/issues/284
 [#285]: https://github.com/aatchison/hummingbird-k8s/issues/285
+
+## `hbird` command tree (scaffolded by [#283])
+
+```text
+hbird deploy-cluster      <-> make deploy-cluster      (body tracked by #289)
+hbird destroy-cluster     <-> make destroy-cluster     (body tracked by #289)
+hbird update-cluster      <-> make update-cluster      (body tracked by #286)
+hbird verify encryption   <-> make verify-encryption   (body tracked by #287)
+hbird verify hardening    <-> make verify-hardening    (body tracked by #287)
+hbird verify app-deploy   <-> make verify-app-deploy   (body tracked by #287)
+hbird verify all          <-> make verify-all          (body tracked by #287)
+hbird get-kubeconfig      <-> make get-kubeconfig      (body tracked by #288)
+hbird export-argocd       <-> make export-argocd      (body tracked by #288)
+hbird nodes               <-> make nodes               (body tracked by #288)
+hbird kubectl …           <-> make kubectl             (body tracked by #288)
+```
+
+Every subcommand currently returns
+`Err("not yet implemented — tracked by #XXX")` with the appropriate
+sub-issue link. The flag set + help text are stable; the Makefile will
+start dispatching to `hbird` per-target as each implementation lands.
+
+Tracing/logging crate choice — deferred. The other foundation crates
+left `// TODO(#283)` markers pointing here; this PR keeps the deferral
+explicit (the binary currently has nothing to log beyond the dispatch
+error) and pushes the decision to the first real subcommand body
+([#286] `update-cluster`), which is where a logging surface will
+actually be exercised.
 
 ## When the Rust binary will appear in the `Makefile`
 
