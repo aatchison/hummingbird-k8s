@@ -20,22 +20,51 @@ that the apiserver answers and nodes report Ready.
 
 ## How to run
 
-On the CP host (kubectl on `PATH`, kubeconfig at the default location):
+### From a workstation through the KVM host (recommended)
+
+This is the common topology — your laptop reaches the cluster only via
+SSH through the KVM host. Set `KVM_HOST` and the verifier auto-defaults
+`KUBECTL` to the in-repo `scripts/kubectl-k8s.sh` wrapper, which tunnels
+kubectl through the KVM host's libvirt NAT. No local kubectl context
+required (issue #271 F3):
+
+```bash
+KVM_HOST=geary make verify-app-deploy
+# ...or, via CONFIG (kubectl-k8s.sh-style: pulls CP_NAME / KVM_HOST from
+# the cluster.local.conf you generated at deploy time):
+make verify-app-deploy CONFIG=cluster.local.conf
+```
+
+The Makefile recipe forwards `CONFIG` and the operator's `KVM_HOST` to
+the script, which sources `CONFIG` and then sets `KUBECTL` to the
+tunneled wrapper when `KVM_HOST` is set. The wrapper in turn uses
+`ssh -t` to `$KVM_HOST` for the `sudo virsh domifaddr` IP probe so a
+cold sudo cache on the KVM host can still prompt for your password
+(issue #249).
+
+### From the CP host (kubectl on `PATH`)
+
+When the script is running on the control-plane node itself (e.g. the
+self-hosted runner copies it onto the VM and execs it there — see
+`tests/integration-boot.sh`), no `KVM_HOST` is set and the script falls
+back to plain `kubectl`:
 
 ```bash
 ./scripts/verify-app-deploy.sh
-# or, via the Makefile:
+# or, via the Makefile from a checkout on the CP host:
 make verify-app-deploy
 ```
 
-From a client laptop via the tunnel:
+### Explicit kubectl override
+
+You can still spell out `KUBECTL=` for any wrapper or path:
 
 ```bash
 KUBECTL=./scripts/kubectl-k8s.sh ./scripts/verify-app-deploy.sh
+KUBECTL=kubectl ./scripts/verify-app-deploy.sh   # force plain kubectl
 ```
 
-The script honors `KUBECTL` (default: `kubectl`) so it can be routed
-through `scripts/kubectl-k8s.sh` or any other wrapper.
+An explicit `KUBECTL=` always wins over the `KVM_HOST`-derived default.
 
 ## Expected output
 

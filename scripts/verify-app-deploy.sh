@@ -10,20 +10,75 @@
 #   3. A second PSA-restricted Pod (busybox probe) can resolve and reach the
 #      Service over HTTP.
 #
-# Run on the CP host or anywhere kubectl works:
+# Run from a workstation through the KVM host (the common topology — see
+# issue #271 F3):
+#
+#   KVM_HOST=geary ./scripts/verify-app-deploy.sh
+#   # ...or:
+#   KVM_HOST=geary make verify-app-deploy
+#
+# When KVM_HOST is set (and no explicit KUBECTL override is provided), the
+# script defaults KUBECTL to the in-repo scripts/kubectl-k8s.sh wrapper,
+# which tunnels kubectl through the KVM host's libvirt NAT — workstation
+# operators don't need a local kubectl context wired to the cluster.
+#
+# Run on the CP host directly (kubectl on PATH, KUBECONFIG resolves):
 #
 #   ./scripts/verify-app-deploy.sh
 #
-# To route through the tunnel from a client, point KUBECTL at kubectl-k8s.sh:
+# Explicit override (any other kubectl wrapper, or to force a path):
 #
-#   KUBECTL=./kubectl-k8s.sh ./scripts/verify-app-deploy.sh
+#   KUBECTL=./scripts/kubectl-k8s.sh ./scripts/verify-app-deploy.sh
+#
+# Env:
+#   KUBECTL    — kubectl command to use. Default: scripts/kubectl-k8s.sh when
+#                KVM_HOST is set; otherwise `kubectl` on PATH. Mirrors the
+#                run-kube-bench.sh convention so workstation operators get
+#                tunneled kubectl for free (issue #271 F3 recommended fix).
+#   KVM_HOST   — SSH alias of the KVM host. When set, selects the tunneled
+#                kubectl wrapper by default (above). Threaded through to
+#                kubectl-k8s.sh, which uses ssh -t to the KVM host for
+#                `sudo virsh domifaddr` so a cold sudo cache can prompt
+#                for the operator's password (issue #249).
+#   CONFIG     — Optional path to cluster.local.conf. When set, sourced so
+#                CP_NAME / KVM_HOST come from the topology file (matches the
+#                `make get-kubeconfig` / `make kubectl` / `make nodes`
+#                pattern). Forwarded to kubectl-k8s.sh.
 #
 # Exits 0 on PASS. Always cleans up the smoketest namespace on EXIT.
 
 set -euo pipefail
 
+# Resolve repo root from this script's location so the sibling
+# kubectl-k8s.sh wrapper resolves no matter what cwd the operator runs us
+# from. Matches the path-anchoring pattern from run-kube-bench.sh and
+# backup-etcd.sh (issue #271 F6).
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+
+# CONFIG: optional cluster.local.conf — load so KVM_HOST / CP_NAME come from
+# the topology file when the operator drives us through `make`. Mirrors
+# kubectl-k8s.sh and the C3 SSH-wrap idiom.
+if [[ -n "${CONFIG:-}" ]]; then
+  [[ -r "$CONFIG" ]] || { echo "${0##*/}: CONFIG not readable: $CONFIG" >&2; exit 2; }
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
+# Default KUBECTL: pick the tunneled wrapper when KVM_HOST is set, so
+# workstation operators don't have to spell out KUBECTL=… on every call.
+# When the operator IS on the CP host (or otherwise has a local kubectl
+# wired to the cluster), KVM_HOST is unset and we fall back to plain
+# `kubectl` — same default as before this change. (issue #271 F3)
+if [[ -z "${KUBECTL:-}" ]]; then
+  if [[ -n "${KVM_HOST:-}" ]]; then
+    KUBECTL="${REPO_ROOT}/scripts/kubectl-k8s.sh"
+  else
+    KUBECTL="kubectl"
+  fi
+fi
+
 NS="smoketest-$(date +%s)"
-KCTL="${KUBECTL:-kubectl}"
+KCTL="$KUBECTL"
 
 log() { printf '[verify-app-deploy] %s\n' "$*" >&2; }
 
