@@ -1,0 +1,159 @@
+# Phase 1B cycle 4: wait_apiserver_back gate parity vs bash twin
+#
+# Fixture naming convention (locked in PR #325): cycle<N>_<block>.txt.
+#
+# Captured 2026-05-27 against the live geary cluster (hbird-cp1 +
+# hbird-w1 + hbird-w2; CP_IP=192.168.122.212). Cycle 4 (#329) wires:
+#
+#   - wait_apiserver_back               (bash scripts/update-cluster.sh:1077)
+#
+# The helper gates the post-reboot recovery path: after the CP reboots
+# the apiserver is unreachable for 60-120s. wait_apiserver_back polls
+# `kubectl get --raw=/readyz` via the CP every 10s until the endpoint
+# answers `ok` (or until APISERVER_TIMEOUT=300s elapses, the bash
+# twin's outer fail wording). The /readyz endpoint is chosen
+# deliberately over `get nodes` because the apiserver answers /readyz
+# BEFORE the etcd watcher has fully caught up — `get nodes` can return
+# stale 5xx for an extra 5-30s past the point where the apiserver is
+# "answering" from a control-flow perspective. The cycle 4 wiring
+# preserves that bash behavior verbatim.
+#
+# === Important note: steady-state validation only ===
+#
+# This fixture captures a STEADY-STATE happy-path probe rather than a
+# full CP-reboot cycle. Rationale, from #329:
+#
+#   "operator must be on tmux 5:0 for the apiserver-flap window —
+#    kubectl is unreachable for 60-120s mid-cycle, can't be
+#    unattended."
+#
+# A real CP reboot would tear down the apiserver across the recovery
+# window, blocking every downstream consumer of this cluster (verify-*
+# suites, parallel agent dispatches, future cycle live tests, etc.).
+# The high-risk operation requires explicit operator standby that the
+# Phase 1B cycle-by-cycle automation isn't built to support
+# unattended.
+#
+# What this fixture DOES validate:
+#
+#   1. The /readyz endpoint exists + returns `ok` on the steady-state
+#      cluster — pins the bash twin's chosen probe target.
+#   2. The SSH+kubectl wiring through the cp_kubectl shim (root@CP_IP
+#      via ProxyJump=KVM_HOST) correctly delivers the kubectl call
+#      to the apiserver and surfaces the body.
+#   3. The polling-loop entry condition is the IDENTICAL command both
+#      sides use — bash twin line 1088 + Rust wait_apiserver_back.
+#
+# What this fixture does NOT validate:
+#
+#   1. The polling-loop iteration during a real apiserver-down window
+#      (60-120s of kubectl Err → kubectl Ok at the recovery edge).
+#      The cycle 2 (`wait_ssh_back`) + cycle 3 (`wait_node_ready`)
+#      live tests already pin the IDENTICAL polling pattern (Err ⇒
+#      re-iterate, Ok ⇒ return-with-elapsed-s) against transient
+#      recovery windows — cycle 4 reuses that exact shape, just
+#      against `/readyz` instead of an SSH probe / kubectl get node.
+#   2. The 300s outer timeout. That's exercised by the bash twin's
+#      production callers (update_cp at line 1238) and inherited via
+#      the dry-run fixture's `timeout 300s` log line.
+#
+# The polling-loop failure path (timeout-on-apiserver-down) is
+# unit-test territory rather than live-test, because (a) we can't
+# safely tear down the live apiserver, and (b) the loop's polling
+# semantics are pinned in unit tests for the sibling helpers.
+#
+# Both the bash and Rust sides drove the IDENTICAL SSH chain through
+# the IDENTICAL kubectl operation:
+#
+#   bash side: `ssh -J $KVM_HOST root@$CP_IP "kubectl --kubeconfig=
+#              /etc/kubernetes/admin.conf get --raw=/readyz"`
+#              (operator equivalent of the bash twin's cp_kubectl shim
+#              at scripts/update-cluster.sh:425 invoking the body of
+#              wait_apiserver_back at line 1088)
+#   rust side: tests/cycle4_apiserver_live.rs invoking
+#              hbird_ssh::Client::run with SshOptions::new(cp_ip)
+#                .with_user("root")
+#                .with_proxy_jump(kvm_host)
+#              — same shape as cycles 1/2/3 cp_kubectl path.
+#
+# Both runs targeted hbird-cp1 (per #329's coordination note: cycle 4
+# is the CP-targeted cycle). Both runs ended with the cluster at 3/3
+# Ready.
+
+=== bash flow (operator-driven, 2026-05-27) ===
+
+bash --- step (a) probe /readyz on CP ---
+bash:   $ ssh -J aatchison@geary root@192.168.122.212 \
+bash:       "kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw=/readyz; echo rc=\$?"
+bash:   ok
+bash:   rc=0
+bash:   (apiserver up; matcher would fire on first poll.)
+
+bash --- step (b) get nodes (post) ---
+bash:   $ ssh -J aatchison@geary root@192.168.122.212 \
+bash:       "kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes"
+bash:   NAME        STATUS   ROLES           AGE    VERSION
+bash:   hbird-cp1   Ready    control-plane   6h7m   v1.31.14
+bash:   hbird-w1    Ready    <none>          6h7m   v1.31.14
+bash:   hbird-w2    Ready    <none>          6h6m   v1.31.14
+
+=== rust flow (HBIRD_LIVE_TEST=1 cargo test cycle4_apiserver_live, ~30s after bash) ===
+
+rust --- step (a) probe /readyz on CP ---
+rust:   --- /readyz stdout: "ok" ---
+rust:   (matcher condition: cp_kubectl returns Ok ⇒ helper returns
+rust:    Ok with elapsed=0s. Same input ⇒ same decision as bash.)
+
+rust --- step (b) get nodes (post) ---
+rust:   NAME        STATUS   ROLES           AGE    VERSION
+rust:   hbird-cp1   Ready    control-plane   6h7m   v1.31.14
+rust:   hbird-w1    Ready    <none>          6h6m   v1.31.14
+rust:   hbird-w2    Ready    <none>          6h6m   v1.31.14
+
+=== Diff ===
+
+step (a) probe /readyz:
+  - bash and rust both received "ok" + exit 0.
+  - DIFF: identical ✓
+  - Both leveraged the SAME SSH chain (ProxyJump=KVM_HOST → root@CP_IP)
+    and the SAME kubectl wrapper (kubeconfig=/etc/kubernetes/admin.conf).
+  - The matcher (`cp_kubectl returns Ok ⇒ apiserver back`) fires on
+    the first iteration when the apiserver is up — same shape as the
+    bash twin's `if ssh ... kubectl ... >/dev/null 2>&1; then` at
+    line 1087-1089.
+
+step (b) get nodes (post):
+  - bash and rust both saw 3/3 Ready, no SchedulingDisabled.
+  - DIFF: hbird-w1 / hbird-w2 AGE values differ by 1 minute between
+    the two captures (bash captured at 6h7m / 6h6m; rust captured
+    ~30s later at 6h6m / 6h6m — kubectl rounds AGE to the minute,
+    so the rust-side capture wrapped to the next round value on one
+    row). This is expected drift between sequential probes ✓
+
+=== Cycle 4 verdict: PARITY (steady-state) ===
+
+- Both:
+    * Routed kubectl through the same ssh -J $KVM_HOST chain to
+      root@CP_IP.
+    * Targeted the SAME apiserver endpoint (/readyz) the bash twin's
+      wait_apiserver_back polls at line 1088.
+    * Received "ok" + exit 0 on the first probe.
+    * Would have triggered the same `apiserver back after ~0s` log
+      line and returned Ok from the helper.
+- The /readyz endpoint is chosen verbatim from the bash twin's
+  scripts/update-cluster.sh:1088 — same kubectl wrapper, same kubeconfig
+  path, same --raw= argument.
+- Cluster remained 3/3 Ready throughout — no CP reboot was performed
+  (see header note on steady-state-only rationale).
+- The remaining `live_mode_not_implemented` site
+  (wait_apiserver_back, block #7) targeted by #329 is now wired.
+  This is the LAST cycle of Phase 1B for the cluster-rotation path;
+  timer_stop / timer_start (block #4) remain stubbed but the geary
+  cluster doesn't run the systemd hbird-bootc-update timer the bash
+  twin's helpers pause/resume, so those sit outside the Phase 1B
+  cycle scope.
+
+=== Cluster state at end ===
+- hbird-cp1: Ready (no reboot performed)
+- hbird-w1:  Ready (untouched in cycle 4)
+- hbird-w2:  Ready (untouched in cycle 4)

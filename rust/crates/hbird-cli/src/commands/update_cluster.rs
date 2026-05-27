@@ -1122,7 +1122,34 @@ fn wait_ssh_drop(plan: &Plan, ip: &str) -> Result<()> {
 }
 
 /// Poll the apiserver via the CP. Mirrors `wait_apiserver_back`
-/// (line 1077). Dry-run emits the same log shape as the bash twin.
+/// (bash `scripts/update-cluster.sh:1077`). Dry-run emits the same
+/// log shape as the bash twin.
+///
+/// Live path (#329 cycle 4): polls `kubectl get --raw=/readyz` via
+/// [`cp_kubectl`] every 10s (matching the bash twin's `interval=10`)
+/// up to `plan.timeouts.apiserver` seconds (default 300s; bash's
+/// `APISERVER_TIMEOUT`). After a CP reboot the apiserver itself goes
+/// away — kubectl returns non-zero / SSH transport errors / NonZeroExit
+/// until the kube-apiserver pod re-registers and `/readyz` answers
+/// `ok`. Bash uses `>/dev/null 2>&1` to suppress the error stream and
+/// keys the loop on the SSH exit code; we mirror by treating any
+/// [`cp_kubectl`] `Err` as "this iteration didn't see ok, try again
+/// next poll".
+///
+/// On success: emits `apiserver back after ~<N>s` (verbatim bash
+/// wording, line 1090). On timeout: bails with the bash-twin error
+/// wording (`apiserver did not return within <N>s`) so the
+/// `update_cp` caller's `with_context` chain ("CP X apiserver did not
+/// return within <N>s") stacks atop the helper's own message —
+/// matches the cycle 3 (`wait_node_ready`) + cycle 2 (`wait_ssh_back`)
+/// pattern.
+///
+/// The bash twin reads `/readyz` rather than `get nodes` because the
+/// apiserver answers `/readyz` BEFORE the etcd watcher has synced —
+/// `get nodes` can return stale 5xx for an extra 5-30s past the point
+/// where the apiserver is "answering". The cycle-4 wiring preserves
+/// that bash behavior verbatim.
+#[tracing::instrument(level = "debug", skip(plan), fields(cp_ip = %plan.cp_ip))]
 fn wait_apiserver_back(plan: &Plan) -> Result<()> {
     let timeout = plan.timeouts.apiserver;
     let cp_ip = &plan.cp_ip;
@@ -1135,10 +1162,32 @@ fn wait_apiserver_back(plan: &Plan) -> Result<()> {
         ));
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "wait_apiserver_back",
-        &format!("ssh root@{cp_ip} kubectl get --raw=/readyz"),
-    ))
+    let interval: u32 = 10;
+    let mut elapsed: u32 = 0;
+    while elapsed < timeout {
+        match cp_kubectl(plan, "get --raw=/readyz") {
+            Ok(_) => {
+                log(&format!("apiserver back after ~{elapsed}s"));
+                return Ok(());
+            }
+            Err(e) => {
+                // Bash twin suppresses errors via `>/dev/null 2>&1` and
+                // simply re-iterates. During the CP-reboot window we
+                // expect SSH NonZeroExit (kubectl 6443 connection
+                // refused), transport errors (sshd torn down), and
+                // intermittent `/readyz` 5xx responses — all
+                // indistinguishable from "not yet back" at this gate.
+                tracing::debug!(
+                    error = ?e,
+                    elapsed,
+                    "wait_apiserver_back: kubectl/readyz flake, will retry",
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_secs(interval.into()));
+        elapsed = elapsed.saturating_add(interval);
+    }
+    bail!("wait_apiserver_back: apiserver did not return within {timeout}s");
 }
 
 /// Wait for a node to report Ready. Mirrors `wait_node_ready`
@@ -2992,6 +3041,57 @@ mod tests {
         assert!(
             src.contains("CP failures always fail-fast"),
             "documentation drift — the policy must remain visible in the source",
+        );
+    }
+
+    /// Cycle 4 (#329): `wait_apiserver_back` MUST short-circuit under
+    /// `--dry-run` to `Ok(())` without attempting SSH. Pins the bash-twin
+    /// line 1083-1086 early-exit shape and keeps the dry-run fixture's
+    /// `DRY-RUN would poll apiserver via ssh root@<ip> kubectl get nodes`
+    /// line byte-stable.
+    #[test]
+    fn wait_apiserver_back_dry_run_short_circuits() {
+        let args = parse_args(&["--dry-run"]);
+        let plan = Plan::from_args(&args, cfg(vec!["w1"]), Timeouts::default()).expect("plan");
+        let res = wait_apiserver_back(&plan);
+        assert!(res.is_ok(), "dry-run must short-circuit Ok: {res:?}");
+    }
+
+    /// Cycle 4 (#329): the live path's bash-twin block-traceability
+    /// markers MUST stay in the source so an operator grepping
+    /// `scripts/update-cluster.sh` finds matching call sites. Pin the
+    /// helper name + the verbatim `/readyz` endpoint that diverges from
+    /// the dry-run `get nodes` sentinel (the bash twin polls `/readyz`
+    /// at line 1088).
+    #[test]
+    fn cycle4_helper_names_present() {
+        let src = include_str!("update_cluster.rs");
+        for name in [
+            "fn wait_apiserver_back",
+            "get --raw=/readyz",
+            "apiserver back after",
+        ] {
+            assert!(
+                src.contains(name),
+                "cycle 4 marker `{name}` removed; bash-twin block-traceability broken (#329)",
+            );
+        }
+    }
+
+    /// Cycle 4 (#329): the bash-twin's `interval=10` poll cadence at
+    /// line 1080 MUST stay in the source. A future tuning that drops
+    /// the interval (or worse: removes the sleep) would either DOS the
+    /// apiserver during recovery or short-circuit the entire timeout.
+    /// Pin the literal so a refactor surfaces here.
+    #[test]
+    fn cycle4_polling_interval_pinned() {
+        let src = include_str!("update_cluster.rs");
+        // The wait_apiserver_back body sets `let interval: u32 = 10;`
+        // — keep this assertion narrowly scoped to that line shape so
+        // unrelated `10` literals elsewhere don't false-positive.
+        assert!(
+            src.contains("let interval: u32 = 10;"),
+            "cycle 4: bash twin's `interval=10` polling cadence dropped from source (#329)",
         );
     }
 }
