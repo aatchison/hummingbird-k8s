@@ -8,7 +8,7 @@ the Makefile just gives operators a stable, discoverable entrypoint. Run
 ## Common flows
 
 Fresh cluster deploy on a clean KVM host (1 CP + N workers, the only
-supported path since #216):
+supported path):
 
 ```bash
 cp cluster.example.conf cluster.local.conf

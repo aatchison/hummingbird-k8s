@@ -179,22 +179,6 @@ skopeo list-tags "docker://${REPO}" \
 | Cadence | Inherited from upstream timer | Daily + 30min jitter (overridable, see above) |
 | Reboot on apply | Yes (the upstream service reboots) | No — stages only; existing reboot/rollback hooks fire next boot |
 
-## Migration from the legacy `:latest` timer
-
-VMs deployed before this change have `bootc-fetch-apply-updates.timer`
-enabled at the host level (the old preset). Upgrading to a new image
-that ships this PR's preset disables it via `systemctl preset` — BUT a
-host-level enable wins over a preset disable on existing nodes. To
-explicitly switch a deployed VM to the semver flow:
-
-```bash
-sudo systemctl disable --now bootc-fetch-apply-updates.timer
-sudo systemctl enable  --now bootc-semver-update.timer
-```
-
-For a freshly-deployed VM from an image that includes this change, the
-preset already does the right thing — no manual step needed.
-
 To verify the per-flavor REPO default matches what the host should be
 pulling (canonical Hummingbird publish):
 
