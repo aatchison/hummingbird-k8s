@@ -268,11 +268,27 @@ INTER_NODE_SLEEP="${INTER_NODE_SLEEP:-5}"
 
 # ---- Root + config ---------------------------------------------------------
 # Dry-run lets us iterate the script without sudo (no ssh/kubectl is ever
-# actually executed). All real-execution paths need root for the libvirt
-# domifaddr lookup used to resolve VM IPs.
+# actually executed).
+#
+# update-cluster.sh's local-libvirt footprint is small: `virsh domifaddr`
+# for IP resolution and ssh known_hosts handling — both of which work for
+# any user in the `libvirt` group on the KVM host (libvirt authorizes
+# `qemu:///system` access via the unix socket's group, not via sudo).
+# Remote ops (ssh + kubectl on the CP) run as `root@<node-ip>` via the
+# operator's SSH key and are unaffected by the local EUID. (#269)
+#
+# Therefore: accept either root OR `libvirt`-group membership. Reject
+# everything else with an actionable diagnostic that includes the
+# one-time setup command. Dry-run keeps its own (more permissive)
+# carve-out via the `DRY_RUN == 0` guard above.
 
 if (( DRY_RUN == 0 )) && [[ $EUID -ne 0 ]]; then
-  fail "must be run as root (libvirt domifaddr + ssh known_hosts handling). Try: sudo -E bash $0 [flags]"
+  if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx libvirt; then
+    fail "must be root or a member of the libvirt group on this host. Add yourself with:
+  sudo usermod -aG libvirt \$USER && newgrp libvirt
+then rerun. (Dry-run does not require either: rerun with --dry-run to preview.)"
+  fi
+  log "running as ${USER:-$(id -un)} (libvirt group member); virsh + kubectl work fine without sudo (#269)"
 fi
 
 CONFIG_PATH="${CONFIG:-${REPO_ROOT}/cluster.local.conf}"
