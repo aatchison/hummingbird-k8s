@@ -34,9 +34,11 @@
 # `cp_ssh` pattern and avoids reinventing the tunnel/kubeconfig dance for
 # the read-only orchestration this script does.
 #
-# Concurrency: a single flock on /run/hbird-update-cluster.lock prevents
-# two operators racing each other into a mass-cordon. The lock is released
-# when the script exits (normally or via the EXIT trap).
+# Concurrency: a single flock on $XDG_RUNTIME_DIR/hbird-update-cluster.lock
+# (per-user; falls back to /tmp when XDG_RUNTIME_DIR is unset) prevents the
+# same operator from racing themselves into a mass-cordon. The lock is
+# released when the script exits (normally or via the EXIT trap). See #275
+# for why this isn't /run/hbird-update-cluster.lock anymore.
 #
 # Flags:
 #   --workers-only             Skip the CP, only roll the workers.
@@ -754,11 +756,22 @@ trap cleanup_on_exit EXIT
 
 # ---- concurrency lock ------------------------------------------------------
 # Prevent two `make update-cluster` runs from mass-cordoning the cluster.
-# /run is tmpfs on systemd hosts; the lock dies with the kernel. Skip
-# locking on dry-run so docs / CI smoke tests don't need /run write access.
+# Skip locking on dry-run so docs / CI smoke tests don't need write access.
+#
+# Lock location: $XDG_RUNTIME_DIR/hbird-update-cluster.lock (typically
+# /run/user/$UID, tmpfs, always writable by the owning user). This is
+# per-user by design: it follows #272's libvirt-group EUID relaxation so
+# non-root operators can take the lock without needing root-owned /run
+# write access. Two operators on the same host get distinct lock files
+# and therefore don't block each other — flock here serializes a given
+# user's own concurrent invocations, not cross-user runs. (#275)
+#
+# Falls back to /tmp when XDG_RUNTIME_DIR is unset (cron / non-interactive
+# sessions don't always have one).
 
 if (( DRY_RUN == 0 )); then
-  LOCK_FILE="/run/hbird-update-cluster.lock"
+  : "${XDG_RUNTIME_DIR:=/tmp}"
+  LOCK_FILE="${XDG_RUNTIME_DIR}/hbird-update-cluster.lock"
   exec 200>"$LOCK_FILE"
   if ! flock -n 200; then
     fail "another update-cluster run is in progress (lock ${LOCK_FILE} held)"
