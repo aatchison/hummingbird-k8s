@@ -559,3 +559,154 @@ _load_example_workers() {
   [ "$status" -eq 0 ]
   ! echo "$output" | grep -qF $'\xe2\x80\xa6'
 }
+
+# ---------------------------------------------------------------------------
+# wait_ssh_drop gate (#261).
+#
+# bootc --apply queues the reboot via systemd-run (small delay) — without
+# a wait_ssh_drop prelude, wait_ssh_back fires immediately on the still-up
+# pre-reboot SSH connection and reports "SSH back ~0s", declaring success
+# before the reboot has even started. The gate is DIAGNOSTIC: a timeout
+# logs WARN but does NOT fail the run; the bootID-changed gate (when not
+# skipped) remains the source of truth for "did the reboot happen".
+# ---------------------------------------------------------------------------
+
+@test "dry-run emits 'DRY-RUN wait_ssh_drop' line for the CP and each worker" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  # cluster.example.conf = 1 CP + 2 workers = 3 nodes total.
+  drop_n="$(echo "$output" | grep -cE 'DRY-RUN wait_ssh_drop ' || true)"
+  [ "$drop_n" -eq 3 ]
+  echo "$output" | grep -q "DRY-RUN wait_ssh_drop"
+  echo "$output" | grep -q "would poll up to 30s"
+}
+
+@test "wait_ssh_drop runs BEFORE wait_ssh_back on every node (dry-run)" {
+  # The whole point of #261 is sequencing — drop must precede back, else
+  # the back-gate false-successes on the pre-reboot connection.
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  # Find first occurrence of each on a worker.
+  drop_line="$(echo "$output" | grep -nE 'DRY-RUN wait_ssh_drop ' | head -1 | cut -d: -f1)"
+  back_line="$(echo "$output" | grep -nE 'waiting for SSH to come back' | head -1 | cut -d: -f1)"
+  [ -n "$drop_line" ]
+  [ -n "$back_line" ]
+  [ "$drop_line" -lt "$back_line" ] || {
+    echo "drop=$drop_line back=$back_line — drop must come first" >&2
+    false
+  }
+}
+
+@test "wait_ssh_drop comes AFTER bootc upgrade --apply (dry-run)" {
+  # Inserted between the upgrade call and wait_ssh_back; assert the
+  # bootc-upgrade log line precedes the drop poll.
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  bootc_line="$(echo "$output" | grep -nE 'ssh root@.* bootc upgrade --apply' | head -1 | cut -d: -f1)"
+  drop_line="$(echo "$output" | grep -nE 'DRY-RUN wait_ssh_drop ' | head -1 | cut -d: -f1)"
+  [ -n "$bootc_line" ]
+  [ -n "$drop_line" ]
+  [ "$bootc_line" -lt "$drop_line" ] || {
+    echo "bootc=$bootc_line drop=$drop_line — bootc upgrade must come first" >&2
+    false
+  }
+}
+
+@test "SSH_DROP_TIMEOUT env override surfaces in the wait_ssh_drop log + startup banner" {
+  SSH_DROP_TIMEOUT=15 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "would poll up to 15s"
+  echo "$output" | grep -q "ssh-drop=15s"
+}
+
+@test "SSH_DROP_TIMEOUT default of 30 appears in the startup banner" {
+  run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "ssh-drop=30s"
+}
+
+@test "SSH_DROP_TIMEOUT rejects bash-arithmetic injection payload" {
+  SSH_DROP_TIMEOUT='a[0$(reboot)]' run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "SSH_DROP_TIMEOUT"
+}
+
+@test "SSH_DROP_TIMEOUT=0 is rejected (strict positive — 0 would defeat the gate)" {
+  SSH_DROP_TIMEOUT=0 run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "SSH_DROP_TIMEOUT"
+}
+
+@test "SSH_DROP_TIMEOUT rejects non-integer value" {
+  SSH_DROP_TIMEOUT='5m' run env CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -q "SSH_DROP_TIMEOUT"
+}
+
+@test "wait_ssh_drop helper returns 1 on 'SSH never drops' simulation" {
+  # Mock harness: extract the wait_ssh_drop helper from the script via awk
+  # (the script's source-only mode short-circuits BEFORE helper definitions
+  # so we can't just `source` it). Then redefine ssh to ALWAYS succeed
+  # (simulating "node never rebooted") and confirm wait_ssh_drop exits
+  # non-zero AND logs the WARN.
+  HELPER="$BATS_TEST_TMPDIR/wait_ssh_drop.sh"
+  awk '/^wait_ssh_drop\(\) \{/,/^\}$/' "$SCRIPT" >"$HELPER"
+  # Sanity: helper extraction picked up something non-empty.
+  [ -s "$HELPER" ]
+  run bash -c '
+    set -euo pipefail
+    DRY_RUN=0
+    SSH_OPTS=()
+    SSH_DROP_TIMEOUT=2          # keep the test fast (2s max)
+    log() { printf "[update-cluster] %s\n" "$*"; }
+    # Stub ssh as always-up. true returns 0 → wait_ssh_drop keeps polling.
+    ssh() { return 0; }
+    source "'"$HELPER"'"
+    if wait_ssh_drop 192.0.2.1 2; then
+      echo "RC=0"
+    else
+      echo "RC=$?"
+    fi
+  '
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "RC=1"
+  echo "$output" | grep -q "WARN: SSH on 192.0.2.1 still up after 2s"
+}
+
+@test "wait_ssh_drop helper returns 0 promptly when SSH drops" {
+  # Inverse of the previous test: stub ssh to always fail (simulating the
+  # reboot tearing down sshd). wait_ssh_drop must return 0 on the first
+  # iteration AND log the "dropped after ~Xs" line.
+  HELPER="$BATS_TEST_TMPDIR/wait_ssh_drop.sh"
+  awk '/^wait_ssh_drop\(\) \{/,/^\}$/' "$SCRIPT" >"$HELPER"
+  [ -s "$HELPER" ]
+  run bash -c '
+    set -euo pipefail
+    DRY_RUN=0
+    SSH_OPTS=()
+    SSH_DROP_TIMEOUT=5
+    log() { printf "[update-cluster] %s\n" "$*"; }
+    # Stub ssh as always-down. Returns 255 (the ssh "could not connect" rc).
+    ssh() { return 255; }
+    source "'"$HELPER"'"
+    if wait_ssh_drop 192.0.2.1 5; then
+      echo "RC=0"
+    else
+      echo "RC=$?"
+    fi
+  '
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "RC=0"
+  echo "$output" | grep -q "dropped after"
+  # No WARN should fire on the success path.
+  ! echo "$output" | grep -q "WARN: SSH on"
+}
+
+@test "wait_ssh_drop --help/banner documents SSH_DROP_TIMEOUT" {
+  # The flag-summary log surfaces ssh-drop=<N>s (covered above), and the
+  # in-file --help block (extracted via sed from the header comment) must
+  # mention SSH_DROP_TIMEOUT for operator discoverability.
+  run bash "$SCRIPT" --help
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "SSH_DROP_TIMEOUT"
+}
