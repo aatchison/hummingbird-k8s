@@ -69,6 +69,7 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 - **`bib-config.toml` `key =` accepts multi-line strings** for multiple authorized_keys entries (verified working). Hashed password works in `password =`.
 - **First SSH from <kvm-host> to a freshly-recreated VM** trips on stale host keys (libvirt re-issues IPs from its NAT pool) from prior VMs. `ssh-keygen -R <ip>` clears it.
 - **bib produces all formats** (qcow2, vmdk, vpc, ovf, archive, gce) even when you only ask for one — just `mv` the qcow2 you care about.
+- **`scripts/kubectl-k8s.sh` swallows stdin during its port-forward bootstrap.** Anything piped on stdin (including `<<EOF … EOF` heredocs) is consumed by the tunnel-setup phase before kubectl ever runs, so kubectl reports `no objects passed to apply`. `verify-hardening.sh`'s PSA-rejection check tripped on this and silently FAILed against a correctly-hardened cluster. Workaround for verify-* scripts: bypass the wrapper and ssh direct to root@CP, e.g. `ssh root@$CP_IP "kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -" <<EOF … EOF` — the heredoc then flows through SSH untouched. Tracked in #332 (bash twin fix) and #330 (Rust twin's `cp_kubectl_with_stdin_lenient` which already had it right).
 
 ## `POOL_DIR` — libvirt storage pool location
 

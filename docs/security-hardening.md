@@ -143,11 +143,22 @@ KVM_HOST=thegeary make verify-hardening CONFIG=cluster.local.conf
 
 If `$KVM_HOST` is set, the script tunnels SSH through that host two
 ways: (1) `ssh -o ProxyJump=$KVM_HOST root@$CP_IP` for the on-CP audit
-log + kubelet checks, and (2) `KUBECTL=scripts/kubectl-k8s.sh` for the
-PodSecurity apply + node lookup (`kubectl-k8s.sh` opens a local-port
-tunnel through `$KVM_HOST` to the apiserver). This lets you run the
-verifier from your dev machine without setting up a route to the
-libvirt NAT subnet. (#271 F4)
+log + kubelet checks **and the PodSecurity apply/delete probes**
+(`kubectl --kubeconfig=/etc/kubernetes/admin.conf …` running on the CP
+itself), and (2) `KUBECTL=scripts/kubectl-k8s.sh` only for the CP-node
+lookup fallback (`kubectl-k8s.sh` opens a local-port tunnel through
+`$KVM_HOST` to the apiserver). This lets you run the verifier from your
+dev machine without setting up a route to the libvirt NAT subnet.
+(#271 F4)
+
+The PodSecurity probes intentionally bypass the `kubectl-k8s.sh`
+wrapper: that wrapper's port-forward bootstrap phase consumes stdin
+before kubectl ever runs, so the `apply -f - <<EOF … EOF` heredoc was
+silently swallowed and the PSA-rejection check FAILed against a
+correctly-hardened cluster. Going direct via `ssh root@$CP_IP "kubectl
+… apply -f -"` preserves heredoc stdin end-to-end. Aligns with the Rust
+twin (`rust/crates/hbird-cli/src/cp_kubectl.rs::cp_kubectl_with_stdin_lenient`,
+PR #330) which already takes this shape. (#332)
 
 CP_IP resolution order (when CP_IP is not set in the environment):
 

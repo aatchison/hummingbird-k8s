@@ -31,11 +31,18 @@
 #   KVM host itself or from any host with a route to the CP).
 #
 # kubectl transport:
-#   The PSA / apply / delete / get-nodes calls go through `$KUBECTL`
-#   (default: scripts/kubectl-k8s.sh, the SSH-tunnel-through-KVM-host
-#   wrapper). Operators on the workstation get a tunneled kubectl for
-#   free; operators on the CP itself can pass `KUBECTL=kubectl` to use
-#   the native binary. Matches the run-kube-bench.sh pattern. (#271 F4)
+#   The CP-node-IP lookup fallback uses `$KUBECTL` (default:
+#   scripts/kubectl-k8s.sh, the SSH-tunnel-through-KVM-host wrapper).
+#   Operators on the workstation get a tunneled kubectl for free;
+#   operators on the CP itself can pass `KUBECTL=kubectl` to use the
+#   native binary. Matches the run-kube-bench.sh pattern. (#271 F4)
+#
+#   The PodSecurity apply/delete probes go DIRECT via `ssh root@$CP_IP
+#   "kubectl --kubeconfig=/etc/kubernetes/admin.conf ..."` — bypassing the
+#   wrapper. This is required because the wrapper's port-forward bootstrap
+#   consumes stdin from the apply heredoc before kubectl ever runs (#332).
+#   Aligns with the Rust twin (#330) which already takes the direct-SSH
+#   shape via `cp_kubectl_with_stdin_lenient`.
 #
 # Env:
 #   CONFIG    — Optional path to cluster.local.conf. When set, sourced
@@ -105,6 +112,11 @@ fi
 # NOT need `ssh -t` here — TTY-on-SSH triggers \r line endings and we'd
 # have to strip them downstream. See scripts/kubectl-k8s.sh (issue #247)
 # for the inverse case (sudo on the KVM host needs -t, and we strip \r).
+# Stdin handling: bash forwards stdin to whatever child process the
+# function exec's, so `on_cp "kubectl apply -f -" <<EOF ... EOF` works for
+# both the localhost (bash -c) and remote (ssh) branches. This is what the
+# PSA-rejection check below relies on after the #332 fix — see comment at
+# check 1/3 for the kubectl-k8s.sh-heredoc bug that motivated the switch.
 on_cp() {
   if [[ "${CP_IP}" == "127.0.0.1" || "${CP_IP}" == "localhost" ]]; then
     bash -c "$1"
@@ -151,7 +163,16 @@ log "CP_IP=$CP_IP"
 # --- 1. PodSecurity restricted ---------------------------------------------
 
 log "check 1/3: PodSecurity restricted rejects a privileged pod"
-ps_out="$(kc apply -f - <<'EOF' 2>&1 || true
+# Issue #332: this check used to route through `kc apply -f -` (the
+# scripts/kubectl-k8s.sh wrapper). That wrapper's port-forward bootstrap
+# phase consumes stdin before kubectl runs, so the heredoc was silently
+# swallowed and kubectl reported "no objects passed to apply" — the PSA
+# marker never appeared on stderr and the check FAILed against a working
+# cluster. Fix: go direct via `on_cp` (ssh root@CP `kubectl ... apply -f -`),
+# which preserves heredoc stdin end-to-end. Aligns with the Rust twin's
+# `cp_kubectl_with_stdin_lenient` shape (rust/crates/hbird-cli/src/
+# cp_kubectl.rs) that PR #330 already had right.
+ps_out="$(on_cp 'kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -' <<'EOF' 2>&1 || true
 apiVersion: v1
 kind: Pod
 metadata:
@@ -167,8 +188,9 @@ spec:
 EOF
 )"
 # Best-effort cleanup in case it somehow got admitted (it shouldn't).
-kc -n default delete pod verify-hardening-privileged-probe \
-  --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+# Same direct-SSH path as the apply above — keeps the PSA check independent
+# of the `kc` wrapper end-to-end.
+on_cp 'kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default delete pod verify-hardening-privileged-probe --ignore-not-found=true --wait=false' >/dev/null 2>&1 || true
 
 if printf '%s' "$ps_out" | grep -q 'violates PodSecurity'; then
   log "  PASS: privileged pod rejected by PodSecurity"
