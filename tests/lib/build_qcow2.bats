@@ -37,7 +37,7 @@ setup() {
   # Wipe library inputs.
   unset SSH_PUBKEY_FILES SSH_PUBKEY_GH_USERS VM_USER VM_USER_GROUPS \
         VM_PASSWORD ENABLE_ROOT_SSH SUDO_USER POOL_DIR BIB BASE_IMAGE \
-        STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT
+        STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT FORCE_REBUILD
 
   # Default sandbox locations for every test.
   export POOL_DIR="${BATS_TEST_TMPDIR}/pool"
@@ -429,6 +429,118 @@ make_cfg() {
   [[ "$output" != *"--root"* ]]
   [[ "$output" != *"--runroot"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Skip-if-exists shortcut (#311 candidate d)
+# ---------------------------------------------------------------------------
+#
+# build_qcow2() now short-circuits when ${POOL_DIR}/${name}.qcow2 already
+# exists as a non-empty file, unless FORCE_REBUILD=1 is set. This lets a
+# libvirt-group operator running deploy-cluster with HBIRD_REMOTE_NO_SUDO=1
+# reuse a previously-built qcow2 without invoking bib (which hard-requires
+# rootful podman). Behavior matrix:
+#
+#   qcow2 exists | FORCE_REBUILD | result
+#   -------------|---------------|--------------------------------
+#   no           | unset         | rebuild (existing behavior)
+#   no           | 1             | rebuild (existing behavior)
+#   yes          | unset         | skip + log (NEW — this PR)
+#   yes          | 1             | rebuild (operator override)
+
+@test "build_qcow2: qcow2 missing -> builds (skip-if-exists does not short-circuit)" {
+  install_stubs
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  # Precondition: no stale qcow2 in the pool.
+  [ ! -e "${POOL_DIR}/hummingbird-k8s.qcow2" ]
+
+  run build_qcow2 localhost/hummingbird-k8s:latest hummingbird-k8s "$cfg"
+  [ "$status" -eq 0 ]
+
+  # bib (podman) WAS invoked — the stub captured argv to PODMAN_ARGS.
+  [ -f "$PODMAN_ARGS" ]
+  grep -qx 'run' "$PODMAN_ARGS"
+  # And the qcow2 was promoted to its final path by the stubbed bib.
+  [ -f "${POOL_DIR}/hummingbird-k8s.qcow2" ]
+  # The skip-message must NOT have been emitted.
+  [[ "$output" != *"skipping rebuild"* ]]
+}
+
+@test "build_qcow2: qcow2 exists + FORCE_REBUILD unset -> skips bib, emits stable log line" {
+  install_stubs
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  # Pre-create the qcow2 with non-empty content so the `-s` guard sees it.
+  echo "pretend qcow2 contents" > "${POOL_DIR}/hummingbird-k8s.qcow2"
+
+  # FORCE_REBUILD intentionally unset (setup() unsets it via the wipe block).
+  unset FORCE_REBUILD
+
+  run build_qcow2 localhost/hummingbird-k8s:latest hummingbird-k8s "$cfg"
+  [ "$status" -eq 0 ]
+
+  # bib (podman) MUST NOT have been invoked — the stub never wrote PODMAN_ARGS.
+  [ ! -f "$PODMAN_ARGS" ]
+
+  # Operator-grepped log line — keep this assertion's literal string in sync
+  # with lib/build-common.sh::build_qcow2.
+  [[ "$output" == *"[build_qcow2] skipping rebuild:"* ]]
+  [[ "$output" == *"${POOL_DIR}/hummingbird-k8s.qcow2 already exists"* ]]
+  [[ "$output" == *"set FORCE_REBUILD=1 to force"* ]]
+
+  # The pre-existing qcow2 must NOT have been clobbered (skip means skip).
+  [ -f "${POOL_DIR}/hummingbird-k8s.qcow2" ]
+  grep -qx 'pretend qcow2 contents' "${POOL_DIR}/hummingbird-k8s.qcow2"
+}
+
+@test "build_qcow2: qcow2 exists + FORCE_REBUILD=1 -> rebuilds (operator override)" {
+  install_stubs
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  # Pre-create the qcow2 — without the override, this would short-circuit.
+  echo "stale contents" > "${POOL_DIR}/hummingbird-k8s.qcow2"
+
+  export FORCE_REBUILD=1
+
+  run build_qcow2 localhost/hummingbird-k8s:latest hummingbird-k8s "$cfg"
+  [ "$status" -eq 0 ]
+
+  # bib MUST have been invoked despite the existing qcow2.
+  [ -f "$PODMAN_ARGS" ]
+  grep -qx 'run' "$PODMAN_ARGS"
+  # The skip-message must NOT have been emitted under the override.
+  [[ "$output" != *"skipping rebuild"* ]]
+  # Built: log line confirms the rebuild path ran end-to-end.
+  [[ "$output" == *"Built: ${POOL_DIR}/hummingbird-k8s.qcow2"* ]]
+}
+
+@test "build_qcow2: empty (zero-byte) qcow2 file does NOT short-circuit" {
+  # Defensive: a half-written qcow2 from a previous crash must not be
+  # mistaken for a valid template. The `-s` guard (size > 0) covers this.
+  install_stubs
+  source_lib
+
+  local cfg
+  cfg="$(make_cfg)"
+  : > "${POOL_DIR}/hummingbird-k8s.qcow2"   # touch, zero bytes
+
+  run build_qcow2 localhost/hummingbird-k8s:latest hummingbird-k8s "$cfg"
+  [ "$status" -eq 0 ]
+
+  # bib WAS invoked (skip-if-exists must not trip on empty file).
+  [ -f "$PODMAN_ARGS" ]
+  [[ "$output" != *"skipping rebuild"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# (original test block resumes)
+# ---------------------------------------------------------------------------
 
 @test "podman_storage_opts: PODMAN_ROOT alone emits only --root pair" {
   install_stubs

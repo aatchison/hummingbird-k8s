@@ -213,6 +213,60 @@ default. `spawn-workers.sh` still requires root on the remote (that's
 the remaining bit of #269's original scope, not yet folded into the
 no-sudo path).
 
+### Reusing pre-built qcow2 templates (#311)
+
+`bootc-image-builder` (bib) — invoked by `build_qcow2` in
+`lib/build-common.sh` — hard-requires **rootful** podman and refuses
+to run under the rootless podman that a libvirt-group operator gets by
+default (it errors with `cannot validate the setup: this command must
+be run in rootful (not rootless) podman`; the constraint is upstream
+and intentional, not a missing flag). That means a no-sudo
+`make deploy-cluster` on a fresh host cannot build the qcow2
+templates from scratch.
+
+To make `HBIRD_REMOTE_NO_SUDO=1 deploy-cluster` usable in the common
+re-stand-up workflow (destroy → redeploy without a new image),
+`build_qcow2` short-circuits when the target qcow2 already exists in
+`$POOL_DIR`:
+
+```text
+[build_qcow2] skipping rebuild: /path/to/hummingbird-k8s.qcow2 already exists (set FORCE_REBUILD=1 to force)
+```
+
+Behavior matrix:
+
+| qcow2 in `$POOL_DIR` | `FORCE_REBUILD` | Result |
+| --- | --- | --- |
+| missing | unset / `0` | run bib (rebuild) |
+| missing | `1` | run bib (rebuild) |
+| present (non-empty) | unset / `0` | **skip + log** (new, default) |
+| present (non-empty) | `1` | run bib (operator override) |
+
+Zero-byte qcow2 files (e.g. from a crashed previous build) do NOT
+trip the skip — the guard uses `[[ -s "$qcow" ]]`, not `[[ -e ]]`.
+
+**Operator workflow for the no-sudo path:**
+
+1. One sudo'd deploy (or one root-on-the-KVM-host deploy) to seed the
+   qcow2 templates into `$POOL_DIR`. This is the only time bib runs.
+2. Subsequent destroy → redeploy cycles can use
+   `HBIRD_REMOTE_NO_SUDO=1` — `build_qcow2` will skip bib and reuse
+   the templates.
+3. When pulling a new GHCR tag, opt out of the skip with
+   `FORCE_REBUILD=1`, which will require sudo for that one
+   invocation (bib still needs rootful podman):
+
+   ```bash
+   FORCE_REBUILD=1 sudo make deploy-cluster CONFIG=cluster.local.conf
+   ```
+
+**Staleness caveat:** the skip does not validate that the on-disk
+qcow2 matches the local container image's digest. After pulling a
+new `ghcr.io/aatchison/hummingbird-k8s:<tag>`, the templates on disk
+are stale until you set `FORCE_REBUILD=1` and rebuild. A future
+candidate could compare the qcow2's recorded build digest against
+the current image — see #311 for the trade-off.
+
 Diagnostic when the operator is neither root nor in the `libvirt`
 group on the KVM host:
 
@@ -262,7 +316,7 @@ Current allowlist:
 | Update-cluster flags | `DRY_RUN`, `SKIP_DRAIN`, `WORKERS_ONLY`, `NODE`, `START_FROM`, `PARALLEL` |
 | Timeouts | `READY_TIMEOUT`, `DRAIN_TIMEOUT`, `APISERVER_TIMEOUT`, `SSH_TIMEOUT`, `INTER_NODE_SLEEP`, `DAEMONSET_TIMEOUT` |
 | Topology | `CP_NAME`, `WORKER_NAMES`, `POOL_DIR` |
-| Image-build knobs | `VM_USER`, `STORAGE_DRIVER`, `PODMAN_ROOT`, `PODMAN_RUNROOT`, `APISERVER_EXTRA_SANS` |
+| Image-build knobs | `VM_USER`, `STORAGE_DRIVER`, `PODMAN_ROOT`, `PODMAN_RUNROOT`, `APISERVER_EXTRA_SANS`, `FORCE_REBUILD` (when `=1`, opts out of `build_qcow2`'s skip-if-exists shortcut and forces a fresh bib invocation; defaults off — pre-existing qcow2 templates are reused. See [Reusing pre-built qcow2 templates](#reusing-pre-built-qcow2-templates-311) below. #311 candidate d.) |
 | Shim itself | `HBIRD_AUTOLOAD_CONFIG_LOCAL`, `HBIRD_REMOTE_REPO`, `HBIRD_OPERATOR_PUBKEY_FILE` (shim-managed, see #248 below), `HBIRD_REMOTE_NO_SUDO` (drops `sudo` from the remote exec when `=1`; see [Running without sudo](#running-without-sudo-libvirt-group-operator-305) for the libvirt-group story — #269 for update-cluster, #305 for deploy/destroy) |
 
 Every value is passed through `printf %q` before being interpolated
