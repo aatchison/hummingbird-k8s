@@ -1,4 +1,4 @@
-//! Mockable SSH-execution seam.
+//! Mockable SSH-execution seam (issue #345).
 //!
 //! [`SshExec`] is the trait consumer crates take when they want a
 //! pluggable SSH backend so unit tests can drive helpers that branch on
@@ -6,30 +6,6 @@
 //! uses the inherent methods on [`crate::Client`] (which implements the
 //! trait); tests use a stand-in implementor that returns canned
 //! [`crate::RunOutput`] / [`crate::Error`] values keyed by command.
-//!
-//! # Why a trait?
-//!
-//! The bash twin's `bootc_upgrade_apply` rc-classification (rc=255 →
-//! Applied, rc=0+matching-digest → AlreadyCurrent, rc=0+differing-digest
-//! → Applied, rc=other → UpgradeFailed; see
-//! `scripts/update-cluster.sh:1114`) is subtle enough that a regression
-//! in any branch is operator-visible only mid-cluster-upgrade. PR #344's
-//! 7-lens review (L5 MEDIUM) flagged that the Rust port of this branch
-//! set ran ONLY through `live-validate` — a real cluster cycle had to
-//! fire before any branch was exercised. Issue #345 tracks closing that
-//! gap with a mock-friendly trait + unit tests that pin each branch.
-//!
-//! # Why not promote `hbird_virt::SshClient`?
-//!
-//! The sibling crate `hbird-virt` already has an `SshClient` trait
-//! (`crates/hbird-virt/src/ssh.rs`) used by its libvirt wrappers. The
-//! long-term home for *one* shared SSH trait is an open question — at
-//! the time #318 landed, that trait deliberately stayed local to avoid
-//! blocking #285 (this crate) and #284 (hbird-virt) on each other.
-//! Issue #345 picks the smaller, lower-risk move: add [`SshExec`] here
-//! so cycle 2's bootc helpers gain unit-test coverage now, and leave
-//! the hbird-virt cross-promotion as a follow-up that can be designed
-//! once both crates' consumers are settled.
 //!
 //! # Trait shape
 //!
@@ -41,9 +17,22 @@
 //! [`impl SshExec for Client`] delegates to the inherent methods so
 //! their behavior remains the single source of truth.
 //!
-//! Trait-object friendly: the trait is `Send + Sync` so callers can
-//! store `Arc<dyn SshExec>` when they want runtime polymorphism (e.g.
-//! threading the same mock across worker threads in a test).
+//! Today all in-tree consumers take `&impl SshExec` (monomorphized).
+//! The trait is `Send + Sync` so it is shape-compatible with dynamic
+//! dispatch (`&dyn SshExec`, `Box<dyn SshExec>`), but the `dyn` path
+//! has no real consumer yet — file an issue if you need it so blanket
+//! impls + the object-safety guarantee can be pinned by an actual
+//! user.
+//!
+//! # Relationship to `hbird_virt::SshClient`
+//!
+//! The sibling crate `hbird-virt` has a separate `SshClient` trait
+//! (`crates/hbird-virt/src/ssh.rs`) used by its libvirt wrappers.
+//! Same conceptual role, different shape; the duplication is
+//! intentional (kept independent so each crate's consumers evolve
+//! without cross-crate coupling). Unifying onto a single workspace
+//! trait is out of scope for #345 — file a follow-up if a real
+//! cross-crate consumer arrives.
 
 use crate::{Client, Result, RunOutput};
 
@@ -54,9 +43,6 @@ use crate::{Client, Result, RunOutput};
 /// [`crate::Client`] (which shells out to `ssh(1)`); tests use canned
 /// implementors that return pre-built [`RunOutput`] / [`crate::Error`]
 /// values keyed by command.
-///
-/// See the module-level docs in `crates/hbird-ssh/src/exec.rs` for the
-/// rationale behind a trait (issue #345 background).
 ///
 /// # Errors
 ///
@@ -116,14 +102,5 @@ mod tests {
         fn takes_trait<T: SshExec>(_: &T) {}
         let client = Client::new(SshOptions::new("h"));
         takes_trait(&client);
-    }
-
-    /// Trait-object construction: callers can erase the concrete type
-    /// behind `&dyn SshExec` (or `Box<dyn SshExec>`) when they want
-    /// runtime polymorphism. Compiles-or-fails — no assert needed.
-    #[test]
-    fn client_is_object_safe() {
-        let client = Client::new(SshOptions::new("h"));
-        let _erased: &dyn SshExec = &client;
     }
 }

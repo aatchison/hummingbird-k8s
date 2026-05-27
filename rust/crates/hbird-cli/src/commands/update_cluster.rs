@@ -914,19 +914,18 @@ impl Drop for LockGuard {
 /// Probe whether the remote bootc supports `upgrade --apply`. Mirrors
 /// bash `bootc_has_apply` (line 523). Dry-run short-circuits to `Ok(true)`.
 ///
-/// Live path (#327 cycle 2): runs `bootc upgrade --help | grep -q -- --apply`
-/// over SSH. Exit 0 → has --apply; exit 1 (no match) → fallback path.
-/// Any other non-zero classifies as an SSH/transport error and bubbles
-/// up so the caller can fail-fast rather than silently downgrade.
-// `#[allow(dead_code)]`: after the issue #345 trait-seam split,
-// `bootc_upgrade_apply` calls `bootc_has_apply_with_exec` directly so it
-// can thread a single mock executor through the whole flow. The outer
-// `bootc_has_apply` is kept as the bash-twin grep anchor (the
-// `cycle2_helper_names_present` regression test requires the `fn
-// bootc_has_apply` source span to remain) and as a future entry point
-// for callers that want the Plan-aware dry-run short-circuit. Remove
-// when both the grep-parity test and any external caller path are
-// retired.
+/// Live path: runs `bootc upgrade --help | grep -q -- --apply` over SSH.
+/// Exit 0 → has --apply; exit 1 (no match) → fallback path. Any other
+/// non-zero classifies as an SSH/transport error and bubbles up so the
+/// caller can fail-fast rather than silently downgrade.
+// `#[cfg(any(test, doc))]`: production callers route through
+// `bootc_has_apply_with_exec` so a single mock executor threads the
+// whole flow; the Plan-aware outer is retained as the bash-twin grep
+// anchor (referenced by `cycle2_helper_names_present`) and for rustdoc
+// without bloating the production binary. `allow(dead_code)` lets
+// clippy accept that the test/doc build also has no caller — this
+// function exists only as a source-level anchor.
+#[cfg(any(test, doc))]
 #[allow(dead_code)]
 #[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip))]
 fn bootc_has_apply(plan: &Plan, ip: &str) -> Result<bool> {
@@ -939,9 +938,8 @@ fn bootc_has_apply(plan: &Plan, ip: &str) -> Result<bool> {
 
 /// Inner helper for [`bootc_has_apply`] taking a mockable
 /// [`hbird_ssh::SshExec`] so unit tests can pin the rc=0 / rc=1 / rc=other
-/// classification without a real SSH connection (issue #345; surfaced by
-/// PR #344's 7-lens review L5 MEDIUM). `ip` is forwarded only for the
-/// error context — the SSH target is owned by the supplied executor.
+/// classification without a real SSH connection. `ip` is forwarded only
+/// for the error context — the SSH target is owned by the supplied executor.
 ///
 /// Branch table (mirrors bash `bootc_has_apply` at
 /// `scripts/update-cluster.sh:523`):
@@ -971,17 +969,15 @@ fn bootc_has_apply_with_exec(exec: &impl hbird_ssh::SshExec, ip: &str) -> Result
 /// `bootc_booted_digest` (line 536). Dry-run returns the sentinel
 /// `<dry-run-digest>` the bash twin uses.
 ///
-/// Live path (#327 cycle 2): runs `bootc status --json | jq -r
+/// Live path: runs `bootc status --json | jq -r
 /// '.status.booted.image.imageDigest // .status.booted.image.digest // empty'`
 /// over SSH. An empty string is a legitimate return (jq's `// empty`
 /// when neither path is populated) — the caller in
 /// [`bootc_upgrade_apply`] treats `pre == post == ""` as "couldn't
 /// determine, treat as applied" matching bash line 1157 which only
 /// short-circuits on a NON-EMPTY equal pair.
-// See `bootc_has_apply` for the `#[allow(dead_code)]` rationale —
-// `bootc_upgrade_apply` now routes through `bootc_booted_digest_with_exec`
-// to keep mock-injection consistent across the flow; the outer fn stays
-// as the bash-twin grep anchor + future-caller entry point.
+// See `bootc_has_apply` for the `#[cfg(any(test, doc))]` rationale.
+#[cfg(any(test, doc))]
 #[allow(dead_code)]
 #[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip))]
 fn bootc_booted_digest(plan: &Plan, ip: &str) -> Result<String> {
@@ -995,8 +991,8 @@ fn bootc_booted_digest(plan: &Plan, ip: &str) -> Result<String> {
 /// Inner helper for [`bootc_booted_digest`] taking a mockable
 /// [`hbird_ssh::SshExec`] so unit tests can drive the `pre == post` /
 /// `pre != post` / empty-string fallback branches that
-/// [`bootc_upgrade_apply`] keys off (issue #345). `ip` carries through
-/// to the error context only — the executor owns the actual SSH target.
+/// [`bootc_upgrade_apply`] keys off. `ip` carries through to the error
+/// context only — the executor owns the actual SSH target.
 fn bootc_booted_digest_with_exec(exec: &impl hbird_ssh::SshExec, ip: &str) -> Result<String> {
     // Bash line 543 uses the same jq expression. We replicate verbatim so
     // operators grepping both sides find a matching call shape.
@@ -1069,42 +1065,43 @@ fn timer_start(plan: &Plan, ip: &str) -> Result<()> {
 /// Wait for SSH to come back on `ip`. Mirrors `wait_ssh_back`
 /// (line 825). Dry-run emits the same one-shot log line.
 ///
-/// Live path (#327 cycle 2): polls `ssh root@ip true` every 5s up to
-/// `plan.timeouts.ssh` seconds. The bash twin uses `interval=5` (line
-/// 827) so we match that cadence exactly. Returns Ok the moment a
-/// connection succeeds; Err with the elapsed time on timeout.
+/// Live path: polls `ssh root@ip true` every 5s up to `plan.timeouts.ssh`
+/// seconds. The bash twin uses `interval=5` (line 827) so we match that
+/// cadence exactly. Returns Ok the moment a connection succeeds; Err
+/// with the elapsed time on timeout.
 ///
 /// Each poll uses a fresh SSH connection (no ControlMaster) with a
 /// short `ConnectTimeout=3` so a hung TCP handshake doesn't eat the
 /// whole interval — same shape as bash's `wait_ssh_drop` uses, but
 /// without `ControlPath=none` since wait_ssh_back's bash equivalent
-/// doesn't pass it (it actually WANTS the controlmaster reused once
-/// the connection is back; line 834 uses `${SSH_OPTS[@]}` verbatim).
+/// doesn't pass it (line 834 uses `${SSH_OPTS[@]}` verbatim).
 #[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip))]
 fn wait_ssh_back(plan: &Plan, ip: &str) -> Result<()> {
     let timeout = plan.timeouts.ssh;
-    log(&format!(
-        "waiting for SSH to come back on {ip} (timeout {timeout}s)"
-    ));
     if plan.dry_run {
-        log(&format!("DRY-RUN would poll ssh root@{ip}"));
-        return Ok(());
+        wait_ssh_back_with(&NeverCalledExec, &NoopClockProd, ip, timeout, true)
+    } else {
+        let client = hbird_ssh::Client::new(
+            node_ssh_opts(plan, ip).with_connect_timeout(Duration::from_secs(3)),
+        );
+        wait_ssh_back_with(&client, &RealClock, ip, timeout, false)
     }
-    let client = hbird_ssh::Client::new(
-        node_ssh_opts(plan, ip).with_connect_timeout(Duration::from_secs(3)),
-    );
-    wait_ssh_back_with(&client, &RealClock, ip, timeout)
 }
 
 /// Inner helper for [`wait_ssh_back`] taking a mockable
 /// [`hbird_ssh::SshExec`] + injectable [`Clock`]. Lets unit tests pin
-/// the never-back / back-after-N-polls poll-loop branches without
-/// burning real wall-clock seconds or opening a socket (issue #345).
+/// the dry-run shortcut + log-line wording + never-back / back-after-N-polls
+/// poll-loop branches without burning real wall-clock seconds or opening
+/// a socket.
 ///
 /// Each iteration:
 /// 1. Run `exec.run("true")`. On `Ok`, log + return `Ok(())`.
 /// 2. On `Err`, sleep `interval` seconds via the clock and add to `elapsed`.
 /// 3. If `elapsed >= timeout`, bail with the bash-twin wording.
+///
+/// `dry_run=true` short-circuits after emitting the announce + sentinel
+/// log lines, without touching `exec` or `clock` — pass a
+/// [`NeverCalledExec`] / [`NoopClockProd`] in that case.
 ///
 /// The interval is pinned at 5s (bash twin's `interval=5` at line 827).
 fn wait_ssh_back_with(
@@ -1112,7 +1109,15 @@ fn wait_ssh_back_with(
     clock: &impl Clock,
     ip: &str,
     timeout: u32,
+    dry_run: bool,
 ) -> Result<()> {
+    log(&format!(
+        "waiting for SSH to come back on {ip} (timeout {timeout}s)"
+    ));
+    if dry_run {
+        log(&format!("DRY-RUN would poll ssh root@{ip}"));
+        return Ok(());
+    }
     let interval: u32 = 5;
     let mut elapsed: u32 = 0;
     while elapsed < timeout {
@@ -1137,7 +1142,7 @@ fn wait_ssh_back_with(
 /// Wait for SSH on `ip` to become unreachable. Mirrors `wait_ssh_drop`
 /// (line 805). Diagnostic gate — a timeout is logged but not fatal.
 ///
-/// Live path (#327 cycle 2): polls `ssh root@ip true` every 1s up to
+/// Live path: polls `ssh root@ip true` every 1s up to
 /// `plan.timeouts.ssh_drop` seconds. Returns Ok the moment a connection
 /// fails (reboot in progress); Err on timeout (operator should grep for
 /// "still up after" — bash twin uses the same wording at line 821).
@@ -1152,31 +1157,39 @@ fn wait_ssh_back_with(
 fn wait_ssh_drop(plan: &Plan, ip: &str) -> Result<()> {
     let max = plan.timeouts.ssh_drop;
     if plan.dry_run {
+        wait_ssh_drop_with(&NeverCalledExec, &NoopClockProd, ip, max, true)
+    } else {
+        let client = hbird_ssh::Client::new(
+            node_ssh_opts(plan, ip).with_connect_timeout(Duration::from_secs(3)),
+        );
+        wait_ssh_drop_with(&client, &RealClock, ip, max, false)
+    }
+}
+
+/// Inner helper for [`wait_ssh_drop`] taking a mockable
+/// [`hbird_ssh::SshExec`] + injectable [`Clock`]. Lets unit tests pin
+/// the dry-run shortcut + log-line wording + drop-after-N-polls /
+/// never-drop branches without burning real seconds. Returns `Ok(())`
+/// in BOTH the drop-observed and the timeout-exhausted cases — the
+/// bash twin's `bail!` was demoted to a WARN log since both callers
+/// already swallowed the error.
+///
+/// `dry_run=true` short-circuits after emitting the DRY-RUN sentinel
+/// without touching `exec` or `clock`.
+fn wait_ssh_drop_with(
+    exec: &impl hbird_ssh::SshExec,
+    clock: &impl Clock,
+    ip: &str,
+    max: u32,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
         log(&format!(
             "DRY-RUN wait_ssh_drop {ip} (would poll up to {max}s)"
         ));
         return Ok(());
     }
     log(&format!("waiting for SSH on {ip} to drop (timeout {max}s)"));
-    let client = hbird_ssh::Client::new(
-        node_ssh_opts(plan, ip).with_connect_timeout(Duration::from_secs(3)),
-    );
-    wait_ssh_drop_with(&client, &RealClock, ip, max)
-}
-
-/// Inner helper for [`wait_ssh_drop`] taking a mockable
-/// [`hbird_ssh::SshExec`] + injectable [`Clock`]. Lets unit tests pin
-/// the drop-after-N-polls / never-drop branches without burning real
-/// seconds (issue #345). Returns `Ok(())` in BOTH the drop-observed and
-/// the timeout-exhausted cases — the bash twin's `bail!` was demoted to
-/// a WARN log in round-2 (lens L3 MED on PR #327) since both callers
-/// already swallowed the error.
-fn wait_ssh_drop_with(
-    exec: &impl hbird_ssh::SshExec,
-    clock: &impl Clock,
-    ip: &str,
-    max: u32,
-) -> Result<()> {
     let mut elapsed: u32 = 0;
     while elapsed < max {
         if exec.run("true").is_err() {
@@ -1200,17 +1213,12 @@ fn wait_ssh_drop_with(
     Ok(())
 }
 
-/// Injectable clock seam — pure unit tests can use a `NoopClock` to skip
-/// real sleeps while preserving the elapsed-counter shape of the poll
-/// loops. Production code uses [`RealClock`] which delegates to
-/// [`std::thread::sleep`]. Kept minimal (only the `sleep(Duration)`
-/// surface needed by [`wait_ssh_drop_with`] / [`wait_ssh_back_with`])
-/// to avoid scope creep; a fuller `now()` API can land if a future
-/// helper needs wall-clock state. (Issue #345.)
-trait Clock {
-    /// Block the calling thread for `duration`. Implementations may be
-    /// no-ops in tests; production callers MUST sleep at least
-    /// `duration` so the bash twin's poll-cadence semantics hold.
+/// Injectable clock seam — pure unit tests can use a `NoopClock` to
+/// skip real sleeps while preserving the elapsed-counter shape of the
+/// poll loops. Production code uses [`RealClock`] which delegates to
+/// [`std::thread::sleep`]. Implementations MUST block at least
+/// `duration` so the bash twin's poll-cadence semantics hold.
+trait Clock: Send + Sync {
     fn sleep(&self, duration: Duration);
 }
 
@@ -1220,6 +1228,40 @@ struct RealClock;
 impl Clock for RealClock {
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+}
+
+/// Production-side no-op clock used only when `dry_run=true` short-circuits
+/// the poll-loop body before any sleep happens. Lets `wait_ssh_back` /
+/// `wait_ssh_drop` route their dry-run path through the same
+/// `*_with_exec` helper without a separate code branch.
+struct NoopClockProd;
+
+impl Clock for NoopClockProd {
+    fn sleep(&self, _duration: Duration) {
+        // Unreachable in production: dry-run short-circuits before the
+        // poll loop ever calls `clock.sleep`. Panic loudly if a future
+        // refactor inadvertently routes a live path through here.
+        unreachable!("NoopClockProd::sleep called outside dry-run short-circuit");
+    }
+}
+
+/// Production-side SshExec stub used only when `dry_run=true`
+/// short-circuits before any SSH call is made. Same rationale as
+/// [`NoopClockProd`].
+struct NeverCalledExec;
+
+impl hbird_ssh::SshExec for NeverCalledExec {
+    fn run(&self, _command: &str) -> hbird_ssh::Result<hbird_ssh::RunOutput> {
+        unreachable!("NeverCalledExec::run called outside dry-run short-circuit");
+    }
+
+    fn run_with_stdin(
+        &self,
+        _command: &str,
+        _stdin: &[u8],
+    ) -> hbird_ssh::Result<hbird_ssh::RunOutput> {
+        unreachable!("NeverCalledExec::run_with_stdin called outside dry-run short-circuit");
     }
 }
 
@@ -1778,13 +1820,11 @@ enum BootcUpgradeOutcome {
 #[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip, node = %name))]
 fn bootc_upgrade_apply(plan: &Plan, ip: &str, name: &str) -> Result<BootcUpgradeOutcome> {
     if plan.dry_run {
-        log(&format!(
-            "DRY-RUN ssh root@{ip} bootc upgrade --apply (with pre/post digest compare)"
-        ));
-        return Ok(BootcUpgradeOutcome::Applied);
+        bootc_upgrade_apply_with_exec(&NeverCalledExec, ip, name, true)
+    } else {
+        let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+        bootc_upgrade_apply_with_exec(&client, ip, name, false)
     }
-    let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
-    bootc_upgrade_apply_with_exec(&client, ip, name)
 }
 
 /// Inner helper for [`bootc_upgrade_apply`] taking a mockable
@@ -1808,7 +1848,14 @@ fn bootc_upgrade_apply_with_exec(
     exec: &impl hbird_ssh::SshExec,
     ip: &str,
     name: &str,
+    dry_run: bool,
 ) -> Result<BootcUpgradeOutcome> {
+    if dry_run {
+        log(&format!(
+            "DRY-RUN ssh root@{ip} bootc upgrade --apply (with pre/post digest compare)"
+        ));
+        return Ok(BootcUpgradeOutcome::Applied);
+    }
     let pre_digest = bootc_booted_digest_with_exec(exec, ip)?;
     log(&format!(
         "  pre-upgrade booted digest: {}",
@@ -2337,15 +2384,15 @@ fn run_one_worker(plan: &Plan, w: &str, results: &mut Results) -> Result<()> {
 // auto ERROR event was misleading. (#331; original wiring #326.)
 #[tracing::instrument(level = "debug", skip(plan), fields(cp_ip = %plan.cp_ip, command = %command))]
 fn cp_kubectl(plan: &Plan, command: &str) -> Result<String> {
-    cp_kubectl_inner(plan, command)
-        .inspect_err(|err| tracing::debug!(error = ?err, "cp_kubectl failed"))
-}
-
-fn cp_kubectl_inner(plan: &Plan, command: &str) -> Result<String> {
     if plan.dry_run {
         log(&format!("DRY-RUN cp_kubectl -- {command}"));
         return Ok(String::new());
     }
+    cp_kubectl_live(plan, command)
+        .inspect_err(|err| tracing::debug!(error = ?err, "cp_kubectl failed"))
+}
+
+fn cp_kubectl_live(plan: &Plan, command: &str) -> Result<String> {
     // Round-2 L1 HIGH (defense-in-depth): the command is forwarded as a
     // single argv element to `ssh root@CP_IP`, which executes it via
     // `/bin/sh -c`. kubectl invocations don't need shell metacharacters;
@@ -3414,7 +3461,7 @@ mod tests {
             nonzero_exit(255, "Connection closed by remote"), // bootc upgrade --apply
         ]);
         let outcome =
-            bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1").expect("rc255 ok");
+            bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1", false).expect("rc255 ok");
         assert_eq!(
             outcome,
             BootcUpgradeOutcome::Applied,
@@ -3433,7 +3480,7 @@ mod tests {
             ok_stdout(""),           // bootc upgrade --apply (rc=0, no reboot)
             ok_stdout("sha256:pre"), // post digest (same)
         ]);
-        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1")
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1", false)
             .expect("rc0+same digest ok");
         assert_eq!(
             outcome,
@@ -3454,7 +3501,7 @@ mod tests {
             ok_stdout(""),            // bootc upgrade --apply (rc=0)
             ok_stdout("sha256:post"), // post digest (differs)
         ]);
-        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1")
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1", false)
             .expect("rc0+diff digest ok");
         assert_eq!(
             outcome,
@@ -3473,7 +3520,7 @@ mod tests {
             ok_stdout(""),                                // has_apply → true
             nonzero_exit(2, "bootc: image fetch failed"), // bootc upgrade --apply (rc=2)
         ]);
-        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1")
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1", false)
             .expect("rc=other must collapse to Ok(UpgradeFailed), not bubble Err");
         assert_eq!(
             outcome,
@@ -3494,8 +3541,8 @@ mod tests {
             ok_stdout(""), // bootc upgrade --apply (rc=0)
             ok_stdout(""), // post digest (also empty)
         ]);
-        let outcome =
-            bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1").expect("empty digests ok");
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1", false)
+            .expect("empty digests ok");
         assert_eq!(
             outcome,
             BootcUpgradeOutcome::Applied,
@@ -3515,7 +3562,7 @@ mod tests {
             ok_stdout(""),           // bootc upgrade (rc=0)
             nonzero_exit(255, ""),   // systemctl reboot (rc=255, reboot tore down ssh)
         ]);
-        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1")
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1", false)
             .expect("two-step rc255 ok");
         assert_eq!(
             outcome,
@@ -3572,7 +3619,7 @@ mod tests {
             nonzero_exit(255, ""), // probe 3: SSH dropped (transport torn down)
         ]);
         let clock = NoopClock::new();
-        let res = wait_ssh_drop_with(&exec, &clock, "10.0.0.1", 30);
+        let res = wait_ssh_drop_with(&exec, &clock, "10.0.0.1", 30, false);
         assert!(res.is_ok(), "drop-observed must return Ok: {res:?}");
         // Two sleeps between the three probes.
         assert_eq!(
@@ -3598,7 +3645,7 @@ mod tests {
             ok_stdout(""),
         ]);
         let clock = NoopClock::new();
-        let res = wait_ssh_drop_with(&exec, &clock, "10.0.0.1", 5);
+        let res = wait_ssh_drop_with(&exec, &clock, "10.0.0.1", 5, false);
         assert!(
             res.is_ok(),
             "round-2 L3 MED: timeout-exhausted MUST return Ok (WARN-only), got {res:?}",
@@ -3620,7 +3667,7 @@ mod tests {
             ok_stdout(""),         // probe 2: back!
         ]);
         let clock = NoopClock::new();
-        let res = wait_ssh_back_with(&exec, &clock, "10.0.0.1", 300);
+        let res = wait_ssh_back_with(&exec, &clock, "10.0.0.1", 300, false);
         assert!(res.is_ok(), "back-observed must return Ok: {res:?}");
         assert_eq!(
             clock.sleep_count(),
@@ -3639,8 +3686,8 @@ mod tests {
         // 10s budget at 5s interval → 2 probes, both failing.
         let exec = MockSshExec::new(vec![nonzero_exit(255, ""), nonzero_exit(255, "")]);
         let clock = NoopClock::new();
-        let err =
-            wait_ssh_back_with(&exec, &clock, "10.0.0.1", 10).expect_err("never-back must bail");
+        let err = wait_ssh_back_with(&exec, &clock, "10.0.0.1", 10, false)
+            .expect_err("never-back must bail");
         let s = err.to_string();
         assert!(
             s.contains("did not come back within 10s") && s.contains("10.0.0.1"),
@@ -3655,9 +3702,113 @@ mod tests {
     fn wait_ssh_back_with_zero_timeout_bails_immediately() {
         let exec = MockSshExec::new(vec![]); // zero probes expected
         let clock = NoopClock::new();
-        let err = wait_ssh_back_with(&exec, &clock, "10.0.0.1", 0)
+        let err = wait_ssh_back_with(&exec, &clock, "10.0.0.1", 0, false)
             .expect_err("zero-timeout must bail without probing");
         assert!(err.to_string().contains("did not come back within 0s"));
         assert_eq!(clock.sleep_count(), 0);
+    }
+
+    /// Round-1 review (fix #5): `wait_ssh_drop_with` first-probe hit
+    /// MUST return Ok without sleeping. Catches a regression where the
+    /// initial probe was placed AFTER `sleep(interval)` (which would
+    /// pad observed reboot time by one full cadence).
+    #[test]
+    fn wait_ssh_drop_with_returns_ok_on_first_probe() {
+        let exec = MockSshExec::new(vec![nonzero_exit(255, "")]);
+        let clock = NoopClock::new();
+        let res = wait_ssh_drop_with(&exec, &clock, "10.0.0.1", 30, false);
+        assert!(res.is_ok(), "first-probe drop must return Ok: {res:?}");
+        assert_eq!(
+            clock.sleep_count(),
+            0,
+            "no sleeps may fire before the first probe — got {}",
+            clock.sleep_count(),
+        );
+    }
+
+    /// Round-1 review (fix #5): `wait_ssh_back_with` first-probe hit
+    /// MUST return Ok without sleeping. Symmetric guarantee to
+    /// `wait_ssh_drop_with_returns_ok_on_first_probe` above.
+    #[test]
+    fn wait_ssh_back_with_returns_ok_on_first_probe() {
+        let exec = MockSshExec::new(vec![ok_stdout("")]);
+        let clock = NoopClock::new();
+        let res = wait_ssh_back_with(&exec, &clock, "10.0.0.1", 300, false);
+        assert!(res.is_ok(), "first-probe back must return Ok: {res:?}");
+        assert_eq!(
+            clock.sleep_count(),
+            0,
+            "no sleeps may fire before the first probe — got {}",
+            clock.sleep_count(),
+        );
+    }
+
+    /// Round-1 review (fix #6): an SSH-transport `Err` (Spawn, Wait,
+    /// IdentityFileMissing, StdinWrite) from the `bootc upgrade`
+    /// invocation MUST propagate as `Err(_)`, NOT be silently classified
+    /// as `Ok(UpgradeFailed)`. Pins the distinction so an operator
+    /// hitting an SSH-binary-missing condition sees the transport
+    /// chain rather than a "bootc upgrade failed" log line that points
+    /// them at the wrong layer.
+    #[test]
+    fn bootc_upgrade_apply_with_exec_ssh_transport_err_propagates() {
+        // Pre-digest is consumed first; serve it Ok so we reach the
+        // upgrade call. has_apply is consumed second; serve it Ok so we
+        // get to the upgrade itself. Then return a transport error
+        // (Spawn stands in for any non-NonZeroExit shape).
+        let exec = MockSshExec::new(vec![
+            ok_stdout("sha256:pre"), // bootc_booted_digest (pre)
+            ok_stdout(""),           // bootc_has_apply → true
+            Err(SshErr::Spawn {
+                program: "ssh".to_string(),
+                host: "10.0.0.1".to_string(),
+                kind: hbird_ssh::SpawnKind::Other,
+                source: std::io::Error::other("simulated transport failure"),
+            }),
+        ]);
+        let err = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1", false)
+            .expect_err("transport error MUST propagate as Err, not collapse to UpgradeFailed");
+        let s = err.to_string();
+        assert!(
+            s.contains("bootc_upgrade_apply") && s.contains("10.0.0.1"),
+            "transport-err context must name helper + host: {s}",
+        );
+    }
+
+    /// Round-1 review (fix #4): `wait_ssh_back_with(dry_run=true)`
+    /// MUST short-circuit Ok without consulting the executor or clock.
+    /// Pin the no-call shape so a future revert that re-routes the
+    /// dry-run through the poll loop fires here.
+    #[test]
+    fn wait_ssh_back_with_dry_run_short_circuits() {
+        let exec = MockSshExec::new(vec![]); // exec must NOT be called
+        let clock = NoopClock::new();
+        let res = wait_ssh_back_with(&exec, &clock, "10.0.0.1", 300, true);
+        assert!(res.is_ok(), "dry-run must return Ok: {res:?}");
+        assert_eq!(clock.sleep_count(), 0, "dry-run must not sleep");
+    }
+
+    /// Round-1 review (fix #4): `wait_ssh_drop_with(dry_run=true)`
+    /// MUST short-circuit Ok without consulting executor or clock.
+    #[test]
+    fn wait_ssh_drop_with_dry_run_short_circuits() {
+        let exec = MockSshExec::new(vec![]); // exec must NOT be called
+        let clock = NoopClock::new();
+        let res = wait_ssh_drop_with(&exec, &clock, "10.0.0.1", 30, true);
+        assert!(res.is_ok(), "dry-run must return Ok: {res:?}");
+        assert_eq!(clock.sleep_count(), 0, "dry-run must not sleep");
+    }
+
+    /// Round-1 review (fix #4): `bootc_upgrade_apply_with_exec(dry_run=true)`
+    /// MUST return Applied without consulting the executor. The outer
+    /// `bootc_upgrade_apply(plan)` wrapper now delegates the dry-run
+    /// shortcut into `_with_exec` so this single test covers both code
+    /// paths.
+    #[test]
+    fn bootc_upgrade_apply_with_exec_dry_run_returns_applied() {
+        let exec = MockSshExec::new(vec![]); // exec must NOT be called
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1", true)
+            .expect("dry-run must succeed");
+        assert_eq!(outcome, BootcUpgradeOutcome::Applied);
     }
 }

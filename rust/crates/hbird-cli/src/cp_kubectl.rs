@@ -152,11 +152,6 @@ fn reject_shell_metachars(context: &str, command: &str) -> Result<()> {
     fields(cp_ip = %target.cp_ip, command = %command),
 )]
 pub(crate) fn cp_kubectl_raw(target: &CpTarget, command: &str) -> Result<hbird_ssh::RunOutput> {
-    cp_kubectl_raw_inner(target, command)
-        .inspect_err(|err| tracing::debug!(error = ?err, "cp_kubectl_raw failed"))
-}
-
-fn cp_kubectl_raw_inner(target: &CpTarget, command: &str) -> Result<hbird_ssh::RunOutput> {
     let client = hbird_ssh::Client::new(target.cp_ssh_opts());
     cp_kubectl_raw_with_exec(&client, &target.cp_ip, command)
 }
@@ -164,8 +159,13 @@ fn cp_kubectl_raw_inner(target: &CpTarget, command: &str) -> Result<hbird_ssh::R
 /// Inner helper for [`cp_kubectl_raw`] taking a mockable
 /// [`hbird_ssh::SshExec`] so unit tests can pin the metacharacter-
 /// rejection + kubectl-prefix wrapping branches without a real SSH
-/// connection (issue #345). `cp_ip` is forwarded only for the error
-/// context — the supplied executor owns the actual target.
+/// connection. `cp_ip` is forwarded only for the error context — the
+/// supplied executor owns the actual target.
+///
+/// Emits a `tracing::debug!` event on the Err path so a caller's
+/// `RUST_LOG=hbird_cli=debug` surfaces the underlying error chain. The
+/// outer wrapper's `#[tracing::instrument]` opens the span; this is the
+/// matching per-call-site logging policy.
 pub(crate) fn cp_kubectl_raw_with_exec(
     exec: &impl hbird_ssh::SshExec,
     cp_ip: &str,
@@ -173,9 +173,11 @@ pub(crate) fn cp_kubectl_raw_with_exec(
 ) -> Result<hbird_ssh::RunOutput> {
     reject_shell_metachars("cp_kubectl_raw", command)?;
     let remote = format!("kubectl --kubeconfig=/etc/kubernetes/admin.conf {command}");
-    exec.run(&remote).with_context(|| {
-        format!("cp_kubectl_raw: ssh-run failed for `kubectl ... {command}` against {cp_ip}")
-    })
+    exec.run(&remote)
+        .with_context(|| {
+            format!("cp_kubectl_raw: ssh-run failed for `kubectl ... {command}` against {cp_ip}")
+        })
+        .inspect_err(|err| tracing::debug!(error = ?err, "cp_kubectl_raw failed"))
 }
 
 /// Run a kubectl command on the CP via SSH, piping `stdin` to it.
@@ -537,5 +539,40 @@ mod tests {
             "exec MUST NOT be called when metachar rejection fires: got {:?}",
             exec.commands(),
         );
+    }
+
+    /// Round-1 review (fix #7): parameterized coverage of the metachar
+    /// allowlist. Each member of the rejection set MUST (a) return Err
+    /// and (b) leave the executor untouched. Catches a future regression
+    /// in `reject_shell_metachars` that silently drops a member of the
+    /// allowed-set (e.g. forgets `\0` or stops rejecting `$(`).
+    #[test]
+    fn cp_kubectl_raw_with_exec_rejects_each_metachar_in_set() {
+        // Each entry pairs a "good kubectl verb" with one bad char so
+        // the metachar is in the middle (not just the prefix) of the
+        // command string — pins that the scan is char-wise, not just
+        // a startswith check.
+        let cases: &[(&str, &str)] = &[
+            (";", "get nodes ; rm /"),
+            ("&", "get nodes & whoami"),
+            ("|", "get nodes | tee /tmp/x"),
+            ("$(...)", "get $(echo nodes)"),
+            ("`...`", "get `whoami`"),
+            ("\\n", "get nodes\nrm /"),
+            ("\\r", "get nodes\rrm /"),
+        ];
+        for (label, bad) in cases {
+            let exec = CapturingExec::new(ok_stdout("should-never-be-returned"));
+            let res = cp_kubectl_raw_with_exec(&exec, "192.168.122.42", bad);
+            assert!(
+                res.is_err(),
+                "metachar {label:?} (cmd={bad:?}) MUST be rejected",
+            );
+            assert!(
+                exec.commands().is_empty(),
+                "exec MUST NOT be called for metachar {label:?} (cmd={bad:?}); got {:?}",
+                exec.commands(),
+            );
+        }
     }
 }
