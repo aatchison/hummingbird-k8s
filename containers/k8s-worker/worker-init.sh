@@ -48,23 +48,27 @@ sysctl --system >/dev/null
 # and surface workers in the cluster under humbird-worker-<machine-id>
 # instead of the names cloud-init was told to use (#186, #254).
 #
-# Resolution rules (#254):
+# Resolution rules (#254, revised for #265):
 #
-#   1. Wait for cloud-init to finish all stages so its hostname module has
-#      definitively committed (or definitively skipped) any user-data /
-#      meta-data hostname. We can't use `After=cloud-init.target` on the
-#      service (it creates an ordering cycle vs multi-user.target — see the
-#      service unit comment), so we block at runtime here. Best-effort only:
-#      if cloud-init isn't installed (the legacy spawn-workers.sh path) the
-#      command is absent and we skip cleanly.
+#   1. Read the PERSISTENT hostname directly via `hostnamectl --static`
+#      (which reads /etc/hostname). cloud-init's hostname module runs at
+#      the network/init stage, which completes BEFORE multi-user.target
+#      activates. worker-init.service is WantedBy=multi-user.target, so by
+#      the time this script runs /etc/hostname already has cloud-init's
+#      seeded value and `hostnamectl --static` returns it.
 #
-#   2. Prefer the PERSISTENT hostname (`hostnamectl --static`, which reads
-#      /etc/hostname) over the running kernel hostname. In #254 we observed
-#      cloud-init writing /etc/hostname correctly while the running kernel
-#      hostname stayed at "localhost.localdomain" because systemd-hostnamed
-#      reads /etc/hostname only at boot — before cloud-init's hostname
-#      module ran. Reading `hostnamectl --static` picks up cloud-init's
-#      write even when `hostname` (kernel) is stale.
+#      We deliberately do NOT call `cloud-init status --wait`: it blocks
+#      on cloud-final.service, which has After=multi-user.target, which
+#      is itself blocked by us. Classic three-way deadlock — PR #255
+#      introduced exactly that and PR #265 removed it (same bug class as
+#      PR #171/#172/#173 fixed on the k8s-init path).
+#
+#   2. Prefer the PERSISTENT hostname over the running kernel hostname.
+#      In #254 we observed cloud-init writing /etc/hostname correctly
+#      while the running kernel hostname stayed at "localhost.localdomain"
+#      because systemd-hostnamed reads /etc/hostname only at boot — before
+#      cloud-init's hostname module ran. Reading `hostnamectl --static`
+#      picks up cloud-init's write even when `hostname` (kernel) is stale.
 #
 #   3. If the persistent hostname IS a meaningful name, re-assert it on the
 #      running kernel (no-op if already correct, fixes #254 stale-kernel case).
@@ -72,9 +76,6 @@ sysctl --system >/dev/null
 #   4. Only fall back to humbird-worker-<machine-id> when the persistent
 #      hostname is the localhost default OR empty (the legacy spawn-workers
 #      path, which does not seed cloud-init user-data).
-if command -v cloud-init >/dev/null 2>&1; then
-  cloud-init status --wait >/dev/null 2>&1 || true
-fi
 static_hostname="$(hostnamectl --static 2>/dev/null || true)"
 # Fall back to /etc/hostname directly, then to `hostname`, if hostnamectl
 # is missing/erroring (unlikely on Fedora bootc but cheap to guard).
