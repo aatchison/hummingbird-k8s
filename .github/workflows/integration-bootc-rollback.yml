@@ -39,7 +39,7 @@ jobs:
       STORAGE_DRIVER: vfs
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install runner deps (CNI + virtinst)
         run: |
