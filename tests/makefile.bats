@@ -37,6 +37,9 @@
 #       `--preserve-env` somewhere (drift fence for the local-fallback
 #       workaround when running on the KVM host with custom podman
 #       storage — issue #233, PR #237 round-2).
+#   20. docs/makefile.md Variables table covers every `?=` default in
+#       the Makefile (drift fence for #271 F7 — docs cannot silently
+#       lag the recipe surface).
 
 setup() {
   # All recipes are anchored at repo root. tests/ lives one level down, so
@@ -385,4 +388,41 @@ make_dry() {
       return 1
     fi
   done
+}
+
+@test "20. every Makefile ?= default has a row in docs/makefile.md Variables table (#271 F7)" {
+  # Drift fence: each `VAR ?= default` line in the top-level Makefile
+  # MUST have a backticked `\`VAR\`` row in docs/makefile.md. Anyone
+  # who adds a new operator knob to the Makefile gets a CI failure if
+  # they forget to document it. Pairs with the Variables table prose
+  # claim that the table is "the authoritative reference."
+  [ -f Makefile ] || { echo "missing Makefile" >&2; return 1; }
+  [ -f docs/makefile.md ] || { echo "missing docs/makefile.md" >&2; return 1; }
+
+  # Extract LHS of every `VAR ?= ...` line. Strip surrounding whitespace.
+  # Skip private/internal vars (_ prefix) — those are Makefile-internal
+  # validation scratch and have no operator-facing surface.
+  mapfile -t vars < <(grep -E '^[A-Z][A-Z0-9_]*[[:space:]]*\?=' Makefile \
+                      | sed -E 's/^([A-Z][A-Z0-9_]*).*$/\1/' \
+                      | grep -v '^_' \
+                      | sort -u)
+
+  [ "${#vars[@]}" -gt 0 ] || { echo "no ?= vars found in Makefile — bug in this test?" >&2; return 1; }
+
+  missing=()
+  for v in "${vars[@]}"; do
+    # Look for a backticked `VAR` token in docs/makefile.md. The table
+    # uses `| \`VAR\` ...` rows so this match is anchored on the
+    # table-cell convention.
+    if ! grep -qE "\`${v}\`" docs/makefile.md; then
+      missing+=("$v")
+    fi
+  done
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "Makefile ?= vars with no row in docs/makefile.md Variables table:" >&2
+    for v in "${missing[@]}"; do echo "  - $v" >&2; done
+    echo "Add each missing var to the Variables section of docs/makefile.md." >&2
+    return 1
+  fi
 }
