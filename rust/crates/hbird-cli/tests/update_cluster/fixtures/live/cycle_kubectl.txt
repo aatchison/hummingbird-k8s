@@ -1,0 +1,60 @@
+# Phase 3 cycle: `hbird kubectl <args>` parity vs bash twin
+#
+# Captured 2026-05-27 against the live geary cluster. Bash side
+# captures the same SSH-equivalent shape `make kubectl ARGS='get
+# pods -A'` exercises.
+#
+# bash side: ssh -o BatchMode=yes -J aatchison@geary root@192.168.122.212
+#   "kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A"
+# rust side: hbird kubectl --config <cluster-live.conf> -- get pods -A
+
+=== bash side stdout (head 20) ===
+NAMESPACE     NAME                                READY   STATUS    RESTARTS        AGE
+kube-system   cilium-2xtbw                        1/1     Running   0               3h20m
+kube-system   cilium-envoy-9fjzj                  1/1     Running   0               3h20m
+kube-system   cilium-envoy-fslgl                  1/1     Running   0               3h20m
+kube-system   cilium-envoy-tpz87                  1/1     Running   0               3h21m
+kube-system   cilium-mv5hq                        1/1     Running   0               3h20m
+kube-system   cilium-operator-6d97c68995-sxtqr    1/1     Running   0               3h21m
+kube-system   cilium-xnc44                        1/1     Running   0               3h21m
+kube-system   coredns-7c65d6cfc9-gs9dm            1/1     Running   0               3h20m
+kube-system   coredns-7c65d6cfc9-m86rc            1/1     Running   0               3h20m
+kube-system   etcd-hbird-cp1                      1/1     Running   0               3h21m
+kube-system   hubble-relay-7b5c9d5cbb-n5wqt       1/1     Running   0               3h21m
+kube-system   kube-apiserver-hbird-cp1            1/1     Running   0               3h21m
+kube-system   kube-controller-manager-hbird-cp1   1/1     Running   0               3h21m
+kube-system   kube-scheduler-hbird-cp1            1/1     Running   0               3h21m
+kube-system   metrics-server-587b667b55-bjmz7     1/1     Running   1 (3h20m ago)   3h21m
+
+=== rust side stdout (head 20) ===
+NAMESPACE     NAME                                READY   STATUS    RESTARTS        AGE
+kube-system   cilium-2xtbw                        1/1     Running   0               3h20m
+kube-system   cilium-envoy-9fjzj                  1/1     Running   0               3h20m
+kube-system   cilium-envoy-fslgl                  1/1     Running   0               3h20m
+kube-system   cilium-envoy-tpz87                  1/1     Running   0               3h21m
+kube-system   cilium-mv5hq                        1/1     Running   0               3h20m
+kube-system   cilium-operator-6d97c68995-sxtqr    1/1     Running   0               3h21m
+kube-system   cilium-xnc44                        1/1     Running   0               3h21m
+kube-system   coredns-7c65d6cfc9-gs9dm            1/1     Running   0               3h20m
+kube-system   coredns-7c65d6cfc9-m86rc            1/1     Running   0               3h20m
+kube-system   etcd-hbird-cp1                      1/1     Running   0               3h21m
+kube-system   hubble-relay-7b5c9d5cbb-n5wqt       1/1     Running   0               3h21m
+kube-system   kube-apiserver-hbird-cp1            1/1     Running   0               3h21m
+kube-system   kube-controller-manager-hbird-cp1   1/1     Running   0               3h21m
+kube-system   kube-scheduler-hbird-cp1            1/1     Running   0               3h21m
+kube-system   metrics-server-587b667b55-bjmz7     1/1     Running   1 (3h20m ago)   3h21m
+
+=== diff stdout ===
+EMPTY DIFF — byte-for-byte parity on stdout including the
+non-trivial whitespace alignment kubectl emits per the cluster's
+longest-name column width. Same `cp_kubectl_raw` route as the
+`nodes` cycle.
+
+=== notes ===
+- The `--` separator after `--config <path>` is clap's standard
+  positional-pass-through boundary; the `args` Vec collects
+  everything after it. `make kubectl ARGS='get pods -A'` works the
+  same way through bash's `$@` expansion.
+- Variadic pass-through is unit-pinned by
+  `tests/cli_smoke.rs::kubectl_passthrough_resolves_targets_and_fails_at_cp_lookup`.
+- Pinned by `tests/cycle_kubectl_live.rs` (env-gated by HBIRD_LIVE_TEST=1).

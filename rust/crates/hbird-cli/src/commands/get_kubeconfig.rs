@@ -3,7 +3,11 @@
 //!
 //! The bash twin calls `scripts/export-argocd.sh` with operator-friendly
 //! defaults (`--output kubeconfig.yaml`, `--context-name=$CP_NAME`). The
-//! Rust shape mirrors those defaults.
+//! Rust shape delegates to [`crate::commands::export_argocd`]'s shared
+//! [`crate::commands::export_argocd::export_kubeconfig`] core, passing
+//! those defaults via [`crate::commands::export_argocd::ExportOptions::for_get_kubeconfig`].
+//!
+//! Same #306/#307 fixes apply here — see the export-argocd module docs.
 //!
 //! Behavior tracked by [#288].
 //!
@@ -11,8 +15,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::Args;
+
+use crate::commands::export_argocd::{ExportOptions, export_kubeconfig};
 
 /// Arguments for `hbird get-kubeconfig`.
 #[derive(Debug, Args)]
@@ -44,23 +50,30 @@ pub struct GetKubeconfigArgs {
     #[arg(long)]
     pub force: bool,
 
-    /// SSH ProxyJump host inserted via the kubeconfig's exec plugin
-    /// (bash: `--proxy-jump=HOST`). Useful when the kubeconfig will be
-    /// consumed from a workstation that can't reach the CP directly.
+    /// SSH ProxyJump host. Defaults to CONFIG's `KVM_HOST` when unset
+    /// (post-#306 resolution order). Pass `--proxy-jump=''` to disable.
     #[arg(long, value_name = "HOST")]
     pub proxy_jump: Option<String>,
+
+    /// Static CP IP. Overrides CONFIG's `CP_IP`. Required when CONFIG
+    /// doesn't pin one.
+    #[arg(long, value_name = "IP", env = "CP_IP")]
+    pub cp_ip: Option<String>,
 }
 
-/// Dispatch — currently `Err("not yet implemented")`. Echoes parsed
-/// args so the operator can confirm clap captured the right config +
-/// output before the stub bails. (PR #319 round-2 review L8 MEDIUM.)
+/// Dispatch — builds an [`ExportOptions`] with the operator-friendly
+/// `--context-name=$CP_NAME` default (vs. the `hummingbird-$CP_NAME`
+/// default that `export-argocd` uses) and delegates to the shared
+/// core.
 pub fn run(args: GetKubeconfigArgs) -> Result<()> {
-    Err(anyhow!(
-        "hbird get-kubeconfig: not yet implemented — tracked by #288 \
-         (https://github.com/aatchison/hummingbird-k8s/issues/288). \
-         Parsed: --config {} --output {}. \
-         Use `make get-kubeconfig CONFIG=…` until then.",
-        args.config.display(),
-        args.output.display(),
-    ))
+    let opts = ExportOptions::for_get_kubeconfig(
+        &args.config,
+        args.output,
+        args.server,
+        args.context,
+        args.proxy_jump,
+        args.cp_ip,
+        args.force,
+    )?;
+    export_kubeconfig(&opts)
 }

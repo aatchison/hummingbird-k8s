@@ -1,0 +1,45 @@
+# Phase 3 cycle: `hbird nodes` parity vs bash twin
+#
+# Captured 2026-05-27 against the live geary cluster (hbird-cp1 +
+# hbird-w1 + hbird-w2). Bash side uses the same SSH chain `make nodes`
+# does AFTER the local-tunnel + local-kubectl step settles: the
+# operator-equivalent `ssh -J $KVM_HOST root@$CP_IP "kubectl ... get
+# nodes"` (kubectl-k8s.sh's local-tunnel transport produces the same
+# stdout content — it's a different path to the same `kubectl get
+# nodes` against the apiserver).
+#
+# bash side: ssh -o BatchMode=yes -J aatchison@geary root@192.168.122.212
+#   "kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes"
+# rust side: hbird nodes --config <cluster-live.conf>
+#
+# Both ran against a stable 3/3-Ready cluster.
+
+=== bash side stdout ===
+NAME        STATUS   ROLES           AGE     VERSION
+hbird-cp1   Ready    control-plane   3h23m   v1.31.14
+hbird-w1    Ready    <none>          3h22m   v1.31.14
+hbird-w2    Ready    <none>          3h22m   v1.31.14
+
+=== rust side stdout ===
+NAME        STATUS   ROLES           AGE     VERSION
+hbird-cp1   Ready    control-plane   3h23m   v1.31.14
+hbird-w1    Ready    <none>          3h22m   v1.31.14
+hbird-w2    Ready    <none>          3h22m   v1.31.14
+
+=== rust side stderr ===
+ INFO hbird{subcommand="nodes"}: close
+
+=== diff stdout ===
+EMPTY DIFF — byte-for-byte parity on stdout. Stderr carries only the
+tracing-subscriber CLOSE span event (RUST_LOG-toggleable), which has
+no bash equivalent and does not corrupt operator pipelines like
+`hbird nodes | grep Ready`.
+
+=== notes ===
+- `hbird nodes` uses `cp_kubectl_raw` from the shared `cp_kubectl.rs`
+  module (sibling of `commands/`). Same SSH wiring as cycle 1
+  drain/uncordon (PR #325).
+- No divergence from bash for the read-only kubectl pass-through —
+  this is the cleanest demo of "no rewrite, just route the bytes
+  through SSH and print them".
+- Pinned by `tests/cycle_nodes_live.rs` (env-gated by HBIRD_LIVE_TEST=1).

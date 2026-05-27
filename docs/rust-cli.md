@@ -29,6 +29,7 @@ subcommands land per the phasing table in
 | [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | `update-cluster` Phase 1A — dry-run parity + orchestration scaffold | landed (PR #321) |
 | [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycle 1 (`cp_kubectl` + drain/uncordon) landed (PR #325); cycles 2–4 pending |
 | [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | `verify-*` Phase 2 — encryption / hardening / app-deploy / all | landed (PR #330) — live-validated 2026-05-27 |
+| [#288](https://github.com/aatchison/hummingbird-k8s/issues/288) | Phase 3 — `export-argocd` / `get-kubeconfig` / `nodes` / `kubectl` | landed (PR #334) — live-validated 2026-05-27 |
 
 ## Foundation crates landed so far
 
@@ -56,19 +57,32 @@ hbird verify encryption   <-> make verify-encryption   (body tracked by #287)
 hbird verify hardening    <-> make verify-hardening    (body tracked by #287)
 hbird verify app-deploy   <-> make verify-app-deploy   (body tracked by #287)
 hbird verify all          <-> make verify-all          (body tracked by #287)
-hbird get-kubeconfig      <-> make get-kubeconfig      (body tracked by #288)
-hbird export-argocd       <-> make export-argocd      (body tracked by #288)
-hbird nodes               <-> make nodes               (body tracked by #288)
-hbird kubectl …           <-> make kubectl             (body tracked by #288)
+hbird get-kubeconfig      <-> make get-kubeconfig      (landed: PR #288)
+hbird export-argocd       <-> make export-argocd      (landed: PR #288)
+hbird nodes               <-> make nodes               (landed: PR #288)
+hbird kubectl …           <-> make kubectl             (landed: PR #288)
 ```
 
-Every subcommand currently returns
-`Err("not yet implemented — tracked by #XXX")` with the appropriate
-sub-issue link — *except* `verify {encryption,hardening,app-deploy,all}`
-(PR #330) and `update-cluster --dry-run` (PR #321), which now reach live
-or dry-run execution per the phasing table above. The flag set + help
-text are stable; the Makefile will start dispatching to `hbird`
-per-target as each implementation lands.
+Subcommand status:
+
+- `update-cluster` — Phase 1A (dry-run) landed (#286 / PR #321); Phase 1B
+  cycle 1 (cp_kubectl + drain/uncordon) landed (#322 / PR #325); cycles
+  2–4 carved out as #327 / #328 / #329 (independently dispatchable).
+- `verify {encryption,hardening,app-deploy,all}` — Phase 2 landed
+  (#287 / PR #330). Live-validated against the geary cluster
+  2026-05-27.
+- `export-argocd` / `get-kubeconfig` / `nodes` / `kubectl` — Phase 3
+  landed (#288 / PR #334). Each routes through the shared `cp_kubectl`
+  module (sibling of `commands/`) — same SSH+ProxyJump wiring as Phase
+  1B cycle 1. The export-argocd / get-kubeconfig paths ship the
+  *corrected* shape (post-#306 ProxyJump-after-config and post-#307
+  non-TTY SSH) — see fixture annotations.
+- `deploy-cluster` / `destroy-cluster` — Phase 4 tracked by #289;
+  still scaffold-only.
+
+The flag set + help text are stable; the Makefile will start
+dispatching to `hbird` per-target as each implementation reaches
+parity.
 
 Tracing/logging — `tracing` + `tracing-subscriber` (chosen by [#323],
 PR #326). Library crates (`hbird-config`, `hbird-ssh`, `hbird-virt`)
@@ -137,6 +151,45 @@ against the live geary cluster with a bash-vs-Rust diff captured under
 | 2 | #6 | `capture_node_bootid`, `wait_node_bootid_changed`, `bootc_upgrade_apply`, `wait_ssh_drop`, `wait_ssh_back` | pending |
 | 3 | #9 | `wait_node_ready`, `wait_node_daemonsets_ready` | pending |
 | 4 | #7 | `wait_apiserver_back`, etcd-backup | pending |
+
+### Phase 3 (`export-argocd` / `get-kubeconfig` / `nodes` / `kubectl`)
+
+Landed by [#288]. Four subcommands share the
+`crates/hbird-cli/src/cp_kubectl.rs` module (sibling of `commands/`)
+which provides:
+
+- `cp_kubectl_raw(target, command)` — kubectl-wrapped SSH (errs on
+  non-zero exit). Used by `nodes` / `kubectl`.
+- `cp_ssh_capture(target, command)` — raw SSH (errs on non-zero,
+  returns raw bytes for binary payloads). Used by `export-argocd` /
+  `get-kubeconfig` to `sudo cat /etc/kubernetes/admin.conf`.
+- `cp_kubectl_with_stdin_lenient` / `cp_ssh_lenient` — non-zero
+  tolerated variants reserved for #287's PSA-rejection + audit-log
+  probes. Both `#[allow(dead_code)]` in this PR; #287 picks them up.
+
+Two known bash bugs the Rust impl deliberately fixes:
+
+- **[#306]** — bash sets `PROXY_JUMP="${KVM_HOST:-}"` BEFORE sourcing
+  `$CONFIG`, so `KVM_HOST=geary` pinned in CONFIG doesn't activate
+  ProxyJump unless also exported in the operator's shell. The Rust
+  path resolves AFTER config load (config → CLI/env override → empty),
+  matching the documented bash semantics.
+- **[#307]** — bash `cp_ssh() { ssh -t ... }` allocates a remote PTY;
+  modern sudo can emit OSC session-start escapes that pollute stdout
+  and break the downstream `grep -q '^apiVersion:'` sanity check. The
+  Rust path uses non-TTY SSH (BatchMode=yes is `hbird-ssh`'s default).
+  A unit test (`sanity_check_rejects_osc_prefix`) pins the rejection
+  shape so a future regression catches it loudly.
+
+Live-validate fixtures:
+`crates/hbird-cli/tests/update_cluster/fixtures/live/cycle_{nodes,kubectl,export_argocd,get_kubeconfig}.txt`.
+`nodes` + `kubectl` are byte-for-byte parity (empty diff);
+`export-argocd` + `get-kubeconfig` carry intentional log-line
+divergence (Rust ships the fixed shape; bash retains buggy behavior
+until #306/#307 land). See each fixture for the per-cycle annotation.
+
+[#306]: https://github.com/aatchison/hummingbird-k8s/issues/306
+[#307]: https://github.com/aatchison/hummingbird-k8s/issues/307
 
 #### Live-validate methodology (template for cycles 2–4)
 
@@ -213,5 +266,6 @@ concurrency lands when block #13 ships.
 
 [#279]: https://github.com/aatchison/hummingbird-k8s/issues/279
 [#286]: https://github.com/aatchison/hummingbird-k8s/issues/286
+[#288]: https://github.com/aatchison/hummingbird-k8s/issues/288
 [#291]: https://github.com/aatchison/hummingbird-k8s/issues/291
 [#322]: https://github.com/aatchison/hummingbird-k8s/issues/322
