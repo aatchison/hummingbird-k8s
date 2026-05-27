@@ -24,12 +24,10 @@ Releases are published on `v*` tag push by
 
 ```sh
 VERSION=v0.0.1
-curl -sSL -o hbird     "https://github.com/aatchison/hummingbird-k8s/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl"
-curl -sSL -o hbird.sig "https://github.com/aatchison/hummingbird-k8s/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.sig"
-curl -sSL -o hbird.pem "https://github.com/aatchison/hummingbird-k8s/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.pem"
+curl -sSL -o hbird               "https://github.com/aatchison/hummingbird-k8s/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl"
+curl -sSL -o hbird.cosign.bundle "https://github.com/aatchison/hummingbird-k8s/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.cosign.bundle"
 cosign verify-blob \
-  --certificate hbird.pem \
-  --signature hbird.sig \
+  --bundle hbird.cosign.bundle \
   --certificate-identity-regexp "^https://github.com/aatchison/hummingbird-k8s/.github/workflows/release.yml@" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   hbird
