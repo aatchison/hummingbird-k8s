@@ -22,7 +22,7 @@ upstream `kubeadm` Kubernetes layered into the bootc image.
 | `cluster.example.conf` | Operator-edited config template: copy to `cluster.local.conf` and edit. Drives `make deploy-cluster` / `make update-cluster`. |
 | `config.example.sh` | Optional per-host build-input overrides (VM_USER, SSH_PUBKEY_FILES, POOL_DIR, etc.). |
 | `references/k8s-bootc-talk.transcript.txt` | KubeCon India 2025 talk transcript (Berkus + Kumar) |
-| `rust/` + `.devcontainer/` | Rust client-side rewrite, foundation only (#280, epic #279). Bash stays canonical until each subcommand reaches behavioral parity. |
+| `rust/` + `.devcontainer/` | Rust client-side rewrite — all phases landed (epic #279). `hbird` binary mirrors every operator-facing Makefile target; see [`docs/rust-cli-migration.md`](docs/rust-cli-migration.md). Bash scripts stay canonical until per-target Makefile dispatch flips. |
 
 ## Host setup (<kvm-host>)
 
@@ -70,6 +70,7 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 - **First SSH from <kvm-host> to a freshly-recreated VM** trips on stale host keys (libvirt re-issues IPs from its NAT pool) from prior VMs. `ssh-keygen -R <ip>` clears it.
 - **bib produces all formats** (qcow2, vmdk, vpc, ovf, archive, gce) even when you only ask for one — just `mv` the qcow2 you care about.
 - **`scripts/kubectl-k8s.sh` swallows stdin during its port-forward bootstrap.** Anything piped on stdin (including `<<EOF … EOF` heredocs) is consumed by the tunnel-setup phase before kubectl ever runs, so kubectl reports `no objects passed to apply`. `verify-hardening.sh`'s PSA-rejection check tripped on this and silently FAILed against a correctly-hardened cluster. Workaround for verify-* scripts: bypass the wrapper and ssh direct to root@CP, e.g. `ssh root@$CP_IP "kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -" <<EOF … EOF` — the heredoc then flows through SSH untouched. Tracked in #332 (bash twin fix) and #330 (Rust twin's `cp_kubectl_with_stdin_lenient` which already had it right).
+- **Rust rewrite shipped (epic #279).** Every operator-facing Makefile target has an `hbird` counterpart in `rust/crates/hbird-cli/`. Foundation crates + Phase 1A/1B/2/3/4 + tracing all landed (PRs #321 #325 #326 #330 #334 #337 #344 #346 #347). The bash scripts under `scripts/` stay canonical until the per-target Makefile dispatch flips (a separate operator decision). The `hbird` binary's deferred work: `hbird deploy-cluster` + `hbird spawn-workers` live execution (tracked by #335) and `update-cluster`'s `timer_stop` / `timer_start` helpers (block #4, deferred because the geary cluster doesn't run scheduled-update timers). See [`docs/rust-cli-migration.md`](docs/rust-cli-migration.md) for the operator-facing `make → hbird` lookup table and [`docs/rust-cli.md`](docs/rust-cli.md) for the per-phase tracking table.
 
 ## `POOL_DIR` — libvirt storage pool location
 

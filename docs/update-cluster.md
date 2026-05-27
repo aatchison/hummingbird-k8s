@@ -1213,6 +1213,34 @@ For rollback procedures (manual `bootc rollback` from a serial
 console, the auto-rollback path that fires on unhealthy boots), see
 [`docs/rollback.md`](rollback.md).
 
+## Rust counterpart
+
+`hbird update-cluster --config cluster.local.conf` is the Rust twin —
+every `FLAGS=` token (`--workers-only`, `--node`, `--start-from`,
+`--parallel`, `--skip-drain`, `--skip-gates`, `--continue-on-error`,
+`--no-delete-emptydir-data`, `--node-name-override`, `--dry-run`)
+is a first-class clap flag with the same semantics. Env-tunable
+timeouts (`DRAIN_TIMEOUT`, `READY_TIMEOUT`, `DAEMONSET_TIMEOUT`,
+`APISERVER_TIMEOUT`, `SSH_TIMEOUT`, `SSH_DROP_TIMEOUT`,
+`INTER_NODE_SLEEP`) are honored verbatim and reproduce the bash
+twin's regex-validation diagnostics for hostile values.
+
+Phase 1A (dry-run parity, [PR #321]) + Phase 1B cycles 1–4 ([PRs
+#325 #344 #346 #347]) cover the cluster-rotation paths end-to-end.
+Deferred: `timer_stop` / `timer_start` (block #4 of the live plan)
+sit outside the Phase 1B cycle scope because the geary cluster
+doesn't run a `bootc-semver-update.timer` for the rust path to
+pause and resume. The Rust binary surfaces a
+`live_mode_not_implemented` diagnostic for these two helpers only;
+the drain/uncordon, bootID, DaemonSet-ready, and `wait_apiserver_back`
+gates are all wired.
+
+See [`docs/rust-cli-migration.md`](rust-cli-migration.md#update-cluster--update-workers--update-node)
+for the full `make → hbird` flag map.
+
+[PR #321]: https://github.com/aatchison/hummingbird-k8s/pull/321
+[PRs #325 #344 #346 #347]: https://github.com/aatchison/hummingbird-k8s/issues/322
+
 ## See also
 
 - [`docs/deploy-cluster.md`](deploy-cluster.md) — the deploy side of
@@ -1224,5 +1252,8 @@ console, the auto-rollback path that fires on unhealthy boots), see
 - [`docs/rollback.md`](rollback.md) — when an upgrade lands a bad
   image and you need to back out.
 - [`docs/makefile.md`](makefile.md) — Makefile target cheatsheet.
+- [`docs/rust-cli.md`](rust-cli.md) — per-phase Rust rewrite status.
+- [`docs/rust-cli-migration.md`](rust-cli-migration.md) — operator-facing
+  `make → hbird` lookup table.
 - Upstream `bootc-upgrade(8)` — `man bootc-upgrade` on any node, or
   the bootc project README at <https://github.com/containers/bootc>.

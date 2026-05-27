@@ -92,3 +92,14 @@ These are intentionally out of scope and tracked as follow-ups:
 
 If any of these become a supported feature of `hummingbird-k8s`, file a
 follow-up issue and extend this script (or add a sibling verifier).
+
+## Rust counterpart
+
+`hbird verify app-deploy --config cluster.local.conf` is the Rust twin
+(Phase 2, [PR #330]) — same PSA-restricted nginx deploy +
+pod-to-pod-connectivity probe sequence. Live-validated against the
+geary cluster. See
+[`docs/rust-cli-migration.md`](rust-cli-migration.md#verify-encryption--verify-hardening--verify-app-deploy--verify-all)
+for the per-flag map.
+
+[PR #330]: https://github.com/aatchison/hummingbird-k8s/pull/330

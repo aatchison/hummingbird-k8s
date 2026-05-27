@@ -249,3 +249,15 @@ kubeadm YAML — which `k8s-init.sh` already writes (see the
 Note that `kubeadm reset` is unaffected and still accepts (and in
 fact needs) `--cri-socket` when multiple runtimes could be present,
 because `reset` does not consume a config file.
+
+## Rust counterpart
+
+`hbird verify encryption --config cluster.local.conf` is the Rust twin
+(Phase 2, [PR #330]) — same probe sequence as the bash verifier,
+routed through the shared `cp_kubectl` shim. The bash twin's
+`PASS:` / `FAIL:` / `OK:` log shape is preserved verbatim so existing
+grep-based health checks keep working. See
+[`docs/rust-cli-migration.md`](rust-cli-migration.md#verify-encryption--verify-hardening--verify-app-deploy--verify-all)
+for the per-flag map.
+
+[PR #330]: https://github.com/aatchison/hummingbird-k8s/pull/330

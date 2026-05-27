@@ -376,3 +376,26 @@ kubectl get sa default -n default -o jsonpath='{.automountServiceAccountToken}'
 ```
 
 Should print `false`.
+
+## Rust counterpart
+
+`hbird verify hardening --config cluster.local.conf` is the Rust twin
+(Phase 2, [PR #330]) — and it observes PSA enforcement that the bash
+twin's check 1/3 misses on a correctly-hardened cluster, because the
+Rust path SSHes directly to `root@CP_IP` for the stdin handoff
+instead of routing through `scripts/kubectl-k8s.sh`'s port-forward
+wrapper (which swallows stdin — [#332]). Each verifier function
+carries the bash twin's grep-anchor name
+(`check_podsecurity_rejects_privileged`,
+`check_apiserver_audit_log_nonempty`,
+`check_kubelet_protect_kernel_defaults`,
+`check_kubelet_rotate_certificates`) to preserve the
+operator-mental-model contract from the epic.
+
+`hbird verify all --config cluster.local.conf` chains
+encryption → hardening → app-deploy in sequence. See
+[`docs/rust-cli-migration.md`](rust-cli-migration.md#verify-encryption--verify-hardening--verify-app-deploy--verify-all)
+for the full map.
+
+[PR #330]: https://github.com/aatchison/hummingbird-k8s/pull/330
+[#332]: https://github.com/aatchison/hummingbird-k8s/issues/332

@@ -665,3 +665,16 @@ path:
   trap removes seed ISOs it created when the deploy fails before
   completion. A successful deploy keeps them so `virsh start` after a
   `virsh destroy` re-reads the same NoCloud datasource.
+
+## Rust counterpart
+
+`hbird deploy-cluster --config cluster.local.conf` mirrors the same
+flag surface (`--kvm-host`, `--no-sudo`, plus a `--dry-run` plan-only
+mode the bash twin lacks). Dry-run parity landed in Phase 4
+([PR #337]); live execution (bib + virt-install + guestfish) is
+deferred to [#335], so today the bash `make deploy-cluster` target
+remains canonical for real deploys. For the full `make → hbird`
+lookup table see [`docs/rust-cli-migration.md`](rust-cli-migration.md).
+
+[PR #337]: https://github.com/aatchison/hummingbird-k8s/pull/337
+[#335]: https://github.com/aatchison/hummingbird-k8s/issues/335

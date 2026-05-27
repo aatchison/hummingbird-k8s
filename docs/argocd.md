@@ -325,3 +325,31 @@ SSH option set is the same. If `KVM_HOST=geary` makes `make kubectl`
 work, it will *usually* also make `make export-argocd` and
 `make backup-etcd` work — but if you're debugging a connectivity issue,
 remember they're not the same SSH topology under the hood.
+
+## Rust counterpart
+
+`hbird export-argocd --config cluster.local.conf` and
+`hbird get-kubeconfig --config cluster.local.conf` are the Rust twins
+(Phase 3, [PR #334]). They share a single core in
+`rust/crates/hbird-cli/src/commands/export_argocd.rs` and route
+through `rust/crates/hbird-cli/src/cp_kubectl.rs` for the SSH +
+ProxyJump wiring — same path as `hbird verify *` and
+`hbird update-cluster`'s drain/uncordon helper.
+
+Both fix two pre-existing bash bugs:
+
+- **[#306]** — Rust resolves ProxyJump AFTER sourcing CONFIG (the
+  documented bash semantics), so `KVM_HOST=geary` pinned in CONFIG
+  activates ProxyJump even when not exported in the operator's shell.
+- **[#307]** — Rust uses non-TTY SSH, so modern sudo can't emit OSC
+  session-start escapes that pollute stdout and break the
+  `apiVersion:` sanity check.
+
+The `--context-name` spelling from the bash twin is preserved as a
+clap `alias` on `--context` for operator muscle memory. See
+[`docs/rust-cli-migration.md#export-argocd`](rust-cli-migration.md#export-argocd)
+for the full per-flag map.
+
+[PR #334]: https://github.com/aatchison/hummingbird-k8s/pull/334
+[#306]: https://github.com/aatchison/hummingbird-k8s/issues/306
+[#307]: https://github.com/aatchison/hummingbird-k8s/issues/307
