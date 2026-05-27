@@ -36,7 +36,23 @@ CONFIG_PATH="${1:?usage: $0 <cluster.local.conf>}"
 
 # Required commands.
 command -v virsh >/dev/null 2>&1 || fail "virsh not on PATH"
-[[ $EUID -eq 0 ]] || fail "must run as root (libvirt qemu:///system)"
+# destroy-cluster.sh historically required root for libvirt qemu:///system +
+# rm of root-owned qcow2/seed files in POOL_DIR. With #305 we accept either
+# root OR a member of the `libvirt` group on the KVM host (mirrors #272's
+# update-cluster pattern). libvirt authorizes qemu:///system via the
+# unix-socket group, not sudo; POOL_DIR files deployed via the no-sudo path
+# (#305) land as <operator>:libvirt and are removable by the operator. Files
+# left over from a pre-#305 sudo-driven deploy are owned by root and will
+# fail to remove for a non-root operator — that's a one-time migration hazard,
+# diagnosed via the rm errors below. Non-root + not in libvirt group is a
+# hard fail with an actionable hint.
+if [[ $EUID -ne 0 ]]; then
+  if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx libvirt; then
+    fail "must be root or a member of the libvirt group on this host. Add yourself with:
+  sudo usermod -aG libvirt \$USER && newgrp libvirt
+then rerun. See docs/deploy-cluster.md#running-without-sudo for the full no-sudo path."
+  fi
+fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_PATH"

@@ -584,3 +584,75 @@ EOF
   [[ "$output" == *"IMAGE_SOURCE must be 'ghcr' or 'local'"* ]]
   [[ "$output" != *"should-not-reach"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# #305 — EUID check accepts root OR libvirt-group membership
+#
+# Mirrors the pattern PR #272 added to tests/scripts/update-cluster.bats:
+# stub `id` on PATH so the script's `id -nG | grep -qx libvirt` hits our
+# fake instead of the real one. We force the script to fail AFTER the EUID
+# check by giving it a non-existent CONFIG path — that fails with
+# "config not readable", which we use as the signal that we made it past
+# the EUID gate.
+#
+# Distinct from the source-only tests above: these exercise the real
+# execution path. We UNSET HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY so the script
+# reaches the EUID check instead of returning from source early.
+# ---------------------------------------------------------------------------
+
+# _stub_id_with_groups groupname [groupname...]
+# Build an `id` shim on PATH that emits the given groups when called as
+# `id -nG`. Other `id` invocations fall through to the real binary so the
+# rest of the script (which may shell out to `id` elsewhere) is unaffected.
+_stub_id_with_groups() {
+  local stubdir="${BATS_TEST_TMPDIR}/bin-305"
+  mkdir -p "$stubdir"
+  local groups="$*"
+  cat > "${stubdir}/id" <<EOF
+#!/usr/bin/env bash
+# bats stub: emit a controlled group list for \`id -nG\`; pass other
+# invocations through to the real id.
+if [[ "\$1" == "-nG" ]]; then
+  printf '%s\n' "${groups}"
+  exit 0
+fi
+exec /usr/bin/id "\$@"
+EOF
+  chmod +x "${stubdir}/id"
+  printf '%s' "$stubdir"
+}
+
+@test "#305 non-root + libvirt-group membership passes the EUID check (fails later on missing CONFIG)" {
+  # Skip when actually running as root — the EUID==0 branch short-circuits
+  # the libvirt-group check entirely and we cannot demote ourselves cheaply.
+  [ "$EUID" -ne 0 ] || skip "running as root; EUID check short-circuits"
+  stubdir="$(_stub_id_with_groups libvirt wheel)"
+  # Point CONFIG at a path that doesn't exist so the script bails AFTER
+  # the EUID/libvirt check — different diagnostic, distinct signal.
+  # Unset HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY so we hit the real EUID path
+  # rather than returning from source.
+  run env -u HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY PATH="${stubdir}:${PATH}" \
+    bash "$SCRIPT" /nonexistent/cluster.local.conf
+  [ "$status" -ne 0 ]
+  # MUST NOT be the EUID-bail message — we have libvirt group.
+  [[ "$output" != *"must be root or a member of the libvirt group"* ]]
+  # MUST fail on the config-not-readable check (proves we got past the EUID gate).
+  [[ "$output" == *"config not readable"* ]]
+  [[ "$output" == *"/nonexistent/cluster.local.conf"* ]]
+}
+
+@test "#305 non-root + NOT in libvirt group bails with the usermod hint" {
+  [ "$EUID" -ne 0 ] || skip "running as root; EUID check short-circuits"
+  stubdir="$(_stub_id_with_groups wheel users)"
+  run env -u HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY PATH="${stubdir}:${PATH}" \
+    bash "$SCRIPT" /nonexistent/cluster.local.conf
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"must be root or a member of the libvirt group"* ]]
+  # The diagnostic must include the one-time setup command so the operator
+  # doesn't have to grep docs to recover.
+  [[ "$output" == *"usermod -aG libvirt"* ]]
+  [[ "$output" == *"newgrp libvirt"* ]]
+  # AND must point at the POOL_DIR group-write prerequisite — that's the
+  # second half of the no-sudo story and easy to miss without a hint.
+  [[ "$output" == *"POOL_DIR"* ]]
+}

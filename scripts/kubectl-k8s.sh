@@ -44,15 +44,16 @@ fi
 : "${KVM_HOST:?Set KVM_HOST (SSH alias of the KVM host) — see config.example.sh}"
 
 if ! ss -ltn | grep -q "127.0.0.1:${LOCAL_PORT} "; then
-  # ssh -t: sudo on the KVM host needs a TTY to prompt for the operator's
-  # password when the remote sudo cache is cold. Without -t the call fails
-  # with `sudo: a terminal is required to read the password`. The remote
-  # TTY makes ssh inject \r into the captured stdout, so strip carriage
-  # returns before awk parses the IP. See issue #247.
-  VM_IP=$(ssh -t "$KVM_HOST" "sudo virsh -c qemu:///system domifaddr ${CP_NAME}" \
-            | tr -d '\r' \
+  # virsh -c qemu:///system works for any libvirt-group member on the KVM host —
+  # no sudo required. Pre-#305 we called `sudo virsh` (with ssh -t to prompt
+  # for the password); the sudo was gratuitous and broke non-interactive
+  # automation from a workstation. Symmetric with #272 (update-cluster) and
+  # #305 (deploy/destroy). Operators not in the libvirt group on $KVM_HOST
+  # will get a clear `virsh: failed to connect` from the remote, which is
+  # the right diagnostic — it points at the group, not at sudo policy.
+  VM_IP=$(ssh "$KVM_HOST" "virsh -c qemu:///system domifaddr ${CP_NAME}" \
             | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')
-  [[ -n "$VM_IP" ]] || { echo "Could not find ${CP_NAME} IP" >&2; exit 1; }
+  [[ -n "$VM_IP" ]] || { echo "Could not find ${CP_NAME} IP (is the operator in the libvirt group on ${KVM_HOST}? see docs/deploy-cluster.md#running-without-sudo)" >&2; exit 1; }
   echo "Starting tunnel: localhost:${LOCAL_PORT} -> ${VM_IP}:6443 via ${KVM_HOST}" >&2
   ssh -fNL "${LOCAL_PORT}:${VM_IP}:6443" "$KVM_HOST"
 fi

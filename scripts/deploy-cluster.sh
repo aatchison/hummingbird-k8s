@@ -213,10 +213,31 @@ setup_logging "[deploy-cluster]"
 
 # ---- Root + arg parsing -----------------------------------------------------
 
+# deploy-cluster.sh historically required root for libvirt qemu:///system,
+# bootc-image-builder, and for writing qcow2 templates + per-VM clones into
+# root-owned $POOL_DIR. With #305 we mirror #272's update-cluster pattern:
+# accept either root OR a member of the `libvirt` group on the KVM host.
+# libvirt authorizes qemu:///system via the unix-socket group, not sudo;
+# bootc-image-builder runs rootless under podman; POOL_DIR writes work for
+# libvirt-group operators when the dir is chgrp'd to libvirt + chmod 2775
+# (one-time host setup, see docs/deploy-cluster.md#running-without-sudo).
+# Non-root + not in libvirt group is still a fail with an actionable hint.
 if [[ $EUID -ne 0 ]]; then
-  fail "must be run as root — libvirt qemu:///system + bootc-image-builder need it. Try: sudo bash $0 [config]"
+  if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx libvirt; then
+    fail "must be root or a member of the libvirt group on this host. Add yourself with:
+  sudo usermod -aG libvirt \$USER && newgrp libvirt
+then rerun. POOL_DIR must also be group-writable (\`sudo chgrp libvirt \$POOL_DIR && sudo chmod 2775 \$POOL_DIR\`) — see docs/deploy-cluster.md#running-without-sudo."
+  fi
 fi
-: "${SUDO_USER:?must be invoked via sudo so SSH to the freshly-booted CP uses the calling-user known_hosts/key}"
+# SUDO_USER was historically required so SSH to the freshly-booted CP picks up
+# the calling-user's known_hosts/key when invoked via `sudo`. The SSH calls
+# themselves use SSH_PRIVKEY_FILE (derived from $SSH_PUBKEY_FILE in CONFIG) and
+# UserKnownHostsFile=/dev/null, so SUDO_USER is informational, not load-bearing.
+# Only insist on it when EUID==0 — a libvirt-group operator runs in their own
+# shell with their own ~/.ssh in place. (#305)
+if [[ $EUID -eq 0 ]]; then
+  : "${SUDO_USER:?must be invoked via sudo so SSH to the freshly-booted CP uses the calling-user known_hosts/key}"
+fi
 
 CONFIG_PATH="${1:-${REPO_ROOT}/cluster.local.conf}"
 [[ -r "$CONFIG_PATH" ]] || fail "config not readable: $CONFIG_PATH (start from cluster.example.conf)"
@@ -430,7 +451,14 @@ fi
 
 log "cloning CP qcow2 -> $CP_QCOW"
 cp --reflink=auto "$CP_TEMPLATE_QCOW" "$CP_QCOW"
-chown root:root "$CP_QCOW"
+# chown root:root only applies when running as root — a libvirt-group operator
+# can't change ownership and doesn't need to (libvirt's dynamic_ownership
+# chowns to qemu:qemu at VM start regardless). Setgid on POOL_DIR (chmod 2775
+# in the one-time host setup) ensures the file lands as <operator>:libvirt
+# either way. (#305)
+if [[ $EUID -eq 0 ]]; then
+  chown root:root "$CP_QCOW"
+fi
 chmod 0644 "$CP_QCOW"
 
 log "virt-install ${CP_NAME} (memory=${CP_MEMORY} vcpus=${CP_VCPUS})"
@@ -504,7 +532,10 @@ for w in "${WORKER_NAMES[@]}"; do
 
   log "cloning worker qcow2 -> $w_qcow"
   cp --reflink=auto "$WORKER_TEMPLATE_QCOW" "$w_qcow"
-  chown root:root "$w_qcow"
+  # See CP qcow2 block above for the EUID-conditional chown rationale. (#305)
+  if [[ $EUID -eq 0 ]]; then
+    chown root:root "$w_qcow"
+  fi
   chmod 0644 "$w_qcow"
 
   log "virt-install ${w} (memory=${WORKER_MEMORY} vcpus=${WORKER_VCPUS}) [bg]"
