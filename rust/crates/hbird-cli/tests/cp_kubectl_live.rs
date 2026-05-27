@@ -111,7 +111,11 @@ impl Drop for UncordonGuard<'_> {
     }
 }
 
+// Round-2 lens L5 MEDIUM (carry-over): `#[ignore]` so the test reports
+// as IGNORED (not PASS) when not opted-in. Operator opts in with
+// `--ignored` + `HBIRD_LIVE_TEST=1` env.
 #[test]
+#[ignore = "live cluster test; opt in with --ignored + HBIRD_LIVE_TEST=1"]
 fn live_cp_kubectl_get_nodes_drain_uncordon_smoke() {
     if env::var("HBIRD_LIVE_TEST").ok().as_deref() != Some("1") {
         eprintln!("HBIRD_LIVE_TEST!=1 — skipping live cluster test");

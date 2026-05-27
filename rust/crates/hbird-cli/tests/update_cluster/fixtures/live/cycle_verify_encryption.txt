@@ -1,0 +1,65 @@
+# Phase 2 #287: verify-encryption parity vs bash twin
+#
+# Captured 2026-05-27 against the live geary cluster (hbird-cp1 +
+# hbird-w1 + hbird-w2). Both sides invoke the same on-CP script
+# (/usr/libexec/verify-encryption.sh — the image-baked copy of
+# scripts/verify-encryption.sh's local-mode body) through identical
+# SSH chains:
+#   ssh -J aatchison@geary root@192.168.122.212 /usr/libexec/verify-encryption.sh
+#
+# bash:   CONFIG=cluster.local.conf KVM_HOST=geary CP_NAME=hbird-cp1 \
+#           bash scripts/verify-encryption.sh
+#         (bash invoked directly because `make verify-encryption` does
+#          not forward CONFIG/KVM_HOST — tracked by #333)
+# Rust:   HBIRD_LIVE_TEST=1 CP_IP=192.168.122.212 KVM_HOST=aatchison@geary \
+#           cargo test -p hbird-cli --test verify_encryption_live -- --nocapture
+#
+# (The bash run goes through resolve_cp_ip -> ssh geary virsh domifaddr
+# hbird-cp1 -> 192.168.122.212. The Rust run accepts CP_IP explicitly to
+# keep the live test hermetic — same SSH chain after the first hop.)
+
+=== bash output ===
+[verify-encryption] remote mode: ssh root@192.168.122.212 via geary
+[verify-encryption] creating probe secret default/etcd-encryption-probe-4941
+[verify-encryption] local etcdctl unavailable, falling back to crictl exec on etcd container
+/usr/libexec/verify-encryption.sh: line 97: warning: command substitution: ignored null byte in input
+[verify-encryption] OK: secret in etcd is encrypted (prefix=k8s:enc:aesgcm:)
+exit=0
+
+=== Rust output ===
+[verify-encryption] remote mode: ssh root@192.168.122.212 via aatchison@geary
+[verify-encryption] creating probe secret default/etcd-encryption-probe-5026
+[verify-encryption] local etcdctl unavailable, falling back to crictl exec on etcd container
+/usr/libexec/verify-encryption.sh: line 97: warning: command substitution: ignored null byte in input
+[verify-encryption] OK: secret in etcd is encrypted (prefix=k8s:enc:aesgcm:)
+ INFO hbird{subcommand="verify"}: close
+exit=0
+
+=== diff ===
+- bash: `via geary`
++ Rust: `via aatchison@geary`
+  (Devcontainer workaround per #320 — `aatchison@` prefix forces the
+   ProxyJump SSH to authenticate as the operator's user. From a host
+   shell with $USER=aatchison both forms are equivalent.)
+
+- bash: probe secret PID = 4941
++ Rust: probe secret PID = 5026
+  (`$$` / `std::process::id()` — different process IDs across runs,
+   expected.)
+
++ Rust adds: ` INFO hbird{subcommand="verify"}: close`
+  (tracing-subscriber emits a span-close event at INFO level — wired
+   in #326. The bash twin has no equivalent. This is a parity-irrelevant
+   debug-aid line; operators grepping `[verify-encryption]` see the
+   exact same `OK:` marker.)
+
+Modulo those three diffs, output is byte-for-byte identical.
+
+=== verdict: PARITY ===
+- Both sides exit 0 with the bash twin's
+  `OK: secret in etcd is encrypted (prefix=k8s:enc:aesgcm:)` marker on
+  stderr. Operators grepping that anchor see identical results.
+- Cluster left 3/3 Ready on both runs (probe secret is cleaned up by
+  the bash-twin's trap and the on-CP /usr/libexec script's trap; the
+  Rust path inherits the same trap because it just SSHes the same
+  script into root@CP_IP).

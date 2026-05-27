@@ -1,0 +1,68 @@
+# Phase 2 #287: `verify all` chain parity
+#
+# Captured 2026-05-27 against the live geary cluster (hbird-cp1 +
+# hbird-w1 + hbird-w2). The chain runs encryption → hardening →
+# app-deploy and short-circuits on the first failure. Bash equivalent:
+# `make verify-all` (Makefile recipe: chain the three Make targets,
+# inheriting make's first-failure semantics).
+#
+# Rust: HBIRD_LIVE_TEST=1 CP_IP=192.168.122.212 KVM_HOST=aatchison@geary \
+#       hbird verify all --cp-ip 192.168.122.212 --kvm-host aatchison@geary
+
+=== Rust output ===
+[verify-encryption] remote mode: ssh root@192.168.122.212 via aatchison@geary
+[verify-encryption] creating probe secret default/etcd-encryption-probe-5432
+[verify-encryption] local etcdctl unavailable, falling back to crictl exec on etcd container
+[verify-encryption] OK: secret in etcd is encrypted (prefix=k8s:enc:aesgcm:)
+[verify-hardening] CP_IP=192.168.122.212
+[verify-hardening] check 1/3: PodSecurity restricted rejects a privileged pod
+ERROR hbird{subcommand="verify"}: error=NonZeroExit { ... violates PodSecurity ... }
+[verify-hardening]   PASS: privileged pod rejected by PodSecurity
+[verify-hardening] check 2/3: apiserver audit log is non-empty on the CP host
+[verify-hardening]   PASS: audit log present (/var/log/kubernetes/k8s-audit.log)
+[verify-hardening] check 3/4: kubelet running with --protect-kernel-defaults=true
+[verify-hardening]   PASS: kubelet has --protect-kernel-defaults=true
+[verify-hardening] check 4/4: kubelet running with --rotate-certificates=true (#121)
+[verify-hardening]   PASS: kubelet has --rotate-certificates=true
+
+[verify-hardening] summary
+  PodSecurity restricted    : PASS
+  apiserver audit log       : PASS
+  kubelet protect-kernel    : PASS
+  kubelet rotate-certs      : PASS
+[verify-hardening] all checks PASSED
+[verify-app-deploy] creating namespace smoketest-1779904650
+[verify-app-deploy] applying nginx Deployment + Service in smoketest-1779904650
+[verify-app-deploy] waiting up to 2m for deployment/nginx to become Available
+[verify-app-deploy] probing http://nginx:8080 from an in-cluster busybox pod
+[verify-app-deploy] PASS: nginx returned the welcome page over ClusterIP
+[verify-app-deploy] verify-app-deploy: PASS
+[verify-app-deploy] cleanup: deleting namespace smoketest-1779904650
+ INFO hbird{subcommand="verify"}: close
+exit=0
+
+=== verdict: PARITY (chain semantics confirmed) ===
+- Three verifiers run in order encryption → hardening → app-deploy,
+  matching `make verify-all` chain order.
+- All three PASS sequentially; chain exits 0 only when every link
+  passes (Rust uses `?` propagation, same first-failure semantics as
+  bash's Make chain).
+- Cluster left 3/3 Ready; smoketest namespace cleaned up.
+- Tracing ERROR line in check 1/3 is the same hbird-ssh
+  `err(Debug)` instrument cosmetic noise documented in
+  cycle_verify_hardening.txt.
+
+=== bash counterpart ===
+`make verify-all` was NOT re-captured for this composite fixture
+because:
+  (a) Bash's verify-hardening still hits the kc-wrapper stdin bug
+      documented in cycle_verify_hardening.txt and would short-circuit
+      the chain with FAIL on check 1/3.
+  (b) The chain semantics ("each target runs only if the previous
+      one returned 0") are a Make-recipe property, not a bash-twin
+      property — Make's first-failure behavior is well-defined and
+      well-tested in CI.
+The individual-verifier fixtures (cycle_verify_encryption.txt,
+cycle_verify_hardening.txt, cycle_verify_app_deploy.txt) cover the
+bash-vs-Rust diff per verifier; this fixture proves the Rust chain
+ties them together with matching exit-on-failure semantics.

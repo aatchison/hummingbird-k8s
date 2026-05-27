@@ -23,9 +23,11 @@ README is the operator-facing entry point.
 > **Rust rewrite in progress** — the client-side bash tooling under
 > [`scripts/`](scripts/) is being rewritten in Rust over several phases per
 > epic [#279](https://github.com/aatchison/hummingbird-k8s/issues/279). The
-> workspace lives at [`rust/`](rust/) and holds the foundation crates plus
-> `update-cluster` dry-run parity (PR #321) and the first live helper
-> (`cp_kubectl`, PR #325). **No operator-facing change yet** — every `make`
+> workspace lives at [`rust/`](rust/) and holds the foundation crates,
+> `update-cluster` dry-run parity (PR #321), the first live helper
+> (`cp_kubectl`, PR #325), and Phase 2 `hbird verify
+> {encryption,hardening,app-deploy,all}` (PR #330). **No operator-facing
+> change yet** — every `make`
 > target still invokes the bash scripts; the Rust `hbird update-cluster`
 > binary builds but still surfaces a stable diagnostic for live blocks
 > not yet wired. See [`docs/rust-cli.md`](docs/rust-cli.md) for the
