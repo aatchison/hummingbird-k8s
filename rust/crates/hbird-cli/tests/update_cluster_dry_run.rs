@@ -79,6 +79,12 @@ fn keep_log_lines(s: &str) -> String {
 /// cluster.local.conf` (relative) so the dry-run log echoes the same
 /// path the bash twin captured — `Path::display()` on an absolute path
 /// would diverge from the bash twin's relative-path echo.
+///
+/// Round-2 CodeRabbit: `out.status` is asserted success here so a
+/// silent regression (dry-run path bailing out with rc!=0 but partial
+/// output) surfaces as a test failure with a clear stderr, instead of
+/// the downstream `assert_matches_fixture` reporting a confusing
+/// "0 lines == expected N lines" diff.
 fn run_dry_run(extra_flags: &[&str]) -> String {
     // Use a per-test tempdir so concurrent test runs don't race on cwd.
     let tmp = tempdir_for_test();
@@ -94,6 +100,14 @@ fn run_dry_run(extra_flags: &[&str]) -> String {
         .args(extra_flags)
         .output()
         .expect("failed to spawn hbird binary");
+    assert!(
+        out.status.success(),
+        "hbird update-cluster --dry-run {extra_flags:?} exited non-zero ({:?})\n\
+         --- stdout:\n{}\n--- stderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
     // Combine stdout + stderr for the filter (warnings on stderr,
     // log lines on stdout — both filtered to keep only [update-cluster]
     // / [parallel:] tagged lines).
@@ -126,12 +140,29 @@ fn tempdir_for_test() -> TempDir {
 
 /// Compare actual output to the fixture file, surfacing the first
 /// diverging line for fast failure diagnosis.
+///
+/// Round-2 lens L5#H1: the previous version of this helper would pass
+/// an empty `actual` against a fixture that happened to also filter to
+/// empty (or that simply hadn't been captured yet). Guard up front:
+/// the fixture corpus is non-empty by design, so an empty `actual`
+/// indicates a regression in the filter or the binary, not a clean run.
 #[track_caller]
 fn assert_matches_fixture(name: &str, actual: &str) {
+    assert!(
+        !actual.trim().is_empty(),
+        "fixture {name}: actual output filtered to 0 [update-cluster]/[parallel:] lines — \
+         either the binary regressed (no log output), the prefix filter regressed, or the \
+         dry-run path bailed out early. Re-run with `cargo test -- --nocapture` to inspect."
+    );
     let expected_path = fixtures_dir().join(format!("{name}.txt"));
     let expected_raw = std::fs::read_to_string(&expected_path)
         .unwrap_or_else(|e| panic!("read fixture {expected_path:?}: {e}"));
     let expected = keep_log_lines(&expected_raw);
+    assert!(
+        !expected.trim().is_empty(),
+        "fixture {name}: fixture file at {expected_path:?} filters to 0 lines after \
+         keep_log_lines() — fixture must contain at least one [update-cluster] line"
+    );
     if expected.trim_end() == actual.trim_end() {
         return;
     }

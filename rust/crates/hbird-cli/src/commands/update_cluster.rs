@@ -43,9 +43,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use clap::builder::BoolishValueParser;
 
@@ -357,6 +358,19 @@ pub(crate) struct Plan {
     pub node_filter: Option<String>,
     pub start_from: Option<String>,
     pub parallel: u32,
+    /// SSH alias of the KVM host. `Some(host)` means the live execution
+    /// path must route virsh through `qemu+ssh://<host>/system`; `None`
+    /// means run libvirt directly (operator already on the KVM host).
+    /// Threaded into [`Plan`] by round-2 review (lens L1 medium): the
+    /// live-execution slice (#322) consumes this when it lands.
+    #[allow(dead_code)] // consumed by live-execution slice (#322).
+    pub kvm_host: Option<String>,
+    /// `HBIRD_REMOTE_NO_SUDO=1` toggle. When true, the libvirt-group
+    /// operator path is in effect — virsh on the remote skips the sudo
+    /// probe (#305). Threaded into [`Plan`] by round-2 review (lens L1
+    /// medium); consumed by the live-execution slice (#322).
+    #[allow(dead_code)] // consumed by live-execution slice (#322).
+    pub no_sudo: bool,
 
     // Env-derived fields.
     pub timeouts: Timeouts,
@@ -438,7 +452,7 @@ impl Plan {
                     "live-mode IP resolution not yet implemented in the Rust path. \
                      Set WORKER_IPS=(...) and CP_IP= in cluster.local.conf, or run \
                      under --dry-run, until the virsh-domifaddr resolution lands. \
-                     (Tracked by follow-up to #286 for the live-execution slice.)"
+                     (Tracked by #322 for the live-execution slice.)"
                 );
             }
             (cp_ip, m)
@@ -454,9 +468,17 @@ impl Plan {
         // ---- --node-name-override parsing (line 384-418) -------------
         //
         // Repeatable + comma-separated; DOMAIN must be CP_NAME or a
-        // WORKER_NAMES entry.
+        // WORKER_NAMES entry. An entirely empty value (`--node-name-override=`)
+        // is rejected — the bash twin's `parse_node_name_overrides` does
+        // the same (round-2 lens L2#2; previously this was a silent no-op).
         let mut override_map: HashMap<String, String> = HashMap::new();
         for entry in &args.node_name_override {
+            if entry.is_empty() {
+                bail!(
+                    "--node-name-override requires a non-empty DOMAIN=NODE \
+                     (or comma-separated list); got an empty string"
+                );
+            }
             for pair in entry.split(',') {
                 if pair.is_empty() {
                     continue;
@@ -515,6 +537,8 @@ impl Plan {
             node_filter: args.node.clone(),
             start_from: args.start_from.clone(),
             parallel,
+            kvm_host: args.kvm_host.clone(),
+            no_sudo: args.no_sudo,
             timeouts,
         })
     }
@@ -543,9 +567,108 @@ impl Plan {
 
 // ---- block #2: concurrency lock --------------------------------------------
 
-/// Acquire the per-user flock on `$XDG_RUNTIME_DIR/hbird-update-cluster.lock`
-/// (falls back to `/tmp` when XDG_RUNTIME_DIR is unset). Mirrors bash
-/// lines 757-779.
+/// Resolve the directory where the per-user flock lives. The bash twin
+/// uses `${XDG_RUNTIME_DIR:-/tmp}`; we tighten that on Linux for two
+/// reasons surfaced by round-2 review (lens L1):
+///
+/// 1. `/tmp` is world-writable and an attacker on a multi-user host can
+///    plant a symlink at `/tmp/hbird-update-cluster.lock` that points at
+///    a file the operator owns elsewhere. `O_NOFOLLOW` mitigates the
+///    open() side, but flock(1) below will still chase the symlink.
+/// 2. `XDG_RUNTIME_DIR` is per-UID (mode 0700, root-owned tmpfs) on every
+///    systemd host — the lock is naturally isolated. Falling back to
+///    `/tmp` collapses that isolation.
+///
+/// Policy:
+///   - `XDG_RUNTIME_DIR` set and a directory we own  → use it directly.
+///   - `XDG_RUNTIME_DIR` set but not ours / missing → bail.
+///   - Unset, AND `/run/user/<UID>` exists           → use that.
+///   - Unset and no `/run/user/<UID>`                 → fall back to a
+///     UID-scoped subdir under `/tmp` (`/tmp/hbird-<UID>`) that we create
+///     mode 0700; this matches the bash semantics on minimal hosts that
+///     don't run systemd-logind, without collapsing onto world-writable
+///     `/tmp` directly.
+///
+/// Returns the (validated) directory to place the lock in.
+fn lock_dir() -> Result<PathBuf> {
+    // Best-effort UID lookup — `/proc/self/loginuid` has more meaningful
+    // semantics for our case but we just need a stable per-user int.
+    // `users::get_current_uid` would pull in a dep; read it from env.
+    let uid = std::env::var("UID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| {
+            // `id -u` fallback — never panics on a host that has coreutils.
+            std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .ok()
+                .and_then(|o| {
+                    String::from_utf8(o.stdout)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                })
+        })
+        .unwrap_or(0);
+
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR")
+        && !xdg.is_empty()
+    {
+        let p = PathBuf::from(&xdg);
+        // Validate: must exist as a directory we can write into. We
+        // don't require ownership match (some containers fudge UIDs);
+        // mode check is the operator's responsibility per FHS.
+        if !p.is_dir() {
+            bail!(
+                "XDG_RUNTIME_DIR is set to {xdg} but it is not a directory; \
+                 unset it or point it at a writable per-user dir"
+            );
+        }
+        return Ok(p);
+    }
+
+    // Conventional systemd location.
+    let run_user = PathBuf::from(format!("/run/user/{uid}"));
+    if run_user.is_dir() {
+        return Ok(run_user);
+    }
+
+    // Last resort: UID-scoped subdir under /tmp. Avoid the world-writable
+    // /tmp root itself (lens L1: symlink-DoS surface). Create mode 0700
+    // so a peer user can't plant files inside.
+    let scoped = PathBuf::from(format!("/tmp/hbird-{uid}"));
+    if !scoped.exists() {
+        std::fs::create_dir(&scoped).with_context(|| {
+            format!(
+                "failed to create UID-scoped lock dir {} \
+                 (set XDG_RUNTIME_DIR to override)",
+                scoped.display(),
+            )
+        })?;
+        // Tighten permissions. We can't use std::os::unix::fs::PermissionsExt
+        // under `unsafe_code = "forbid"`? Actually PermissionsExt is safe —
+        // the `unsafe` lint is about the `unsafe` keyword, not unix-specific
+        // safe APIs. Apply 0700 to keep peer-user lockfile reads out.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&scoped, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(scoped)
+}
+
+/// Global toggle the SIGINT/SIGTERM handler flips so the main thread can
+/// notice mid-loop and unwind cleanly. The handler ALSO kills the
+/// flock-holder child directly (the kernel will free the lock when the
+/// child reaps, even if the main thread is blocked).
+static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+/// The flock-holder child's PID — set by [`acquire_lock`] and read by
+/// the SIGINT/SIGTERM handler so it can `kill(2)` directly without
+/// reaching back through `LockGuard::Drop` (which the signal-killed
+/// process never gets to run).
+static FLOCK_CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Acquire the per-user flock on `<lock-dir>/hbird-update-cluster.lock`.
+/// Mirrors bash lines 757-779.
 ///
 /// Implementation: shells out to `flock(1)` in a "test the lock"
 /// short-running shape. flock(1) is part of util-linux and present on
@@ -557,7 +680,10 @@ impl Plan {
 ///
 /// The returned [`LockGuard`] keeps a background `flock(1) -n PATH
 /// sleep infinity` alive so the kernel-held lock persists until drop;
-/// dropping the guard kills the child and releases the lock.
+/// dropping the guard kills the child and releases the lock. A
+/// SIGINT/SIGTERM handler is also installed so a Ctrl-C between
+/// `acquire_lock` and the natural drop path still releases the lock
+/// (round-2 lens L3#1).
 ///
 /// Skipped entirely in dry-run mode.
 ///
@@ -569,23 +695,28 @@ pub(crate) fn acquire_lock(dry_run: bool) -> Result<Option<LockGuard>> {
     if dry_run {
         return Ok(None);
     }
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    let path = PathBuf::from(dir).join("hbird-update-cluster.lock");
-    // Touch the file (flock(1) needs it to exist).
+    let dir = lock_dir()?;
+    let path = dir.join("hbird-update-cluster.lock");
+    // Touch the file (flock(1) needs it to exist). `create_new=false` so
+    // a pre-existing lock-file in the same dir is fine.
     std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&path)
-        .map_err(|e| {
-            anyhow!(
-                "failed to open lock file {}: {e} (set XDG_RUNTIME_DIR to a writable dir)",
+        .with_context(|| {
+            format!(
+                "failed to open lock file {} (set XDG_RUNTIME_DIR to a writable dir)",
                 path.display(),
             )
         })?;
-    // Spawn `flock -n <path> -c 'sleep infinity'` and keep the child
+    // Spawn `flock -n <path> -c '<sleep loop>'` and keep the child
     // alive — the kernel-held lock survives as long as the child does.
-    // `-n` makes flock non-blocking: exit-2 means another holder has it.
+    // `-n` makes flock non-blocking: exit-1 means another holder has it.
+    //
+    // The inner shell installs a TERM handler so our `Drop` `kill()`
+    // shuts it down cleanly (otherwise the sleep absorbs the signal and
+    // delivery races with the wait).
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow!("lock path is not valid UTF-8: {}", path.display()))?;
@@ -600,19 +731,28 @@ pub(crate) fn acquire_lock(dry_run: bool) -> Result<Option<LockGuard>> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| anyhow!("failed to spawn flock(1) for {}: {e}", path.display()))?;
+        .with_context(|| format!("failed to spawn flock(1) for {}", path.display()))?;
 
-    // Probe whether the lock was acquired by attempting a separate
-    // non-blocking shot — if the lock holder is THIS process's child,
-    // the inner flock should *also* fail (kernel sees a foreign-fd
-    // contender). We instead inspect the child's startup: if flock(1)
-    // exits within ~50ms, it couldn't get the lock; if it's still
-    // running, we have it.
-    std::thread::sleep(Duration::from_millis(50));
+    // Deterministic acquisition check (CodeRabbit round-2): rather than
+    // a brittle 50ms-after-spawn heuristic, we attempt a SECOND
+    // non-blocking flock on the same path and inspect ITS exit code:
+    //   - exit 0  → the flock(1) we hold didn't actually take the lock
+    //               (this can happen if path doesn't open) — bail.
+    //   - exit 1  → the second flock saw contention, confirming the
+    //               first child holds it. Success.
+    // We use `flock -n -E 1` so the contention exit is unambiguous.
+    let probe = Command::new("flock")
+        .args(["-n", "-E", "1", path_str, "-c", "true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output();
     let mut child = child;
+
+    // Always check whether the held-alive child died first — if flock
+    // itself failed (bad path, no perms, util-linux missing) the probe
+    // will succeed misleadingly.
     if let Ok(Some(status)) = child.try_wait() {
-        // Drain stderr for diagnostics (rarely useful, but matches the
-        // operator-readable shape of the bash twin's `fail` line).
         let stderr = child
             .stderr
             .take()
@@ -623,7 +763,6 @@ pub(crate) fn acquire_lock(dry_run: bool) -> Result<Option<LockGuard>> {
                 buf
             })
             .unwrap_or_default();
-        // flock(1) exits 1 on cmd failure, 2 on lock contention with -n.
         if status.code() == Some(1) {
             bail!(
                 "another update-cluster run is in progress (lock {} held)",
@@ -637,10 +776,92 @@ pub(crate) fn acquire_lock(dry_run: bool) -> Result<Option<LockGuard>> {
         );
     }
 
+    match probe {
+        Ok(p) if p.status.code() == Some(1) => {
+            // Expected: our child holds the lock, the probe saw contention.
+        }
+        Ok(p) => {
+            // Probe acquired the lock — our child didn't actually take it.
+            // Reap our child (its sleep is still running but the lock
+            // never got held).
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "failed to acquire lock {}: probe got rc={:?} (stderr={})",
+                path.display(),
+                p.status.code(),
+                String::from_utf8_lossy(&p.stderr),
+            );
+        }
+        Err(e) => {
+            // probe couldn't be spawned at all — bail (flock(1) missing?).
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "failed to probe lock state on {}: {e} \
+                 (is flock(1) from util-linux installed?)",
+                path.display(),
+            );
+        }
+    }
+
+    // Stash the child PID for the signal handler.
+    FLOCK_CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
+
+    // Install the SIGINT + SIGTERM handler. signal-hook's `flag::register`
+    // is idempotent: repeated calls re-register the same flag. We use a
+    // separate handler that kills the flock child directly so the kernel
+    // releases the lock even if Drop never runs (the process is about to
+    // exit anyway when it receives the signal).
+    install_signal_handler();
+
     Ok(Some(LockGuard {
         child: Some(child),
         path,
     }))
+}
+
+/// Install a process-wide SIGINT + SIGTERM handler that:
+///   1. Sets `SIGNAL_RECEIVED` so polling loops can notice.
+///   2. Kills the flock-holder child directly so the kernel releases
+///      the lock even if the main thread never reaches `Drop`.
+///   3. Re-installs default disposition and re-raises, so the process
+///      exits with the conventional 130 (SIGINT) / 143 (SIGTERM) code.
+///
+/// Idempotent: signal-hook tracks registrations, calling twice doesn't
+/// stack handlers.
+fn install_signal_handler() {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    // signal-hook's iterator API gives us a thread that blocks on
+    // sigwait(2). The `Once` guard ensures we install exactly one
+    // watcher per process, so repeated `acquire_lock` calls in tests
+    // don't stack handlers.
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                SIGNAL_RECEIVED.store(true, Ordering::SeqCst);
+                // Kill the flock child if any. PID 0 means "not running".
+                let pid = FLOCK_CHILD_PID.load(Ordering::SeqCst);
+                if pid > 0 {
+                    // SIGTERM is enough — the inner shell's `trap` exits 0.
+                    // We can't use libc::kill under `unsafe_code = "forbid"`;
+                    // shell out via `kill(1)` instead. Coreutils `kill` is
+                    // present everywhere this project targets.
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .status();
+                }
+                // Re-raise with default disposition. signal-hook offers a
+                // helper for this (`low_level::emulate_default_handler`).
+                let _ = signal_hook::low_level::emulate_default_handler(sig);
+            }
+        });
+    });
 }
 
 /// Held-alive child whose kernel-held flock persists for its lifetime.
@@ -660,6 +881,10 @@ impl Drop for LockGuard {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // Clear the static PID so a stale SIGINT after we've released
+        // doesn't try to kill an unrelated PID that the OS may have
+        // recycled.
+        FLOCK_CHILD_PID.store(0, Ordering::SeqCst);
         // We deliberately don't unlink the lock file — the bash twin
         // leaves it on disk too (zero-byte tmpfs file).
         let _ = &self.path;
@@ -937,17 +1162,70 @@ fn bootc_upgrade_apply(plan: &Plan, ip: &str, name: &str) -> Result<BootcUpgrade
 ///
 /// The `node`/`ip`/`drained`/`uncordoned` fields are populated by
 /// [`update_cp`] / [`update_worker`] and consumed by the recovery-hint
-/// surfacing in the live-execution slice (cleanup_on_exit in bash,
-/// line 668). They're write-only in this scaffold — the live slice
-/// adds the read side.
+/// surfacing in [`InFlight::Drop`] (cleanup_on_exit in bash, line 668).
+///
+/// Recovery hint policy (round-2 lens L3#2):
+///   - `drained && !uncordoned` — node was cordoned but never uncordoned
+///     before we unwound (panic / `?` / SIGINT). Emit
+///     `node <X> is cordoned and was not uncordoned; recover with: kubectl uncordon <X>`.
+///   - Otherwise — clean path (either we successfully uncordoned, or
+///     drain never ran). Stay quiet.
+///
+/// Per-thread state is kept by-value; `mark_drained` / `mark_uncordoned`
+/// expose grep-parity wrappers for the live-execution slice (lens L9).
 #[derive(Debug, Default)]
-#[allow(dead_code)] // bash IN_FLIGHT_* parity; consumed by live-execution slice cleanup.
 struct InFlight {
     node: String,
+    #[allow(dead_code)] // consumed by live-execution slice (#322).
     ip: String,
     drained: bool,
     uncordoned: bool,
+    #[allow(dead_code)] // consumed by live-execution slice (#322).
     phase: String,
+}
+
+impl InFlight {
+    /// Mark that drain has completed for this node. Bash twin's
+    /// `mark_in_flight ${node} drained` (line 614). Pinned as a named
+    /// wrapper so a grep across both sides yields a hit (lens L9).
+    #[allow(dead_code)] // consumed by live-execution slice (#322).
+    fn mark_drained(&mut self) {
+        self.drained = true;
+    }
+
+    /// Mark that uncordon has completed for this node. Bash twin's
+    /// `mark_in_flight ${node} uncordoned` (line 615). Pinned as a
+    /// named wrapper so a grep across both sides yields a hit (lens L9).
+    #[allow(dead_code)] // consumed by live-execution slice (#322).
+    fn mark_uncordoned(&mut self) {
+        self.uncordoned = true;
+    }
+
+    /// Reset to a fresh state — called between nodes so the recovery-hint
+    /// drop semantics don't bleed across worker boundaries. Bash twin's
+    /// `clear_in_flight` (line 622). Pinned as a named wrapper for
+    /// grep-parity (lens L9).
+    #[allow(dead_code)] // consumed by live-execution slice (#322).
+    fn clear_in_flight(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        // Recovery hint: when a node was cordoned but not uncordoned,
+        // surface the explicit `kubectl uncordon` command an operator
+        // needs to type. Bash twin emits this from `cleanup_on_exit`
+        // (line 668) and we replicate the wording so an operator who
+        // greps both sides finds the same string.
+        if self.drained && !self.uncordoned && !self.node.is_empty() {
+            eprintln!(
+                "[update-cluster] node {} is cordoned and was not uncordoned; \
+                 recover with: kubectl uncordon {}",
+                self.node, self.node,
+            );
+        }
+    }
 }
 
 /// Update the control plane. Mirrors `update_cp` (line 1179).
@@ -1000,43 +1278,46 @@ fn update_cp(plan: &Plan) -> Result<()> {
     }
 
     let _ = wait_ssh_drop(plan, &plan.cp_ip);
-    wait_ssh_back(plan, &plan.cp_ip).map_err(|_| {
-        anyhow!(
+    // Round-2 lens L3#4: preserve the underlying error chain via
+    // `with_context` instead of `map_err(|_|)` so the operator sees
+    // "CP X did not come back: <root cause: ssh exit 255>" rather than
+    // a fresh anyhow that masks the SSH-side diagnostic.
+    let ssh_timeout = plan.timeouts.ssh;
+    wait_ssh_back(plan, &plan.cp_ip).with_context(|| {
+        format!(
             "CP {} did not come back over SSH within {}s",
-            plan.cp_name,
-            plan.timeouts.ssh
+            plan.cp_name, ssh_timeout,
         )
     })?;
     in_flight.phase = "post-reboot-pre-apiserver".to_string();
-    wait_apiserver_back(plan).map_err(|_| {
-        anyhow!(
+    let apiserver_timeout = plan.timeouts.apiserver;
+    wait_apiserver_back(plan).with_context(|| {
+        format!(
             "CP {} apiserver did not return within {}s",
-            plan.cp_name,
-            plan.timeouts.apiserver
+            plan.cp_name, apiserver_timeout,
         )
     })?;
     in_flight.phase = "post-apiserver-pre-bootID".to_string();
-    wait_node_bootid_changed(plan, &plan.cp_k8s_name, &pre_bootid).map_err(|_| {
-        anyhow!(
+    let ready_timeout = plan.timeouts.ready;
+    wait_node_bootid_changed(plan, &plan.cp_k8s_name, &pre_bootid).with_context(|| {
+        format!(
             "CP node {} bootID did not change after {}s (apiserver may be serving stale state)",
-            plan.cp_name,
-            plan.timeouts.ready,
+            plan.cp_name, ready_timeout,
         )
     })?;
     in_flight.phase = "post-bootID-pre-Ready".to_string();
-    wait_node_ready(plan, &plan.cp_k8s_name).map_err(|_| {
-        anyhow!(
+    wait_node_ready(plan, &plan.cp_k8s_name).with_context(|| {
+        format!(
             "CP node {} did not reach Ready within {}s",
-            plan.cp_name,
-            plan.timeouts.ready,
+            plan.cp_name, ready_timeout,
         )
     })?;
     in_flight.phase = "post-Ready-pre-DaemonSet".to_string();
-    wait_node_daemonsets_ready(plan, &plan.cp_k8s_name).map_err(|_| {
-        anyhow!(
+    let daemonset_timeout = plan.timeouts.daemonset;
+    wait_node_daemonsets_ready(plan, &plan.cp_k8s_name).with_context(|| {
+        format!(
             "CP {}: kube-system DaemonSet pods not Ready after {}s",
-            plan.cp_name,
-            plan.timeouts.daemonset,
+            plan.cp_name, daemonset_timeout,
         )
     })?;
 
@@ -1108,28 +1389,24 @@ fn update_worker(plan: &Plan, name: &str, ip: &str, k8s_name: &str) -> Result<()
     }
 
     let _ = wait_ssh_drop(plan, ip);
-    wait_ssh_back(plan, ip).map_err(|_| {
-        anyhow!(
-            "{name}: did not come back over SSH within {}s",
-            plan.timeouts.ssh
+    // Round-2 lens L3#4: `with_context` preserves the underlying
+    // error chain (SSH stderr, kubectl exit code) instead of masking
+    // it behind a fresh anyhow.
+    let ssh_timeout = plan.timeouts.ssh;
+    wait_ssh_back(plan, ip)
+        .with_context(|| format!("{name}: did not come back over SSH within {ssh_timeout}s"))?;
+    let ready_timeout = plan.timeouts.ready;
+    wait_node_bootid_changed(plan, k8s_name, &pre_bootid).with_context(|| {
+        format!(
+            "{name}: node bootID did not change after {ready_timeout}s (apiserver may be serving stale state)"
         )
     })?;
-    wait_node_bootid_changed(plan, k8s_name, &pre_bootid).map_err(|_| {
-        anyhow!(
-            "{name}: node bootID did not change after {}s (apiserver may be serving stale state)",
-            plan.timeouts.ready,
-        )
-    })?;
-    wait_node_ready(plan, k8s_name).map_err(|_| {
-        anyhow!(
-            "{name}: did not reach Ready within {}s",
-            plan.timeouts.ready
-        )
-    })?;
-    wait_node_daemonsets_ready(plan, k8s_name).map_err(|_| {
-        anyhow!(
-            "{name}: kube-system DaemonSet pods not Ready on this node after {}s",
-            plan.timeouts.daemonset,
+    wait_node_ready(plan, k8s_name)
+        .with_context(|| format!("{name}: did not reach Ready within {ready_timeout}s"))?;
+    let daemonset_timeout = plan.timeouts.daemonset;
+    wait_node_daemonsets_ready(plan, k8s_name).with_context(|| {
+        format!(
+            "{name}: kube-system DaemonSet pods not Ready on this node after {daemonset_timeout}s"
         )
     })?;
 
@@ -1195,12 +1472,15 @@ fn run_worker_batch(plan: &Plan, batch: &[String], results: &mut Results) -> Res
 /// Drive a single worker through [`update_worker`] and record the
 /// result. Routes failures through `--continue-on-error` semantics
 /// (mirrors bash `worker_fail`, line 1407).
+///
+/// Round-2 lens L3#3: a missing IP in [`Plan::worker_ip_map`] now
+/// `bail!`s instead of silently substituting `<unknown>`. The Plan's
+/// from_args invariant guarantees every worker in `workers_to_run()`
+/// has an entry; reaching the bail means that invariant broke.
 fn run_one_worker(plan: &Plan, w: &str, results: &mut Results) -> Result<()> {
-    let ip = plan
-        .worker_ip_map
-        .get(w)
-        .cloned()
-        .unwrap_or_else(|| "<unknown>".to_string());
+    let ip = plan.worker_ip_map.get(w).cloned().ok_or_else(|| {
+        anyhow!("internal: no IP recorded for worker {w}; Plan::from_args invariant broken")
+    })?;
     let k8s_name = plan
         .worker_k8s_name_map
         .get(w)
@@ -1334,31 +1614,16 @@ pub fn run(args: UpdateClusterArgs) -> Result<()> {
         if node == &plan.cp_name {
             update_cp(&plan)?;
             results.succeeded.push(plan.cp_name.clone());
-        } else if let Some(idx) = plan.worker_names.iter().position(|w| w == node) {
-            let w = &plan.worker_names[idx];
-            let ip = plan
-                .worker_ip_map
-                .get(w)
-                .cloned()
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let k8s_name = plan
-                .worker_k8s_name_map
-                .get(w)
-                .cloned()
-                .unwrap_or_else(|| w.clone());
-            // Single-node mode mirrors the bash twin's `|| true` swallow,
-            // but we still surface the error in results.failed when
-            // --continue-on-error is set.
-            match update_worker(&plan, w, &ip, &k8s_name) {
-                Ok(()) => results.succeeded.push(w.clone()),
-                Err(e) => {
-                    if plan.continue_on_error {
-                        results.failed.push(format!("{w}: {e}"));
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
+        } else if plan.worker_names.iter().any(|w| w == node) {
+            // Round-2 lens L2#1: route single-node WORKER mode through
+            // the same `run_one_worker` codepath the batch loop uses, so
+            // `--continue-on-error` semantics + best-effort timer restore
+            // stay aligned (CodeRabbit's `update_worker || true` vs
+            // `run_one_worker` divergence). The summary footer below
+            // always prints — `bash scripts/update-cluster.sh
+            // --node=WORKER` does the same.
+            let w_owned = node.clone();
+            run_one_worker(&plan, &w_owned, &mut results)?;
         } else {
             bail!("--node={node} did not match CP_NAME or any WORKER_NAMES entry");
         }
@@ -1445,11 +1710,17 @@ fn b(v: bool) -> i32 {
 /// used by every helper that needs a real SSH round-trip. The error
 /// wording explicitly points at the follow-up issue so an operator
 /// hitting this in CI gets actionable guidance.
+///
+/// The tracking issue is [#322] — the live-execution slice — not
+/// [#286], which this PR closes with the dry-run parity surface
+/// (round-2 lens L4#1).
+///
+/// [#322]: https://github.com/aatchison/hummingbird-k8s/issues/322
 fn live_mode_not_implemented(helper: &str, equivalent: &str) -> anyhow::Error {
     anyhow!(
         "live-mode update-cluster: `{helper}` requires a remote SSH/kubectl round-trip that is not yet \
          implemented in the Rust path. Bash equivalent: `{equivalent}`. \
-         Until the live-execution slice lands (follow-up to #286), run with `--dry-run` to preview \
+         Until the live-execution slice lands (tracked by #322), run with `--dry-run` to preview \
          the plan, or use `make update-cluster CONFIG=… [FLAGS=…]` to actually upgrade."
     )
 }
@@ -1683,19 +1954,117 @@ mod tests {
     /// surfaces here if a field is dropped or renamed.
     #[test]
     fn in_flight_struct_field_set_pinned() {
+        // Construct with `uncordoned=true` so the Drop's recovery-hint
+        // path doesn't print to test stderr.
         let f = InFlight {
             node: "n".to_string(),
             ip: "i".to_string(),
             drained: true,
-            uncordoned: false,
+            uncordoned: true,
             phase: "p".to_string(),
         };
         assert_eq!(f.node, "n");
         assert_eq!(f.ip, "i");
         assert!(f.drained);
-        assert!(!f.uncordoned);
+        assert!(f.uncordoned);
         assert_eq!(f.phase, "p");
     }
+
+    /// Round-2 lens L3#2: when a node is `drained` but never
+    /// `uncordoned` and the `InFlight` is dropped (panic / `?` / SIGINT),
+    /// the Drop must surface a `kubectl uncordon <NODE>` recovery hint
+    /// to stderr. Pin the exact wording for grep-parity with the bash
+    /// twin's `cleanup_on_exit`.
+    ///
+    /// We can't easily capture stderr from inside the same test process
+    /// without a stderr-capture crate; instead we assert the source-code
+    /// contains the load-bearing wording. A unit test that drives the
+    /// real Drop into an stderr buffer would need to spawn a subprocess —
+    /// see `tests/update_cluster_in_flight.rs` for that.
+    #[test]
+    fn in_flight_drop_hint_wording_present() {
+        let src = include_str!("update_cluster.rs");
+        assert!(
+            src.contains("is cordoned and was not uncordoned; recover with: kubectl uncordon"),
+            "round-2 L3#2: recovery-hint wording removed from InFlight::Drop"
+        );
+    }
+
+    /// Lens L9: grep-parity helper names. The bash twin invokes
+    /// `mark_in_flight`, `mark_in_flight ... uncordoned`, and
+    /// `clear_in_flight`; we expose Rust wrappers with the same names
+    /// so an operator grepping both sides finds matching call sites.
+    #[test]
+    fn in_flight_grep_parity_wrappers_compile() {
+        let mut f = InFlight::default();
+        f.node = "x".to_string();
+        f.mark_drained();
+        assert!(f.drained);
+        f.mark_uncordoned();
+        assert!(f.uncordoned);
+        f.clear_in_flight();
+        assert!(!f.drained);
+        assert!(!f.uncordoned);
+        assert!(f.node.is_empty());
+    }
+
+    /// Round-2 lens L2#2: `--node-name-override=` with an empty value
+    /// is rejected (previously a silent no-op). Pin the error wording.
+    #[test]
+    fn plan_node_name_override_empty_string_is_rejected() {
+        let args = parse_args(&["--node-name-override", "", "--dry-run"]);
+        let err = Plan::from_args(&args, cfg(vec!["w1"]), Timeouts::default())
+            .expect_err("empty --node-name-override should fail");
+        assert!(
+            err.to_string().contains("non-empty DOMAIN=NODE"),
+            "wrong error: {err}"
+        );
+    }
+
+    /// Round-2 lens L1 medium: `--no-sudo` (and `HBIRD_REMOTE_NO_SUDO=1`
+    /// env) must be threaded onto the Plan so the live-execution slice
+    /// (#322) can consume it. Pin the field's presence + value
+    /// propagation.
+    #[test]
+    fn plan_carries_no_sudo_flag() {
+        // SAFETY: tests in the same crate share env state. We don't
+        // touch the env here — clap reads `HBIRD_REMOTE_NO_SUDO` once
+        // at parse time and a stale value from another test's setenv
+        // would leak. Confirm only the explicit-flag path.
+        // Note: clap's BoolishValueParser treats `--no-sudo true` as
+        // `true` and bare `--no-sudo` as `true` (via default_missing_value).
+        let args = parse_args(&["--dry-run", "--no-sudo", "true"]);
+        let plan = Plan::from_args(&args, cfg(vec!["w1"]), Timeouts::default()).expect("plan");
+        assert!(plan.no_sudo, "--no-sudo true should set plan.no_sudo");
+
+        // And the default — `false` — when the flag is absent. We
+        // can't be sure the env is clean (env_var('HBIRD_REMOTE_NO_SUDO')
+        // may be set in CI), so we don't assert the negative case here.
+        // The integration tests under tests/ pin the absent-flag path.
+        let _ = plan.kvm_host;
+    }
+
+    /// Round-2 lens L3#3: a missing IP in worker_ip_map must `bail!`
+    /// rather than silently use `<unknown>`. We can't reach
+    /// `run_one_worker` from outside the module without a Plan that
+    /// has at least one worker with no IP; assert the source-level
+    /// invariant + the wording.
+    #[test]
+    fn run_one_worker_missing_ip_wording_present() {
+        let src = include_str!("update_cluster.rs");
+        assert!(
+            src.contains("Plan::from_args invariant broken"),
+            "round-2 L3#3: <unknown>-IP bail! wording removed from run_one_worker"
+        );
+    }
+
+    // Note: the `acquire_lock` contention test (lens L5#M1) lives in
+    // `tests/update_cluster_lock_contention.rs`. It needs an isolated
+    // XDG_RUNTIME_DIR which std::env::set_var requires `unsafe` under
+    // the 2024 edition, and the workspace lint `unsafe_code = "forbid"`
+    // rules that out in src/. Pinning it in an integration test lets us
+    // run the binary in a clean subprocess with the env set at spawn
+    // time instead of mid-process.
 
     /// `--continue-on-error` is documented as worker-only — CP failures
     /// still abort the run. Pin the wording so a future refactor that

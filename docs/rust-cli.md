@@ -96,12 +96,13 @@ update-cluster --config cluster.local.conf --dry-run` emits a log line
 sequence byte-for-byte identical to `make update-cluster
 CONFIG=cluster.local.conf FLAGS=--dry-run`. This is pinned in CI by
 `rust/crates/hbird-cli/tests/update_cluster_dry_run.rs`, which compares
-the Rust output to ten fixtures under
+the Rust output to **eleven** fixtures under
 `rust/crates/hbird-cli/tests/update_cluster/fixtures/`. The fixtures
-cover every flag combination (`--workers-only`, `--node`, `--start-from`,
-`--skip-drain`, `--skip-gates`, `--no-delete-emptydir-data`,
-`--parallel=2`, `--node-name-override`) and were captured by running the
-bash twin against a synthetic config that names the live cluster's VMs.
+cover every flag combination (`--workers-only`, `--node` for both CP and
+worker, `--start-from`, `--skip-drain`, `--skip-gates`,
+`--no-delete-emptydir-data`, `--parallel=2`, `--node-name-override`,
+`--continue-on-error`) and were captured by running the bash twin
+against a synthetic config that names the live cluster's VMs.
 
 ### Phase 1 (`update-cluster`) — live execution slice (follow-up)
 

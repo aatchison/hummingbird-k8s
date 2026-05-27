@@ -48,10 +48,20 @@ anyhow = "1"
 
 # Foundation crates the update-cluster body builds on. `hbird-config`
 # parses `cluster.local.conf`; the SSH transport + libvirt wrapper land
-# as the live-execution slice follows (deferred per #286 module docs).
+# as the live-execution slice follows (deferred per #286 module docs;
+# tracked by #322).
 # Path deps stay path-only — no version bumps until release engineering
 # (#290) wires cargo-dist.
 hbird-config = { path = "../hbird-config", version = "0.0.1" }
+
+# Signal handling for the SIGINT/SIGTERM lock-release path (round-2
+# review of #321, lens L3#1). `LockGuard::Drop` doesn't fire when the
+# process is killed by a signal we don't trap, so `acquire_lock`
+# installs a handler that releases the kernel-held flock before
+# re-raising. `signal-hook` is the de-facto async-signal-safe crate
+# on stable Rust (used by tokio/tracing); the workspace lint
+# `unsafe_code = "forbid"` rules out raw `sigaction(2)` bindings.
+signal-hook = "0.3"
 
 [dev-dependencies]
 # Integration tests (`tests/cli_smoke.rs`) parse the command tree without
