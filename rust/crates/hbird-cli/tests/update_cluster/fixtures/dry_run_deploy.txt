@@ -1,0 +1,33 @@
+[deploy-cluster] config: cluster.local.conf
+[deploy-cluster] config OK: CP=hbird-cp1, workers=(hbird-w1 hbird-w2), source=ghcr, tag=v0.42.0
+[deploy-cluster] DRY-RUN would podman pull ghcr.io/aatchison/hummingbird-k8s:v0.42.0
+[deploy-cluster] DRY-RUN would podman pull ghcr.io/aatchison/hummingbird-k8s-worker:v0.42.0
+[deploy-cluster] DRY-RUN would render bib config + build /mnt/pool/hummingbird-k8s-deploy.qcow2 from ghcr.io/aatchison/hummingbird-k8s:v0.42.0
+[deploy-cluster] DRY-RUN would render bib config + build /mnt/pool/hummingbird-k8s-worker-deploy.qcow2 from ghcr.io/aatchison/hummingbird-k8s-worker:v0.42.0
+[deploy-cluster]   (bib invocation requires rootful podman — see #311; the live path will honor #311's skip-if-exists shortcut)
+[deploy-cluster] DRY-RUN would render CP cloud-init user-data (auto-update-cp=true, switch-to-ghcr=true, ghcr-tag=v0.42.0)
+[deploy-cluster] DRY-RUN would build CP cloud-init seed /mnt/pool/hbird-cp1-seed.iso
+[deploy-cluster] DRY-RUN would refuse to overwrite if CP VM 'hbird-cp1' already defined
+[deploy-cluster] DRY-RUN would clone /mnt/pool/hummingbird-k8s-deploy.qcow2 -> /mnt/pool/hbird-cp1.qcow2 (reflink=auto)
+[deploy-cluster] DRY-RUN would virt-install hbird-cp1 (memory=8192 vcpus=4) attaching /mnt/pool/hbird-cp1.qcow2 + /mnt/pool/hbird-cp1-seed.iso
+[deploy-cluster] DRY-RUN would resolve CP IP via 'virsh domifaddr hbird-cp1' (timeout ~5min)
+[deploy-cluster] DRY-RUN would poll 'kubectl get nodes' on CP until Ready (timeout ~600s)
+[deploy-cluster] DRY-RUN would mint 2h-TTL kubeadm join token via 'ssh root@<resolved-at-runtime> kubeadm token create --print-join-command'
+[deploy-cluster] DRY-RUN would refuse to overwrite if worker VM 'hbird-w1' already defined
+[deploy-cluster] DRY-RUN would render worker cloud-init user-data with join command + build seed /mnt/pool/hbird-w1-seed.iso
+[deploy-cluster] DRY-RUN would clone /mnt/pool/hummingbird-k8s-worker-deploy.qcow2 -> /mnt/pool/hbird-w1.qcow2 (reflink=auto)
+[deploy-cluster] DRY-RUN would virt-install hbird-w1 (memory=4096 vcpus=2) attaching /mnt/pool/hbird-w1.qcow2 + /mnt/pool/hbird-w1-seed.iso [parallel]
+[deploy-cluster] DRY-RUN would refuse to overwrite if worker VM 'hbird-w2' already defined
+[deploy-cluster] DRY-RUN would render worker cloud-init user-data with join command + build seed /mnt/pool/hbird-w2-seed.iso
+[deploy-cluster] DRY-RUN would clone /mnt/pool/hummingbird-k8s-worker-deploy.qcow2 -> /mnt/pool/hbird-w2.qcow2 (reflink=auto)
+[deploy-cluster] DRY-RUN would virt-install hbird-w2 (memory=4096 vcpus=2) attaching /mnt/pool/hbird-w2.qcow2 + /mnt/pool/hbird-w2-seed.iso [parallel]
+[deploy-cluster] DRY-RUN would wait for 2 parallel virt-install processes
+[deploy-cluster] DRY-RUN would poll cluster until 3 nodes Ready (timeout ~600s)
+[deploy-cluster] 
+[deploy-cluster] ==============================================================
+[deploy-cluster] DRY-RUN plan complete. No VMs were created.
+[deploy-cluster]   CP:         hbird-cp1 (<resolved-at-runtime>)
+[deploy-cluster]   Workers:    hbird-w1 hbird-w2
+[deploy-cluster]   Image src:  ghcr (tag=v0.42.0)
+[deploy-cluster]   Kubeconfig: root@<resolved-at-runtime>:/etc/kubernetes/admin.conf
+[deploy-cluster] ==============================================================

@@ -50,8 +50,9 @@ subcommands land per the phasing table in
 ## `hbird` command tree (scaffolded by [#283])
 
 ```text
-hbird deploy-cluster      <-> make deploy-cluster      (body tracked by #289)
-hbird destroy-cluster     <-> make destroy-cluster     (body tracked by #289)
+hbird deploy-cluster      <-> make deploy-cluster      (dry-run landed PR #289; live tracked by #335)
+hbird destroy-cluster     <-> make destroy-cluster     (dry-run + live landed PR #289)
+hbird spawn-workers       <-> make spawn-workers       (dry-run landed PR #289; live tracked by #335)
 hbird update-cluster      <-> make update-cluster      (body tracked by #286)
 hbird verify encryption   <-> make verify-encryption   (body tracked by #287)
 hbird verify hardening    <-> make verify-hardening    (body tracked by #287)
@@ -77,8 +78,17 @@ Subcommand status:
   1B cycle 1. The export-argocd / get-kubeconfig paths ship the
   *corrected* shape (post-#306 ProxyJump-after-config and post-#307
   non-TTY SSH) — see fixture annotations.
-- `deploy-cluster` / `destroy-cluster` — Phase 4 tracked by #289;
-  still scaffold-only.
+- `deploy-cluster` / `destroy-cluster` / `spawn-workers` — Phase 4
+  landed (#289). Dry-run planners for all three pin byte-for-byte
+  fixtures (`tests/update_cluster/fixtures/dry_run_{deploy,destroy,spawn}.txt`).
+  `destroy-cluster` ships with full live execution wired through
+  `hbird-virt::Connection` (additive `destroy_domain` / `undefine_domain`
+  / `remote_rm_f` / `remote_rm_rf` / `remote_path_exists` verbs)
+  bridged to `hbird-ssh::Client` via an in-crate `CliSshBridge`.
+  `deploy-cluster` + `spawn-workers` live execution is deferred to
+  [#335](https://github.com/aatchison/hummingbird-k8s/issues/335) —
+  bib + virt-install + guestfish parity is a hundreds-of-LOC follow-up
+  that overlaps with #311's bib-rootful work in flight.
 
 The flag set + help text are stable; the Makefile will start
 dispatching to `hbird` per-target as each implementation reaches

@@ -62,6 +62,14 @@ hbird-config = { path = "../hbird-config", version = "0.0.1" }
 # contract this wraps.
 hbird-ssh = { path = "../hbird-ssh", version = "0.0.1" }
 
+# Phase 4 (#289): libvirt wrapper used by `destroy-cluster` for the
+# `virsh destroy / undefine / domifaddr / dominfo` round-trips plus the
+# qcow2 + seed ISO + scratch-dir cleanup. The bridge in
+# `commands/destroy_cluster.rs::CliSshBridge` adapts `hbird-ssh::Client`
+# to `hbird-virt::SshClient` so the libvirt verbs and the `rm -f` runs
+# share one SSH session.
+hbird-virt = { path = "../hbird-virt", version = "0.0.1" }
+
 # Signal handling for the SIGINT/SIGTERM lock-release path (round-2
 # review of #321, lens L3#1). `LockGuard::Drop` doesn't fire when the
 # process is killed by a signal we don't trap, so `acquire_lock`

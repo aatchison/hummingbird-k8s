@@ -49,7 +49,8 @@ mod cp_kubectl;
 use commands::{
     deploy_cluster::DeployClusterArgs, destroy_cluster::DestroyClusterArgs,
     export_argocd::ExportArgocdArgs, get_kubeconfig::GetKubeconfigArgs, kubectl::KubectlArgs,
-    nodes::NodesArgs, update_cluster::UpdateClusterArgs, verify::VerifyArgs,
+    nodes::NodesArgs, spawn_workers::SpawnWorkersArgs, update_cluster::UpdateClusterArgs,
+    verify::VerifyArgs,
 };
 
 /// Top-level entry point. Parse argv, dispatch to the chosen subcommand.
@@ -156,6 +157,12 @@ enum Command {
     /// Implementation tracked by #289.
     DestroyCluster(DestroyClusterArgs),
 
+    /// Spawn N additional workers against an existing cluster.
+    ///
+    /// Bash twin: `scripts/spawn-workers.sh` (via `make spawn-workers COUNT=N`).
+    /// Implementation tracked by #289; live execution slice tracked by #335.
+    SpawnWorkers(SpawnWorkersArgs),
+
     /// Rolling bootc upgrade across CP + workers with bootID + daemonset gates.
     ///
     /// Bash twin: `scripts/update-cluster.sh` (via `make update-cluster`,
@@ -212,6 +219,7 @@ impl Command {
         match self {
             Command::DeployCluster(_) => "deploy-cluster",
             Command::DestroyCluster(_) => "destroy-cluster",
+            Command::SpawnWorkers(_) => "spawn-workers",
             Command::UpdateCluster(_) => "update-cluster",
             Command::Verify(_) => "verify",
             Command::GetKubeconfig(_) => "get-kubeconfig",
@@ -227,6 +235,7 @@ impl Command {
         match self {
             Command::DeployCluster(args) => commands::deploy_cluster::run(args),
             Command::DestroyCluster(args) => commands::destroy_cluster::run(args),
+            Command::SpawnWorkers(args) => commands::spawn_workers::run(args),
             Command::UpdateCluster(args) => commands::update_cluster::run(args),
             Command::Verify(args) => commands::verify::run(args),
             Command::GetKubeconfig(args) => commands::get_kubeconfig::run(args),
@@ -272,6 +281,10 @@ mod tests {
             (
                 &["hbird", "destroy-cluster", "--config", "/dev/null"],
                 "destroy-cluster",
+            ),
+            (
+                &["hbird", "spawn-workers", "--config", "/dev/null"],
+                "spawn-workers",
             ),
             (
                 &["hbird", "update-cluster", "--config", "/dev/null"],

@@ -38,11 +38,16 @@
 //!   [`Connection::dominfo`].
 //! - [`Error`] — flat enum carrying URI / SSH / virsh-output failures.
 //!
-//! Mutating libvirt operations (`start`, `destroy`, `undefine`, etc.)
-//! intentionally are NOT exposed here yet — they land when the
-//! consumer crates need them ([#289] for spawn-workers /
-//! destroy-cluster). Starting small keeps the test surface narrow and
-//! the trait obligations on `SshClient` minimal.
+//! Mutating libvirt operations: as of [#289] Phase 4,
+//! [`Connection::destroy_domain`] and [`Connection::undefine_domain`]
+//! are exposed for the destroy-cluster live path; additional verbs
+//! (`start`, `define`, etc.) land when consumer crates need them.
+//! Auxiliary remote-shell helpers ([`Connection::remote_rm_f`],
+//! [`Connection::remote_rm_rf`], [`Connection::remote_path_exists`])
+//! are exposed here too — they target the same SSH session the
+//! libvirt verbs run over, so callers don't need a second
+//! `SshClient` plumb to clean qcow2 + seed ISO artifacts that
+//! `virsh` itself can't reach.
 //!
 //! [#279]: https://github.com/aatchison/hummingbird-k8s/issues/279
 //! [#284]: https://github.com/aatchison/hummingbird-k8s/issues/284
@@ -234,6 +239,125 @@ impl Connection {
         );
         let stdout = self.run(&cmd)?;
         parse_dominfo(&stdout, &cmd)
+    }
+
+    /// Force-stop a running domain (`virsh destroy`).
+    ///
+    /// Bash twin: `scripts/destroy-cluster.sh::78` —
+    /// `virsh -c qemu:///system destroy "$name" >/dev/null 2>&1 || true`.
+    ///
+    /// Returns `Ok(())` even if the domain was already shut off — bash's
+    /// `|| true` swallows that case. A non-existent domain still surfaces
+    /// as [`Error::VirshFailed`]; callers are expected to gate this
+    /// behind a [`Self::dominfo`] probe (see destroy-cluster's
+    /// `destroy_vm` helper which checks `dominfo` first).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] when `virsh` exits non-zero for reasons
+    ///   other than "domain not running" (which the bash twin already
+    ///   silences via `|| true`; we surface it so callers can choose).
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain), err(Debug))]
+    pub fn destroy_domain(&self, domain: &str) -> Result<()> {
+        let cmd = format!(
+            "virsh -c {} destroy {}",
+            self.uri.remote_uri(),
+            shell_quote(domain),
+        );
+        self.run(&cmd).map(|_| ())
+    }
+
+    /// Undefine a domain, removing the libvirt definition + NVRAM
+    /// (`virsh undefine --nvram`).
+    ///
+    /// Bash twin: `scripts/destroy-cluster.sh::79` —
+    /// `virsh -c qemu:///system undefine --nvram "$name" >/dev/null 2>&1 || true`.
+    ///
+    /// `--nvram` is required on Q35/UEFI guests; the bash twin passes
+    /// it unconditionally and we mirror that.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] when `virsh` exits non-zero (e.g.
+    ///   domain not defined).
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain), err(Debug))]
+    pub fn undefine_domain(&self, domain: &str) -> Result<()> {
+        let cmd = format!(
+            "virsh -c {} undefine --nvram {}",
+            self.uri.remote_uri(),
+            shell_quote(domain),
+        );
+        self.run(&cmd).map(|_| ())
+    }
+
+    /// Remove a file on the remote (or local) KVM host via the SSH
+    /// transport. Used by destroy-cluster to clean qcow2 + seed ISO +
+    /// scratch-dir artifacts that aren't visible to `virsh`.
+    ///
+    /// Bash twin: `scripts/destroy-cluster.sh::95` —
+    /// `rm_err=$(rm -f -- "$f" 2>&1)`. The `--` separator hardens against
+    /// filenames that start with `-`. `rm -f` is idempotent on missing
+    /// targets, matching the bash twin's idempotent-cleanup contract.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] (overloaded — captures `rm`'s stderr)
+    ///   when `rm` exits non-zero. The bash twin surfaces this as a
+    ///   `WARN:` log line and continues; callers here are expected to
+    ///   do the same (the destroy-cluster command runs each remove
+    ///   independently and aggregates warnings).
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path), err(Debug))]
+    pub fn remote_rm_f(&self, path: &str) -> Result<()> {
+        let cmd = format!("rm -f -- {}", shell_quote(path));
+        self.run(&cmd).map(|_| ())
+    }
+
+    /// Recursively remove a directory on the remote KVM host
+    /// (`rm -rf --`). Used to clean the `${POOL_DIR}/deploy-cluster`
+    /// scratch dir.
+    ///
+    /// Bash twin: `scripts/destroy-cluster.sh::113` —
+    /// `_scratch_err=$(rm -rf -- "${POOL_DIR}/deploy-cluster" 2>&1)`.
+    /// Idempotent on missing dirs.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] (overloaded — captures `rm`'s stderr)
+    ///   when `rm` exits non-zero.
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path), err(Debug))]
+    pub fn remote_rm_rf(&self, path: &str) -> Result<()> {
+        let cmd = format!("rm -rf -- {}", shell_quote(path));
+        self.run(&cmd).map(|_| ())
+    }
+
+    /// Probe whether a path exists on the remote KVM host
+    /// (`test -e <path>`). Returns `Ok(true)` when the path exists,
+    /// `Ok(false)` when it doesn't, `Err(_)` only on SSH transport
+    /// failures.
+    ///
+    /// Bash twin: `scripts/destroy-cluster.sh::94` — `[[ -e "$f" ]] ||
+    /// continue`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, path), err(Debug))]
+    pub fn remote_path_exists(&self, path: &str) -> Result<bool> {
+        // `test -e` exits 0 when present, 1 when absent. The SshClient
+        // trait surfaces exit-1 as RemoteExit; we translate the binary
+        // outcome locally.
+        let cmd = format!("test -e {}", shell_quote(path));
+        match self.ssh.run(&self.uri.ssh_target(), &cmd) {
+            Ok(_) => Ok(true),
+            Err(SshError::RemoteExit {
+                exit_code: Some(1), ..
+            }) => Ok(false),
+            Err(other) => Err(Error::from(other)),
+        }
     }
 
     /// Run a remote command, wrapping transport / non-zero-exit failures

@@ -48,6 +48,7 @@ fn help_lists_every_operator_facing_subcommand() {
     for sub in [
         "deploy-cluster",
         "destroy-cluster",
+        "spawn-workers",
         "update-cluster",
         "verify",
         "get-kubeconfig",
@@ -89,28 +90,68 @@ fn version_flag_works() {
     );
 }
 
+/// #289 landed the real deploy-cluster body (dry-run parity). `/dev/null`
+/// is no longer a valid stand-in; the config parser will reject it.
+/// Confirm the failure mode is config-parse (CP_NAME missing) rather
+/// than the pre-#289 stub.
 #[test]
-fn deploy_cluster_returns_not_yet_implemented() {
-    // Run with a dummy config path — the command should fail before
-    // touching the filesystem because the body is the
-    // not-yet-implemented stub. If a future PR (#289) wires real
-    // behavior, this test will fail and the implementer can swap it
-    // for a real integration test (or delete it).
+fn deploy_cluster_against_empty_config_fails_at_config_parse() {
     let (status, _stdout, stderr) = run(&["deploy-cluster", "--config", "/dev/null"]);
-    assert!(!status.success(), "deploy-cluster stub exited zero");
+    assert!(!status.success(), "deploy-cluster with /dev/null exited 0");
+    // Stub error from PR #319 was:
+    //   "deploy-cluster not yet implemented — tracked by #289"
+    // Both halves must be absent for the stub to be truly gone.
+    let stub_marker = stderr.contains("not yet implemented") && stderr.contains("#289");
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#289"),
-        "deploy-cluster stub error missing tracker. stderr:\n{stderr}"
+        !stub_marker,
+        "deploy-cluster should not be a stub anymore. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CP_NAME")
+            || stderr.contains("SSH_PUBKEY_FILE")
+            || stderr.contains("required")
+            || stderr.contains("missing"),
+        "deploy-cluster should fail at config-parse on empty config. stderr:\n{stderr}"
     );
 }
 
+/// Same shape for `destroy-cluster`: real body landed in #289, the
+/// failure should be a config-parse error rather than a stub.
 #[test]
-fn destroy_cluster_returns_not_yet_implemented() {
+fn destroy_cluster_against_empty_config_fails_at_config_parse() {
     let (status, _stdout, stderr) = run(&["destroy-cluster", "--config", "/dev/null"]);
     assert!(!status.success());
+    let stub_marker = stderr.contains("not yet implemented") && stderr.contains("#289");
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#289"),
-        "destroy-cluster stub error missing tracker. stderr:\n{stderr}"
+        !stub_marker,
+        "destroy-cluster should not be a stub anymore. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CP_NAME")
+            || stderr.contains("SSH_PUBKEY_FILE")
+            || stderr.contains("required")
+            || stderr.contains("missing"),
+        "destroy-cluster should fail at config-parse on empty config. stderr:\n{stderr}"
+    );
+}
+
+/// `hbird spawn-workers` is new in #289. Confirm it parses + reaches
+/// the config-parse failure with the same shape as deploy/destroy.
+#[test]
+fn spawn_workers_against_empty_config_fails_at_config_parse() {
+    let (status, _stdout, stderr) = run(&["spawn-workers", "--config", "/dev/null"]);
+    assert!(!status.success());
+    let stub_marker = stderr.contains("not yet implemented") && stderr.contains("#289");
+    assert!(
+        !stub_marker,
+        "spawn-workers should not be a stub anymore. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CP_NAME")
+            || stderr.contains("SSH_PUBKEY_FILE")
+            || stderr.contains("required")
+            || stderr.contains("missing"),
+        "spawn-workers should fail at config-parse on empty config. stderr:\n{stderr}"
     );
 }
 
@@ -382,20 +423,24 @@ fn kubectl_no_args_surfaces_clear_error() {
 
 /// `deploy-cluster`'s `--kvm-host` carries `env = "KVM_HOST"`. The bash
 /// twin reads `KVM_HOST` from the env; the Rust binary must too, or
-/// operator muscle memory breaks. Verify by setting the env var, then
-/// reading the args-echo for the value.
+/// operator muscle memory breaks. Verify by parsing `--help` with the
+/// env var set — clap surfaces env defaults in the help output, so a
+/// missing `env =` binding regresses the help line. Pre-#289 the
+/// stub-echo could observe the env var directly; now the body reaches
+/// the config-parse failure before the echo, so `--help` is the most
+/// hermetic place to assert the env binding survived.
 #[test]
-fn deploy_cluster_kvm_host_falls_back_to_env() {
+fn deploy_cluster_kvm_host_env_binding_present_in_help() {
     let out = Command::new(hbird_bin())
-        .args(["deploy-cluster", "--config", "/dev/null"])
+        .args(["deploy-cluster", "--help"])
         .env("KVM_HOST", "geary-via-env")
         .output()
         .expect("failed to spawn hbird binary");
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "--help exited non-zero");
     assert!(
-        stderr.contains("geary-via-env"),
-        "KVM_HOST env didn't reach --kvm-host. stderr:\n{stderr}"
+        stdout.contains("KVM_HOST"),
+        "deploy-cluster --help should mention KVM_HOST env binding. stdout:\n{stdout}"
     );
 }
 
@@ -417,24 +462,23 @@ fn verify_encryption_reads_kvm_host_from_env() {
 }
 
 /// `--no-sudo` honors `HBIRD_REMOTE_NO_SUDO=1` (matches bash twin's
-/// `scripts/lib/ssh-wrap.sh`). Verify the env binding lands by setting
-/// the env var and confirming the stub still bails (we can't directly
-/// observe the bool, but at minimum we confirm clap accepts the env-var
-/// path without complaint).
+/// `scripts/lib/ssh-wrap.sh`). Pre-#289 this verified by reading the
+/// stub echo; post-#289 the real body fails at config-parse before any
+/// echo. Assert the env binding is wired by spotting `HBIRD_REMOTE_NO_SUDO`
+/// in `--help` instead — clap surfaces env-var bindings in the per-flag
+/// help line.
 #[test]
-fn deploy_cluster_no_sudo_env_var_accepted() {
+fn deploy_cluster_no_sudo_env_binding_present_in_help() {
     let out = Command::new(hbird_bin())
-        .args(["deploy-cluster", "--config", "/dev/null"])
+        .args(["deploy-cluster", "--help"])
         .env("HBIRD_REMOTE_NO_SUDO", "1")
         .output()
         .expect("failed to spawn hbird binary");
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    // Should reach the stub (not-yet-implemented) — that means clap
-    // happily parsed the env var.
-    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "--help exited non-zero");
     assert!(
-        stderr.contains("not yet implemented"),
-        "HBIRD_REMOTE_NO_SUDO env didn't parse cleanly. stderr:\n{stderr}"
+        stdout.contains("HBIRD_REMOTE_NO_SUDO"),
+        "deploy-cluster --help should mention HBIRD_REMOTE_NO_SUDO env binding. stdout:\n{stdout}"
     );
 }
 
