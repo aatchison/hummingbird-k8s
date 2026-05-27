@@ -165,7 +165,10 @@ jobs:
           tool: cargo-deny
       - name: Supply-chain audit (advisories / bans / licenses / sources)
         working-directory: rust
-        run: cargo deny --show-stats check
+        # `--show-stats` is a check-subcommand flag, not a top-level
+        # cargo-deny flag — putting it before `check` exits non-zero
+        # with a usage error.
+        run: cargo deny check --show-stats
 
   lint-inheritance:
     # Lens 6 MEDIUM finding from PR #313 round-2 review: every crate must
