@@ -918,15 +918,44 @@ impl Drop for LockGuard {
 /// over SSH. Exit 0 → has --apply; exit 1 (no match) → fallback path.
 /// Any other non-zero classifies as an SSH/transport error and bubbles
 /// up so the caller can fail-fast rather than silently downgrade.
+// `#[allow(dead_code)]`: after the issue #345 trait-seam split,
+// `bootc_upgrade_apply` calls `bootc_has_apply_with_exec` directly so it
+// can thread a single mock executor through the whole flow. The outer
+// `bootc_has_apply` is kept as the bash-twin grep anchor (the
+// `cycle2_helper_names_present` regression test requires the `fn
+// bootc_has_apply` source span to remain) and as a future entry point
+// for callers that want the Plan-aware dry-run short-circuit. Remove
+// when both the grep-parity test and any external caller path are
+// retired.
+#[allow(dead_code)]
 #[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip))]
 fn bootc_has_apply(plan: &Plan, ip: &str) -> Result<bool> {
     if plan.dry_run {
         return Ok(true);
     }
     let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+    bootc_has_apply_with_exec(&client, ip)
+}
+
+/// Inner helper for [`bootc_has_apply`] taking a mockable
+/// [`hbird_ssh::SshExec`] so unit tests can pin the rc=0 / rc=1 / rc=other
+/// classification without a real SSH connection (issue #345; surfaced by
+/// PR #344's 7-lens review L5 MEDIUM). `ip` is forwarded only for the
+/// error context — the SSH target is owned by the supplied executor.
+///
+/// Branch table (mirrors bash `bootc_has_apply` at
+/// `scripts/update-cluster.sh:523`):
+///
+/// | Exec result                            | Returned                          |
+/// |----------------------------------------|-----------------------------------|
+/// | `Ok(_)`                                | `Ok(true)`                        |
+/// | `Err(NonZeroExit { code=Some(1) })`    | `Ok(false)` (grep found nothing)  |
+/// | `Err(NonZeroExit { code=other/None })` | `Err(...)` with context           |
+/// | `Err(_)` (transport/spawn/wait/...)    | `Err(...)` with context           |
+fn bootc_has_apply_with_exec(exec: &impl hbird_ssh::SshExec, ip: &str) -> Result<bool> {
     // Same shape as bash line 529:
     //   ssh "${SSH_OPTS[@]}" "root@${ip}" "bootc upgrade --help 2>/dev/null | grep -q -- '--apply'"
-    match client.run("bootc upgrade --help 2>/dev/null | grep -q -- '--apply'") {
+    match exec.run("bootc upgrade --help 2>/dev/null | grep -q -- '--apply'") {
         Ok(_) => Ok(true),
         Err(hbird_ssh::Error::NonZeroExit { status, .. }) if status.code() == Some(1) => {
             // grep exit 1 = pattern not found = no --apply support.
@@ -949,12 +978,26 @@ fn bootc_has_apply(plan: &Plan, ip: &str) -> Result<bool> {
 /// [`bootc_upgrade_apply`] treats `pre == post == ""` as "couldn't
 /// determine, treat as applied" matching bash line 1157 which only
 /// short-circuits on a NON-EMPTY equal pair.
+// See `bootc_has_apply` for the `#[allow(dead_code)]` rationale —
+// `bootc_upgrade_apply` now routes through `bootc_booted_digest_with_exec`
+// to keep mock-injection consistent across the flow; the outer fn stays
+// as the bash-twin grep anchor + future-caller entry point.
+#[allow(dead_code)]
 #[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip))]
 fn bootc_booted_digest(plan: &Plan, ip: &str) -> Result<String> {
     if plan.dry_run {
         return Ok("<dry-run-digest>".to_string());
     }
     let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+    bootc_booted_digest_with_exec(&client, ip)
+}
+
+/// Inner helper for [`bootc_booted_digest`] taking a mockable
+/// [`hbird_ssh::SshExec`] so unit tests can drive the `pre == post` /
+/// `pre != post` / empty-string fallback branches that
+/// [`bootc_upgrade_apply`] keys off (issue #345). `ip` carries through
+/// to the error context only — the executor owns the actual SSH target.
+fn bootc_booted_digest_with_exec(exec: &impl hbird_ssh::SshExec, ip: &str) -> Result<String> {
     // Bash line 543 uses the same jq expression. We replicate verbatim so
     // operators grepping both sides find a matching call shape.
     // Round-2 lens L2 MED: fallback path matches bash twin literally
@@ -968,7 +1011,7 @@ fn bootc_booted_digest(plan: &Plan, ip: &str) -> Result<String> {
     // `|| true` keeps a transient jq error from blowing up the digest
     // snapshot — bash twin does the same; empty string falls through to
     // the caller's `<unknown>` fallback log line.
-    match client.run(cmd) {
+    match exec.run(cmd) {
         Ok(out) => Ok(out.stdout_lossy().trim().to_string()),
         Err(e) => {
             Err(e).with_context(|| format!("bootc_booted_digest: ssh-run failed against root@{ip}"))
@@ -1047,13 +1090,33 @@ fn wait_ssh_back(plan: &Plan, ip: &str) -> Result<()> {
         log(&format!("DRY-RUN would poll ssh root@{ip}"));
         return Ok(());
     }
-    let interval: u32 = 5;
     let client = hbird_ssh::Client::new(
         node_ssh_opts(plan, ip).with_connect_timeout(Duration::from_secs(3)),
     );
+    wait_ssh_back_with(&client, &RealClock, ip, timeout)
+}
+
+/// Inner helper for [`wait_ssh_back`] taking a mockable
+/// [`hbird_ssh::SshExec`] + injectable [`Clock`]. Lets unit tests pin
+/// the never-back / back-after-N-polls poll-loop branches without
+/// burning real wall-clock seconds or opening a socket (issue #345).
+///
+/// Each iteration:
+/// 1. Run `exec.run("true")`. On `Ok`, log + return `Ok(())`.
+/// 2. On `Err`, sleep `interval` seconds via the clock and add to `elapsed`.
+/// 3. If `elapsed >= timeout`, bail with the bash-twin wording.
+///
+/// The interval is pinned at 5s (bash twin's `interval=5` at line 827).
+fn wait_ssh_back_with(
+    exec: &impl hbird_ssh::SshExec,
+    clock: &impl Clock,
+    ip: &str,
+    timeout: u32,
+) -> Result<()> {
+    let interval: u32 = 5;
     let mut elapsed: u32 = 0;
     while elapsed < timeout {
-        match client.run("true") {
+        match exec.run("true") {
             Ok(_) => {
                 log(&format!("SSH back on {ip} after ~{elapsed}s"));
                 return Ok(());
@@ -1065,7 +1128,7 @@ fn wait_ssh_back(plan: &Plan, ip: &str) -> Result<()> {
                 // `>/dev/null 2>&1` + condition on the if-statement.
             }
         }
-        std::thread::sleep(Duration::from_secs(interval.into()));
+        clock.sleep(Duration::from_secs(interval.into()));
         elapsed = elapsed.saturating_add(interval);
     }
     bail!("wait_ssh_back: SSH on {ip} did not come back within {timeout}s");
@@ -1098,15 +1161,31 @@ fn wait_ssh_drop(plan: &Plan, ip: &str) -> Result<()> {
     let client = hbird_ssh::Client::new(
         node_ssh_opts(plan, ip).with_connect_timeout(Duration::from_secs(3)),
     );
+    wait_ssh_drop_with(&client, &RealClock, ip, max)
+}
+
+/// Inner helper for [`wait_ssh_drop`] taking a mockable
+/// [`hbird_ssh::SshExec`] + injectable [`Clock`]. Lets unit tests pin
+/// the drop-after-N-polls / never-drop branches without burning real
+/// seconds (issue #345). Returns `Ok(())` in BOTH the drop-observed and
+/// the timeout-exhausted cases — the bash twin's `bail!` was demoted to
+/// a WARN log in round-2 (lens L3 MED on PR #327) since both callers
+/// already swallowed the error.
+fn wait_ssh_drop_with(
+    exec: &impl hbird_ssh::SshExec,
+    clock: &impl Clock,
+    ip: &str,
+    max: u32,
+) -> Result<()> {
     let mut elapsed: u32 = 0;
     while elapsed < max {
-        if client.run("true").is_err() {
+        if exec.run("true").is_err() {
             log(&format!(
                 "  SSH on {ip} dropped after ~{elapsed}s (reboot in progress)"
             ));
             return Ok(());
         }
-        std::thread::sleep(Duration::from_secs(1));
+        clock.sleep(Duration::from_secs(1));
         elapsed = elapsed.saturating_add(1);
     }
     // Bash line 821: WARN + return non-zero. Both callers
@@ -1119,6 +1198,29 @@ fn wait_ssh_drop(plan: &Plan, ip: &str) -> Result<()> {
         "  WARN: SSH on {ip} still up after {max}s — bootc may have queued without rebooting"
     ));
     Ok(())
+}
+
+/// Injectable clock seam — pure unit tests can use a `NoopClock` to skip
+/// real sleeps while preserving the elapsed-counter shape of the poll
+/// loops. Production code uses [`RealClock`] which delegates to
+/// [`std::thread::sleep`]. Kept minimal (only the `sleep(Duration)`
+/// surface needed by [`wait_ssh_drop_with`] / [`wait_ssh_back_with`])
+/// to avoid scope creep; a fuller `now()` API can land if a future
+/// helper needs wall-clock state. (Issue #345.)
+trait Clock {
+    /// Block the calling thread for `duration`. Implementations may be
+    /// no-ops in tests; production callers MUST sleep at least
+    /// `duration` so the bash twin's poll-cadence semantics hold.
+    fn sleep(&self, duration: Duration);
+}
+
+/// Production clock — delegates to [`std::thread::sleep`].
+struct RealClock;
+
+impl Clock for RealClock {
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 /// Poll the apiserver via the CP. Mirrors `wait_apiserver_back`
@@ -1681,8 +1783,33 @@ fn bootc_upgrade_apply(plan: &Plan, ip: &str, name: &str) -> Result<BootcUpgrade
         ));
         return Ok(BootcUpgradeOutcome::Applied);
     }
+    let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+    bootc_upgrade_apply_with_exec(&client, ip, name)
+}
 
-    let pre_digest = bootc_booted_digest(plan, ip)?;
+/// Inner helper for [`bootc_upgrade_apply`] taking a mockable
+/// [`hbird_ssh::SshExec`]. The trait seam (issue #345) makes the four
+/// outcome branches unit-testable without a live cluster cycle:
+///
+/// | rc / state                                         | Outcome                              |
+/// |----------------------------------------------------|--------------------------------------|
+/// | `Ok(_)` + `pre == post` (both non-empty)           | [`BootcUpgradeOutcome::AlreadyCurrent`]|
+/// | `Ok(_)` + `pre != post` (or either empty)          | [`BootcUpgradeOutcome::Applied`]     |
+/// | `Err(NonZeroExit { status=Some(255) })`            | [`BootcUpgradeOutcome::Applied`]     |
+/// | `Err(NonZeroExit { status=Some(other)/None })`     | [`BootcUpgradeOutcome::UpgradeFailed]`|
+/// | `Err(_)` (transport, identity, spawn, wait)        | `Err(...)` with context              |
+///
+/// `name` is forwarded only for log messages; `ip` only for the
+/// error-context string — the supplied executor owns the real SSH
+/// target. Calls into [`bootc_booted_digest_with_exec`] and
+/// [`bootc_has_apply_with_exec`] route through the SAME executor so a
+/// single mock can drive the whole flow.
+fn bootc_upgrade_apply_with_exec(
+    exec: &impl hbird_ssh::SshExec,
+    ip: &str,
+    name: &str,
+) -> Result<BootcUpgradeOutcome> {
+    let pre_digest = bootc_booted_digest_with_exec(exec, ip)?;
     log(&format!(
         "  pre-upgrade booted digest: {}",
         if pre_digest.is_empty() {
@@ -1692,15 +1819,14 @@ fn bootc_upgrade_apply(plan: &Plan, ip: &str, name: &str) -> Result<BootcUpgrade
         }
     ));
 
-    let has_apply = bootc_has_apply(plan, ip)?;
-    let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+    let has_apply = bootc_has_apply_with_exec(exec, ip)?;
     let result = if has_apply {
-        client.run("bootc upgrade --apply")
+        exec.run("bootc upgrade --apply")
     } else {
         log(&format!(
             "  bootc on {name} lacks --apply; falling back to 'bootc upgrade && systemctl reboot'"
         ));
-        let upgrade_result = client.run("bootc upgrade");
+        let upgrade_result = exec.run("bootc upgrade");
         match upgrade_result {
             Ok(out) => {
                 // Emit stdout/stderr to operator log for parity with the
@@ -1719,7 +1845,7 @@ fn bootc_upgrade_apply(plan: &Plan, ip: &str, name: &str) -> Result<BootcUpgrade
                 // true` (the remote bash would die before the OR could
                 // fire anyway) so the remote command matches bash
                 // verbatim.
-                client.run("systemctl reboot >/dev/null 2>&1")
+                exec.run("systemctl reboot >/dev/null 2>&1")
             }
             Err(e) => Err(e),
         }
@@ -1739,7 +1865,7 @@ fn bootc_upgrade_apply(plan: &Plan, ip: &str, name: &str) -> Result<BootcUpgrade
             }
             // rc=0: command returned cleanly. Disambiguate "no update"
             // vs "applied but didn't reboot" via post-digest compare.
-            let post_digest = bootc_booted_digest(plan, ip)?;
+            let post_digest = bootc_booted_digest_with_exec(exec, ip)?;
             log(&format!(
                 "  post-upgrade booted digest: {}",
                 if post_digest.is_empty() {
@@ -3093,5 +3219,445 @@ mod tests {
             src.contains("let interval: u32 = 10;"),
             "cycle 4: bash twin's `interval=10` polling cadence dropped from source (#329)",
         );
+    }
+
+    // ============================================================
+    // Issue #345 — SshExec trait + injectable clock unit tests.
+    //
+    // Surfaced by PR #344's 7-lens review L5 MEDIUM: the bootc-upgrade
+    // rc classification branches in `bootc_upgrade_apply` (rc=255 →
+    // Applied, rc=0+different-digest → Applied, rc=0+matching-digest →
+    // AlreadyCurrent, rc=other → UpgradeFailed) were validated by
+    // live-validate only because no SSH-mocking infrastructure existed.
+    //
+    // The trait seam (`hbird_ssh::SshExec`) + `Clock` trait below let
+    // each branch fire from a pure unit test in <1ms, so a regression
+    // in any of them surfaces in `cargo test` rather than mid-cluster
+    // upgrade. (Issue #345; epic #279; cycle 2 #327.)
+    // ============================================================
+
+    use hbird_ssh::{Error as SshErr, RunOutput, SshExec};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    /// Test-only SshExec implementor that returns canned responses
+    /// from a FIFO queue. Each call pops one response; `expect_empty`
+    /// at end of test confirms the helper exercised the full script.
+    ///
+    /// `Mutex` (not `RefCell`) is used so the impl can be `Send + Sync`,
+    /// matching the trait's bound; tests still run single-threaded
+    /// inside a fixture.
+    struct MockSshExec {
+        /// Pre-canned responses, in call order. Each entry is the
+        /// result returned by one `run` / `run_with_stdin` call.
+        responses: std::sync::Mutex<std::collections::VecDeque<Result<RunOutput, SshErr>>>,
+        /// Observed commands, captured per call for assertions.
+        observed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MockSshExec {
+        fn new(responses: Vec<Result<RunOutput, SshErr>>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+                observed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.observed.lock().unwrap().clone()
+        }
+    }
+
+    impl SshExec for MockSshExec {
+        fn run(&self, command: &str) -> Result<RunOutput, SshErr> {
+            self.observed.lock().unwrap().push(command.to_string());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("MockSshExec: ran out of canned responses — extend the script")
+        }
+
+        fn run_with_stdin(&self, command: &str, _stdin: &[u8]) -> Result<RunOutput, SshErr> {
+            self.observed.lock().unwrap().push(command.to_string());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("MockSshExec: ran out of canned responses — extend the script")
+        }
+    }
+
+    /// Build a `RunOutput` with the given stdout (and empty stderr,
+    /// exit-status 0). Convenience for canning rc=0 responses.
+    fn ok_stdout(s: &str) -> Result<RunOutput, SshErr> {
+        Ok(RunOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: s.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    /// Build a [`SshErr::NonZeroExit`] with the given exit code +
+    /// stdout/stderr. The exit code is converted to the wait-status
+    /// shape (`code << 8`) that POSIX `wait(2)` uses; `ExitStatus::code()`
+    /// returns the high byte unchanged, so the bash-twin's `if [[ $rc
+    /// == 1 ]]` checks match.
+    fn nonzero_exit(code: i32, stderr: &str) -> Result<RunOutput, SshErr> {
+        // POSIX wait-status: high byte = exit code; low byte zero on
+        // normal exit. `ExitStatus::from_raw` takes that combined value.
+        let raw = (code & 0xff) << 8;
+        Err(SshErr::NonZeroExit {
+            host: "test-host".to_string(),
+            status: ExitStatus::from_raw(raw),
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        })
+    }
+
+    /// Sanity-check the `nonzero_exit` helper: the constructed
+    /// ExitStatus must report the same code the test asked for, so
+    /// downstream `.code() == Some(N)` matches behave as expected.
+    #[test]
+    fn nonzero_exit_helper_round_trips_code() {
+        for code in [0_i32, 1, 2, 42, 255] {
+            let err = nonzero_exit(code, "");
+            match err {
+                Err(SshErr::NonZeroExit { status, .. }) => {
+                    assert_eq!(
+                        status.code(),
+                        Some(code),
+                        "ExitStatus::from_raw round-trip failed for code {code}",
+                    );
+                }
+                other => panic!("expected NonZeroExit, got {other:?}"),
+            }
+        }
+    }
+
+    // ---- bootc_has_apply_with_exec ----
+
+    /// rc=0 → has --apply. Acceptance: "bootc_has_apply similar (rc=1 →
+    /// false; other → propagate)" implies rc=0 must return true.
+    #[test]
+    fn bootc_has_apply_with_exec_rc0_returns_true() {
+        let exec = MockSshExec::new(vec![ok_stdout("")]);
+        let got = bootc_has_apply_with_exec(&exec, "10.0.0.1").expect("rc=0 must succeed");
+        assert!(got, "rc=0 means grep found --apply: must return true");
+        // The command shape MUST match the bash twin verbatim so
+        // operators grepping both sides find a single call site.
+        assert_eq!(
+            exec.commands(),
+            vec!["bootc upgrade --help 2>/dev/null | grep -q -- '--apply'"],
+        );
+    }
+
+    /// rc=1 → grep exit code for "pattern not found" → no --apply
+    /// support → return Ok(false). Pinning this branch is the issue
+    /// #345 acceptance criterion.
+    #[test]
+    fn bootc_has_apply_with_exec_rc1_returns_false() {
+        let exec = MockSshExec::new(vec![nonzero_exit(1, "")]);
+        let got = bootc_has_apply_with_exec(&exec, "10.0.0.1").expect("rc=1 must collapse to Ok");
+        assert!(!got, "rc=1 means grep found nothing: must return false");
+    }
+
+    /// rc=other (not 0, not 1) → propagate as Err with context. Pinning
+    /// this branch keeps SSH/transport-level failures from being
+    /// silently mistaken for "no --apply support".
+    #[test]
+    fn bootc_has_apply_with_exec_rc_other_propagates() {
+        let exec = MockSshExec::new(vec![nonzero_exit(2, "some ssh failure")]);
+        let err = bootc_has_apply_with_exec(&exec, "10.0.0.1")
+            .expect_err("rc=2 must propagate (not Ok(false))");
+        let s = err.to_string();
+        assert!(
+            s.contains("bootc_has_apply") && s.contains("10.0.0.1"),
+            "wrong error: {s}"
+        );
+    }
+
+    // ---- bootc_booted_digest_with_exec ----
+
+    /// Successful digest snapshot — return the trimmed stdout. Pins
+    /// the `// empty` jq fallback's empty-string passthrough.
+    #[test]
+    fn bootc_booted_digest_with_exec_returns_trimmed_stdout() {
+        let exec = MockSshExec::new(vec![ok_stdout("sha256:abc123\n")]);
+        let got = bootc_booted_digest_with_exec(&exec, "10.0.0.1").expect("digest ok");
+        assert_eq!(got, "sha256:abc123");
+    }
+
+    /// Empty stdout (jq's `// empty` fallback) → empty string. The
+    /// caller in `bootc_upgrade_apply` treats `pre == post == ""` as
+    /// "couldn't determine", which must NOT match the
+    /// `AlreadyCurrent` short-circuit (matching bash line 1157 that
+    /// only short-circuits on NON-EMPTY equal pairs).
+    #[test]
+    fn bootc_booted_digest_with_exec_empty_passes_through() {
+        let exec = MockSshExec::new(vec![ok_stdout("")]);
+        let got = bootc_booted_digest_with_exec(&exec, "10.0.0.1").expect("empty is valid");
+        assert_eq!(got, "");
+    }
+
+    // ---- bootc_upgrade_apply_with_exec — the four-branch matrix ----
+
+    /// Branch 1: rc=255 → reboot tore down ssh → Applied. The most
+    /// subtle branch in the bash twin (line 1165) and the one that
+    /// PR #344's review L5 MEDIUM specifically called out as
+    /// unit-test-only-reachable-via-live-validate.
+    #[test]
+    fn bootc_upgrade_apply_with_exec_rc255_classifies_applied() {
+        let exec = MockSshExec::new(vec![
+            ok_stdout("sha256:pre"),                          // bootc_booted_digest (pre)
+            ok_stdout(""),                                    // bootc_has_apply → true
+            nonzero_exit(255, "Connection closed by remote"), // bootc upgrade --apply
+        ]);
+        let outcome =
+            bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1").expect("rc255 ok");
+        assert_eq!(
+            outcome,
+            BootcUpgradeOutcome::Applied,
+            "rc=255 (reboot tore down ssh) MUST classify as Applied — bash line 1165",
+        );
+    }
+
+    /// Branch 2: rc=0 + post digest matches pre digest → AlreadyCurrent.
+    /// Matches bash line 1157's "only short-circuit on NON-EMPTY equal
+    /// pairs" semantics.
+    #[test]
+    fn bootc_upgrade_apply_with_exec_rc0_same_digest_classifies_already_current() {
+        let exec = MockSshExec::new(vec![
+            ok_stdout("sha256:pre"), // pre digest
+            ok_stdout(""),           // has_apply → true
+            ok_stdout(""),           // bootc upgrade --apply (rc=0, no reboot)
+            ok_stdout("sha256:pre"), // post digest (same)
+        ]);
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1")
+            .expect("rc0+same digest ok");
+        assert_eq!(
+            outcome,
+            BootcUpgradeOutcome::AlreadyCurrent,
+            "rc=0 + matching pre/post digest MUST classify as AlreadyCurrent — bash line 1157",
+        );
+    }
+
+    /// Branch 3: rc=0 + post digest differs from pre digest → Applied.
+    /// Pinned so a future refactor doesn't accidentally collapse this
+    /// branch into AlreadyCurrent (the "no-op upgrade" trap surfaced by
+    /// PR #344's live-validate).
+    #[test]
+    fn bootc_upgrade_apply_with_exec_rc0_diff_digest_classifies_applied() {
+        let exec = MockSshExec::new(vec![
+            ok_stdout("sha256:pre"),  // pre digest
+            ok_stdout(""),            // has_apply → true
+            ok_stdout(""),            // bootc upgrade --apply (rc=0)
+            ok_stdout("sha256:post"), // post digest (differs)
+        ]);
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1")
+            .expect("rc0+diff digest ok");
+        assert_eq!(
+            outcome,
+            BootcUpgradeOutcome::Applied,
+            "rc=0 + differing pre/post digest MUST classify as Applied",
+        );
+    }
+
+    /// Branch 4: rc=other (e.g. rc=2) → UpgradeFailed. Caller (update_worker
+    /// / update_cp) decides whether to route through worker_fail or
+    /// abort hard; `bootc_upgrade_apply_with_exec` itself must NOT bail.
+    #[test]
+    fn bootc_upgrade_apply_with_exec_rc_other_classifies_upgrade_failed() {
+        let exec = MockSshExec::new(vec![
+            ok_stdout("sha256:pre"),                      // pre digest
+            ok_stdout(""),                                // has_apply → true
+            nonzero_exit(2, "bootc: image fetch failed"), // bootc upgrade --apply (rc=2)
+        ]);
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1")
+            .expect("rc=other must collapse to Ok(UpgradeFailed), not bubble Err");
+        assert_eq!(
+            outcome,
+            BootcUpgradeOutcome::UpgradeFailed,
+            "rc=other MUST classify as UpgradeFailed (caller picks the policy) — bash line 1173",
+        );
+    }
+
+    /// Edge: pre digest empty + post digest empty → Applied (NOT
+    /// AlreadyCurrent). The AlreadyCurrent short-circuit requires
+    /// BOTH digests non-empty AND equal — pin the negative case so a
+    /// future refactor doesn't drop the `!is_empty()` guard.
+    #[test]
+    fn bootc_upgrade_apply_with_exec_rc0_both_empty_digests_classifies_applied() {
+        let exec = MockSshExec::new(vec![
+            ok_stdout(""), // pre digest (empty)
+            ok_stdout(""), // has_apply → true
+            ok_stdout(""), // bootc upgrade --apply (rc=0)
+            ok_stdout(""), // post digest (also empty)
+        ]);
+        let outcome =
+            bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1").expect("empty digests ok");
+        assert_eq!(
+            outcome,
+            BootcUpgradeOutcome::Applied,
+            "both-empty digests MUST NOT short-circuit to AlreadyCurrent — bash line 1157",
+        );
+    }
+
+    /// Two-step fallback path (bootc <1.1): rc=255 on the second SSH
+    /// call (`systemctl reboot`) → Applied. Pinned because the fallback
+    /// flow has its own rc-classification surface that PR #344's review
+    /// also identified as live-validate-only.
+    #[test]
+    fn bootc_upgrade_apply_with_exec_two_step_fallback_classifies_applied() {
+        let exec = MockSshExec::new(vec![
+            ok_stdout("sha256:pre"), // pre digest
+            nonzero_exit(1, ""),     // has_apply → false (grep no match → fallback)
+            ok_stdout(""),           // bootc upgrade (rc=0)
+            nonzero_exit(255, ""),   // systemctl reboot (rc=255, reboot tore down ssh)
+        ]);
+        let outcome = bootc_upgrade_apply_with_exec(&exec, "10.0.0.1", "hbird-w1")
+            .expect("two-step rc255 ok");
+        assert_eq!(
+            outcome,
+            BootcUpgradeOutcome::Applied,
+            "two-step fallback rc=255 on `systemctl reboot` MUST classify as Applied",
+        );
+        // Verify the issued commands match the bash twin's two-step shape.
+        let cmds = exec.commands();
+        assert!(
+            cmds.iter().any(|c| c == "bootc upgrade"),
+            "two-step path must issue bare `bootc upgrade` before reboot (got {cmds:?})",
+        );
+        assert!(
+            cmds.iter().any(|c| c == "systemctl reboot >/dev/null 2>&1"),
+            "two-step path must issue `systemctl reboot ...` (got {cmds:?})",
+        );
+    }
+
+    // ---- wait_ssh_drop_with + wait_ssh_back_with — poll-loop tests ----
+
+    /// Test clock that records every sleep duration without blocking.
+    /// `Mutex` to satisfy the `Send + Sync` blanket requirement on the
+    /// trait when used by reference in tests.
+    struct NoopClock {
+        sleeps: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl NoopClock {
+        fn new() -> Self {
+            Self {
+                sleeps: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sleep_count(&self) -> usize {
+            self.sleeps.lock().unwrap().len()
+        }
+    }
+
+    impl Clock for NoopClock {
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.lock().unwrap().push(duration);
+        }
+    }
+
+    /// `wait_ssh_drop_with`: SSH drops on the third probe → return Ok
+    /// without exhausting the timeout. The bash twin (line 805+) does
+    /// the same shape; this pins it without the real-time penalty.
+    #[test]
+    fn wait_ssh_drop_with_returns_ok_when_ssh_drops() {
+        let exec = MockSshExec::new(vec![
+            ok_stdout(""),         // probe 1: still up
+            ok_stdout(""),         // probe 2: still up
+            nonzero_exit(255, ""), // probe 3: SSH dropped (transport torn down)
+        ]);
+        let clock = NoopClock::new();
+        let res = wait_ssh_drop_with(&exec, &clock, "10.0.0.1", 30);
+        assert!(res.is_ok(), "drop-observed must return Ok: {res:?}");
+        // Two sleeps between the three probes.
+        assert_eq!(
+            clock.sleep_count(),
+            2,
+            "exactly one sleep between each pair of probes — got {}",
+            clock.sleep_count(),
+        );
+    }
+
+    /// `wait_ssh_drop_with`: SSH never drops → return Ok (with WARN log)
+    /// after exhausting the timeout budget. Round-2 lens L3 MED on PR
+    /// #327 promoted this from `bail!` to `Ok(())` because both callers
+    /// swallow the error; pin the Ok shape so a future revert is loud.
+    #[test]
+    fn wait_ssh_drop_with_returns_ok_on_timeout() {
+        // 5-probe budget: 5 successful `true` calls = "still up the whole time".
+        let exec = MockSshExec::new(vec![
+            ok_stdout(""),
+            ok_stdout(""),
+            ok_stdout(""),
+            ok_stdout(""),
+            ok_stdout(""),
+        ]);
+        let clock = NoopClock::new();
+        let res = wait_ssh_drop_with(&exec, &clock, "10.0.0.1", 5);
+        assert!(
+            res.is_ok(),
+            "round-2 L3 MED: timeout-exhausted MUST return Ok (WARN-only), got {res:?}",
+        );
+        assert_eq!(
+            clock.sleep_count(),
+            5,
+            "one sleep per iteration (5 probes → 5 sleeps), got {}",
+            clock.sleep_count(),
+        );
+    }
+
+    /// `wait_ssh_back_with`: SSH returns on the second probe → return
+    /// Ok without exhausting the budget. Bash twin line 825+ shape.
+    #[test]
+    fn wait_ssh_back_with_returns_ok_when_ssh_comes_back() {
+        let exec = MockSshExec::new(vec![
+            nonzero_exit(255, ""), // probe 1: still down
+            ok_stdout(""),         // probe 2: back!
+        ]);
+        let clock = NoopClock::new();
+        let res = wait_ssh_back_with(&exec, &clock, "10.0.0.1", 300);
+        assert!(res.is_ok(), "back-observed must return Ok: {res:?}");
+        assert_eq!(
+            clock.sleep_count(),
+            1,
+            "exactly one sleep between probe 1 (down) and probe 2 (back)",
+        );
+    }
+
+    /// `wait_ssh_back_with`: SSH never comes back → bail with the
+    /// timeout wording. The bash twin (line 838) returns non-zero
+    /// here and the caller in `update_worker` / `update_cp` chains
+    /// `.with_context(|| ...)` on top — pin the load-bearing
+    /// "did not come back within Ns" substring.
+    #[test]
+    fn wait_ssh_back_with_bails_on_timeout() {
+        // 10s budget at 5s interval → 2 probes, both failing.
+        let exec = MockSshExec::new(vec![nonzero_exit(255, ""), nonzero_exit(255, "")]);
+        let clock = NoopClock::new();
+        let err =
+            wait_ssh_back_with(&exec, &clock, "10.0.0.1", 10).expect_err("never-back must bail");
+        let s = err.to_string();
+        assert!(
+            s.contains("did not come back within 10s") && s.contains("10.0.0.1"),
+            "wrong timeout wording: {s}",
+        );
+    }
+
+    /// `wait_ssh_back_with`: zero timeout → immediately bail without
+    /// any probe. Pins the loop-bound off-by-one (the bash twin's
+    /// `while [ "$elapsed" -lt "$timeout" ]` would also skip).
+    #[test]
+    fn wait_ssh_back_with_zero_timeout_bails_immediately() {
+        let exec = MockSshExec::new(vec![]); // zero probes expected
+        let clock = NoopClock::new();
+        let err = wait_ssh_back_with(&exec, &clock, "10.0.0.1", 0)
+            .expect_err("zero-timeout must bail without probing");
+        assert!(err.to_string().contains("did not come back within 0s"));
+        assert_eq!(clock.sleep_count(), 0);
     }
 }

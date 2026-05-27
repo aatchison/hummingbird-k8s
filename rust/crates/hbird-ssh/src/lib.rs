@@ -50,6 +50,13 @@
 //!   identity, ProxyJump, timeout, ControlMaster, batch mode).
 //! - [`Client`] — owns an [`SshOptions`] and runs commands via
 //!   [`Client::run`] / [`Client::run_with_stdin`].
+//! - [`SshExec`] — mockable trait (issue #345) that [`Client`]
+//!   implements. Consumer crates take `&impl SshExec` so unit tests can
+//!   inject canned responses without a real SSH round-trip — added so
+//!   `update-cluster`'s bootc-upgrade rc-classification branches
+//!   (rc=255 / rc=0+same-digest / rc=0+diff-digest / rc=other) gain
+//!   `cargo test`-level coverage that previously required a live
+//!   cluster cycle.
 //! - [`RunOutput`] — captured stdout + stderr + [`std::process::ExitStatus`].
 //! - [`Error`] — typed failure modes; round-2 added per-variant `host`
 //!   context + a [`crate::SpawnKind`] discriminator + a dedicated
@@ -89,9 +96,11 @@ use std::io::Write;
 use std::process::{Command, ExitStatus, Stdio};
 
 mod error;
+mod exec;
 mod options;
 
 pub use error::{Error, SpawnKind};
+pub use exec::SshExec;
 pub use options::SshOptions;
 
 /// Result alias used throughout the crate.

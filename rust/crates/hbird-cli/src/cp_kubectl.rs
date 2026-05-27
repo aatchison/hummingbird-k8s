@@ -157,14 +157,24 @@ pub(crate) fn cp_kubectl_raw(target: &CpTarget, command: &str) -> Result<hbird_s
 }
 
 fn cp_kubectl_raw_inner(target: &CpTarget, command: &str) -> Result<hbird_ssh::RunOutput> {
-    reject_shell_metachars("cp_kubectl_raw", command)?;
     let client = hbird_ssh::Client::new(target.cp_ssh_opts());
+    cp_kubectl_raw_with_exec(&client, &target.cp_ip, command)
+}
+
+/// Inner helper for [`cp_kubectl_raw`] taking a mockable
+/// [`hbird_ssh::SshExec`] so unit tests can pin the metacharacter-
+/// rejection + kubectl-prefix wrapping branches without a real SSH
+/// connection (issue #345). `cp_ip` is forwarded only for the error
+/// context — the supplied executor owns the actual target.
+pub(crate) fn cp_kubectl_raw_with_exec(
+    exec: &impl hbird_ssh::SshExec,
+    cp_ip: &str,
+    command: &str,
+) -> Result<hbird_ssh::RunOutput> {
+    reject_shell_metachars("cp_kubectl_raw", command)?;
     let remote = format!("kubectl --kubeconfig=/etc/kubernetes/admin.conf {command}");
-    client.run(&remote).with_context(|| {
-        format!(
-            "cp_kubectl_raw: ssh-run failed for `kubectl ... {command}` against {}",
-            target.cp_ip
-        )
+    exec.run(&remote).with_context(|| {
+        format!("cp_kubectl_raw: ssh-run failed for `kubectl ... {command}` against {cp_ip}")
     })
 }
 
@@ -431,6 +441,101 @@ mod tests {
         assert!(
             err.to_string().contains("shell metacharacter"),
             "wrong error: {err}"
+        );
+    }
+
+    // ---- Issue #345 — SshExec trait seam unit tests ----
+    //
+    // The `cp_kubectl_raw_with_exec` inner takes `&impl SshExec` so a
+    // canned executor can verify the kubectl-prefix wrap shape +
+    // command forwarding without a real SSH round-trip.
+    //
+    // PR #344 review L5 MEDIUM gap (live-validate-only branches) was
+    // largest on update-cluster's bootc helpers; cp_kubectl_raw is
+    // simpler but gets the same treatment for consistency so future
+    // callers can mock it too.
+
+    use hbird_ssh::{Error as SshErr, RunOutput, SshExec};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    struct CapturingExec {
+        canned: std::sync::Mutex<Option<Result<RunOutput, SshErr>>>,
+        observed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CapturingExec {
+        fn new(canned: Result<RunOutput, SshErr>) -> Self {
+            Self {
+                canned: std::sync::Mutex::new(Some(canned)),
+                observed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn commands(&self) -> Vec<String> {
+            self.observed.lock().unwrap().clone()
+        }
+    }
+
+    impl SshExec for CapturingExec {
+        fn run(&self, command: &str) -> Result<RunOutput, SshErr> {
+            self.observed.lock().unwrap().push(command.to_string());
+            self.canned
+                .lock()
+                .unwrap()
+                .take()
+                .expect("CapturingExec: only one canned response per fixture")
+        }
+        fn run_with_stdin(&self, command: &str, _stdin: &[u8]) -> Result<RunOutput, SshErr> {
+            self.observed.lock().unwrap().push(command.to_string());
+            self.canned.lock().unwrap().take().expect("only one canned")
+        }
+    }
+
+    fn ok_stdout(s: &str) -> Result<RunOutput, SshErr> {
+        Ok(RunOutput {
+            status: ExitStatus::from_raw(0),
+            stdout: s.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        })
+    }
+
+    /// `cp_kubectl_raw_with_exec` MUST wrap `command` with the
+    /// `kubectl --kubeconfig=/etc/kubernetes/admin.conf ` prefix
+    /// before forwarding to the executor. Pinning the exact prefix
+    /// guards against silent drift away from bash twin's call shape
+    /// in `scripts/update-cluster.sh:425`.
+    #[test]
+    fn cp_kubectl_raw_with_exec_prefixes_kubectl_command() {
+        let exec = CapturingExec::new(ok_stdout("Ready"));
+        let out =
+            cp_kubectl_raw_with_exec(&exec, "192.168.122.42", "get nodes").expect("happy path ok");
+        assert_eq!(out.stdout_lossy().trim(), "Ready");
+        let cmds = exec.commands();
+        assert_eq!(cmds.len(), 1, "exactly one ssh call expected: {cmds:?}");
+        assert_eq!(
+            cmds[0], "kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes",
+            "kubectl prefix MUST match bash twin exactly",
+        );
+    }
+
+    /// `cp_kubectl_raw_with_exec` MUST reject shell metacharacters
+    /// BEFORE calling the executor — the metachar defense is a
+    /// security boundary, not an after-the-fact log. Pin the
+    /// no-executor-call shape so a future refactor that moves the
+    /// check below the exec.run() surfaces here.
+    #[test]
+    fn cp_kubectl_raw_with_exec_rejects_metachar_before_exec_call() {
+        let exec = CapturingExec::new(ok_stdout("should-never-be-returned"));
+        let err = cp_kubectl_raw_with_exec(&exec, "192.168.122.42", "get nodes; rm -rf /")
+            .expect_err("metachar must be rejected");
+        assert!(
+            err.to_string().contains("shell metacharacter"),
+            "wrong error: {err}"
+        );
+        assert!(
+            exec.commands().is_empty(),
+            "exec MUST NOT be called when metachar rejection fires: got {:?}",
+            exec.commands(),
         );
     }
 }
