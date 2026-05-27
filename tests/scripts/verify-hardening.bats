@@ -403,3 +403,125 @@ EOF
   ' "${REPO_ROOT}/Makefile" \
     | grep -qE 'CONFIG="\$\(CONFIG\)"'
 }
+
+# ---------------------------------------------------------------------------
+# #332: PSA-rejection apply must NOT route through the `kc`/$KUBECTL
+# wrapper, because scripts/kubectl-k8s.sh sets up a port-forward tunnel
+# before invoking kubectl and that setup consumes stdin from the
+# heredoc — leaving kubectl with "no objects passed to apply" and the
+# check failing against a correctly-hardened cluster. The fix is to go
+# direct via `on_cp` (ssh root@CP "kubectl ... apply -f -"), so heredoc
+# stdin flows through SSH untouched. Aligns with the Rust twin (#330)
+# which already takes this shape via `cp_kubectl_with_stdin_lenient`.
+# ---------------------------------------------------------------------------
+
+@test "#332: PSA apply uses on_cp (direct SSH), NOT kc/\$KUBECTL wrapper" {
+  # The `apply -f -` line in the PSA check must call on_cp, not kc.
+  # Find the line that opens the `apply -f -` heredoc and assert its
+  # invocation target.
+  run grep -nE "apply -f -.*<<'?EOF'?" "$SCRIPT"
+  [ "$status" -eq 0 ]
+  # The matched line should start the invocation with on_cp, not kc.
+  echo "$output" | grep -qE 'on_cp .*apply -f -.*<<'
+  ! echo "$output" | grep -qE '^[0-9]+:[[:space:]]*[^#]*\bkc[[:space:]]+apply -f -'
+}
+
+@test "#332: PSA cleanup delete also goes direct via on_cp (not kc)" {
+  # The follow-up `delete pod verify-hardening-privileged-probe` must
+  # also bypass the wrapper. No `kc ... delete pod
+  # verify-hardening-privileged-probe` anywhere in the script.
+  ! grep -qE '\bkc[[:space:]].*delete pod verify-hardening-privileged-probe' \
+    "$SCRIPT"
+  # And on_cp invokes a kubectl delete with the probe pod name + the CP-local
+  # admin kubeconfig — confirms the direct-SSH path is wired up correctly.
+  grep -qE 'on_cp .*kubectl.*--kubeconfig=/etc/kubernetes/admin\.conf.*delete pod verify-hardening-privileged-probe' \
+    "$SCRIPT"
+}
+
+@test "#332: docstring explains why PSA probes bypass the kc wrapper" {
+  # Future maintainers reading the header must understand the heredoc
+  # interaction with kubectl-k8s.sh's port-forward setup. The fix only
+  # works if the rationale survives — otherwise someone will "tidy up"
+  # the direct-SSH call back into the wrapper.
+  grep -qE '#332' "$SCRIPT"
+  grep -qE 'port-forward|heredoc|stdin' "$SCRIPT"
+}
+
+@test "#332: PSA apply heredoc stdin flows through to ssh's remote-cmd argv" {
+  # End-to-end: with CP_IP set (skip resolve_cp_ip) the script's PSA
+  # apply path must invoke ssh with `root@<CP_IP>` and a remote command
+  # containing `kubectl … apply -f -`, AND the heredoc body bytes must
+  # arrive on the stub's stdin (proving the kubectl-k8s.sh wrapper is
+  # out of the path entirely).
+  _make_ssh_stub_capture_stdin
+
+  run env -u CONFIG -u KVM_HOST \
+    KUBECTL=kubectl \
+    CP_NAME=hbird-cp1 \
+    CP_IP=192.168.99.42 \
+    PATH="${STUB_DIR}:${PATH}" \
+    bash "$SCRIPT"
+
+  # Find the ssh invocation whose remote command is the PSA apply.
+  local found_apply=0
+  local apply_stdin_file=""
+  for f in "${SSH_ARGV_DIR}"/argv-*; do
+    [ -f "$f" ] || continue
+    if grep -qF 'kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -' "$f"; then
+      found_apply=1
+      # Same numeric suffix → stdin capture.
+      local n="${f##*/argv-}"
+      apply_stdin_file="${SSH_ARGV_DIR}/stdin-${n}"
+      break
+    fi
+  done
+  if [ "$found_apply" -ne 1 ]; then
+    echo "FAIL: no ssh argv carried the PSA 'kubectl … apply -f -' remote cmd" >&2
+    for f in "${SSH_ARGV_DIR}"/argv-*; do
+      [ -f "$f" ] || continue
+      echo "--- $f ---" >&2
+      cat "$f" >&2
+    done
+    return 1
+  fi
+  [ -s "$apply_stdin_file" ]
+  # The heredoc body must include the Pod manifest's marker fields.
+  grep -qF 'verify-hardening-privileged-probe' "$apply_stdin_file"
+  grep -qF 'privileged: true' "$apply_stdin_file"
+}
+
+# ssh stub variant that captures stdin alongside argv. Used by the #332
+# end-to-end assertion that the PSA heredoc body actually reaches the
+# remote `kubectl apply -f -`.
+_make_ssh_stub_capture_stdin() {
+  cat > "$STUB_DIR/ssh" <<'EOF'
+#!/usr/bin/env bash
+n=$(( $(cat "${SSH_ARGV_DIR}/counter" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" > "${SSH_ARGV_DIR}/counter"
+printf '%s\n' "$@" > "${SSH_ARGV_DIR}/argv-${n}"
+
+remote_cmd="${!#}"
+# Always drain stdin into a per-call capture file so the PSA-apply test
+# can assert the heredoc body arrived. cat will block on a non-pipe
+# stdin, so use a non-blocking timeout-ish read via dd with count=0?
+# Simplest: read all of stdin (callers without input still close stdin).
+cat > "${SSH_ARGV_DIR}/stdin-${n}" 2>/dev/null || true
+
+if [[ "$remote_cmd" == *"virsh -c qemu:///system domifaddr"* ]]; then
+  cat <<'YML'
+ Name       MAC address          Protocol     Address
+-------------------------------------------------------------------------------
+ vnet0      52:54:00:aa:bb:cc    ipv4         10.5.6.7/24
+YML
+  exit 0
+fi
+# PSA apply path: emit the PodSecurity rejection marker on stderr so the
+# script's grep finds it. (Bash twin parity with apiserver behavior.)
+if [[ "$remote_cmd" == *"apply -f -"* ]]; then
+  printf 'Error from server (Forbidden): pods "verify-hardening-privileged-probe" is forbidden: violates PodSecurity "restricted:latest"\n' >&2
+  exit 1
+fi
+exit 0
+EOF
+  chmod +x "$STUB_DIR/ssh"
+}
