@@ -17,7 +17,7 @@
 #     - First-boot runcmd: `bootc switch` to the GHCR ref; enable the
 #       auto-update timer on the CP (overrides #48's opt-out)
 #
-# This is the canonical (and, since #216, only) supported way to stand
+# This is the canonical (and only) supported way to stand
 # up a Hummingbird cluster: ENABLE_CLOUD_INIT=1 images, per-VM NoCloud
 # seed ISOs attached at virt-install time, worker join via cloud-init's
 # write_files (no offline qcow2 mutation, no libguestfs fishing the

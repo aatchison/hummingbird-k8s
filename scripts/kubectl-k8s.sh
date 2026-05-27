@@ -19,8 +19,7 @@ set -euo pipefail
 
 _KK_REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # Prefer CONFIG (cluster topology) when supplied — that's where CP_NAME
-# now lives post-#216. Fall back to config.local.sh (image-build inputs),
-# which historically carried VM_NAME for single-VM deploys.
+# lives. Fall back to config.local.sh (image-build inputs).
 if [[ -n "${CONFIG:-}" ]]; then
   [[ -r "$CONFIG" ]] || { echo "${0##*/}: CONFIG not readable: $CONFIG" >&2; exit 2; }
   # shellcheck disable=SC1090

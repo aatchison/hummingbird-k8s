@@ -5,8 +5,7 @@
 # wiring without touching libvirt / podman / sudo. Designed to run in a
 # vanilla Ubuntu/Fedora CI runner — no KVM host required.
 #
-# Coverage (post-#216, with the k3s flavor and legacy single-VM targets
-# retired):
+# Coverage:
 #   1.  `make help` exits 0 and lists at least 10 targets.
 #   2.  `make -n deploy-cluster CONFIG=…` -> bash scripts/deploy-cluster.sh
 #   3.  `make -n destroy-cluster CONFIG=…` -> bash scripts/destroy-cluster.sh
