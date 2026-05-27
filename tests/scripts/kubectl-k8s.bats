@@ -198,3 +198,50 @@ _ssh_argv_file() {
 @test "kubectl-k8s: source does NOT pipe the domifaddr stdout through tr -d '\\r' (#305)" {
   ! grep -qE "tr -d '\\\\r'" "${REPO_ROOT}/scripts/kubectl-k8s.sh"
 }
+
+# ---------------------------------------------------------------------------
+# #320: every ssh to $KVM_HOST must pass `-4` so SSH never tries the AAAA
+# (link-local IPv6) path. The KVM host typically advertises an
+# fe80::…%iface AAAA — not reachable off-LAN, and not in the operator's
+# ~/.ssh/known_hosts — which triggers an interactive TOFU host-key prompt
+# that breaks `make deploy-cluster -> verify-app-deploy` under
+# automation. These tests pin both the domifaddr ssh AND the -fNL tunnel
+# ssh as passing `-4`.
+# ---------------------------------------------------------------------------
+
+@test "kubectl-k8s: domifaddr ssh invocation passes -4 (#320)" {
+  run _invoke get nodes
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"KUBECTL_STUB_RAN"* ]]
+
+  local argv1
+  argv1="$(_ssh_argv_file 1)"
+  [ -f "$argv1" ]
+  if ! grep -qxF -e '-4' "$argv1"; then
+    printf 'FAIL: domifaddr ssh argv missing -4 (#320):\n%s\n' \
+      "$(cat "$argv1")"
+    return 1
+  fi
+}
+
+@test "kubectl-k8s: tunnel ssh -fNL passes -4 (#320)" {
+  run _invoke get nodes
+  [ "$status" -eq 0 ]
+
+  local argv2
+  argv2="$(_ssh_argv_file 2)"
+  [ -f "$argv2" ]
+  if ! grep -qxF -e '-4' "$argv2"; then
+    printf 'FAIL: tunnel ssh argv missing -4 (#320):\n%s\n' \
+      "$(cat "$argv2")"
+    return 1
+  fi
+}
+
+@test "kubectl-k8s: source contains the #320 -4 rationale comment" {
+  # Pin the issue reference so a future refactor that drops -4 also
+  # has to consciously delete the documented reason. Use `--` to
+  # disambiguate `-4` from a grep flag.
+  grep -qF -- '#320' "${REPO_ROOT}/scripts/kubectl-k8s.sh"
+  grep -qF -- '-4' "${REPO_ROOT}/scripts/kubectl-k8s.sh"
+}

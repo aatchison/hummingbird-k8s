@@ -44,6 +44,16 @@ fi
 : "${KVM_HOST:?Set KVM_HOST (SSH alias of the KVM host) — see config.example.sh}"
 
 if ! ss -ltn | grep -q "127.0.0.1:${LOCAL_PORT} "; then
+  # Force IPv4 (-4) for every ssh to $KVM_HOST (#320). If the KVM host
+  # advertises an AAAA record (typically a link-local fe80::…%iface
+  # address on the LAN), SSH will try the IPv6 path first and, because
+  # the workstation's ~/.ssh/known_hosts only has the IPv4 entry, drop
+  # into an interactive host-key (TOFU) prompt — which breaks the
+  # chained `deploy-cluster -> verify-app-deploy` flow under
+  # automation. Link-local IPv6 isn't reachable off-LAN anyway, so
+  # AAAA is the wrong transport for these tunnels.
+  _ssh_kvm_opts=(-4)
+
   # virsh -c qemu:///system works for any libvirt-group member on the KVM host —
   # no sudo required. Pre-#305 we called `sudo virsh` (with ssh -t to prompt
   # for the password); the sudo was gratuitous and broke non-interactive
@@ -53,7 +63,7 @@ if ! ss -ltn | grep -q "127.0.0.1:${LOCAL_PORT} "; then
   # ssh auth failure all look identical without it — round-2 review L8).
   _virsh_err=$(mktemp -t hbird-virsh-err.XXXXXX)
   trap 'rm -f "$_virsh_err"' EXIT
-  VM_IP=$(ssh "$KVM_HOST" "virsh -c qemu:///system domifaddr ${CP_NAME}" 2>"$_virsh_err" \
+  VM_IP=$(ssh "${_ssh_kvm_opts[@]}" "$KVM_HOST" "virsh -c qemu:///system domifaddr ${CP_NAME}" 2>"$_virsh_err" \
             | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')
   if [[ -z "$VM_IP" ]]; then
     {
@@ -67,7 +77,7 @@ if ! ss -ltn | grep -q "127.0.0.1:${LOCAL_PORT} "; then
     exit 1
   fi
   echo "Starting tunnel: localhost:${LOCAL_PORT} -> ${VM_IP}:6443 via ${KVM_HOST}" >&2
-  ssh -fNL "${LOCAL_PORT}:${VM_IP}:6443" "$KVM_HOST"
+  ssh "${_ssh_kvm_opts[@]}" -fNL "${LOCAL_PORT}:${VM_IP}:6443" "$KVM_HOST"
 fi
 
 [[ -f "$KCFG" ]] || {
