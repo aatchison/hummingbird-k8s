@@ -116,6 +116,40 @@ jobs:
           sudo --preserve-env=TAG,GITHUB_RUN_ID,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
             tests/integration-boot.sh "${TAG}"
 
+      - name: Collect serial console log (failure only)
+        # tests/integration-boot.sh tees the VM's serial console to
+        # /var/log/libvirt/qemu/<VM_NAME>-console.log (or /tmp/ fallback) and
+        # preserves the file when the script exits non-zero (#224). Stage it
+        # into the workspace so actions/upload-artifact can grab it — the
+        # libvirt log dir is owned by root and unreadable to the runner user.
+        if: failure()
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          mkdir -p artifacts
+          vm_name="hummingbird-it-boot-${GITHUB_RUN_ID}"
+          for candidate in \
+              "/var/log/libvirt/qemu/${vm_name}-console.log" \
+              "/tmp/${vm_name}-console.log"; do
+            if sudo test -s "$candidate"; then
+              sudo cp "$candidate" "artifacts/${vm_name}-console.log"
+              sudo chown "$(id -u):$(id -g)" "artifacts/${vm_name}-console.log"
+              echo "captured $candidate"
+              break
+            fi
+          done
+          ls -la artifacts/ || true
+
+      - name: Upload serial console log (failure only)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-boot-serial-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Force-clean integration VMs (always)
         # Belt-and-suspenders to the in-script `trap cleanup EXIT` in
         # tests/integration-boot.sh — that trap is killed when a runner is
