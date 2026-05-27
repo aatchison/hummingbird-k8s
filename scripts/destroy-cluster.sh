@@ -105,10 +105,15 @@ for w in "${WORKER_NAMES_ARR[@]}"; do
 done
 
 # Also clean the per-deploy scratch dir under the pool, used by
-# deploy-cluster.sh to hold transient cloud-init payloads.
+# deploy-cluster.sh to hold transient cloud-init payloads. Surface rm
+# failures like destroy_vm() does — same silent-leak class as the
+# per-VM cleanup loop above (#305 round-2 re-review).
 if [[ -d "${POOL_DIR}/deploy-cluster" ]]; then
   log "removing scratch dir ${POOL_DIR}/deploy-cluster"
-  rm -rf "${POOL_DIR}/deploy-cluster" || true
+  if ! _scratch_err=$(rm -rf -- "${POOL_DIR}/deploy-cluster" 2>&1); then
+    log "WARN: could not fully remove ${POOL_DIR}/deploy-cluster: ${_scratch_err}. If pre-#305 root-owned, run once as root: sudo rm -rf ${POOL_DIR}/deploy-cluster"
+  fi
+  unset _scratch_err
 fi
 
 log "done."
