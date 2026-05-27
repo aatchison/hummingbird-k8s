@@ -18,10 +18,10 @@ foundation; subcommands land per the phasing table in
 |-----------|------|--------|
 | [#280](https://github.com/aatchison/hummingbird-k8s/issues/280) | Devcontainer + cargo workspace skeleton | landed (PR #313) |
 | [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | CI workflow (fmt / clippy / test / deny / pre-commit / devcontainer smoke / lint inheritance) | landed (PR #314) |
-| [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | `ClusterConfig` parser (first real crate) | this PR |
+| [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | `ClusterConfig` parser (first real crate) | landed (PR #315) |
 | [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | clap command tree (binary crate) | pending (gated on foundation) |
-| [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | pending |
-| [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | this PR |
+| [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | this PR |
+| [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | landed (PR #317) |
 
 ## Foundation crates landed so far
 
@@ -30,9 +30,11 @@ foundation; subcommands land per the phasing table in
 | `hbird-common` | Workspace bootstrap placeholder (project constants). | [#280] |
 | `hbird-config` | Typed parser for `cluster.local.conf`. | [#282] |
 | `hbird-ssh` | SSH transport — Rust twin of `scripts/lib/ssh-wrap.sh` + `ssh_opts_array{,_no_identity}`. | [#285] |
+| `hbird-virt` | libvirt CLI wrapper + typed `qemu+ssh://` URI parser. Talks to a remote KVM host via a `SshClient` trait object (real impl lands in [#285] / [#286]). | [#284] |
 
 [#280]: https://github.com/aatchison/hummingbird-k8s/issues/280
 [#282]: https://github.com/aatchison/hummingbird-k8s/issues/282
+[#284]: https://github.com/aatchison/hummingbird-k8s/issues/284
 [#285]: https://github.com/aatchison/hummingbird-k8s/issues/285
 
 ## When the Rust binary will appear in the `Makefile`
