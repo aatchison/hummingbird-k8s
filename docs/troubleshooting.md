@@ -170,6 +170,36 @@ old endpoint.
   make kubectl ARGS='get nodes'
   ```
 
+### Interactive SSH host-key prompt on KVM-host link-local IPv6
+
+`scripts/kubectl-k8s.sh` (and any other wrapper that ssh's to `$KVM_HOST`)
+can drop into an interactive
+`The authenticity of host 'geary (fe80::…%enp…) ' can't be established`
+prompt when the KVM host advertises an AAAA record — typically a
+link-local `fe80::…%iface` address on the LAN. The operator's
+`~/.ssh/known_hosts` only carries the IPv4 entry, so SSH treats the
+link-local IPv6 path as a new host (TOFU) and asks for confirmation,
+which has no answer under non-interactive automation
+(`make deploy-cluster CONFIG=… KVM_HOST=geary`). The flow then hangs in
+the chained `verify-app-deploy` step.
+
+- Symptom (from `make deploy-cluster`):
+
+  ```
+  [verify-app-deploy] creating namespace smoketest-…
+  The authenticity of host 'geary (fe80::…%enp…)' can't be established.
+  ED25519 key fingerprint is: SHA256:…
+  Are you sure you want to continue connecting (yes/no/[fingerprint])?
+  ```
+
+- Fix (permanent, landed): `scripts/kubectl-k8s.sh` passes `-4` on every
+  ssh to `$KVM_HOST`, forcing the IPv4 transport. Link-local IPv6
+  isn't reachable off-LAN anyway, so the AAAA path is the wrong
+  transport. See issue #320.
+- Workaround on an unfixed build: seed the IPv6 known_hosts entry once
+  (`ssh -6 "$KVM_HOST" true` and accept the fingerprint) — but TOFU on
+  a link-local address is dodgy, so prefer the `-4` fix.
+
 ### `sudo: a terminal is required to read the password` from day-2 wrappers
 
 `scripts/kubectl-k8s.sh` and `scripts/export-argocd.sh` ssh to
