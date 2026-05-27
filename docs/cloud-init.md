@@ -147,12 +147,11 @@ that drop-in is in place before `kubeadm init` reads it.
 cloud-init's hostname module is **authoritative** for worker nodes. If
 your NoCloud seed declares a `local-hostname` in `meta-data` (or a
 `hostname:` directive in `#cloud-config` user-data), cloud-init writes
-that name to `/etc/hostname` during the network stage. `worker-init.sh`
+that name to `/etc/hostname` during the network/init stage — which
+completes BEFORE `multi-user.target` activates. `worker-init.sh`
 then:
 
-1. Blocks on `cloud-init status --wait` so cloud-init's hostname module
-   has definitively committed (or skipped) any user-data hostname.
-2. Reads `hostnamectl --static` (with fall-back to `/etc/hostname`),
+1. Reads `hostnamectl --static` (with fall-back to `/etc/hostname`),
    which reflects what cloud-init wrote — even when the running kernel
    hostname is still the boot-time default (`localhost.localdomain`)
    because `systemd-hostnamed` only reads `/etc/hostname` at boot,
@@ -161,12 +160,22 @@ then:
    `hostname`-based check tripped the `localhost*` fallback, and
    workers registered as `humbird-worker-<machine-id>` despite a
    correct cloud-init seed.
-3. Re-asserts the persistent hostname onto the running kernel via
+2. Re-asserts the persistent hostname onto the running kernel via
    `hostnamectl set-hostname` so `kubeadm join` (which reads the
    running kernel hostname) uses the operator-declared name.
-4. Falls back to the machine-id-derived `humbird-worker-<suffix>` name
+3. Falls back to the machine-id-derived `humbird-worker-<suffix>` name
    only when the persistent hostname is empty or matches `localhost` /
    `localhost.*` (the unseeded default).
+
+`worker-init.sh` deliberately does **not** call `cloud-init status
+--wait`: that wait blocks on `cloud-final.service`, which has
+`After=multi-user.target`, which is itself blocked by
+`worker-init.service`. Calling it from worker-init produces a three-way
+deadlock — PR #255 introduced exactly that and PR #265 removed it (same
+bug class as PR #171/#172/#173 fixed earlier on the k8s-init path).
+Because the hostname module runs at the init stage, no wait is needed:
+`/etc/hostname` is already settled by the time `worker-init.service`
+fires.
 
 This means:
 

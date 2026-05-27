@@ -285,10 +285,12 @@ for `SWITCH_TO_GHCR=false`.
 8. **Per-worker seed.** Emit `#cloud-config` with `hostname:
    ${WORKER_NAMES[i]}`, SSH key, `write_files` for
    `/etc/hummingbird/worker-join.env`, and the `bootc switch` runcmd.
-   `worker-init.sh` blocks on `cloud-init status --wait` then reads
-   `hostnamectl --static` (which reflects what cloud-init wrote to
-   `/etc/hostname`) so kubeadm join uses the operator-declared name
-   even when the running kernel hostname is stale — see #254.
+   `worker-init.sh` reads `hostnamectl --static` directly (which
+   reflects what cloud-init wrote to `/etc/hostname` during the init
+   stage, before `multi-user.target` activates) so kubeadm join uses
+   the operator-declared name even when the running kernel hostname is
+   stale — see #254. It does NOT call `cloud-init status --wait`:
+   that wait deadlocks against `multi-user.target` — see #265.
 9. **virt-install workers in parallel.** Each gets its own seed ISO.
 10. **Wait for `N+1` nodes Ready.**
 11. **Optional verify.** `RUN_VERIFY=true` runs
