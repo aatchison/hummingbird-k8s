@@ -100,7 +100,13 @@ Since C3 (#232), `deploy-cluster.sh`, `destroy-cluster.sh`,
 via SSH when `KVM_HOST` is set and the local short hostname doesn't
 match `${KVM_HOST%%.*}`. The client never needs `sudo` or `libvirt`
 installed — only `ssh` + the operator's SSH key. Sudo happens on the
-remote.
+remote by default; `update-cluster` accepts a libvirt-group operator
+on the remote and can be invoked without sudo entirely via
+`HBIRD_REMOTE_NO_SUDO=1` — see
+[`docs/update-cluster.md`](update-cluster.md#running-without-sudo-libvirt-group-operator-269)
+(#269). The other three scripts (deploy / destroy / spawn) still need
+root on the remote because they write qcow2 files to the root-owned
+`POOL_DIR` — that's deferred to Phase 3 of the same issue.
 
 ### One-time remote setup
 
@@ -180,7 +186,7 @@ Current allowlist:
 | Timeouts | `READY_TIMEOUT`, `DRAIN_TIMEOUT`, `APISERVER_TIMEOUT`, `SSH_TIMEOUT`, `INTER_NODE_SLEEP`, `DAEMONSET_TIMEOUT` |
 | Topology | `CP_NAME`, `WORKER_NAMES`, `POOL_DIR` |
 | Image-build knobs | `VM_USER`, `STORAGE_DRIVER`, `PODMAN_ROOT`, `PODMAN_RUNROOT`, `APISERVER_EXTRA_SANS` |
-| Shim itself | `HBIRD_AUTOLOAD_CONFIG_LOCAL`, `HBIRD_REMOTE_REPO`, `HBIRD_OPERATOR_PUBKEY_FILE` (shim-managed, see #248 below) |
+| Shim itself | `HBIRD_AUTOLOAD_CONFIG_LOCAL`, `HBIRD_REMOTE_REPO`, `HBIRD_OPERATOR_PUBKEY_FILE` (shim-managed, see #248 below), `HBIRD_REMOTE_NO_SUDO` (drops `sudo` from the remote exec when `=1`; see [`docs/update-cluster.md`](update-cluster.md#running-without-sudo-libvirt-group-operator-269) for the libvirt-group story, #269) |
 
 Every value is passed through `printf %q` before being interpolated
 into the remote command, so values with spaces, quotes, or shell

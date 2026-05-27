@@ -255,6 +255,22 @@ still need `sudo` — only the five cluster-lifecycle targets
 `update-workers`, `update-node`) dropped client-side `sudo` in PR
 #237.
 
+Going one step further: `update-cluster` now accepts a `libvirt`-group
+member on the KVM host (no root needed), and the C3 shim drops `sudo`
+from the remote exec when `HBIRD_REMOTE_NO_SUDO=1` is set (#269). The
+operator setup is `ssh $KVM_HOST 'sudo usermod -aG libvirt $USER'`
+once, then:
+
+```bash
+KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 \
+  make update-cluster CONFIG=cluster.local.conf
+```
+
+`deploy-cluster` / `destroy-cluster` / `spawn-workers` still need root
+on the KVM host (qcow2 writes to root-owned `POOL_DIR`); that's Phase 3
+of #269. Full reference:
+[`docs/update-cluster.md#running-without-sudo`](docs/update-cluster.md#running-without-sudo-libvirt-group-operator-269).
+
 ### Rolling cluster updates
 
 `make update-cluster` walks the cluster one node at a time, pulls the latest

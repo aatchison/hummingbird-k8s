@@ -32,6 +32,94 @@ setup() {
 }
 
 # ---------------------------------------------------------------------------
+# #269 — EUID check accepts root OR libvirt-group membership
+#
+# update-cluster.sh's local libvirt footprint (virsh domifaddr,
+# ssh known_hosts) is reachable to any libvirt-group member without sudo
+# on the KVM host. Remote ops run as root@<node-ip> via the operator's
+# SSH key, unaffected by local EUID. So a non-root operator in the
+# libvirt group must NOT be bailed by the EUID check; non-root + not in
+# the group MUST still fail loudly with the usermod hint.
+#
+# These tests exercise the non-dry-run EUID path by stubbing `id` on a
+# tweaked PATH (so the script's `id -nG` call hits our stub instead of
+# the real one). We force-fail past the post-check libvirt/virsh calls
+# by giving the stub a non-existent CONFIG path — that fails after the
+# EUID check, so we can tell from the error message whether the EUID
+# check was the gate (libvirt-hint message) or whether we passed it
+# (config-not-readable message). DRY_RUN=0 is enforced by NOT passing
+# --dry-run; the script's `(( DRY_RUN == 0 ))` guard then takes the
+# real EUID path.
+# ---------------------------------------------------------------------------
+
+# _stub_id_with_groups groupname [groupname...]
+# Build an `id` shim on PATH that emits the given groups when called as
+# `id -nG`. All other `id` invocations fall through to the real binary
+# so the rest of the script (e.g. update-bashism) is unaffected.
+_stub_id_with_groups() {
+  local stubdir="${BATS_TEST_TMPDIR}/bin"
+  mkdir -p "$stubdir"
+  local groups="$*"
+  cat > "${stubdir}/id" <<EOF
+#!/usr/bin/env bash
+# bats stub: emit a controlled group list for \`id -nG\`; pass other
+# invocations through to the real id.
+if [[ "\$1" == "-nG" ]]; then
+  printf '%s\n' "${groups}"
+  exit 0
+fi
+exec /usr/bin/id "\$@"
+EOF
+  chmod +x "${stubdir}/id"
+  printf '%s' "$stubdir"
+}
+
+@test "#269 non-root + libvirt-group membership passes the EUID check (fails later on missing CONFIG)" {
+  # Skip when actually running as root — the EUID==0 guard short-circuits
+  # the libvirt check entirely, and we cannot demote ourselves cheaply.
+  [ "$EUID" -ne 0 ] || skip "running as root; EUID check short-circuits"
+  stubdir="$(_stub_id_with_groups libvirt wheel)"
+  # Point CONFIG at a path that doesn't exist so the script bails AFTER
+  # the EUID/libvirt check — but with a different diagnostic. That
+  # difference is the test signal.
+  run env PATH="${stubdir}:${PATH}" CONFIG=/nonexistent/cluster.local.conf \
+    bash "$SCRIPT"
+  [ "$status" -ne 0 ]
+  # MUST NOT be the EUID-bail message.
+  [[ "$output" != *"must be root or a member of the libvirt group"* ]]
+  # MUST surface the post-check libvirt-group log line.
+  [[ "$output" == *"libvirt group member"* ]]
+  # AND must fail on the config not being readable (proves we got past
+  # the EUID check).
+  [[ "$output" == *"config not readable"* ]] || [[ "$output" == *"/nonexistent/cluster.local.conf"* ]]
+}
+
+@test "#269 non-root + NOT in libvirt group bails with the usermod hint" {
+  [ "$EUID" -ne 0 ] || skip "running as root; EUID check short-circuits"
+  stubdir="$(_stub_id_with_groups wheel users)"
+  run env PATH="${stubdir}:${PATH}" CONFIG=/nonexistent/cluster.local.conf \
+    bash "$SCRIPT"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"must be root or a member of the libvirt group"* ]]
+  # The diagnostic must include the actionable one-time setup command so
+  # the operator doesn't have to grep the docs to fix it.
+  [[ "$output" == *"usermod -aG libvirt"* ]]
+  [[ "$output" == *"newgrp libvirt"* ]]
+}
+
+@test "#269 dry-run bypasses the EUID/libvirt check entirely (no group needed)" {
+  # The pre-existing carve-out: dry-run never touches libvirt or ssh, so
+  # neither root nor libvirt-group membership is required. Even with a
+  # stub that reports a no-group user, --dry-run must succeed against
+  # the real example config.
+  stubdir="$(_stub_id_with_groups nogroup)"
+  run env PATH="${stubdir}:${PATH}" CONFIG="$CONF" bash "$SCRIPT" --dry-run
+  [ "$status" -eq 0 ]
+  # No libvirt-group hint should fire — we never reached the check.
+  [[ "$output" != *"must be root or a member of the libvirt group"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # Flag parsing — mutual exclusion + bad input
 # ---------------------------------------------------------------------------
 
