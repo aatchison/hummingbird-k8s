@@ -39,11 +39,21 @@ pub struct KubectlArgs {
     pub args: Vec<String>,
 }
 
-/// Dispatch — currently `Err("not yet implemented")`.
-pub fn run(_args: KubectlArgs) -> Result<()> {
+/// Dispatch — currently `Err("not yet implemented")`. Echoes the
+/// parsed pass-through args so the operator can confirm clap captured
+/// the dashed flags they typed before the stub bails. (PR #319 round-2
+/// review L8 MEDIUM.)
+pub fn run(args: KubectlArgs) -> Result<()> {
+    let config = args
+        .config
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unset>".into());
     Err(anyhow!(
         "hbird kubectl: not yet implemented — tracked by #288 \
          (https://github.com/aatchison/hummingbird-k8s/issues/288). \
-         Use `make kubectl ARGS='…'` until then."
+         Parsed: --config {config} args={:?}. \
+         Use `make kubectl ARGS='…'` until then.",
+        args.args,
     ))
 }

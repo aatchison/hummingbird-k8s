@@ -30,9 +30,10 @@ pub struct ExportArgocdArgs {
     /// Context name. Bash-twin default: `hummingbird-$CP_NAME` (prefix
     /// avoids colliding with whatever ArgoCD already has registered).
     /// CLI flag renamed from `--context-name` to `--context` for
-    /// consistency with the rest of the binary; the bash twin retains
-    /// `--context-name`.
-    #[arg(long, value_name = "NAME")]
+    /// consistency with the rest of the binary; `alias = "context-name"`
+    /// keeps the bash twin's spelling working so operator muscle memory
+    /// doesn't break. (PR #319 round-2 review L9 MEDIUM.)
+    #[arg(long, alias = "context-name", value_name = "NAME")]
     pub context: Option<String>,
 
     /// SSH ProxyJump host inserted via the kubeconfig's exec plugin.
@@ -44,11 +45,16 @@ pub struct ExportArgocdArgs {
     pub force: bool,
 }
 
-/// Dispatch — currently `Err("not yet implemented")`.
-pub fn run(_args: ExportArgocdArgs) -> Result<()> {
+/// Dispatch — currently `Err("not yet implemented")`. Echoes parsed
+/// args so the operator can confirm clap captured the right config +
+/// output before the stub bails. (PR #319 round-2 review L8 MEDIUM.)
+pub fn run(args: ExportArgocdArgs) -> Result<()> {
     Err(anyhow!(
         "hbird export-argocd: not yet implemented — tracked by #288 \
          (https://github.com/aatchison/hummingbird-k8s/issues/288). \
-         Use `make export-argocd CONFIG=…` until then."
+         Parsed: --config {} --output {}. \
+         Use `make export-argocd CONFIG=…` until then.",
+        args.config.display(),
+        args.output.display(),
     ))
 }

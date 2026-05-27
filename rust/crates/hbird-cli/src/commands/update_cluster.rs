@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use clap::Args;
+use clap::builder::BoolishValueParser;
 
 /// Arguments for `hbird update-cluster`.
 ///
@@ -39,8 +40,17 @@ pub struct UpdateClusterArgs {
     pub kvm_host: Option<String>,
 
     /// Skip the `sudo` probe on the KVM host (libvirt-group operator
-    /// path, #272).
-    #[arg(long)]
+    /// path, #305). `env` mirrors `HBIRD_REMOTE_NO_SUDO=1` used by the
+    /// bash twin's `scripts/lib/ssh-wrap.sh`; `BoolishValueParser`
+    /// accepts `1`/`0`/`yes`/`no` so the env-var path matches the bash
+    /// twin's `[[ -n $HBIRD_REMOTE_NO_SUDO ]]` truthiness.
+    #[arg(
+        long,
+        env = "HBIRD_REMOTE_NO_SUDO",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = BoolishValueParser::new(),
+    )]
     pub no_sudo: bool,
 
     /// Roll workers only — skip the control plane.
@@ -89,11 +99,16 @@ pub struct UpdateClusterArgs {
     pub node_name_override: Vec<String>,
 }
 
-/// Dispatch — currently `Err("not yet implemented")`.
-pub fn run(_args: UpdateClusterArgs) -> Result<()> {
+/// Dispatch — currently `Err("not yet implemented")`. Echoes parsed
+/// args so the operator can confirm clap captured the right config +
+/// host before the stub bails. (PR #319 round-2 review L8 MEDIUM.)
+pub fn run(args: UpdateClusterArgs) -> Result<()> {
     Err(anyhow!(
         "hbird update-cluster: not yet implemented — tracked by #286 \
          (https://github.com/aatchison/hummingbird-k8s/issues/286). \
-         Use `make update-cluster CONFIG=… [FLAGS=…]` until then."
+         Parsed: --config {} --kvm-host {}. \
+         Use `make update-cluster CONFIG=… [FLAGS=…]` until then.",
+        args.config.display(),
+        args.kvm_host.as_deref().unwrap_or("<unset>"),
     ))
 }

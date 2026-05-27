@@ -33,8 +33,11 @@ pub struct GetKubeconfigArgs {
     pub server: Option<String>,
 
     /// Override the context name written into the kubeconfig (bash:
-    /// `--context-name`). Default: `CP_NAME` from `--config`.
-    #[arg(long, value_name = "NAME")]
+    /// `--context-name`). Default: `CP_NAME` from `--config`. The bash
+    /// twin's `--context-name` spelling is preserved via clap `alias`
+    /// so operator muscle memory keeps working. (PR #319 round-2 review
+    /// L9 MEDIUM.)
+    #[arg(long, alias = "context-name", value_name = "NAME")]
     pub context: Option<String>,
 
     /// Overwrite `--output` if it already exists (bash: `--force`).
@@ -48,11 +51,16 @@ pub struct GetKubeconfigArgs {
     pub proxy_jump: Option<String>,
 }
 
-/// Dispatch — currently `Err("not yet implemented")`.
-pub fn run(_args: GetKubeconfigArgs) -> Result<()> {
+/// Dispatch — currently `Err("not yet implemented")`. Echoes parsed
+/// args so the operator can confirm clap captured the right config +
+/// output before the stub bails. (PR #319 round-2 review L8 MEDIUM.)
+pub fn run(args: GetKubeconfigArgs) -> Result<()> {
     Err(anyhow!(
         "hbird get-kubeconfig: not yet implemented — tracked by #288 \
          (https://github.com/aatchison/hummingbird-k8s/issues/288). \
-         Use `make get-kubeconfig CONFIG=…` until then."
+         Parsed: --config {} --output {}. \
+         Use `make get-kubeconfig CONFIG=…` until then.",
+        args.config.display(),
+        args.output.display(),
     ))
 }

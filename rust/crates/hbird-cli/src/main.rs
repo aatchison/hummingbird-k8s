@@ -56,6 +56,11 @@ use commands::{
 /// without a stack trace by default (the bash twins are similarly
 /// quiet). Set `RUST_BACKTRACE=1` to opt into one.
 fn main() -> Result<()> {
+    // TODO(#286): wrap parse + dispatch in a `tracing_subscriber` init +
+    // top-level `tracing::info_span!("hbird", subcommand = …)` once the
+    // workspace picks a logging crate. The hbird-ssh / hbird-virt
+    // `tracing::instrument` seams already exist — main is the missing
+    // half. (PR #319 round-2 review L8 DISCUSS deferred to #286.)
     let cli = Cli::parse();
     cli.command.run()
 }

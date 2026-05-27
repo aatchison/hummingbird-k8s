@@ -24,11 +24,19 @@ pub struct NodesArgs {
     pub config: Option<PathBuf>,
 }
 
-/// Dispatch — currently `Err("not yet implemented")`.
-pub fn run(_args: NodesArgs) -> Result<()> {
+/// Dispatch — currently `Err("not yet implemented")`. Echoes parsed
+/// args so the operator can confirm clap captured the right config
+/// before the stub bails. (PR #319 round-2 review L8 MEDIUM.)
+pub fn run(args: NodesArgs) -> Result<()> {
+    let config = args
+        .config
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unset>".into());
     Err(anyhow!(
         "hbird nodes: not yet implemented — tracked by #288 \
          (https://github.com/aatchison/hummingbird-k8s/issues/288). \
+         Parsed: --config {config}. \
          Use `make nodes CONFIG=…` until then."
     ))
 }

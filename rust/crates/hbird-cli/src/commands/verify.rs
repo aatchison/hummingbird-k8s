@@ -70,17 +70,26 @@ pub struct VerifyCommonArgs {
     pub kubectl: Option<PathBuf>,
 }
 
-/// Dispatch — currently `Err("not yet implemented")`.
+/// Dispatch — currently `Err("not yet implemented")`. Echoes parsed
+/// args so the operator can confirm clap captured the right config +
+/// host before the stub bails. (PR #319 round-2 review L8 MEDIUM.)
 pub fn run(args: VerifyArgs) -> Result<()> {
-    let which = match args.command {
-        VerifySubcommand::Encryption(_) => "verify-encryption",
-        VerifySubcommand::Hardening(_) => "verify-hardening",
-        VerifySubcommand::AppDeploy(_) => "verify-app-deploy",
-        VerifySubcommand::All(_) => "verify-all",
+    let (which, common) = match &args.command {
+        VerifySubcommand::Encryption(c) => ("verify-encryption", c),
+        VerifySubcommand::Hardening(c) => ("verify-hardening", c),
+        VerifySubcommand::AppDeploy(c) => ("verify-app-deploy", c),
+        VerifySubcommand::All(c) => ("verify-all", c),
     };
+    let config = common
+        .config
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unset>".into());
     Err(anyhow!(
         "hbird verify {which}: not yet implemented — tracked by #287 \
          (https://github.com/aatchison/hummingbird-k8s/issues/287). \
-         Use `make {which}` until then."
+         Parsed: --config {config} --kvm-host {}. \
+         Use `make {which}` until then.",
+        common.kvm_host.as_deref().unwrap_or("<unset>"),
     ))
 }

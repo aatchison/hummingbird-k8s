@@ -6,10 +6,14 @@ for the workspace layout and the epic for the architectural plan.
 
 ## Operator-facing status (today)
 
-**No operator-facing change yet.** All `make deploy-cluster`, `make
-update-cluster`, `make destroy-cluster`, `make verify-*`, etc. continue to
-invoke the existing bash scripts. The Rust workspace at `../rust/` is a
-foundation; subcommands land per the phasing table in
+**The `hbird` binary now builds and parses every operator-facing
+subcommand**, but every subcommand body returns
+`Err("not yet implemented — tracked by #XXX")`. All `make
+deploy-cluster`, `make update-cluster`, `make destroy-cluster`,
+`make verify-*`, etc. continue to invoke the existing bash scripts —
+those remain canonical until the per-command implementation PRs
+([#286]–[#289]) land. The Rust workspace at `../rust/` is a foundation;
+subcommands land per the phasing table in
 [`rust/README.md`](../rust/README.md).
 
 ## Foundation status

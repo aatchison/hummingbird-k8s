@@ -219,3 +219,134 @@ fn unknown_subcommand_fails_to_parse() {
         "unknown-subcommand path didn't print clap-shaped error. stderr:\n{stderr}"
     );
 }
+
+// --- PR #319 round-2 review L5 HIGH: negative-parse + variadic +
+// env-var fallback coverage. -----------------------------------------
+
+/// `deploy-cluster` without `--config` must fail at parse time, not
+/// silently default to nothing. Mirrors the bash twin's required-arg
+/// shape so an operator who forgets `--config` sees a clap error rather
+/// than a confusing not-yet-implemented stub.
+#[test]
+fn deploy_cluster_missing_config_fails_to_parse() {
+    let (status, _stdout, stderr) = run(&["deploy-cluster"]);
+    assert!(
+        !status.success(),
+        "deploy-cluster without --config exited 0"
+    );
+    // clap's "required argument missing" wording varies across versions —
+    // pin on the flag name + an error marker instead.
+    assert!(
+        stderr.contains("--config") && (stderr.contains("error") || stderr.contains("required")),
+        "expected clap to complain about missing --config. stderr:\n{stderr}"
+    );
+}
+
+/// Same negative-parse check for `destroy-cluster` (also `--config`-
+/// required per bash twin).
+#[test]
+fn destroy_cluster_missing_config_fails_to_parse() {
+    let (status, _stdout, stderr) = run(&["destroy-cluster"]);
+    assert!(
+        !status.success(),
+        "destroy-cluster without --config exited 0"
+    );
+    assert!(
+        stderr.contains("--config") && (stderr.contains("error") || stderr.contains("required")),
+        "expected clap to complain about missing --config. stderr:\n{stderr}"
+    );
+}
+
+/// `kubectl` is the only subcommand with variadic pass-through (the
+/// rest take fixed flags). Confirm the variadic args actually land in
+/// the parsed `Vec<String>` by checking the stub's args-echo.
+#[test]
+fn kubectl_variadic_capture_echoes_args() {
+    let (status, _stdout, stderr) = run(&["kubectl", "get", "pods", "-A"]);
+    assert!(!status.success());
+    // The stub now echoes `args=["get", "pods", "-A"]` — pin the
+    // observable substring so a future change to the echo format that
+    // accidentally drops args is caught.
+    assert!(
+        stderr.contains("\"get\"") && stderr.contains("\"pods\"") && stderr.contains("\"-A\""),
+        "kubectl args weren't captured into the variadic vec. stderr:\n{stderr}"
+    );
+}
+
+/// `deploy-cluster`'s `--kvm-host` carries `env = "KVM_HOST"`. The bash
+/// twin reads `KVM_HOST` from the env; the Rust binary must too, or
+/// operator muscle memory breaks. Verify by setting the env var, then
+/// reading the args-echo for the value.
+#[test]
+fn deploy_cluster_kvm_host_falls_back_to_env() {
+    let out = Command::new(hbird_bin())
+        .args(["deploy-cluster", "--config", "/dev/null"])
+        .env("KVM_HOST", "geary-via-env")
+        .output()
+        .expect("failed to spawn hbird binary");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("geary-via-env"),
+        "KVM_HOST env didn't reach --kvm-host. stderr:\n{stderr}"
+    );
+}
+
+/// Same env-var fallback check for the verify-* family, which reads
+/// `KVM_HOST` *and* `CONFIG` from the env (matches the bash twins).
+#[test]
+fn verify_encryption_reads_kvm_host_from_env() {
+    let out = Command::new(hbird_bin())
+        .args(["verify", "encryption"])
+        .env("KVM_HOST", "geary-via-env")
+        .output()
+        .expect("failed to spawn hbird binary");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("geary-via-env"),
+        "KVM_HOST env didn't reach verify's --kvm-host. stderr:\n{stderr}"
+    );
+}
+
+/// `--no-sudo` honors `HBIRD_REMOTE_NO_SUDO=1` (matches bash twin's
+/// `scripts/lib/ssh-wrap.sh`). Verify the env binding lands by setting
+/// the env var and confirming the stub still bails (we can't directly
+/// observe the bool, but at minimum we confirm clap accepts the env-var
+/// path without complaint).
+#[test]
+fn deploy_cluster_no_sudo_env_var_accepted() {
+    let out = Command::new(hbird_bin())
+        .args(["deploy-cluster", "--config", "/dev/null"])
+        .env("HBIRD_REMOTE_NO_SUDO", "1")
+        .output()
+        .expect("failed to spawn hbird binary");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // Should reach the stub (not-yet-implemented) — that means clap
+    // happily parsed the env var.
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("not yet implemented"),
+        "HBIRD_REMOTE_NO_SUDO env didn't parse cleanly. stderr:\n{stderr}"
+    );
+}
+
+/// The bash twin's `--context-name` spelling must still work after the
+/// rename to `--context`. Pin via clap `alias`.
+#[test]
+fn export_argocd_accepts_legacy_context_name_alias() {
+    let (status, _stdout, stderr) = run(&[
+        "export-argocd",
+        "--config",
+        "/dev/null",
+        "--context-name",
+        "legacy-spelling",
+    ]);
+    // Reaches the stub (not-yet-implemented) — confirms the alias is
+    // accepted by clap rather than failing parse.
+    assert!(!status.success());
+    assert!(
+        stderr.contains("not yet implemented"),
+        "legacy --context-name alias failed to parse. stderr:\n{stderr}"
+    );
+}
