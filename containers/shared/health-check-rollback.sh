@@ -20,7 +20,7 @@
 # previous deployment is what we just upgraded from, so the rollback lands
 # the node back on the last image that was known-good when it was running.
 
-set -eu
+set -euo pipefail
 
 MARKER=/var/lib/bootc-just-upgraded
 
