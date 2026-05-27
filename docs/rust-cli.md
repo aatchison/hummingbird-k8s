@@ -4,6 +4,79 @@ The bash client-side tooling under [`../scripts/`](../scripts/) is being
 rewritten in Rust over several phases. See [`rust/README.md`](../rust/README.md)
 for the workspace layout and the epic for the architectural plan.
 
+## Install (from a tagged release)
+
+Releases are published on `v*` tag push by
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) (issue
+[#290]). Each release ships:
+
+- A statically-linked `x86_64-unknown-linux-musl` `hbird` binary (no
+  glibc / no shared-library dependencies — runs on any Linux x86_64
+  host, including Alpine / scratch containers).
+- A cosign keyless-OIDC signature (`.sig` + `.pem`) over the binary,
+  recorded in the Rekor public transparency log.
+- An OCI image at `ghcr.io/aatchison/hbird:VERSION` (immutable tag) +
+  `ghcr.io/aatchison/hbird:latest`, also cosign-signed by digest. The
+  image is `FROM scratch` (~5MB, single-binary).
+- A `SHA256SUMS` file for the binary.
+
+### Verify + install the binary
+
+```sh
+VERSION=v0.0.1
+curl -sSL -o hbird     "https://github.com/aatchison/hummingbird-k8s/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl"
+curl -sSL -o hbird.sig "https://github.com/aatchison/hummingbird-k8s/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.sig"
+curl -sSL -o hbird.pem "https://github.com/aatchison/hummingbird-k8s/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.pem"
+cosign verify-blob \
+  --certificate hbird.pem \
+  --signature hbird.sig \
+  --certificate-identity-regexp "^https://github.com/aatchison/hummingbird-k8s/.github/workflows/release.yml@" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  hbird
+chmod +x hbird
+sudo install -m 0755 hbird /usr/local/bin/hbird
+hbird --version
+```
+
+`cosign verify-blob` validates that (a) the signature matches the
+binary's hash and (b) the signing cert was minted by Fulcio for this
+exact GitHub Actions workflow on this repository. A failure means
+either the binary or signature was tampered with, or someone is
+serving a forgery from a look-alike URL.
+
+### Verify + pull the OCI image
+
+```sh
+VERSION=v0.0.1
+podman pull ghcr.io/aatchison/hbird:${VERSION}
+cosign verify ghcr.io/aatchison/hbird:${VERSION} \
+  --certificate-identity-regexp "^https://github.com/aatchison/hummingbird-k8s/.github/workflows/release.yml@" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+podman run --rm ghcr.io/aatchison/hbird:${VERSION} --version
+```
+
+The image is `FROM scratch`, so it has no shell — invocations must
+go via `podman run … <subcommand>`, not `podman exec`. Operators
+typically use the OCI image only for k8s-native CronJob /
+`run-once` workflows; on a workstation the binary install is faster
+and integrates with the operator's `ssh-agent` / `~/.ssh` automatically.
+
+### Smoke-testing the release pipeline before a tag push
+
+The release workflow accepts a `workflow_dispatch` trigger with a
+`dry_run` input (defaults to `true`). When `dry_run=true`, every
+step EXCEPT the final publish (GHCR push, cosign sign image, gh
+release create) runs — the binary is built, statically-linked,
+cosign-signed (the OIDC flow exercised end-to-end), and the OCI
+image is built locally. The job summary lists what was staged. Use
+this before a real `v*` tag push to confirm the workflow is healthy.
+
+```sh
+gh workflow run release.yml -f version=v0.0.0-dryrun -f dry_run=true
+```
+
+[#290]: https://github.com/aatchison/hummingbird-k8s/issues/290
+
 ## Operator-facing status (today)
 
 **The `hbird` binary now builds and parses every operator-facing

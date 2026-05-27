@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1
+# hadolint global ignore=DL3006,DL3007,DL3008
+#
+# Containerfile.hbird — single-binary release image for the `hbird` CLI.
+#
+# Built by .github/workflows/release.yml on `v*` tag push. The release
+# workflow first builds a static x86_64-unknown-linux-musl binary with
+# `cargo build --release` against the workspace at rust/, then ships
+# the binary into a minimal `scratch` runtime so the final image is
+# (a) tiny — ~5MB, just the binary itself — and (b) attack-surface
+# minimal: no libc, no shell, no package manager.
+#
+# Image consumers can do:
+#   podman pull ghcr.io/aatchison/hbird:v0.0.1
+#   podman run --rm ghcr.io/aatchison/hbird:v0.0.1 --version
+#
+# The image is signed via cosign keyless OIDC by the same release
+# workflow; see docs/rust-cli.md "Install" section for the verify
+# recipe.
+#
+# Why scratch and not distroless/cc-static?
+# - The musl binary is fully statically linked (CARGO_BUILD_TARGET=
+#   x86_64-unknown-linux-musl + RUSTFLAGS="-C target-feature=+crt-static").
+#   No glibc, no /lib loader needed.
+# - The binary doesn't need /etc/passwd, /etc/resolv.conf, or any
+#   other runtime config files baked in: SSH-to-remote-host is via
+#   the operator's own ssh-agent + ~/.ssh, mounted from the host
+#   when the container is invoked (or, more typically, the binary is
+#   downloaded from the GH release and run on the operator's host
+#   directly — the OCI image is a convenience for k8s-native workflows).
+# - scratch is the smallest possible base. Distroless/cc-static would
+#   add a few MB of libc + ld.so we explicitly don't use.
+#
+# Tagging:
+# - VERSION (e.g. v0.0.1) — immutable per release tag.
+# - latest — moves on every default-branch release.
+
+# The release workflow builds the binary on the GHA runner (cached
+# cargo registry, native compilation) and supplies it via build context.
+# This is faster than a multi-stage build that runs cargo inside a
+# Rust builder image — the runner's cache hits on every subsequent
+# release, and the final image stays trivially small (single COPY).
+FROM scratch
+
+# Label the image so consumers can trace origin from `podman inspect`.
+# OCI annotation keys per https://github.com/opencontainers/image-spec.
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="hbird" \
+      org.opencontainers.image.description="hummingbird-k8s operator CLI" \
+      org.opencontainers.image.source="https://github.com/aatchison/hummingbird-k8s" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
+
+# Single binary. The workflow's docker build step supplies hbird as the
+# build context root, so `COPY hbird /hbird` picks up the locally-built
+# musl binary. No chmod needed — the workflow chmods +x before COPY.
+COPY hbird /hbird
+
+# Use the exec form so PID 1 is hbird itself (no shell wrapper to swallow
+# signals). scratch has no /bin/sh, so the shell form wouldn't work anyway.
+ENTRYPOINT ["/hbird"]
