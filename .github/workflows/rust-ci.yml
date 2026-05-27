@@ -1,14 +1,16 @@
 # CI for the Rust client-side rewrite (epic #279, foundation #281).
 #
 # Trigger surface: only PRs that touch rust/, the devcontainer image, the
-# pre-commit config, or this workflow itself. The existing pr-validate.yml
-# covers the bash side; this workflow is deliberately scoped narrow so a
-# bash-only PR doesn't pay for a Rust toolchain spin-up.
+# pre-commit config, this workflow itself, OR the verify-rust-lints-inheritance
+# helper script (so a fix to the helper actually exercises the helper).
+# The existing pr-validate.yml covers the bash side; this workflow is
+# deliberately scoped narrow so a bash-only PR doesn't pay for a Rust
+# toolchain spin-up.
 #
 # Implementation choice: most jobs run on a flat ubuntu-latest runner with
 # rustup + the same cargo-* tools the devcontainer installs. The
 # devcontainer-smoke job builds the actual `.devcontainer/Containerfile`
-# image and runs `cargo --version` inside it — that gives strict by-image
+# image and runs `cargo check` inside it — that gives strict by-image
 # dev/CI parity verification (the epic's stated goal) without paying the
 # 5-10 minute image-build cost on every fmt/clippy/test job.
 #
@@ -21,9 +23,18 @@
 # - Image caching (docker buildx + GHA cache) keeps repeat runs fast even
 #   for the smoke job.
 #
-# Security: this workflow consumes only repo-controlled context values
-# (github.workspace, github.ref). No untrusted PR-body / commit-message
-# / issue-title interpolation into `run:` scripts.
+# Security:
+# - This workflow consumes only repo-controlled context values
+#   (github.workspace, github.ref). No untrusted PR-body / commit-message
+#   / issue-title interpolation into `run:` scripts.
+# - All third-party actions are SHA-pinned per the repo convention
+#   (see build-worker.yml for the established pattern). The `# vX.Y.Z`
+#   trailing comment is for human readability; the SHA is the trust anchor.
+# - The devcontainer-smoke job mounts the workspace read-only and writes
+#   cargo's target directory to a container-internal /tmp/target. This
+#   prevents (a) a malicious build.rs from mutating the runner's checkout
+#   and (b) the uid-mismatch failure where the container's vscode user
+#   (uid 1000) can't write to the GHA runner's checkout (owned by uid 1001).
 
 name: Rust CI
 
@@ -35,6 +46,8 @@ on:
       - ".devcontainer/**"
       - ".pre-commit-config.yaml"
       - ".github/workflows/rust-ci.yml"
+      - "scripts/verify-rust-lints-inheritance.sh"
+      - "tests/scripts/verify-rust-lints-inheritance.bats"
   push:
     branches: [main]
     paths:
@@ -42,15 +55,19 @@ on:
       - ".devcontainer/**"
       - ".pre-commit-config.yaml"
       - ".github/workflows/rust-ci.yml"
+      - "scripts/verify-rust-lints-inheritance.sh"
+      - "tests/scripts/verify-rust-lints-inheritance.bats"
 
 permissions:
   contents: read
 
 # Cancel in-progress runs when a new commit is pushed to the same PR/branch.
 # Rust toolchain spins are expensive; no value in completing a superseded run.
+# Pre-existing on-main runs are left alone (cancel only on PRs) so a
+# fast-follow merge doesn't suppress the prior merge's CI signal on main.
 concurrency:
   group: rust-ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -60,77 +77,95 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Install Rust toolchain (channel + components from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
         with:
           components: rustfmt
-      - name: cargo fmt --all -- --check
+      - name: Check formatting (cargo fmt --check)
         working-directory: rust
-        run: cargo fmt --all -- --check
+        # On failure also dump the diff so the operator can apply it
+        # locally with `cargo fmt --all`. (PR #314 round-2 review Lens 3
+        # HIGH: --check exits non-zero with file list but no diff.)
+        run: |
+          if ! cargo fmt --all -- --check; then
+            echo "::group::Diff that would apply"
+            cargo fmt --all -- --check --files-with-diff || true
+            cargo fmt --all -- --emit=diff || true
+            echo "::endgroup::"
+            echo "::error::cargo fmt would change files — run \`cargo fmt --all\` locally to fix."
+            exit 1
+          fi
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
         with:
           components: clippy
       - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           workspaces: rust
-      - name: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Reject clippy warnings (-D warnings)
         working-directory: rust
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
       - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           workspaces: rust
-      - name: cargo build --workspace --all-targets
+      - name: Workspace build (all targets)
         working-directory: rust
         run: cargo build --workspace --all-targets
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
       - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           workspaces: rust
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8f531eaecd1898bc3da7d104ad91bee98d1b97bd # v2.79.9
         with:
           tool: cargo-nextest
-      - name: cargo nextest run --workspace
+      - name: Workspace test run (nextest, --no-fail-fast)
         working-directory: rust
-        run: cargo nextest run --workspace
+        # --no-fail-fast so a single CI run surfaces all failing tests at
+        # once, not just the first. (PR #314 round-2 review Lens 3 LOW.)
+        run: cargo nextest run --workspace --no-fail-fast
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8f531eaecd1898bc3da7d104ad91bee98d1b97bd # v2.79.9
         with:
           tool: cargo-deny
-      - name: cargo deny check
+      - name: Supply-chain audit (advisories / bans / licenses / sources)
         working-directory: rust
-        run: cargo deny check
+        run: cargo deny --show-stats check
 
   lint-inheritance:
     # Lens 6 MEDIUM finding from PR #313 round-2 review: every crate must
@@ -139,34 +174,43 @@ jobs:
     # bypasses any future crate whose author forgets the stanza. The
     # workspace has no way to enforce this from the [workspace.lints]
     # side (cargo intentionally requires opt-in per crate); CI is the
-    # backstop.
+    # backstop. Helper script lives at scripts/verify-rust-lints-inheritance.sh
+    # and has bats coverage at tests/scripts/verify-rust-lints-inheritance.bats.
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Every crate must declare `[lints] workspace = true`
-        run: bash scripts/check-lints-inheritance.sh
+        run: bash scripts/verify-rust-lints-inheritance.sh
 
   pre-commit:
     # Runs the project's pre-commit hooks against the full tree. Catches
     # both hook drift (rules changed but a stale snapshot got committed)
     # and the case where someone bypassed pre-commit with --no-verify.
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        with:
+          # fetch-depth: 0 so any pre-commit hook that consults git
+          # history (check-merge-conflict, end-of-file-fixer's
+          # changed-only mode, anything using `git diff`) sees the full
+          # tree. PR #314 round-2 review Lens 3 MEDIUM.
+          fetch-depth: 0
       - name: Install Rust toolchain (hooks shell out to cargo fmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
         with:
           components: rustfmt, clippy
       - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           workspaces: rust
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.0.0
         with:
           python-version: "3.x"
       - name: Install pre-commit
         run: pip install pre-commit
-      - name: pre-commit run --all-files
+      - name: Run all pre-commit hooks
         run: pre-commit run --all-files --show-diff-on-failure
 
   devcontainer-smoke:
@@ -176,12 +220,13 @@ jobs:
     # per PR, not per fmt/clippy job. If this fails while flat jobs pass,
     # the devcontainer has drifted from what CI/dev was supposed to share.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Set up Docker buildx (for GHA-cache-backed layer reuse)
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.10.0
       - name: Build devcontainer image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.18.0
         with:
           # devcontainer.json sets `context: ".."` so the build context is
           # the repo root, matching what `devcontainer up` produces locally.
@@ -195,14 +240,19 @@ jobs:
       - name: Confirm toolchain + cargo tools present in the image
         env:
           WORKSPACE: ${{ github.workspace }}
+        # Mount workspace READ-ONLY (Lens 1 MEDIUM — prevents a malicious
+        # build.rs from mutating the runner's checkout) and direct cargo's
+        # target dir to a container-internal /tmp/target via
+        # CARGO_TARGET_DIR. The :ro mount also incidentally fixes the
+        # uid-mismatch CI failure where the container's vscode user (uid
+        # 1000) couldn't write to the GHA runner's checkout (owned by uid
+        # 1001) when cargo tried to create rust/target/.
         run: |
           set -euo pipefail
-          # Mount the workspace the same way devcontainer.json does so the
-          # rust-toolchain.toml inside `rust/` selects the same channel the
-          # flat jobs picked up.
           docker run --rm \
-            -v "${WORKSPACE}:/workspaces/hummingbird-k8s" \
+            -v "${WORKSPACE}:/workspaces/hummingbird-k8s:ro" \
             -w /workspaces/hummingbird-k8s/rust \
+            -e CARGO_TARGET_DIR=/tmp/target \
             hummingbird-k8s-devcontainer:ci \
             bash -c '
               set -euo pipefail
