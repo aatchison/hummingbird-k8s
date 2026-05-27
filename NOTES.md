@@ -149,3 +149,22 @@ they collided with `deploy-cluster`'s operator-chosen names, hardcoded
 operator-specific qcow2 paths (the geary-host-local pool), and carried CI cost for
 a flavor that was no longer deployed. `make deploy-cluster` is now the
 single supported entry point.
+
+### `cloud-init status --wait` deadlock on worker-init (#255 → #265)
+
+PR #255 added `cloud-init status --wait` at the top of
+`containers/k8s-worker/worker-init.sh` so the script could read the
+persistent hostname (`hostnamectl --static`) AFTER cloud-init's
+hostname module ran. The wait reintroduced the exact deadlock PR
+#171/#172/#173 had previously fixed on the k8s-init path:
+`worker-init.service` is part of `multi-user.target`, `cloud-final.service`
+has `After=multi-user.target`, and `cloud-init status --wait` blocks
+until `cloud-final` finishes — three-way deadlock, cluster hung at
+1/3 Ready on every fresh deploy until the wait was killed by hand.
+
+PR #265 drops the wait entirely: cloud-init's hostname module runs at
+the init stage, which completes before `multi-user.target` activates,
+so `/etc/hostname` is already set by the time `worker-init.service`
+runs. A bats drift fence (`tests/containers/worker-init-no-cloud-init-wait.bats`)
+now blocks the `cloud-init status --wait` string from re-landing in
+`worker-init.sh`.

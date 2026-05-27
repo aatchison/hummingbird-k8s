@@ -2,8 +2,12 @@
 Description=Join the Hummingbird Kubernetes cluster as a worker
 # Any After= on cloud-final.service or cloud-init.target creates a systemd
 # ordering cycle (those units are inside multi-user.target's transaction and
-# this service is WantedBy=multi-user.target). worker-init.sh blocks on
-# `cloud-init status --wait` at runtime instead.
+# this service is WantedBy=multi-user.target). worker-init.sh does NOT block
+# on `cloud-init status --wait` either — that wait blocks on cloud-final,
+# which is After=multi-user.target, which is itself blocked by this service
+# (deadlock — PR #265). Hostname is read directly via `hostnamectl --static`
+# because cloud-init's hostname module runs at the init stage, before
+# multi-user.target activates.
 After=crio.service network-online.target
 Wants=crio.service network-online.target
 ConditionPathExists=!/var/lib/worker-init.done
