@@ -38,7 +38,8 @@ rust/
 ├── deny.toml              # cargo-deny license/security policy
 └── crates/
     ├── hbird-common/      # placeholder (#280); future crates land per phasing
-    └── hbird-config/      # cluster.local.conf parser (#282)
+    ├── hbird-config/      # cluster.local.conf parser (#282)
+    └── hbird-openssh/     # SSH transport — `ssh_opts_array` Rust twin (#285)
 ```
 
 ## Phasing (per [epic #279])
@@ -50,7 +51,7 @@ rust/
 | Foundation — ClusterConfig parser | [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | this PR |
 | Transport — clap command tree | [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | pending |
 | Transport — virt + qemu+ssh URI | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | pending |
-| Transport — openssh | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | pending |
+| Transport — openssh | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | this PR |
 | Phase 1 — `update-cluster` | [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | pending |
 | Phase 2 — `verify-*` | [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | pending |
 | Phase 3 — `export-argocd` / `get-kubeconfig` | [#288](https://github.com/aatchison/hummingbird-k8s/issues/288) | pending |
