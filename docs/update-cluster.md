@@ -12,8 +12,10 @@ cluster one node at a time:
 KVM_HOST=geary make update-cluster CONFIG=cluster.local.conf
 
 # Same invocation, but ALSO drop sudo on the KVM host (operator is in
-# the libvirt group there). Default keeps sudo for the other lifecycle
-# scripts pending Phase 3 of #269. See "Running without sudo" below.
+# the libvirt group there). As of #305 the same HBIRD_REMOTE_NO_SUDO=1
+# flag also works for deploy-cluster + destroy-cluster — see
+# `docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305`.
+# `spawn-workers` is the last lifecycle script still requiring root.
 KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 make update-cluster CONFIG=cluster.local.conf
 
 # On the KVM host: either root OR a member of the `libvirt` group
@@ -116,7 +118,7 @@ Environment variables the script honors:
 | --- | --- | --- |
 | `CONFIG` | `./cluster.local.conf` | Path to the cluster config. |
 | `DRY_RUN=1` | unset | Same as `--dry-run` — print actions, don't ssh/kubectl. Useful for unprivileged previews; bypasses the root-or-libvirt-group check (see [Running without sudo](#running-without-sudo-libvirt-group-operator-269)). |
-| `HBIRD_REMOTE_NO_SUDO=1` | unset | When the C3 shim re-execs on `$KVM_HOST`, drop the `sudo` prefix from the remote command. Appropriate when the operator is in the `libvirt` group on the KVM host. See [Running without sudo](#running-without-sudo-libvirt-group-operator-269). Default keeps `sudo` so the other lifecycle scripts (which need POOL_DIR root) stay correct. |
+| `HBIRD_REMOTE_NO_SUDO=1` | unset | When the C3 shim re-execs on `$KVM_HOST`, drop the `sudo` prefix from the remote command. Appropriate when the operator is in the `libvirt` group on the KVM host. See [Running without sudo](#running-without-sudo-libvirt-group-operator-269). Also accepted by `deploy-cluster` / `destroy-cluster` (#305) — `spawn-workers` is the last lifecycle target still requiring root. |
 | `DRAIN_TIMEOUT` | `5m` | `kubectl drain --timeout=` value (Go duration string). Tune up for workloads with slow graceful-shutdown. |
 | `READY_TIMEOUT` | `300` | Seconds to wait for `kubectl get node` to report `Ready` post-reboot. Also bounds the [bootID-changed gate](#reboot-detection-bootid). Must be > 0. |
 | `DAEMONSET_TIMEOUT` | `${READY_TIMEOUT}` | Seconds to wait for the [DaemonSet readiness gate](#daemonset-readiness-gate). Defaults to `READY_TIMEOUT` for compatibility; set independently when the DS gate needs more (or less) headroom than node-Ready. Must be > 0. |
@@ -206,16 +208,17 @@ make update-cluster CONFIG=cluster.local.conf
 ```
 
 Defaults are conservative: `HBIRD_REMOTE_NO_SUDO` is **off** by
-default, and the other lifecycle scripts (`deploy-cluster`,
-`destroy-cluster`, `spawn-workers`) still require root locally + sudo
-on the remote because they write to the root-owned `POOL_DIR`. That
-deferred work is tracked as Phase 3 of #269.
+default. As of #305, `deploy-cluster` and `destroy-cluster` accept
+the same `HBIRD_REMOTE_NO_SUDO=1` + libvirt-group operator path —
+see [`docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305`](deploy-cluster.md#running-without-sudo-libvirt-group-operator-305).
+`spawn-workers` is the last lifecycle script still requiring root —
+the remaining piece of #269's original scope.
 
 Diagnostic when neither condition holds (non-root + not in the
 `libvirt` group):
 
 ```text
-[update-cluster] FAIL: must be root or a member of the libvirt group on this host. Add yourself with:
+[update-cluster] ERROR: must be root or a member of the libvirt group on this host. Add yourself with:
   sudo usermod -aG libvirt $USER && newgrp libvirt
 then rerun. (Dry-run does not require either: rerun with --dry-run to preview.)
 ```

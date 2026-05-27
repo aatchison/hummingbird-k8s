@@ -44,15 +44,28 @@ fi
 : "${KVM_HOST:?Set KVM_HOST (SSH alias of the KVM host) — see config.example.sh}"
 
 if ! ss -ltn | grep -q "127.0.0.1:${LOCAL_PORT} "; then
-  # ssh -t: sudo on the KVM host needs a TTY to prompt for the operator's
-  # password when the remote sudo cache is cold. Without -t the call fails
-  # with `sudo: a terminal is required to read the password`. The remote
-  # TTY makes ssh inject \r into the captured stdout, so strip carriage
-  # returns before awk parses the IP. See issue #247.
-  VM_IP=$(ssh -t "$KVM_HOST" "sudo virsh -c qemu:///system domifaddr ${CP_NAME}" \
-            | tr -d '\r' \
+  # virsh -c qemu:///system works for any libvirt-group member on the KVM host —
+  # no sudo required. Pre-#305 we called `sudo virsh` (with ssh -t to prompt
+  # for the password); the sudo was gratuitous and broke non-interactive
+  # automation from a workstation. Symmetric with #272 (update-cluster) and
+  # #305 (deploy/destroy). Capture stderr to a temp file so a failed virsh
+  # surfaces with its real cause (Permission denied vs domain not found vs
+  # ssh auth failure all look identical without it — round-2 review L8).
+  _virsh_err=$(mktemp -t hbird-virsh-err.XXXXXX)
+  trap 'rm -f "$_virsh_err"' EXIT
+  VM_IP=$(ssh "$KVM_HOST" "virsh -c qemu:///system domifaddr ${CP_NAME}" 2>"$_virsh_err" \
             | awk '/ipv4/{split($4,a,"/"); print a[1]; exit}')
-  [[ -n "$VM_IP" ]] || { echo "Could not find ${CP_NAME} IP" >&2; exit 1; }
+  if [[ -z "$VM_IP" ]]; then
+    {
+      echo "Could not find ${CP_NAME} IP via ssh ${KVM_HOST} 'virsh ... domifaddr ${CP_NAME}'."
+      if [[ -s "$_virsh_err" ]]; then
+        echo "Remote stderr:"
+        sed 's/^/  /' "$_virsh_err"
+      fi
+      echo "Common causes: operator not in libvirt group on ${KVM_HOST}; virsh not installed there; domain not defined. See docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305."
+    } >&2
+    exit 1
+  fi
   echo "Starting tunnel: localhost:${LOCAL_PORT} -> ${VM_IP}:6443 via ${KVM_HOST}" >&2
   ssh -fNL "${LOCAL_PORT}:${VM_IP}:6443" "$KVM_HOST"
 fi

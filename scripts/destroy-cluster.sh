@@ -36,7 +36,29 @@ CONFIG_PATH="${1:?usage: $0 <cluster.local.conf>}"
 
 # Required commands.
 command -v virsh >/dev/null 2>&1 || fail "virsh not on PATH"
-[[ $EUID -eq 0 ]] || fail "must run as root (libvirt qemu:///system)"
+# destroy-cluster.sh historically required root for libvirt qemu:///system +
+# rm of root-owned qcow2/seed files in POOL_DIR. With #305 we accept either
+# root OR a member of the `libvirt` group on the KVM host (mirrors #272's
+# update-cluster pattern). libvirt authorizes qemu:///system via the
+# unix-socket group, not sudo; POOL_DIR files deployed via the no-sudo path
+# (#305) land as <operator>:libvirt and are removable by the operator. Files
+# left over from a pre-#305 sudo-driven deploy are owned by root and will
+# fail to remove for a non-root operator — that's a one-time migration hazard,
+# diagnosed via the rm errors below. Non-root + not in libvirt group is a
+# hard fail with an actionable hint.
+if [[ $EUID -ne 0 ]]; then
+  if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx libvirt; then
+    fail "must be root or a member of the libvirt group on this host. Add yourself with:
+  sudo usermod -aG libvirt \$USER && newgrp libvirt
+then rerun. See docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305 for the full no-sudo path."
+  fi
+  # Symmetric with update-cluster.sh's #272 log + deploy-cluster.sh's #305
+  # log (round-2 review L8). Announce the branch so the operator sees which
+  # path ran — especially relevant when destroying a cluster that may have
+  # been deployed pre-#305 (root-owned qcow2s; see rm error-surfacing in
+  # destroy_vm() below for the diagnostic).
+  log "running as ${USER:-$(id -un)} (libvirt group member); virsh + cleanup work without sudo (#305)"
+fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_PATH"
@@ -58,10 +80,22 @@ destroy_vm() {
   else
     log "$name: no such domain (already torn down)"
   fi
-  # Clean disk + seed ISO regardless. Trailing-glob covers any clone variants.
-  rm -f "${POOL_DIR}/${name}.qcow2" \
-        "${POOL_DIR}/${name}-seed.iso" \
-        "${POOL_DIR}/${name}-cloud-init.iso" 2>/dev/null || true
+  # Clean disk + seed ISO. Pre-#305 this silenced rm errors to /dev/null
+  # which masked the EXACT failure mode #305's round-2 review L7 flagged:
+  # a non-root operator destroying a cluster deployed pre-#305 (qcow2s
+  # still owned by root) sees `done.` while 30-60 GiB of qcow2 leaks.
+  # Now: capture rm stderr, surface a warn per file that couldn't be
+  # removed, point at the recovery recipe. Still don't fail-stop (other
+  # files may be removable; operator may want partial cleanup).
+  local f rm_err
+  for f in "${POOL_DIR}/${name}.qcow2" \
+           "${POOL_DIR}/${name}-seed.iso" \
+           "${POOL_DIR}/${name}-cloud-init.iso"; do
+    [[ -e "$f" ]] || continue
+    if ! rm_err=$(rm -f -- "$f" 2>&1); then
+      log "WARN: could not remove ${f}: ${rm_err}. If pre-#305 root-owned, run once as root: sudo rm -f ${f}"
+    fi
+  done
 }
 
 log "tearing down cluster defined in $CONFIG_PATH"
@@ -71,10 +105,15 @@ for w in "${WORKER_NAMES_ARR[@]}"; do
 done
 
 # Also clean the per-deploy scratch dir under the pool, used by
-# deploy-cluster.sh to hold transient cloud-init payloads.
+# deploy-cluster.sh to hold transient cloud-init payloads. Surface rm
+# failures like destroy_vm() does — same silent-leak class as the
+# per-VM cleanup loop above (#305 round-2 re-review).
 if [[ -d "${POOL_DIR}/deploy-cluster" ]]; then
   log "removing scratch dir ${POOL_DIR}/deploy-cluster"
-  rm -rf "${POOL_DIR}/deploy-cluster" || true
+  if ! _scratch_err=$(rm -rf -- "${POOL_DIR}/deploy-cluster" 2>&1); then
+    log "WARN: could not fully remove ${POOL_DIR}/deploy-cluster: ${_scratch_err}. If pre-#305 root-owned, run once as root: sudo rm -rf ${POOL_DIR}/deploy-cluster"
+  fi
+  unset _scratch_err
 fi
 
 log "done."

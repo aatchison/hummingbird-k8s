@@ -1,28 +1,28 @@
 #!/usr/bin/env bats
 #
-# Unit tests for scripts/kubectl-k8s.sh — issue #247.
+# Unit tests for scripts/kubectl-k8s.sh.
 #
 # The day-2 kubectl wrapper ssh's to $KVM_HOST and runs
-# `sudo virsh -c qemu:///system domifaddr <CP>` to find the control-plane
-# VM's IP, then sets up a local-port-forward tunnel. Issue #247 fixed two
-# bugs in that flow:
+# `virsh -c qemu:///system domifaddr <CP>` to find the control-plane
+# VM's IP, then sets up a local-port-forward tunnel.
 #
-#   1. The first ssh invocation MUST pass `-t` so sudo on the remote can
-#      prompt for the operator's password when the remote sudo cache is
-#      cold. Without -t the call fails with
-#      `sudo: a terminal is required to read the password`.
-#
-#   2. ssh -t allocates a remote TTY which causes sshd to inject \r on
-#      every newline of the captured stdout. The IP-extraction awk then
-#      sees `192.0.2.10\r` and the carriage return either ends up in the
-#      tunnel target ("192.0.2.10\r:6443" — ssh rejects it as malformed)
-#      or trips downstream consumers. We strip \r before awk parses.
+# History:
+#   - Issue #247 originally added `ssh -t` + remote `sudo virsh` + a
+#     `tr -d '\r'` filter because sudo on the KVM host needed a TTY.
+#   - Issue #305 dropped the `sudo` (gratuitous when the operator is in
+#     the libvirt group on the KVM host, which is now the documented
+#     baseline — see docs/deploy-cluster.md#running-without-sudo) and
+#     therefore also dropped `-t` (no remote sudo prompt = no need for a
+#     remote PTY) and the `tr -d '\r'` workaround (no PTY = no CR
+#     injection). This file pins that simpler #305 shape; the #247
+#     regressions are folded into the assertions below.
 #
 # We stub `ssh`, `ss`, and `kubectl` on PATH so the script's real network
 # work is replaced by argv-capture and canned output. The stubs let us
-# assert: (a) the first ssh call carries `-t`; (b) the captured stdout
-# has \r stripped before awk; (c) the second ssh (-fNL tunnel) gets a
-# clean IP without trailing \r.
+# assert: (a) the first ssh call does NOT carry `-t`; (b) the remote
+# command is bare `virsh …` (no `sudo`); (c) the captured stdout has no
+# \r to strip (the stub emits clean `\n`), and the second ssh (-fNL
+# tunnel) gets a clean IP regardless.
 
 setup() {
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
@@ -37,10 +37,9 @@ setup() {
 
   # ssh stub: write each invocation's argv to $SSH_ARGV_DIR/argv-N (one
   # arg per line, in $SSH_ARGV_DIR/counter we tally calls). On the FIRST
-  # call (the domifaddr probe) emit a virsh-formatted line that ENDS with
-  # \r, mimicking what an interactive sshd sends back when -t is passed.
-  # The test then asserts that the script's `tr -d '\r'` strips it before
-  # awk runs.
+  # call (the domifaddr probe) emit a virsh-formatted line with plain `\n`
+  # — post-#305 we don't use `ssh -t`, so sshd does NOT inject CR. (#247's
+  # \r-stripping concern doesn't apply once -t is gone.)
   cat > "$STUB_DIR/ssh" <<'EOF'
 #!/usr/bin/env bash
 # Bump the call counter atomically (single-writer; tests are serial).
@@ -59,11 +58,11 @@ for a in "$@"; do
 done
 
 # Otherwise: this is the domifaddr probe. Emit virsh-domifaddr-shaped
-# stdout WITH explicit \r line endings so the test verifies the script's
-# tr -d '\r' strip works against the real sshd-with-TTY output pattern.
-printf ' Name       MAC address          Protocol     Address\r\n'
-printf '-------------------------------------------------------------------------------\r\n'
-printf ' vnet0      52:54:00:de:ad:be    ipv4         192.0.2.10/24\r\n'
+# stdout with plain `\n` (no CR — we no longer pass `ssh -t`, so sshd
+# does not allocate a remote TTY).
+printf ' Name       MAC address          Protocol     Address\n'
+printf '-------------------------------------------------------------------------------\n'
+printf ' vnet0      52:54:00:de:ad:be    ipv4         192.0.2.10/24\n'
 EOF
   chmod +x "$STUB_DIR/ssh"
 
@@ -114,25 +113,29 @@ _ssh_argv_file() {
 }
 
 # ---------------------------------------------------------------------------
-# Issue #247: ssh -t for the sudo virsh domifaddr call
+# #305: domifaddr ssh probe does NOT pass -t (no remote sudo prompt to read)
 # ---------------------------------------------------------------------------
 
-@test "kubectl-k8s: domifaddr ssh invocation passes -t (issue #247)" {
+@test "kubectl-k8s: domifaddr ssh invocation does NOT pass -t (#305)" {
   run _invoke get nodes
   [ "$status" -eq 0 ]
   [[ "$output" == *"KUBECTL_STUB_RAN"* ]]
 
-  # The FIRST ssh invocation is the `sudo virsh domifaddr` probe. It MUST
-  # include -t so the remote sudo can prompt for the operator's password
-  # when the cache is cold. argv is one-arg-per-line in $SSH_ARGV_DIR/argv-1.
+  # The FIRST ssh invocation is the `virsh domifaddr` probe. Post-#305 it
+  # MUST NOT include -t — there's no remote sudo to prompt, and -t would
+  # re-introduce the OSC / \r pollution problems #247 papered over.
   local argv1
   argv1="$(_ssh_argv_file 1)"
   [ -f "$argv1" ]
   # busybox grep treats `-t` as a flag — use -e to pass it as a pattern.
-  grep -qxF -e '-t' "$argv1"
+  if grep -qxF -e '-t' "$argv1"; then
+    printf 'FAIL: domifaddr ssh argv contains -t (regression from #305):\n%s\n' \
+      "$(cat "$argv1")"
+    return 1
+  fi
 }
 
-@test "kubectl-k8s: domifaddr ssh argv contains 'sudo virsh' + CP_NAME" {
+@test "kubectl-k8s: domifaddr ssh argv is bare 'virsh …' (no sudo) (#305)" {
   run _invoke get nodes
   [ "$status" -eq 0 ]
 
@@ -140,17 +143,25 @@ _ssh_argv_file() {
   argv1="$(_ssh_argv_file 1)"
   [ -f "$argv1" ]
   grep -qxF 'stub-kvm' "$argv1"
-  grep -qxF 'sudo virsh -c qemu:///system domifaddr hbird-cp1' "$argv1"
+  # Post-#305 the remote command drops `sudo` — libvirt-group on the KVM
+  # host is the documented baseline. Pin the new shape verbatim.
+  grep -qxF 'virsh -c qemu:///system domifaddr hbird-cp1' "$argv1"
+  # And explicitly confirm the old `sudo virsh …` form is gone.
+  if grep -qxF 'sudo virsh -c qemu:///system domifaddr hbird-cp1' "$argv1"; then
+    printf 'FAIL: domifaddr ssh argv still contains `sudo virsh …` (regression from #305):\n%s\n' \
+      "$(cat "$argv1")"
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
-# Issue #247: \r stripping. The ssh -t stub emits CR-terminated lines.
-# Without `tr -d '\r'` the awk pipeline would capture "192.0.2.10\r"
-# and the tunnel-setup ssh -fNL would get "192.0.2.10\r:6443" as the
-# forward target. Assert the second ssh's argv has a clean IP.
+# Tunnel argv must still receive a clean IP. With #305 dropping -t the
+# stub no longer emits \r, so this is now trivially clean — but pin it
+# as a regression guard against someone re-adding -t without re-adding a
+# stripper (or re-adding both and silently regressing on something else).
 # ---------------------------------------------------------------------------
 
-@test "kubectl-k8s: tunnel ssh -fNL gets carriage-return-free IP (issue #247)" {
+@test "kubectl-k8s: tunnel ssh -fNL gets carriage-return-free IP (#305)" {
   run _invoke get nodes
   [ "$status" -eq 0 ]
 
@@ -161,7 +172,7 @@ _ssh_argv_file() {
   # busybox grep treats `-fNL` as a flag bundle — use -e to pass it as a pattern.
   grep -qxF -e '-fNL' "$argv2"
   # Forward spec must be exactly "6443:192.0.2.10:6443" — no \r between
-  # the IP and the port. Match the bare-line arg with grep -Fx.
+  # the IP and the port.
   grep -qxF -e '6443:192.0.2.10:6443' "$argv2"
   # And confirm there's no literal \r anywhere in the argv.
   if grep -q $'\r' "$argv2"; then
@@ -171,17 +182,19 @@ _ssh_argv_file() {
 }
 
 # ---------------------------------------------------------------------------
-# Regression guard: the LITERAL bytes `ssh -t` appear in the source at
-# the domifaddr line. Catches a future refactor that accidentally drops
-# the -t (the per-invocation argv test above would also catch it, but a
-# source-grep is a cheap belt-and-suspenders).
+# Source-grep regression guards. Pinning the literal bytes makes a future
+# refactor that re-adds `ssh -t` or `sudo virsh` or `tr -d '\r'` fail loudly
+# at the unit-test stage, not the operator's terminal.
 # ---------------------------------------------------------------------------
 
-@test "kubectl-k8s: source contains 'ssh -t' for the domifaddr probe" {
-  grep -qE 'ssh -t "\$KVM_HOST" "sudo virsh' "${REPO_ROOT}/scripts/kubectl-k8s.sh"
+@test "kubectl-k8s: source does NOT pass 'ssh -t' to the domifaddr probe (#305)" {
+  ! grep -qE 'ssh -t "\$KVM_HOST" "(sudo )?virsh' "${REPO_ROOT}/scripts/kubectl-k8s.sh"
 }
 
-@test "kubectl-k8s: source pipes the domifaddr stdout through tr -d for \\r" {
-  # Look for the tr -d '\r' immediately following the ssh in the pipeline.
-  grep -qE "tr -d '\\\\r'" "${REPO_ROOT}/scripts/kubectl-k8s.sh"
+@test "kubectl-k8s: source does NOT prefix the remote virsh with 'sudo' (#305)" {
+  ! grep -qE 'ssh.*"\$KVM_HOST".*sudo virsh' "${REPO_ROOT}/scripts/kubectl-k8s.sh"
+}
+
+@test "kubectl-k8s: source does NOT pipe the domifaddr stdout through tr -d '\\r' (#305)" {
+  ! grep -qE "tr -d '\\\\r'" "${REPO_ROOT}/scripts/kubectl-k8s.sh"
 }

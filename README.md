@@ -205,7 +205,7 @@ Then, from a client:
 
 ```bash
 export KVM_HOST=geary
-make deploy-cluster   CONFIG=cluster.local.conf  # ssh -t $KVM_HOST cd ~/hummingbird-k8s && sudo bash scripts/deploy-cluster.sh ...
+make deploy-cluster   CONFIG=cluster.local.conf  # ssh -t $KVM_HOST cd ~/hummingbird-k8s && sudo bash scripts/deploy-cluster.sh ...  (drop `sudo` via HBIRD_REMOTE_NO_SUDO=1 + libvirt-group operator; see #305)
 make destroy-cluster  CONFIG=cluster.local.conf
 make update-cluster   CONFIG=cluster.local.conf
 make spawn-workers    COUNT=2
@@ -266,21 +266,36 @@ only the five cluster-lifecycle targets (`deploy-cluster`,
 dropped client-side `sudo` in PR #237. As of #271 F1+F5, `switch-to-ghcr` and `clean-vms` join them when `KVM_HOST` is set (sudo happens on the remote, not
 locally).
 
-Going one step further: `update-cluster` now accepts a `libvirt`-group
-member on the KVM host (no root needed), and the C3 shim drops `sudo`
-from the remote exec when `HBIRD_REMOTE_NO_SUDO=1` is set (#269). The
-operator setup is `ssh $KVM_HOST 'sudo usermod -aG libvirt $USER'`
-once, then:
+Going one step further: `update-cluster`, `deploy-cluster`, and
+`destroy-cluster` now accept a `libvirt`-group member on the KVM host
+(no root needed), and the C3 shim drops `sudo` from the remote exec
+when `HBIRD_REMOTE_NO_SUDO=1` is set (#269 for update, #305 for
+deploy/destroy). One-time operator setup on the KVM host:
 
 ```bash
+ssh $KVM_HOST 'sudo usermod -aG libvirt $USER && newgrp libvirt'
+# AND, for deploy/destroy (which write qcow2s + seed ISOs to POOL_DIR).
+# Substitute the actual POOL_DIR from your cluster.local.conf for <POOL_DIR>
+# below — default is /var/lib/libvirt/images; this repo's cluster.example.conf
+# uses /mnt/mass2/vms.
+ssh $KVM_HOST 'sudo chgrp libvirt <POOL_DIR> && sudo chmod 2775 <POOL_DIR>'
+```
+
+Then from a workstation:
+
+```bash
+KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 \
+  make deploy-cluster CONFIG=cluster.local.conf
+KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 \
+  make destroy-cluster CONFIG=cluster.local.conf
 KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 \
   make update-cluster CONFIG=cluster.local.conf
 ```
 
-`deploy-cluster` / `destroy-cluster` / `spawn-workers` still need root
-on the KVM host (qcow2 writes to root-owned `POOL_DIR`); that's Phase 3
-of #269. Full reference:
-[`docs/update-cluster.md#running-without-sudo`](docs/update-cluster.md#running-without-sudo-libvirt-group-operator-269).
+`spawn-workers` is the last lifecycle target that still requires root
+on the KVM host — the remaining piece of #269's original scope. Full
+reference:
+[`docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305`](docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305).
 
 ### Rolling cluster updates
 

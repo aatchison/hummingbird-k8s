@@ -100,13 +100,13 @@ Since C3 (#232), `deploy-cluster.sh`, `destroy-cluster.sh`,
 via SSH when `KVM_HOST` is set and the local short hostname doesn't
 match `${KVM_HOST%%.*}`. The client never needs `sudo` or `libvirt`
 installed — only `ssh` + the operator's SSH key. Sudo happens on the
-remote by default; `update-cluster` accepts a libvirt-group operator
-on the remote and can be invoked without sudo entirely via
-`HBIRD_REMOTE_NO_SUDO=1` — see
-[`docs/update-cluster.md`](update-cluster.md#running-without-sudo-libvirt-group-operator-269)
-(#269). The other three scripts (deploy / destroy / spawn) still need
-root on the remote because they write qcow2 files to the root-owned
-`POOL_DIR` — that's deferred to Phase 3 of the same issue.
+remote by default; `update-cluster`, `deploy-cluster`, and
+`destroy-cluster` accept a libvirt-group operator on the remote and
+can be invoked without sudo entirely via `HBIRD_REMOTE_NO_SUDO=1` —
+see [Running without sudo](#running-without-sudo-libvirt-group-operator-305)
+below (#269, extended to deploy/destroy by #305). `spawn-workers.sh`
+still requires root on the remote — that's the remaining piece of
+`#269`'s original scope.
 
 ### One-time remote setup
 
@@ -149,7 +149,84 @@ accepted but won't trip the "already local" guard correctly — use
 
 NOPASSWD sudo on the remote is RECOMMENDED for unattended runs, but
 not mandatory — with the round-2 checkout-on-remote model, sudo can
-prompt normally on the SSH TTY.
+prompt normally on the SSH TTY. As of #305, the cleaner answer for
+unattended runs from a workstation is to skip `sudo` entirely via
+`HBIRD_REMOTE_NO_SUDO=1` + a libvirt-group operator on the KVM host —
+see [Running without sudo](#running-without-sudo-libvirt-group-operator-305).
+
+### Running without sudo (libvirt-group operator, #305)
+
+`deploy-cluster.sh`, `destroy-cluster.sh`, and `update-cluster.sh`
+all accept either root OR a member of the `libvirt` group on the KVM
+host. libvirt authorizes `qemu:///system` via the unix-socket group
+(not via sudo); `bootc-image-builder` runs rootless under podman;
+remote ops on the cluster VMs (ssh + kubectl) run as `root@<node-ip>`
+via the operator's SSH key and are unaffected by the local EUID.
+
+**One-time setup on the KVM host:**
+
+```bash
+# 1. Add the operator to the libvirt group.
+ssh $KVM_HOST 'sudo usermod -aG libvirt $USER && newgrp libvirt'
+# (or just log out + back in to pick up the new group)
+
+# 2. Make POOL_DIR group-writable so deploy-cluster can drop qcow2 +
+#    seed ISO files there without root. setgid (2775) makes new files
+#    inherit the libvirt group, so qemu (which is also in libvirt) can
+#    read them after libvirt's dynamic_ownership chowns to qemu:qemu at
+#    VM start.
+#
+#    Substitute the actual POOL_DIR value from your cluster.local.conf —
+#    the placeholder below is illustrative. Example for the geary host
+#    where cluster.local.conf has POOL_DIR=/mnt/mass2/vms:
+#      ssh geary 'sudo chgrp libvirt /mnt/mass2/vms && sudo chmod 2775 /mnt/mass2/vms'
+ssh $KVM_HOST "sudo chgrp libvirt <POOL_DIR_from_cluster.local.conf> && sudo chmod 2775 <POOL_DIR_from_cluster.local.conf>"
+```
+
+**Invocation from a workstation:**
+
+```bash
+# The shim re-execs over SSH WITHOUT prefixing sudo on the remote when
+# HBIRD_REMOTE_NO_SUDO=1 is set. Combined with the libvirt-group
+# operator on the remote (above), this is a fully unattended path —
+# no TTY, no password prompt.
+KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 \
+  make deploy-cluster CONFIG=cluster.local.conf
+KVM_HOST=geary HBIRD_REMOTE_NO_SUDO=1 \
+  make destroy-cluster CONFIG=cluster.local.conf
+```
+
+**Invocation on the KVM host directly:**
+
+```bash
+# As a libvirt-group user (no sudo needed):
+make deploy-cluster   CONFIG=cluster.local.conf
+make destroy-cluster  CONFIG=cluster.local.conf
+make update-cluster   CONFIG=cluster.local.conf
+
+# Or as root (the pre-#305 invocation pattern still works):
+sudo make deploy-cluster CONFIG=cluster.local.conf
+```
+
+Defaults are conservative: `HBIRD_REMOTE_NO_SUDO` is **off** by
+default. `spawn-workers.sh` still requires root on the remote (that's
+the remaining bit of #269's original scope, not yet folded into the
+no-sudo path).
+
+Diagnostic when the operator is neither root nor in the `libvirt`
+group on the KVM host:
+
+```text
+[deploy-cluster] ERROR: must be root or a member of the libvirt group on this host. Add yourself with:
+  sudo usermod -aG libvirt $USER && newgrp libvirt
+then rerun. POOL_DIR must also be group-writable. One-time setup (substitute your POOL_DIR from cluster.local.conf — defaults to /var/lib/libvirt/images):
+  sudo chgrp libvirt /var/lib/libvirt/images
+  sudo chmod 2775 /var/lib/libvirt/images
+See docs/deploy-cluster.md#running-without-sudo-libvirt-group-operator-305.
+```
+
+The same diagnostic shape is emitted by `destroy-cluster.sh` (with
+its own script name) when run by a non-root non-libvirt-group user.
 
 ### Pre-flight checks
 
@@ -186,7 +263,7 @@ Current allowlist:
 | Timeouts | `READY_TIMEOUT`, `DRAIN_TIMEOUT`, `APISERVER_TIMEOUT`, `SSH_TIMEOUT`, `INTER_NODE_SLEEP`, `DAEMONSET_TIMEOUT` |
 | Topology | `CP_NAME`, `WORKER_NAMES`, `POOL_DIR` |
 | Image-build knobs | `VM_USER`, `STORAGE_DRIVER`, `PODMAN_ROOT`, `PODMAN_RUNROOT`, `APISERVER_EXTRA_SANS` |
-| Shim itself | `HBIRD_AUTOLOAD_CONFIG_LOCAL`, `HBIRD_REMOTE_REPO`, `HBIRD_OPERATOR_PUBKEY_FILE` (shim-managed, see #248 below), `HBIRD_REMOTE_NO_SUDO` (drops `sudo` from the remote exec when `=1`; see [`docs/update-cluster.md`](update-cluster.md#running-without-sudo-libvirt-group-operator-269) for the libvirt-group story, #269) |
+| Shim itself | `HBIRD_AUTOLOAD_CONFIG_LOCAL`, `HBIRD_REMOTE_REPO`, `HBIRD_OPERATOR_PUBKEY_FILE` (shim-managed, see #248 below), `HBIRD_REMOTE_NO_SUDO` (drops `sudo` from the remote exec when `=1`; see [Running without sudo](#running-without-sudo-libvirt-group-operator-305) for the libvirt-group story — #269 for update-cluster, #305 for deploy/destroy) |
 
 Every value is passed through `printf %q` before being interpolated
 into the remote command, so values with spaces, quotes, or shell
