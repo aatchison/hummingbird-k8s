@@ -27,7 +27,7 @@ subcommands land per the phasing table in
 | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | landed (PR #318) |
 | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | landed (PR #317) |
 | [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | `update-cluster` Phase 1A — dry-run parity + orchestration scaffold | landed (PR #321) |
-| [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycle 1 (`cp_kubectl` + drain/uncordon) landed (PR #325); cycles 2–4 pending |
+| [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycles 1 (`cp_kubectl` + drain/uncordon, PR #325) + 2 (bootID + bootc upgrade + SSH drop/back, PR #344) landed; cycles 3 ([#328](https://github.com/aatchison/hummingbird-k8s/issues/328)) + 4 ([#329](https://github.com/aatchison/hummingbird-k8s/issues/329)) pending |
 | [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | `verify-*` Phase 2 — encryption / hardening / app-deploy / all | landed (PR #330) — live-validated 2026-05-27 |
 | [#288](https://github.com/aatchison/hummingbird-k8s/issues/288) | Phase 3 — `export-argocd` / `get-kubeconfig` / `nodes` / `kubectl` | landed (PR #334) — live-validated 2026-05-27 |
 
@@ -67,8 +67,10 @@ hbird kubectl …           <-> make kubectl             (landed: PR #288)
 Subcommand status:
 
 - `update-cluster` — Phase 1A (dry-run) landed (#286 / PR #321); Phase 1B
-  cycle 1 (cp_kubectl + drain/uncordon) landed (#322 / PR #325); cycles
-  2–4 carved out as #327 / #328 / #329 (independently dispatchable).
+  cycle 1 (cp_kubectl + drain/uncordon) landed (#322 / PR #325); cycle 2
+  (bootID + bootc upgrade + SSH drop/back) landed (#327 / PR #344);
+  remaining cycles 3 & 4 carved out as #328 / #329 (independently
+  dispatchable).
 - `verify {encryption,hardening,app-deploy,all}` — Phase 2 landed
   (#287 / PR #330). Live-validated against the geary cluster
   2026-05-27.
@@ -158,7 +160,7 @@ against the live geary cluster with a bash-vs-Rust diff captured under
 | Cycle | Block | Helpers wired | Status |
 |-------|-------|---------------|--------|
 | 1 | #5 + part of update_worker | `cp_kubectl`, drain, uncordon | landed (PR #325) |
-| 2 | #6 | `capture_node_bootid`, `wait_node_bootid_changed`, `bootc_upgrade_apply`, `wait_ssh_drop`, `wait_ssh_back` | pending |
+| 2 | #6 + #8 + #10 | `capture_node_bootid`, `wait_node_bootid_changed`, `bootc_upgrade_apply` (+ `bootc_has_apply` + `bootc_booted_digest`), `wait_ssh_drop`, `wait_ssh_back` | landed (#327) |
 | 3 | #9 | `wait_node_ready`, `wait_node_daemonsets_ready` | pending |
 | 4 | #7 | `wait_apiserver_back`, etcd-backup | pending |
 
@@ -254,16 +256,18 @@ to root@CP_IP and pipe stdin), so kubectl sees the manifest and the
 apiserver correctly rejects it — Rust observes PSA enforcement that
 bash misses. Documented in `cycle_verify_hardening.txt`.
 
-#### Still scaffolded (12 of 13 `live_mode_not_implemented` sites)
+#### Still scaffolded (5 of 13 `live_mode_not_implemented` sites)
 
-Cycles 2–4 each wire one or more of these stubs:
+Cycles 3–4 each wire one or more of these remaining stubs:
 
 - `timer_stop` / `timer_start` (block #4)
-- `capture_node_bootid` / `wait_node_bootid_changed` (block #6)
-- `bootc_upgrade_apply` (block #10)
-- `wait_ssh_drop` / `wait_ssh_back` (block #8)
 - `wait_node_ready` / `wait_node_daemonsets_ready` (block #9)
 - `wait_apiserver_back` (block #7)
+
+Cycle 2 (#327) wired the bootID gate (`capture_node_bootid`,
+`wait_node_bootid_changed`), the bootc upgrade life-cycle
+(`bootc_has_apply`, `bootc_booted_digest`, `bootc_upgrade_apply`), and
+the SSH drop/back gates (`wait_ssh_drop`, `wait_ssh_back`).
 
 Real virsh-domifaddr IP resolution through `hbird-virt::Connection`
 also remains stubbed — operators set `CP_IP=`/`WORKER_IPS=()` in

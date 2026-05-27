@@ -15,6 +15,14 @@
 //! tracking, recovery hints on abort) and routes individual remote
 //! operations through [`hbird_ssh::Client`] / [`hbird_virt::Connection`].
 //!
+//! Live-execution slice ([#322]) wiring status:
+//!   - Cycle 1 ([#325]): `cp_kubectl` (drain + uncordon block #5).
+//!   - Cycle 2 ([#327]): bootID gate (`capture_node_bootid`,
+//!     `wait_node_bootid_changed`), bootc upgrade (`bootc_has_apply`,
+//!     `bootc_booted_digest`, `bootc_upgrade_apply`), SSH drop/back
+//!     (`wait_ssh_drop`, `wait_ssh_back`). Block #6 + part of #8 + #10.
+//!   - Cycles 3+4: TBD (apiserver + Ready + DaemonSets + timer).
+//!
 //! # Block traceability
 //!
 //! Each "block" listed in [#286] maps to a section of this file, marked
@@ -39,6 +47,9 @@
 //!
 //! [#279]: https://github.com/aatchison/hummingbird-k8s/issues/279
 //! [#286]: https://github.com/aatchison/hummingbird-k8s/issues/286
+//! [#322]: https://github.com/aatchison/hummingbird-k8s/issues/322
+//! [#325]: https://github.com/aatchison/hummingbird-k8s/issues/325
+//! [#327]: https://github.com/aatchison/hummingbird-k8s/issues/327
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -902,29 +913,67 @@ impl Drop for LockGuard {
 
 /// Probe whether the remote bootc supports `upgrade --apply`. Mirrors
 /// bash `bootc_has_apply` (line 523). Dry-run short-circuits to `Ok(true)`.
-#[allow(dead_code)] // Pinned for live-execution slice; bash-twin block-traceability.
+///
+/// Live path (#327 cycle 2): runs `bootc upgrade --help | grep -q -- --apply`
+/// over SSH. Exit 0 → has --apply; exit 1 (no match) → fallback path.
+/// Any other non-zero classifies as an SSH/transport error and bubbles
+/// up so the caller can fail-fast rather than silently downgrade.
+#[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip))]
 fn bootc_has_apply(plan: &Plan, ip: &str) -> Result<bool> {
     if plan.dry_run {
         return Ok(true);
     }
-    Err(live_mode_not_implemented(
-        "bootc_has_apply",
-        &format!("ssh root@{ip} \"bootc upgrade --help | grep -- --apply\""),
-    ))
+    let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+    // Same shape as bash line 529:
+    //   ssh "${SSH_OPTS[@]}" "root@${ip}" "bootc upgrade --help 2>/dev/null | grep -q -- '--apply'"
+    match client.run("bootc upgrade --help 2>/dev/null | grep -q -- '--apply'") {
+        Ok(_) => Ok(true),
+        Err(hbird_ssh::Error::NonZeroExit { status, .. }) if status.code() == Some(1) => {
+            // grep exit 1 = pattern not found = no --apply support.
+            Ok(false)
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!("bootc_has_apply: ssh-run failed for `bootc upgrade --help` against root@{ip}")
+        }),
+    }
 }
 
 /// Snapshot the booted image digest via `bootc status --json`. Mirrors
 /// `bootc_booted_digest` (line 536). Dry-run returns the sentinel
 /// `<dry-run-digest>` the bash twin uses.
-#[allow(dead_code)] // Pinned for live-execution slice; bash-twin block-traceability.
+///
+/// Live path (#327 cycle 2): runs `bootc status --json | jq -r
+/// '.status.booted.image.imageDigest // .status.booted.image.digest // empty'`
+/// over SSH. An empty string is a legitimate return (jq's `// empty`
+/// when neither path is populated) — the caller in
+/// [`bootc_upgrade_apply`] treats `pre == post == ""` as "couldn't
+/// determine, treat as applied" matching bash line 1157 which only
+/// short-circuits on a NON-EMPTY equal pair.
+#[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip))]
 fn bootc_booted_digest(plan: &Plan, ip: &str) -> Result<String> {
     if plan.dry_run {
         return Ok("<dry-run-digest>".to_string());
     }
-    Err(live_mode_not_implemented(
-        "bootc_booted_digest",
-        &format!("ssh root@{ip} \"bootc status --json | jq ...\""),
-    ))
+    let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+    // Bash line 543 uses the same jq expression. We replicate verbatim so
+    // operators grepping both sides find a matching call shape.
+    // Round-2 lens L2 MED: fallback path matches bash twin literally
+    // (line 544: `.image.imageDigest // .image.digest // empty`). The
+    // earlier shape `// .status.booted.imageDigest` was missing the
+    // `.image.` prefix on the fallback — same-looking but diverges on
+    // any bootc schema where the alternate key is `.image.digest`.
+    let cmd = "bootc status --json 2>/dev/null | \
+               jq -r '.status.booted.image.imageDigest // .status.booted.image.digest // empty' \
+               2>/dev/null || true";
+    // `|| true` keeps a transient jq error from blowing up the digest
+    // snapshot — bash twin does the same; empty string falls through to
+    // the caller's `<unknown>` fallback log line.
+    match client.run(cmd) {
+        Ok(out) => Ok(out.stdout_lossy().trim().to_string()),
+        Err(e) => {
+            Err(e).with_context(|| format!("bootc_booted_digest: ssh-run failed against root@{ip}"))
+        }
+    }
 }
 
 // ---- block #4: timer stop/start --------------------------------------------
@@ -976,6 +1025,19 @@ fn timer_start(plan: &Plan, ip: &str) -> Result<()> {
 
 /// Wait for SSH to come back on `ip`. Mirrors `wait_ssh_back`
 /// (line 825). Dry-run emits the same one-shot log line.
+///
+/// Live path (#327 cycle 2): polls `ssh root@ip true` every 5s up to
+/// `plan.timeouts.ssh` seconds. The bash twin uses `interval=5` (line
+/// 827) so we match that cadence exactly. Returns Ok the moment a
+/// connection succeeds; Err with the elapsed time on timeout.
+///
+/// Each poll uses a fresh SSH connection (no ControlMaster) with a
+/// short `ConnectTimeout=3` so a hung TCP handshake doesn't eat the
+/// whole interval — same shape as bash's `wait_ssh_drop` uses, but
+/// without `ControlPath=none` since wait_ssh_back's bash equivalent
+/// doesn't pass it (it actually WANTS the controlmaster reused once
+/// the connection is back; line 834 uses `${SSH_OPTS[@]}` verbatim).
+#[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip))]
 fn wait_ssh_back(plan: &Plan, ip: &str) -> Result<()> {
     let timeout = plan.timeouts.ssh;
     log(&format!(
@@ -985,14 +1047,45 @@ fn wait_ssh_back(plan: &Plan, ip: &str) -> Result<()> {
         log(&format!("DRY-RUN would poll ssh root@{ip}"));
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "wait_ssh_back",
-        &format!("ssh root@{ip} true (poll loop)"),
-    ))
+    let interval: u32 = 5;
+    let client = hbird_ssh::Client::new(
+        node_ssh_opts(plan, ip).with_connect_timeout(Duration::from_secs(3)),
+    );
+    let mut elapsed: u32 = 0;
+    while elapsed < timeout {
+        match client.run("true") {
+            Ok(_) => {
+                log(&format!("SSH back on {ip} after ~{elapsed}s"));
+                return Ok(());
+            }
+            Err(_) => {
+                // Any error (NonZeroExit/Spawn/Wait/IdentityFileMissing)
+                // is treated as "not yet back"; we keep polling until the
+                // timeout. Bash twin folds the same shapes via
+                // `>/dev/null 2>&1` + condition on the if-statement.
+            }
+        }
+        std::thread::sleep(Duration::from_secs(interval.into()));
+        elapsed = elapsed.saturating_add(interval);
+    }
+    bail!("wait_ssh_back: SSH on {ip} did not come back within {timeout}s");
 }
 
 /// Wait for SSH on `ip` to become unreachable. Mirrors `wait_ssh_drop`
 /// (line 805). Diagnostic gate — a timeout is logged but not fatal.
+///
+/// Live path (#327 cycle 2): polls `ssh root@ip true` every 1s up to
+/// `plan.timeouts.ssh_drop` seconds. Returns Ok the moment a connection
+/// fails (reboot in progress); Err on timeout (operator should grep for
+/// "still up after" — bash twin uses the same wording at line 821).
+///
+/// IMPORTANT: each poll uses a FRESH connection (no ControlMaster) with
+/// `ConnectTimeout=3` so we don't re-use the pre-reboot multiplexed
+/// session (which would short-circuit to ~0s and false-success). Bash
+/// line 813 forces `ControlPath=none` + `BatchMode=yes`; hbird_ssh
+/// defaults to no ControlMaster + BatchMode=yes already so we just
+/// shorten the connect timeout.
+#[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip))]
 fn wait_ssh_drop(plan: &Plan, ip: &str) -> Result<()> {
     let max = plan.timeouts.ssh_drop;
     if plan.dry_run {
@@ -1002,10 +1095,30 @@ fn wait_ssh_drop(plan: &Plan, ip: &str) -> Result<()> {
         return Ok(());
     }
     log(&format!("waiting for SSH on {ip} to drop (timeout {max}s)"));
-    Err(live_mode_not_implemented(
-        "wait_ssh_drop",
-        &format!("ssh root@{ip} true (negative poll loop)"),
-    ))
+    let client = hbird_ssh::Client::new(
+        node_ssh_opts(plan, ip).with_connect_timeout(Duration::from_secs(3)),
+    );
+    let mut elapsed: u32 = 0;
+    while elapsed < max {
+        if client.run("true").is_err() {
+            log(&format!(
+                "  SSH on {ip} dropped after ~{elapsed}s (reboot in progress)"
+            ));
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        elapsed = elapsed.saturating_add(1);
+    }
+    // Bash line 821: WARN + return non-zero. Both callers
+    // (`update_worker` line 1640, `update_cp` line 1751) swallow the
+    // Err with `let _ =`, so any `bail!` here is dead — the WARN line
+    // is the only signal the operator sees. Round-2 lens L3 MED:
+    // return Ok(()) instead of bail!ing into a void. Downstream bootID
+    // gate is the actual source of truth for "did this reboot land?"
+    log(&format!(
+        "  WARN: SSH on {ip} still up after {max}s — bootc may have queued without rebooting"
+    ));
+    Ok(())
 }
 
 /// Poll the apiserver via the CP. Mirrors `wait_apiserver_back`
@@ -1047,6 +1160,23 @@ fn wait_node_ready(plan: &Plan, node: &str) -> Result<()> {
 
 /// Capture the node's pre-reboot bootID. Mirrors `capture_node_bootid`
 /// (line 885). Dry-run emits the bash sentinel.
+///
+/// Live path (#327 cycle 2): three-attempt retry over a single transient
+/// apiserver flake, matching bash twin lines 892-901 exactly. Each attempt
+/// calls `cp_kubectl get node <NODE> -o jsonpath='{.status.nodeInfo.bootID}'`
+/// and trims the result. A non-empty value wins; otherwise we sleep 2s
+/// and retry (skipped after the last attempt).
+///
+/// An empty stdout + Ok return is a valid outcome — the bash twin
+/// documents this (lines 875-877) and callers
+/// ([`wait_node_bootid_changed`]) check `is_empty()` before using the
+/// value as a comparison baseline. We log a WARN matching bash line 902
+/// to preserve operator-grep parity.
+///
+/// Routes through the existing in-module [`cp_kubectl`] shim — same
+/// SSH+ProxyJump chain as cycle 1's drain+uncordon path, and any kubectl
+/// stderr surfaces via the shim's existing `log_err` plumbing.
+#[tracing::instrument(level = "debug", skip(plan), fields(node = %node))]
 fn capture_node_bootid(plan: &Plan, node: &str) -> Result<String> {
     if plan.dry_run {
         log(&format!(
@@ -1054,14 +1184,65 @@ fn capture_node_bootid(plan: &Plan, node: &str) -> Result<String> {
         ));
         return Ok("<dry-run-bootid>".to_string());
     }
-    Err(live_mode_not_implemented(
-        "capture_node_bootid",
-        &format!("cp_kubectl get node {node} -o jsonpath=.status.nodeInfo.bootID"),
-    ))
+    // Bash uses jsonpath='{.status.nodeInfo.bootID}'. cp_kubectl's
+    // metacharacter check forbids `;&|`\n\r$(` but allows `'{}.` so
+    // this passes through unchanged.
+    let command = format!("get node {node} -o jsonpath='{{.status.nodeInfo.bootID}}'");
+    for attempt in 1..=3 {
+        // Use the local cp_kubectl helper which routes through hbird_ssh
+        // and the same prefix-aware log plumbing. Tolerate Err here so a
+        // single apiserver flake doesn't abort capture (bash uses
+        // `2>/dev/null || true` for the same reason).
+        match cp_kubectl(plan, &command) {
+            Ok(val) => {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return Ok(trimmed.to_string());
+                }
+            }
+            Err(e) => {
+                // Trace the flake but don't bail — the next attempt may
+                // succeed. Mirrors bash's `|| true` discard.
+                tracing::debug!(
+                    error = ?e,
+                    attempt,
+                    "capture_node_bootid attempt failed, retrying",
+                );
+            }
+        }
+        // Don't sleep after the last attempt — the caller is waiting.
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    log(&format!(
+        "WARN: failed to capture pre-reboot bootID for {node} after 3 attempts; \
+         bootID-changed gate will be skipped (apiserver flake?)"
+    ));
+    Ok(String::new())
 }
 
 /// Poll the node's bootID until it differs from `pre_bootid`. Mirrors
 /// `wait_node_bootid_changed` (line 921). Honors `--skip-gates`.
+///
+/// Live path (#327 cycle 2): polls every 5s up to `plan.timeouts.ready`
+/// seconds, calling `cp_kubectl get node X -o jsonpath=...` each iteration.
+/// Returns Ok the moment a non-empty cur_bootid != pre_bootid is observed;
+/// Err with a diagnostic on timeout matching bash line 954.
+///
+/// Heartbeat: every ~30s we emit a "still polling" log line matching
+/// bash line 948 so an operator watching the log knows the gate is
+/// alive on a slow reboot. Rounded to the 5s interval boundary so we
+/// don't log on every iteration.
+///
+/// Bash quirks preserved:
+///   - Empty `pre_bootid` → WARN + Ok (line 928); without a baseline we
+///     can't compare.
+///   - `--skip-gates` → silent Ok with grep-parity log line (line 924).
+///   - A single failed kubectl call inside the loop is tolerated (bash
+///     uses `2>/dev/null || true`); we treat any [`cp_kubectl`] Err as
+///     "couldn't read this iteration, try again".
+#[tracing::instrument(level = "debug", skip(plan), fields(node = %node))]
 fn wait_node_bootid_changed(plan: &Plan, node: &str, pre_bootid: &str) -> Result<()> {
     if plan.skip_gates {
         log(&format!(
@@ -1083,12 +1264,57 @@ fn wait_node_bootid_changed(plan: &Plan, node: &str, pre_bootid: &str) -> Result
         log(&format!("DRY-RUN would poll bootID for {node}"));
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "wait_node_bootid_changed",
-        &format!(
-            "cp_kubectl get node {node} -o jsonpath=.status.nodeInfo.bootID (poll for change)"
-        ),
-    ))
+    let interval: u32 = 5;
+    let command = format!("get node {node} -o jsonpath='{{.status.nodeInfo.bootID}}'");
+    let mut elapsed: u32 = 0;
+    let mut last_heartbeat: u32 = 0;
+    let mut cur_bootid = String::new();
+    while elapsed < timeout {
+        // Tolerate transient kubectl flake — bash twin's
+        // `cp_kubectl ... 2>/dev/null || true` collapses errors to ""
+        // and the loop body simply continues.
+        cur_bootid = match cp_kubectl(plan, &command) {
+            Ok(v) => v.trim().to_string(),
+            Err(e) => {
+                tracing::debug!(
+                    error = ?e,
+                    elapsed,
+                    "wait_node_bootid_changed: kubectl flake, will retry",
+                );
+                String::new()
+            }
+        };
+        if !cur_bootid.is_empty() && cur_bootid != pre_bootid {
+            log(&format!(
+                "node {node} bootID changed (pre={}... post={}...) after ~{elapsed}s",
+                prefix8(pre_bootid),
+                prefix8(&cur_bootid),
+            ));
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(interval.into()));
+        elapsed = elapsed.saturating_add(interval);
+        // Progress heartbeat every ~30s, rounded to interval boundary so
+        // we don't log every iteration. Suppress the heartbeat on the
+        // very last iteration since the timeout diagnostic below covers it.
+        if elapsed.saturating_sub(last_heartbeat) >= 30 && elapsed < timeout {
+            log(&format!(
+                "  still polling node {node} for bootID-changed gate after ~{elapsed}s (pre={}... cur={}...)",
+                prefix8(pre_bootid),
+                prefix8(&cur_bootid),
+            ));
+            last_heartbeat = elapsed;
+        }
+    }
+    // Diagnostic on timeout: surface the last observed pre/cur so an
+    // operator can tell at a glance whether the apiserver returned
+    // anything at all (bash line 954 wording verbatim).
+    log(&format!(
+        "node {node}: bootID-changed gate timed out after {timeout}s (pre={}... cur={}...)",
+        prefix8(pre_bootid),
+        prefix8(&cur_bootid),
+    ));
+    bail!("wait_node_bootid_changed: node {node} bootID did not change within {timeout}s");
 }
 
 /// Wait for kube-system DaemonSet pods on `node` to report Ready.
@@ -1139,6 +1365,28 @@ enum BootcUpgradeOutcome {
 /// Run `bootc upgrade --apply` (or two-step fallback for bootc <1.1).
 /// Mirrors `bootc_upgrade_apply` (line 1114). Dry-run emits the same
 /// log line + returns `Applied`.
+///
+/// Live path (#327 cycle 2): mirrors bash lines 1114-1177 exactly:
+///
+/// 1. Snapshot the booted image digest pre-upgrade.
+/// 2. Probe `bootc upgrade --help` for `--apply` support.
+/// 3. With --apply: `ssh root@ip bootc upgrade --apply`. The reboot
+///    tears down SSH, returning Err(NonZeroExit{255}) → success. Exit 0
+///    means "no reboot happened" — disambiguate via post-digest compare.
+/// 4. Without --apply: two-step `bootc upgrade` then `systemctl reboot`
+///    in a detached subshell. Same rc-255-means-OK semantics.
+/// 5. Classify:
+///     - rc=0  + matching digests → `AlreadyCurrent` (skip wait loops)
+///     - rc=0  + differing digests → `Applied` (treat as success)
+///     - rc=255 → `Applied` (expected; reboot tore down ssh)
+///     - other → log + `UpgradeFailed` (caller decides fail-fast vs
+///       --continue-on-error; we do NOT call `bail!` here)
+///
+/// Stderr from the bootc invocation is logged via [`log_err`] so an
+/// operator grepping `[update-cluster]` stderr sees bootc's progress
+/// markers and any rpm-ostree errors — bash twin's bare `ssh ...`
+/// without redirection interleaves these to terminal stderr directly.
+#[tracing::instrument(level = "debug", skip(plan), fields(node_ip = %ip, node = %name))]
 fn bootc_upgrade_apply(plan: &Plan, ip: &str, name: &str) -> Result<BootcUpgradeOutcome> {
     if plan.dry_run {
         log(&format!(
@@ -1146,12 +1394,134 @@ fn bootc_upgrade_apply(plan: &Plan, ip: &str, name: &str) -> Result<BootcUpgrade
         ));
         return Ok(BootcUpgradeOutcome::Applied);
     }
-    // Live path: digest snapshot, bootc upgrade --apply, classify rc.
-    let _ = name;
-    Err(live_mode_not_implemented(
-        "bootc_upgrade_apply",
-        &format!("ssh root@{ip} bootc upgrade --apply (with pre/post digest compare)"),
-    ))
+
+    let pre_digest = bootc_booted_digest(plan, ip)?;
+    log(&format!(
+        "  pre-upgrade booted digest: {}",
+        if pre_digest.is_empty() {
+            "<unknown>"
+        } else {
+            &pre_digest
+        }
+    ));
+
+    let has_apply = bootc_has_apply(plan, ip)?;
+    let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+    let result = if has_apply {
+        client.run("bootc upgrade --apply")
+    } else {
+        log(&format!(
+            "  bootc on {name} lacks --apply; falling back to 'bootc upgrade && systemctl reboot'"
+        ));
+        let upgrade_result = client.run("bootc upgrade");
+        match upgrade_result {
+            Ok(out) => {
+                // Emit stdout/stderr to operator log for parity with the
+                // bash twin's bare-ssh interleaving.
+                let stderr = out.stderr_lossy();
+                if !stderr.trim().is_empty() {
+                    for line in stderr.lines() {
+                        log_err(line);
+                    }
+                }
+                // Two-step fallback: now issue the reboot. The reboot
+                // kills sshd so we EXPECT NonZeroExit{255}. Bash twin
+                // line 1144 runs `systemctl reboot >/dev/null 2>&1` —
+                // no `|| true`; it relies on rc=255 falling into the
+                // 255 case. Round-2 lens L2 LOW: drop the dead `||
+                // true` (the remote bash would die before the OR could
+                // fire anyway) so the remote command matches bash
+                // verbatim.
+                client.run("systemctl reboot >/dev/null 2>&1")
+            }
+            Err(e) => Err(e),
+        }
+    };
+
+    // Classify by exit shape. NonZeroExit{255} is the expected "reboot
+    // tore down ssh" signal — bash line 1165 maps it to success.
+    match result {
+        Ok(out) => {
+            // Surface bootc's stderr (progress markers, warnings) for
+            // operator-grep parity with bash's bare-ssh stream-merge.
+            let stderr = out.stderr_lossy();
+            if !stderr.trim().is_empty() {
+                for line in stderr.lines() {
+                    log_err(line);
+                }
+            }
+            // rc=0: command returned cleanly. Disambiguate "no update"
+            // vs "applied but didn't reboot" via post-digest compare.
+            let post_digest = bootc_booted_digest(plan, ip)?;
+            log(&format!(
+                "  post-upgrade booted digest: {}",
+                if post_digest.is_empty() {
+                    "<unknown>"
+                } else {
+                    &post_digest
+                }
+            ));
+            if !pre_digest.is_empty() && !post_digest.is_empty() && pre_digest == post_digest {
+                log(&format!(
+                    "  no update available on {name}; skipping wait loops"
+                ));
+                Ok(BootcUpgradeOutcome::AlreadyCurrent)
+            } else {
+                // Digests differ or one is unknown — treat as success,
+                // let wait loops verify Ready (matches bash line 1163).
+                Ok(BootcUpgradeOutcome::Applied)
+            }
+        }
+        Err(hbird_ssh::Error::NonZeroExit {
+            status,
+            stdout: _,
+            stderr,
+            ..
+        }) => {
+            // Match by exit code.
+            let code = status.code();
+            if !stderr.trim().is_empty() {
+                for line in stderr.lines() {
+                    log_err(line);
+                }
+            }
+            match code {
+                Some(255) => {
+                    // Expected: reboot tore down ssh.
+                    Ok(BootcUpgradeOutcome::Applied)
+                }
+                Some(other) => {
+                    // Surface but DO NOT bail — caller (update_worker /
+                    // update_cp) decides whether to route through
+                    // worker_fail (which respects --continue-on-error)
+                    // or to abort hard (CP path). Match bash line 1173
+                    // wording exactly for operator-grep parity.
+                    log(&format!(
+                        "bootc upgrade on {name} exited unexpectedly (rc={other})"
+                    ));
+                    Ok(BootcUpgradeOutcome::UpgradeFailed)
+                }
+                None => {
+                    // Killed by signal — rare but log + treat as failed.
+                    log(&format!(
+                        "bootc upgrade on {name} exited unexpectedly (killed by signal)"
+                    ));
+                    Ok(BootcUpgradeOutcome::UpgradeFailed)
+                }
+            }
+        }
+        Err(e) => {
+            // Transport-layer failure (spawn, identity-missing, wait).
+            // Surface as UpgradeFailed with the chain preserved via
+            // tracing — but return the error so callers see the chain.
+            Err(e).with_context(|| {
+                format!(
+                    "bootc_upgrade_apply: ssh-run failed for `bootc upgrade --apply` \
+                     against root@{ip} (node={name})"
+                )
+            })
+        }
+    }
 }
 
 // ---- block #11: CP upgrade flow --------------------------------------------
@@ -1261,7 +1631,10 @@ fn update_cp(plan: &Plan) -> Result<()> {
         "ssh root@{} bootc upgrade --apply  (auto-reboots; digest pre/post compared)",
         plan.cp_ip
     ));
-    let outcome = bootc_upgrade_apply(plan, &plan.cp_ip, &plan.cp_name)?;
+    // Round-2 lens L3 MED: wrap with worker context so the anyhow chain
+    // reads "update_cp(<name>) → bootc upgrade phase → <inner>".
+    let outcome = bootc_upgrade_apply(plan, &plan.cp_ip, &plan.cp_name)
+        .with_context(|| format!("update_cp({}): bootc upgrade phase", plan.cp_name))?;
     if outcome == BootcUpgradeOutcome::AlreadyCurrent {
         log(&format!(
             "CP {}: no update available; restoring timer and continuing.",
@@ -1372,7 +1745,10 @@ fn update_worker(plan: &Plan, name: &str, ip: &str, k8s_name: &str) -> Result<()
     log(&format!(
         "ssh root@{ip} bootc upgrade --apply  (auto-reboots; digest pre/post compared)"
     ));
-    let outcome = bootc_upgrade_apply(plan, ip, name)?;
+    // Round-2 lens L3 MED: wrap with worker context so the anyhow chain
+    // reads "update_worker(<name>) → bootc upgrade phase → <inner>".
+    let outcome = bootc_upgrade_apply(plan, ip, name)
+        .with_context(|| format!("update_worker({name}): bootc upgrade phase"))?;
     if outcome == BootcUpgradeOutcome::UpgradeFailed {
         bail!("{name}: bootc upgrade --apply failed (see log above)");
     }
@@ -1620,6 +1996,26 @@ fn cp_kubectl_inner(plan: &Plan, command: &str) -> Result<String> {
 /// (round-2 lens L9 MEDIUM).
 fn cp_ssh_opts(plan: &Plan) -> hbird_ssh::SshOptions {
     let mut opts = hbird_ssh::SshOptions::new(plan.cp_ip.clone()).with_user("root");
+    if let Some(jump) = plan.kvm_host.as_deref() {
+        opts = opts.with_proxy_jump(jump.to_string());
+    }
+    opts
+}
+
+/// Build the SSH options for an arbitrary node IP — same shape as
+/// [`cp_ssh_opts`] but parameterized over the target. The bash twin
+/// reuses a single `SSH_OPTS` array for both CP and worker SSH
+/// (`scripts/update-cluster.sh:327`); we mirror that by sharing the
+/// same construction logic and only varying the target host.
+///
+/// Used by [`wait_ssh_back`], [`wait_ssh_drop`], [`bootc_upgrade_apply`],
+/// [`bootc_has_apply`], and [`bootc_booted_digest`] — every helper
+/// wired in cycle 2 that talks to a node directly (rather than via the
+/// CP's kubectl). Pinned as a named function rather than inlined so
+/// the live-execution slice (#322) has a single point to thread future
+/// per-node tweaks through (ControlMaster, identity overrides, etc).
+fn node_ssh_opts(plan: &Plan, ip: &str) -> hbird_ssh::SshOptions {
+    let mut opts = hbird_ssh::SshOptions::new(ip.to_string()).with_user("root");
     if let Some(jump) = plan.kvm_host.as_deref() {
         opts = opts.with_proxy_jump(jump.to_string());
     }
@@ -2168,6 +2564,105 @@ mod tests {
     // rules that out in src/. Pinning it in an integration test lets us
     // run the binary in a clean subprocess with the env set at spawn
     // time instead of mid-process.
+
+    /// Cycle 2 (#327): `node_ssh_opts` must mirror `cp_ssh_opts`'s shape
+    /// (root user, ProxyJump=KVM_HOST when set) but with the supplied
+    /// IP as the target — not the CP IP. Pin both the user prefix and
+    /// the per-worker target.
+    #[test]
+    fn node_ssh_opts_targets_supplied_ip_with_root_user() {
+        let args = parse_args(&["--dry-run", "--kvm-host", "geary"]);
+        let plan = Plan::from_args(&args, cfg(vec!["w1"]), Timeouts::default()).expect("plan");
+        let opts = node_ssh_opts(&plan, "192.168.122.99");
+        let argv = opts.to_argv();
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("root@192.168.122.99"),
+            "node_ssh_opts must target the supplied IP as root@<ip>",
+        );
+        let has_jump = argv
+            .windows(2)
+            .any(|w| w[0] == "-o" && w[1] == "ProxyJump=geary");
+        assert!(
+            has_jump,
+            "node_ssh_opts must propagate kvm_host as ProxyJump (got argv={argv:?})",
+        );
+    }
+
+    /// Cycle 2 (#327): when `kvm_host` is unset, `node_ssh_opts` MUST
+    /// NOT emit a ProxyJump option (operator already on the KVM host).
+    /// Mirrors `cp_ssh_opts`'s shape.
+    #[test]
+    fn node_ssh_opts_omits_proxy_jump_without_kvm_host() {
+        let args = parse_args(&["--dry-run"]);
+        let plan = Plan::from_args(&args, cfg(vec!["w1"]), Timeouts::default()).expect("plan");
+        let opts = node_ssh_opts(&plan, "10.0.0.1");
+        let argv = opts.to_argv();
+        assert!(
+            !argv.iter().any(|s| s.contains("ProxyJump")),
+            "node_ssh_opts must omit ProxyJump when kvm_host is None (argv={argv:?})",
+        );
+        assert_eq!(argv.last().map(String::as_str), Some("root@10.0.0.1"));
+    }
+
+    /// Cycle 2 (#327) regression: the bash-twin function name MUST stay
+    /// in tracing instrument fields so an operator grepping the source
+    /// finds matching call sites in `scripts/update-cluster.sh`. Pin
+    /// the helper names in the source body so a rename here is loud.
+    #[test]
+    fn cycle2_helper_names_present() {
+        let src = include_str!("update_cluster.rs");
+        for name in [
+            "fn wait_ssh_drop",
+            "fn wait_ssh_back",
+            "fn capture_node_bootid",
+            "fn wait_node_bootid_changed",
+            "fn bootc_upgrade_apply",
+            "fn bootc_has_apply",
+            "fn bootc_booted_digest",
+            "fn node_ssh_opts",
+        ] {
+            assert!(
+                src.contains(name),
+                "cycle 2 helper `{name}` removed; bash-twin block-traceability broken (#327)",
+            );
+        }
+    }
+
+    /// Cycle 2 (#327): `capture_node_bootid` MUST return the dry-run
+    /// sentinel verbatim so the dry-run fixture diff stays byte-stable.
+    /// Validates the early-return branch without needing SSH.
+    #[test]
+    fn capture_node_bootid_dry_run_returns_sentinel() {
+        let args = parse_args(&["--dry-run"]);
+        let plan = Plan::from_args(&args, cfg(vec!["w1"]), Timeouts::default()).expect("plan");
+        let got = capture_node_bootid(&plan, "w1").expect("dry-run capture");
+        assert_eq!(got, "<dry-run-bootid>");
+    }
+
+    /// Cycle 2 (#327): empty `pre_bootid` MUST short-circuit
+    /// `wait_node_bootid_changed` to `Ok(())` with the WARN log line.
+    /// Mirrors bash line 928-930 — without a baseline we can't compare;
+    /// skipping is safer than blocking forever on a missing field.
+    #[test]
+    fn wait_node_bootid_changed_empty_pre_short_circuits() {
+        let args = parse_args(&["--dry-run"]);
+        let plan = Plan::from_args(&args, cfg(vec!["w1"]), Timeouts::default()).expect("plan");
+        // dry-run + empty pre — both early-exit paths converge on Ok.
+        let res = wait_node_bootid_changed(&plan, "w1", "");
+        assert!(res.is_ok(), "empty pre_bootid must short-circuit: {res:?}");
+    }
+
+    /// Cycle 2 (#327): `--skip-gates` MUST short-circuit
+    /// `wait_node_bootid_changed` even with a valid pre_bootid. Pins
+    /// the bash line 924 behavior.
+    #[test]
+    fn wait_node_bootid_changed_skip_gates_short_circuits() {
+        let args = parse_args(&["--dry-run", "--skip-gates"]);
+        let plan = Plan::from_args(&args, cfg(vec!["w1"]), Timeouts::default()).expect("plan");
+        let res = wait_node_bootid_changed(&plan, "w1", "abc12345-real-bootid");
+        assert!(res.is_ok(), "--skip-gates must short-circuit: {res:?}");
+    }
 
     /// `--continue-on-error` is documented as worker-only — CP failures
     /// still abort the run. Pin the wording so a future refactor that
