@@ -153,7 +153,12 @@ else
     echo "ERROR: cannot read $k8s_init to extract Cilium pin" >&2
     exit 2
   }
-  cilium_version="$(extract_cilium_pin "$k8s_init")"
+  # Important: with `set -o pipefail`, an empty `grep` match inside the
+  # pipeline returns non-zero, which `$(...)` then propagates and aborts
+  # the script with a bare exit-1 BEFORE we reach the "could not extract"
+  # diagnostic below. Capture with `|| true` and check emptiness so the
+  # ERROR path with exit 2 is actually reachable on a malformed file.
+  cilium_version="$(extract_cilium_pin "$k8s_init" || true)"
 fi
 
 if [ -n "$K8S_OVERRIDE" ]; then
@@ -163,7 +168,8 @@ else
     echo "ERROR: cannot read $containerfile to extract K8S_VERSION pin" >&2
     exit 2
   }
-  k8s_minor="$(extract_k8s_pin "$containerfile")"
+  # See pipefail note above; same reasoning applies here.
+  k8s_minor="$(extract_k8s_pin "$containerfile" || true)"
 fi
 
 if [ -z "${cilium_version:-}" ]; then
@@ -190,22 +196,33 @@ cilium_minor="$(printf '%s\n' "$cilium_version" | sed -E 's/^([0-9]+\.[0-9]+).*/
 # patch-level fixes against the same K8s window; a 1.16.x patch bump
 # does not change the K8s compat window. So checking minor-vs-minor is
 # the right granularity.
+#
+# MATRIX_REVIEWED_AS_OF: 2026-05-27
+# Freshness signal — update this date when a human re-checks the per-row
+# upstream URLs (trailing comments) against the live docs. A long stale
+# date is a hint to re-validate before relying on the verdict.
 cilium_compat_matrix() {
+  # Per-row source URL is appended as a trailing `#` comment so the
+  # awk consumer below stays correct (awk's `-F=` split keeps the
+  # comment glued to the value; the membership check iterates only
+  # tokens that look like K8s minors and the `#…` token is ignored).
   cat <<'EOF'
-1.14=1.19 1.20 1.21 1.22 1.23 1.24 1.25 1.26 1.27
-1.15=1.26 1.27 1.28 1.29
-1.16=1.27 1.28 1.29 1.30
-1.17=1.29 1.30 1.31 1.32
-1.18=1.30 1.31 1.32 1.33
+1.14=1.19 1.20 1.21 1.22 1.23 1.24 1.25 1.26 1.27  # https://docs.cilium.io/en/v1.14/network/kubernetes/compatibility/
+1.15=1.26 1.27 1.28 1.29                            # https://docs.cilium.io/en/v1.15/network/kubernetes/compatibility/
+1.16=1.27 1.28 1.29 1.30                            # https://docs.cilium.io/en/v1.16/network/kubernetes/compatibility/
+1.17=1.29 1.30 1.31 1.32                            # https://docs.cilium.io/en/v1.17/network/kubernetes/compatibility/
+1.18=1.30 1.31 1.32 1.33                            # https://docs.cilium.io/en/v1.18/network/kubernetes/compatibility/
 EOF
 }
 
 # Look up the supported K8s minors for a given Cilium minor; prints them
 # space-separated, or empty if the Cilium minor is unknown.
+# Strips the trailing `# <url>` source-comment so callers (printing or
+# iterating) see only the K8s minors.
 lookup_supported_k8s() {
   local cilium_m="$1"
   cilium_compat_matrix \
-    | awk -F= -v c="$cilium_m" '$1 == c { print $2; exit }'
+    | awk -F= -v c="$cilium_m" '$1 == c { sub(/[[:space:]]*#.*/, "", $2); print $2; exit }'
 }
 
 # Membership test: is $k8s_minor in the space-separated $supported list?
@@ -241,11 +258,42 @@ if k8s_in_supported "$k8s_minor" "$supported"; then
 fi
 
 # Mismatch — primary case the script exists for.
+#
+# Direction-aware remediation: if the operator's K8s minor is BELOW the
+# lowest supported minor for this Cilium row, "bump Cilium" is backwards
+# advice — they should downgrade Cilium or upgrade K8s. Compute the
+# min/max of the supported row and tailor the hint.
+sup_min=""
+sup_max=""
+for m in $supported; do
+  if [ -z "$sup_min" ] || awk -v a="$m" -v b="$sup_min" 'BEGIN{exit !(a+0 < b+0 || ((a+0)==(b+0) && a<b))}'; then
+    sup_min="$m"
+  fi
+  if [ -z "$sup_max" ] || awk -v a="$m" -v b="$sup_max" 'BEGIN{exit !(a+0 > b+0 || ((a+0)==(b+0) && a>b))}'; then
+    sup_max="$m"
+  fi
+done
+
+# Compare k8s_minor against sup_min / sup_max as decimal pairs (X.Y).
+# awk is portable, handles 1.9 vs 1.10 correctly via split on '.'.
+below_range=$(awk -v k="$k8s_minor" -v lo="$sup_min" 'BEGIN{
+  split(k, kp, "."); split(lo, lp, ".");
+  if (kp[1]+0 < lp[1]+0) print 1;
+  else if (kp[1]+0 == lp[1]+0 && kp[2]+0 < lp[2]+0) print 1;
+  else print 0;
+}')
+
 {
   echo "WARN: Cilium ${cilium_version} does NOT list K8s ${k8s_minor} as a supported minor."
   echo "      Cilium ${cilium_minor}.x supported K8s minors: ${supported}"
-  echo "      Bump Cilium first (see docs/cilium-migration.md) OR pick a K8s minor in range."
+  if [ "$below_range" = "1" ]; then
+    echo "      K8s ${k8s_minor} is BELOW Cilium ${cilium_minor}.x's window (lowest: ${sup_min})."
+    echo "      Downgrade Cilium to a minor that supports K8s ${k8s_minor}, OR upgrade K8s into range."
+  else
+    echo "      Bump Cilium first (see docs/cilium-migration.md) OR pick a K8s minor in range."
+  fi
   echo "      Upstream matrix: https://docs.cilium.io/en/v${cilium_minor}/network/kubernetes/compatibility/"
+  echo "      See also: docs/k8s-version-upgrade.md \"Pre-flight checklist\"."
 } >&2
 
 if [ "$STRICT" -eq 1 ]; then

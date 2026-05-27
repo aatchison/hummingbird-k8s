@@ -215,6 +215,9 @@ the `make` command line for the targets that use them.
 | `CONTEXT`           | `hummingbird-$CP_NAME` (`export-argocd`); `$CP_NAME` (`get-kubeconfig`) | `export-argocd`, `get-kubeconfig` (override the kubeconfig context name) |
 | `FORCE`             | unset                         | `export-argocd`, `get-kubeconfig` (when `=1`, overwrite an existing `$OUTPUT` instead of erroring) |
 | `PROXY_JUMP`        | `$KVM_HOST` when set (`export-argocd`/`get-kubeconfig`); else empty | `export-argocd`, `get-kubeconfig` (SSH `ProxyJump` host inserted into the kubeconfig so kubectl reaches an internal CP through the KVM host) |
+| `CILIUM`            | unset (defaults to in-repo pin) | `check-cilium-k8s-compat` (override the Cilium version, e.g. `CILIUM=1.17.0`, for what-if checks against the embedded matrix; passes to the script as `--cilium=X.Y.Z`). |
+| `K8S`               | unset (defaults to in-repo pin) | `check-cilium-k8s-compat` (override the K8s minor, e.g. `K8S=v1.32` or `K8S=1.32`, for what-if checks; passes to the script as `--k8s=vX.Y`). |
+| `STRICT`            | unset                         | `check-cilium-k8s-compat` (when `=1`, escalates a Cilium/K8s mismatch from a stderr WARN+exit-0 to exit-1 — wire this form into pre-merge gates that should hard-fail on incompatibility). |
 
 ### Honored env vars (recipe-supplied or exported)
 
@@ -314,5 +317,14 @@ The embedded matrix mirrors the per-minor pages at
 <https://docs.cilium.io/en/v1.16/network/kubernetes/compatibility/>
 (swap the `v1.16` segment to consult another release). Refresh it in
 `scripts/check-cilium-k8s-compat.sh` when bumping the Cilium pin past
-the highest known minor; `tests/scripts/check-cilium-k8s-compat.bats`
-pins specific cells so an accidental row flip is loud.
+the highest known minor, **or when upstream adds K8s minors to an
+existing Cilium row** (check the per-minor page even between Cilium
+bumps — Cilium occasionally back-fills K8s support in patch releases);
+`tests/scripts/check-cilium-k8s-compat.bats` pins specific cells so an
+accidental row flip is loud.
+
+See also the [`k8s-version-upgrade.md` pre-flight
+checklist](k8s-version-upgrade.md#pre-flight-checklist) — this target
+codifies the "check the Cilium compatibility matrix" bullet there, so
+the operator running the upgrade gets the same answer the docs prescribe
+without having to read the upstream matrix by hand.

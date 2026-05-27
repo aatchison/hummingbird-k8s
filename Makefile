@@ -404,7 +404,7 @@ BATS_IMAGE := docker.io/bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556ede
 test-lib: ## Run bats unit tests for lib/build-common.sh
 	podman run --rm -v "$(CURDIR):/repo:Z" -w /repo $(BATS_IMAGE) tests/lib/
 
-test-scripts: ## Run bats unit tests for scripts/ (update-cluster.sh, export-argocd.sh)
+test-scripts: ## Run bats unit tests for scripts/ (scripts/*.sh suites)
 	podman run --rm -v "$(CURDIR):/repo:Z" -w /repo $(BATS_IMAGE) tests/scripts/
 
 test-all: test-lib test-scripts ## Run all bats unit suites (lib + scripts)
