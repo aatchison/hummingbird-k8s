@@ -1,0 +1,110 @@
+# Phase 3 cycle: `hbird export-argocd` parity vs bash twin
+#
+# Captured 2026-05-27 against the live geary cluster (hbird-cp1).
+# This is the most-complex of the four Phase 3 cycles; bash + Rust
+# both fetch /etc/kubernetes/admin.conf via SSH+sudo and rewrite the
+# server/cluster/context/user names. Expect INTENTIONAL divergence
+# in the log lines below — Rust ships the post-#306/#307 fixed
+# shape; bash retains the buggy behavior until #306 + #307 land.
+#
+# bash side:
+#   CONFIG=/tmp/cluster-live.conf bash scripts/export-argocd.sh \
+#     --output /tmp/bash-make-argocd.yaml --force
+# rust side:
+#   hbird export-argocd --config /tmp/cluster-live.conf \
+#     --output /tmp/rust-make-argocd.yaml --force
+#
+# Live config (/tmp/cluster-live.conf):
+#   CP_NAME=hbird-cp1
+#   SSH_PUBKEY_FILE=/home/aatchison/.ssh/id_ed25519.pub
+#   KVM_HOST=aatchison@geary
+#   CP_IP=192.168.122.212
+
+=== bash side log (buggy per #306 / #307 — see notes) ===
+[export-argocd] fetching /etc/kubernetes/admin.conf from root@192.168.122.212
+[export-argocd] rewriting server URL via sed -> https://192.168.122.212:6443
+[export-argocd] rewriting cluster/context/user names via sed -> hummingbird-hbird-cp1
+[export-argocd] kubeconfig written to /tmp/bash-make-argocd.yaml
+[export-argocd] register with:  argocd cluster add hummingbird-hbird-cp1 --kubeconfig /tmp/bash-make-argocd.yaml
+[export-argocd] sanity check:   KUBECONFIG=/tmp/bash-make-argocd.yaml kubectl get nodes
+
+=== rust side log (post-#306/#307 fixed shape) ===
+[export-argocd] fetching /etc/kubernetes/admin.conf from root@192.168.122.212
+[export-argocd] kubeconfig written to /tmp/rust-make-argocd.yaml
+[export-argocd] register with:  argocd cluster add hummingbird-hbird-cp1 --kubeconfig /tmp/rust-make-argocd.yaml
+[export-argocd] sanity check:   KUBECONFIG=/tmp/rust-make-argocd.yaml kubectl get nodes
+[export-argocd] note: ProxyJump used for fetch — direct 'kubectl get nodes' from
+[export-argocd]       this workstation may fail (apiserver isn't reachable here);
+[export-argocd]       that is expected and does not invalidate the kubeconfig.
+ INFO hbird{subcommand="export-argocd"}: close
+
+=== diff: INTENTIONAL DIVERGENCE — Rust ships fixed behavior; bash fix tracked by #306/#307 ===
+1. Log lines that ONLY appear in bash:
+   "rewriting server URL via sed -> ..."
+   "rewriting cluster/context/user names via sed -> ..."
+   Rationale: bash twin emits which-path (yq vs sed) it took for
+   the rewrite step. Rust uses a pure-Rust line-anchored rewrite
+   (no external yq/sed) so there's no path-selection to log. Same
+   final output — see kubeconfig diff below.
+2. Log lines that ONLY appear in Rust:
+   "note: ProxyJump used for fetch — direct 'kubectl get nodes' ..."
+   "INFO hbird{subcommand=...}: close"
+   Rationale: Rust applies ProxyJump correctly (post-#306 fix). The
+   note line is conditional on ProxyJump being active. The INFO
+   line is the tracing-subscriber CLOSE event (#326; stderr-only,
+   silent at default RUST_LOG=info, on for=debug).
+3. (Hypothetical, not observed here) — On a workstation where the
+   #307 OSC pollution actually fires, the bash kubeconfig would
+   carry an ESC]3008;...ESC\\ prefix and the bash `grep -q
+   '^apiVersion:'` sanity check would fail. The Rust path uses
+   BatchMode=yes (no TTY) so no escape is ever emitted; the Rust
+   sanity check is pinned by
+   `commands::export_argocd::tests::sanity_check_rejects_osc_prefix`.
+
+=== kubeconfig content diff (bash YAML vs Rust YAML) ===
+EMPTY DIFF — both produce byte-for-byte identical YAML (verified by
+`diff /tmp/bash-make-argocd.yaml /tmp/rust-make-argocd.yaml`):
+- Same `apiVersion: v1`
+- Same `kind: Config`
+- Same `server: https://192.168.122.212:6443`
+- Same cluster/context/user names rewritten to `hummingbird-hbird-cp1`
+- Same `current-context: hummingbird-hbird-cp1`
+- Same base64 cert + key blobs (`certificate-authority-data`,
+  `client-certificate-data`, `client-key-data`) — sanity proof that
+  the line-anchored sed/Rust rewrite leaves base64 substrings
+  containing "kubernetes" untouched.
+
+=== Why bash didn't exhibit #306 on this workstation ===
+The bash twin's `PROXY_JUMP="${KVM_HOST:-}"` defaults to empty when
+KVM_HOST is not exported (only in CONFIG). On this workstation
+(judah), the libvirt NAT subnet 192.168.122.0/24 IS directly
+routable, so SSH to `root@192.168.122.212` works WITHOUT ProxyJump.
+On a typical workstation operator's machine, the subnet would not
+be routable, the bash twin would hang or fail, and the operator
+would have to manually `export KVM_HOST=geary` before each invocation.
+The Rust path resolves `KVM_HOST` from CONFIG after sourcing,
+applying ProxyJump correctly without operator gymnastics.
+
+=== Why bash didn't exhibit #307 on this workstation ===
+Modern sudo only emits the OSC session-start escape under specific
+PTY+sudoers combinations. The CP's sudo configuration here did not
+trigger it. On a regression where it does (e.g. a sudo upgrade), the
+bash kubeconfig would fail the `grep -q '^apiVersion:'` sanity check
+and the operator would see a confusing "fetched file does not look
+like a kubeconfig" diagnostic. The Rust path uses BatchMode=yes (no
+TTY) so the escape sequence is never emitted regardless of sudo
+version.
+
+=== Once #306 and #307 land in bash, the diff above goes empty ===
+At that point the bash twin will:
+- Apply ProxyJump from CONFIG correctly (no manual export needed).
+- Use non-TTY SSH so sudo never emits OSC escapes.
+The log-line cosmetic differences (yq/sed banner, INFO close span)
+will remain — those are byte-for-byte parity discussions tracked
+under broader logging-shape parity (out of scope here).
+
+=== Pinned by ===
+- `tests/cycle_export_argocd_live.rs` (env-gated by HBIRD_LIVE_TEST=1)
+  exercises the SSH+fetch+rewrite+0600-write round-trip.
+- `commands::export_argocd::tests::*` unit-pins the rewrite logic +
+  the OSC-rejection sanity check + context-name validation.

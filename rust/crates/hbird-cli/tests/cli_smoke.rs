@@ -208,45 +208,101 @@ fn verify_all_no_cluster_surfaces_bash_resolve_cp_ip_diagnostic() {
     );
 }
 
+/// #288 landed the real get-kubeconfig body. `/dev/null` is no longer
+/// a valid stand-in; the config parser will reject it. Pin that the
+/// failure mode is config-parse (CP_NAME missing) rather than a stub.
 #[test]
-fn get_kubeconfig_returns_not_yet_implemented() {
+fn get_kubeconfig_against_empty_config_fails_at_config_parse() {
     let (status, _stdout, stderr) = run(&["get-kubeconfig", "--config", "/dev/null"]);
-    assert!(!status.success());
+    assert!(!status.success(), "get-kubeconfig with /dev/null exited 0");
+    let stub_marker = stderr.contains("not yet implemented") && stderr.contains("#288");
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#288"),
-        "get-kubeconfig stub error missing tracker. stderr:\n{stderr}"
+        !stub_marker,
+        "get-kubeconfig should not be a stub anymore. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CP_NAME")
+            || stderr.contains("SSH_PUBKEY_FILE")
+            || stderr.contains("required")
+            || stderr.contains("missing"),
+        "get-kubeconfig should fail at config-parse on empty config. stderr:\n{stderr}"
     );
 }
 
+/// Same shape for `export-argocd`: real body landed in #288, the
+/// failure should be a config-parse error rather than a stub.
 #[test]
-fn export_argocd_returns_not_yet_implemented() {
+fn export_argocd_against_empty_config_fails_at_config_parse() {
     let (status, _stdout, stderr) = run(&["export-argocd", "--config", "/dev/null"]);
-    assert!(!status.success());
+    assert!(!status.success(), "export-argocd with /dev/null exited 0");
+    let stub_marker = stderr.contains("not yet implemented") && stderr.contains("#288");
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#288"),
-        "export-argocd stub error missing tracker. stderr:\n{stderr}"
+        !stub_marker,
+        "export-argocd should not be a stub anymore. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CP_NAME")
+            || stderr.contains("SSH_PUBKEY_FILE")
+            || stderr.contains("required")
+            || stderr.contains("missing"),
+        "export-argocd should fail at config-parse on empty config. stderr:\n{stderr}"
     );
 }
 
+/// `nodes` with no config / env returns a missing-CP_NAME error
+/// (real body landed in #288). The failure is at target-resolution,
+/// not the old not-yet-implemented stub.
 #[test]
-fn nodes_returns_not_yet_implemented() {
-    let (status, _stdout, stderr) = run(&["nodes"]);
-    assert!(!status.success());
+fn nodes_without_config_or_env_fails_at_resolve() {
+    // Scrub CONFIG/CP_NAME/CP_IP/KVM_HOST so env doesn't satisfy the
+    // resolver. The fmt-subscriber init in main() is idempotent so the
+    // env-clean doesn't affect tracing.
+    let out = Command::new(hbird_bin())
+        .args(["nodes"])
+        .env_remove("CONFIG")
+        .env_remove("CP_NAME")
+        .env_remove("CP_IP")
+        .env_remove("KVM_HOST")
+        .output()
+        .expect("failed to spawn hbird binary");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "nodes with no config exited 0");
+    let stub_marker = stderr.contains("not yet implemented") && stderr.contains("#288");
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#288"),
-        "nodes stub error missing tracker. stderr:\n{stderr}"
+        !stub_marker,
+        "nodes should not be a stub anymore. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CP_NAME") || stderr.contains("CP_IP"),
+        "nodes should fail at target-resolve with a CP_NAME/CP_IP \
+         diagnostic. stderr:\n{stderr}"
     );
 }
 
+/// `kubectl` with positional args reaches target-resolve, fails on
+/// missing CP_NAME/CP_IP (real body landed in #288). Confirms variadic
+/// args still parse cleanly through the new dispatch.
 #[test]
-fn kubectl_passthrough_returns_not_yet_implemented() {
-    // The pass-through accepts arbitrary args — make sure clap doesn't
-    // intercept them and they pile into args[].
-    let (status, _stdout, stderr) = run(&["kubectl", "get", "pods", "-A"]);
-    assert!(!status.success());
+fn kubectl_passthrough_resolves_targets_and_fails_at_cp_lookup() {
+    let out = Command::new(hbird_bin())
+        .args(["kubectl", "get", "pods", "-A"])
+        .env_remove("CONFIG")
+        .env_remove("CP_NAME")
+        .env_remove("CP_IP")
+        .env_remove("KVM_HOST")
+        .output()
+        .expect("failed to spawn hbird binary");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success());
+    let stub_marker = stderr.contains("not yet implemented") && stderr.contains("#288");
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#288"),
-        "kubectl stub error missing tracker. stderr:\n{stderr}"
+        !stub_marker,
+        "kubectl should not be a stub anymore. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CP_NAME") || stderr.contains("CP_IP"),
+        "kubectl should fail at target-resolve with a CP_NAME/CP_IP \
+         diagnostic. stderr:\n{stderr}"
     );
 }
 
@@ -299,19 +355,28 @@ fn destroy_cluster_missing_config_fails_to_parse() {
     );
 }
 
-/// `kubectl` is the only subcommand with variadic pass-through (the
-/// rest take fixed flags). Confirm the variadic args actually land in
-/// the parsed `Vec<String>` by checking the stub's args-echo.
+/// `kubectl` with NO positional args is rejected by our own dispatch
+/// (real body landed in #288). The bash twin's `kubectl-k8s.sh` runs
+/// `kubectl` with no args (which prints its own help); we surface a
+/// clearer error because the SSH spawn is non-trivial. The variadic
+/// shape is verified by [`kubectl_passthrough_resolves_targets_and_fails_at_cp_lookup`]
+/// — if the variadic args ever stopped reaching `args.join(" ")`,
+/// that test would fail at target-resolve before kubectl ever runs.
 #[test]
-fn kubectl_variadic_capture_echoes_args() {
-    let (status, _stdout, stderr) = run(&["kubectl", "get", "pods", "-A"]);
-    assert!(!status.success());
-    // The stub now echoes `args=["get", "pods", "-A"]` — pin the
-    // observable substring so a future change to the echo format that
-    // accidentally drops args is caught.
+fn kubectl_no_args_surfaces_clear_error() {
+    let out = Command::new(hbird_bin())
+        .args(["kubectl"])
+        .env_remove("CONFIG")
+        .env_remove("CP_NAME")
+        .env_remove("CP_IP")
+        .env_remove("KVM_HOST")
+        .output()
+        .expect("failed to spawn hbird binary");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success());
     assert!(
-        stderr.contains("\"get\"") && stderr.contains("\"pods\"") && stderr.contains("\"-A\""),
-        "kubectl args weren't captured into the variadic vec. stderr:\n{stderr}"
+        stderr.contains("no positional args"),
+        "expected explicit no-args error. stderr:\n{stderr}"
     );
 }
 
@@ -384,11 +449,13 @@ fn export_argocd_accepts_legacy_context_name_alias() {
         "--context-name",
         "legacy-spelling",
     ]);
-    // Reaches the stub (not-yet-implemented) — confirms the alias is
-    // accepted by clap rather than failing parse.
+    // Reaches the config-parse failure — confirms the alias is
+    // accepted by clap rather than failing parse. (Pre-#288 stub
+    // marker is gone; the body now fails at config-parse because
+    // /dev/null has no CP_NAME.)
     assert!(!status.success());
     assert!(
-        stderr.contains("not yet implemented"),
-        "legacy --context-name alias failed to parse. stderr:\n{stderr}"
+        !stderr.contains("error: unexpected argument") && !stderr.contains("unrecognized"),
+        "legacy --context-name alias failed clap parse. stderr:\n{stderr}"
     );
 }
