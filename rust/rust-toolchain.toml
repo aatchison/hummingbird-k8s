@@ -1,0 +1,8 @@
+# Pin the toolchain channel for reproducibility. `stable` tracks the latest
+# released compiler; CI (#281) is responsible for catching MSRV regressions
+# via a separate matrix entry. Components mirror what the pre-commit hooks
+# + the devcontainer's cargo-* binstall expects.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

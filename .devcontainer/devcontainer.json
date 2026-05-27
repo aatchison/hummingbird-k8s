@@ -1,0 +1,36 @@
+{
+  "name": "hummingbird-k8s rust dev",
+  "build": {
+    "dockerfile": "Containerfile",
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspaces/hummingbird-k8s",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/hummingbird-k8s,type=bind,consistency=cached",
+  "runArgs": [
+    "--security-opt",
+    "label=disable"
+  ],
+  "containerEnv": {
+    "CARGO_TERM_COLOR": "always"
+  },
+  "postCreateCommand": "if git rev-parse --git-dir >/dev/null 2>&1; then pre-commit install --hook-type pre-commit; else echo '[devcontainer] workspace is not a usable git repo (likely a git worktree whose gitdir is outside the bind mount); skipping pre-commit install — run it from the host instead'; fi",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "fill-labs.dependi",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.targetDir": true,
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      }
+    }
+  }
+}

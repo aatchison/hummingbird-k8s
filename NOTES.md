@@ -22,6 +22,7 @@ upstream `kubeadm` Kubernetes layered into the bootc image.
 | `cluster.example.conf` | Operator-edited config template: copy to `cluster.local.conf` and edit. Drives `make deploy-cluster` / `make update-cluster`. |
 | `config.example.sh` | Optional per-host build-input overrides (VM_USER, SSH_PUBKEY_FILES, POOL_DIR, etc.). |
 | `references/k8s-bootc-talk.transcript.txt` | KubeCon India 2025 talk transcript (Berkus + Kumar) |
+| `rust/` + `.devcontainer/` | Rust client-side rewrite, foundation only (#280, epic #279). Bash stays canonical until each subcommand reaches behavioral parity. |
 
 ## Host setup (<kvm-host>)
 

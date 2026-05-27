@@ -1,0 +1,13 @@
+[package]
+name = "hbird-core"
+version = "0.0.1"
+description = "Placeholder crate for the hummingbird-k8s Rust rewrite (#280 workspace bootstrap)."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true

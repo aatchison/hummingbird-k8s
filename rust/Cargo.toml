@@ -1,0 +1,34 @@
+# Cargo workspace for the hummingbird-k8s Rust client-side rewrite
+# (#280, epic #279). The bash equivalents under ../scripts/ remain
+# canonical until each Rust subcommand reaches behavioral parity with
+# its bash twin (see the operator-mental-model contract in the epic).
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+repository = "https://github.com/aatchison/hummingbird-k8s"
+authors = ["Arron Atchison"]
+
+# Shared lints — overridable per-crate via `[lints]` (workspace inheritance
+# explicitly opt-in: each crate adds `[lints] workspace = true`).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# Pedantic intentionally stays opt-in per crate — too noisy as a workspace
+# default. Re-enable on a crate-by-crate basis when its surface stabilizes.
+
+# Release profile: optimize for binary size + stripped symbols. The eventual
+# #290 release pipeline (cargo-dist) inherits this; the only knob we expect
+# to flip later is LTO=fat once compile time matters less than artifact size.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,45 @@
+# cargo-deny config for the hummingbird-k8s Rust workspace.
+#
+# Run via:
+#   cargo deny check          # all checks (advisories, bans, licenses, sources)
+#   cargo deny check licenses # just license policy
+#
+# Policy: allow permissive licenses compatible with the workspace's own
+# Apache-2.0. Copyleft (GPL, AGPL, LGPL) is excluded — we ship binaries +
+# distribute via OCI/musl per #290, and copyleft transitive deps would
+# affect the resulting binary's distribution terms.
+
+[licenses]
+version = 2
+# SPDX expressions. Add new licenses here as deps require them, after a
+# brief compatibility check against Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016", # Unicode crate (older bound)
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+version = 2
+# Default vulnerability DB; deny known-vulnerable crates outright. Yanked
+# crates are warnings (someone may want to pin to a yanked version
+# temporarily during a security investigation).
+yanked = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

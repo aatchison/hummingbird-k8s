@@ -1,0 +1,29 @@
+# pre-commit hooks for the Rust client-side rewrite (#280).
+#
+# Installed by the devcontainer's postCreateCommand (`pre-commit install
+# --hook-type pre-commit`). To install manually outside the devcontainer:
+#   pre-commit install --hook-type pre-commit
+# To run all hooks across the tree:
+#   pre-commit run --all-files
+#
+# Scope: hooks only fire when files under `rust/` change. Bash files under
+# scripts/ have their own bats/shellcheck coverage via the existing CI;
+# duplicating it here would conflict with the staged-migration approach
+# (bash stays canonical until each Rust subcommand reaches parity).
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check (rust/)
+        entry: bash -c 'cd rust && cargo fmt --all -- --check'
+        language: system
+        files: ^rust/.*\.rs$
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy -D warnings (rust/)
+        entry: bash -c 'cd rust && cargo clippy --workspace --all-targets -- -D warnings'
+        language: system
+        # Trigger on rust files OR Cargo.toml/lock changes (a dep bump can
+        # surface new clippy lints even without a .rs edit).
+        files: ^rust/.*\.(rs|toml|lock)$
+        pass_filenames: false

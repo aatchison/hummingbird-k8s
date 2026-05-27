@@ -1,0 +1,51 @@
+# Dev/CI parity image for the hummingbird-k8s Rust rewrite (#280, epic #279).
+#
+# Base: Microsoft's prebuilt Rust devcontainer image — gives us rustup +
+# cargo + a non-root `vscode` user with sudo. We layer in the cargo tools
+# the operator brief calls for so dev + CI (#281) produce byte-identical
+# artifacts.
+#
+# When bumping VARIANT, regenerate the pinned cargo-binstall manifest by
+# running the install step locally and committing the resulting Cargo.lock
+# from the workspace (not done here yet — placeholder crate doesn't pull
+# external deps).
+ARG VARIANT=1-bookworm
+FROM mcr.microsoft.com/devcontainers/rust:${VARIANT}
+
+# System packages: musl-tools for the eventual #290 static binaries (the
+# bash project ships scripts; the Rust binaries will be cosign-signed musl
+# statics per the epic). clang + libssl-dev are usually needed for native
+# deps (openssl-sys, ring). pre-commit is the framework rustfmt + clippy
+# hooks plug into.
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       clang \
+       libssl-dev \
+       musl-tools \
+       pkg-config \
+       pre-commit \
+  && rm -rf /var/lib/apt/lists/*
+
+# cargo-binstall fetches prebuilt cargo-* binaries when available (much
+# faster + more reliable than `cargo install` for image builds). Falls
+# back to `cargo install` on miss, so the spec stays unchanged.
+#
+# Note: the mcr rust image installs rustup/cargo system-wide via
+# CARGO_HOME=/usr/local/cargo + PATH=/usr/local/cargo/bin, NOT in
+# /home/vscode/.cargo. We rely on `cargo` being on PATH (it is, for
+# both root and vscode) rather than hardcoding any homedir path.
+USER vscode
+RUN curl --proto '=https' --tlsv1.2 -sSfL \
+      https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+    | bash
+
+# Cargo tools per the operator brief: nextest (faster runner), watch
+# (rebuild-on-save), deny (license/security), dist (release pipeline
+# per #290), expand (macro diagnostics). cargo-tree is intentionally
+# omitted — `cargo tree` ships with cargo since 1.44.
+RUN cargo binstall --no-confirm --no-symlinks \
+      cargo-nextest \
+      cargo-watch \
+      cargo-deny \
+      cargo-dist \
+      cargo-expand
