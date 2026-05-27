@@ -35,9 +35,10 @@ VS Code users: `F1 → "Dev Containers: Reopen in Container"`.
 rust/
 ├── Cargo.toml             # workspace root
 ├── rust-toolchain.toml    # pinned to stable + rustfmt + clippy
+├── deny.toml              # cargo-deny license/security policy
 └── crates/
     ├── hbird-common/      # placeholder (#280); future crates land per phasing
-    └── deny.toml           # cargo-deny license/security policy
+    └── hbird-config/      # cluster.local.conf parser (#282)
 ```
 
 ## Phasing (per [epic #279])
@@ -45,8 +46,8 @@ rust/
 | Phase | Tracked by | Status |
 |-------|-----------|--------|
 | Foundation — devcontainer + workspace | [#280](https://github.com/aatchison/hummingbird-k8s/issues/280) | landed (PR #313) |
-| Foundation — CI workflow | [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | this PR |
-| Foundation — ClusterConfig parser | [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | pending |
+| Foundation — CI workflow | [#281](https://github.com/aatchison/hummingbird-k8s/issues/281) | landed (PR #314) |
+| Foundation — ClusterConfig parser | [#282](https://github.com/aatchison/hummingbird-k8s/issues/282) | this PR |
 | Transport — clap command tree | [#283](https://github.com/aatchison/hummingbird-k8s/issues/283) | pending |
 | Transport — virt + qemu+ssh URI | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | pending |
 | Transport — openssh | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | pending |
