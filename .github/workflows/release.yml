@@ -187,6 +187,18 @@ jobs:
       # tag-ref gate, artifact staging, dry-run summary). Trade-off
       # accepted: dry-run no longer validates the cosign step itself,
       # but it no longer leaves permanent Rekor records either.
+      # Caught by v0.0.1 REAL release (run 26540413369): cosign now
+      # defaults to --new-bundle-format which deprecates
+      # --output-signature + --output-certificate (both ignored) AND
+      # requires --bundle <path>. Without it cosign tries to create a
+      # bundle at "" and errors with "create bundle file: open : no
+      # such file or directory". PR #351 had warned this would surface
+      # on the first real run; here it is.
+      #
+      # Migrate to --bundle for both sign-blob and verify-blob. The
+      # bundle is a JSON file containing signature + cert + Rekor entry
+      # all in one — operators verify with `cosign verify-blob --bundle
+      # <path>` (verify command also handles the new format).
       - name: Cosign sign binary (keyless OIDC)
         if: steps.v.outputs.dry_run == 'false'
         env:
@@ -195,14 +207,13 @@ jobs:
         run: |
           set -euo pipefail
           cosign sign-blob --yes \
-            --output-signature "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.sig" \
-            --output-certificate "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.pem" \
+            --bundle "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.cosign.bundle" \
             "$BINARY"
           ls -la dist/
 
       # Verify what we just signed BEFORE publishing. Depends on
-      # cosign-sign's outputs; skipped in dry-run (cosign-sign is also
-      # skipped).
+      # cosign-sign's bundle output; skipped in dry-run (cosign-sign is
+      # also skipped).
       - name: Verify cosign signature locally before publish
         if: steps.v.outputs.dry_run == 'false'
         env:
@@ -212,8 +223,7 @@ jobs:
         run: |
           set -euo pipefail
           cosign verify-blob \
-            --certificate "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.pem" \
-            --signature "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.sig" \
+            --bundle "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.cosign.bundle" \
             --certificate-identity-regexp "^https://github.com/${REPO}/.github/workflows/release.yml@" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "$BINARY"
@@ -312,11 +322,9 @@ jobs:
             echo
             echo '```sh'
             echo "curl -sSL -o hbird https://github.com/${REPO}/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl"
-            echo "curl -sSL -o hbird.sig https://github.com/${REPO}/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.sig"
-            echo "curl -sSL -o hbird.pem https://github.com/${REPO}/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.pem"
+            echo "curl -sSL -o hbird.cosign.bundle https://github.com/${REPO}/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.cosign.bundle"
             echo "cosign verify-blob \\"
-            echo "  --certificate hbird.pem \\"
-            echo "  --signature hbird.sig \\"
+            echo "  --bundle hbird.cosign.bundle \\"
             echo "  --certificate-identity-regexp \"^https://github.com/${REPO}/.github/workflows/release.yml@\" \\"
             echo "  --certificate-oidc-issuer \"https://token.actions.githubusercontent.com\" \\"
             echo "  hbird"
@@ -336,8 +344,7 @@ jobs:
             --title "hbird $VERSION" \
             --notes-file "$notes_file" \
             "dist/hbird-${VERSION}-x86_64-unknown-linux-musl" \
-            "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.sig" \
-            "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.pem" \
+            "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.cosign.bundle" \
             "dist/hbird-${VERSION}-SHA256SUMS"
 
       - name: Dry-run summary
