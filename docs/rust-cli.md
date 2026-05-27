@@ -28,6 +28,7 @@ subcommands land per the phasing table in
 | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | landed (PR #317) |
 | [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | `update-cluster` Phase 1A — dry-run parity + orchestration scaffold | landed (PR #321) |
 | [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycle 1 (`cp_kubectl` + drain/uncordon) landed (PR #325); cycles 2–4 pending |
+| [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | `verify-*` Phase 2 — encryption / hardening / app-deploy / all | landed (PR #287) — live-validated 2026-05-27 |
 
 ## Foundation crates landed so far
 
@@ -151,6 +152,41 @@ The canonical pattern is `rust/crates/hbird-cli/tests/update_cluster/fixtures/li
 4. Diff the two captures. Empty diff (modulo timestamps, node AGE
    values, and bootID-after) = block validated. Commit the side-by-side
    capture as the cycle's fixture file.
+
+### Phase 2 (`verify-*`) — landed in PR #287
+
+The four `hbird verify <sub>` subcommands (`encryption`, `hardening`,
+`app-deploy`, `all`) replace the bash twins in
+`scripts/verify-encryption.sh`, `scripts/verify-hardening.sh`,
+`scripts/verify-app-deploy.sh`. Each Rust verifier function carries the
+bash twin's grep-anchor name (e.g.
+`check_podsecurity_rejects_privileged`, `check_apiserver_audit_log_nonempty`)
+to preserve the operator-mental-model contract from the epic.
+
+A new shared module `hbird-cli/src/cp_kubectl.rs` houses the
+`cp_kubectl_raw` / `cp_kubectl_with_stdin_lenient` / `cp_ssh_lenient`
+helpers — extracted from `commands/update_cluster.rs` so both
+update-cluster (Phase 1B) and verify-\* (Phase 2) share the SSH +
+shell-metacharacter-defense wiring. update_cluster.rs's existing
+`cp_kubectl` keeps its parallel-batch log-prefix threading and isn't
+disturbed.
+
+Live-validate fixtures from the geary cluster:
+
+- `rust/crates/hbird-cli/tests/update_cluster/fixtures/live/cycle_verify_encryption.txt`
+- `rust/crates/hbird-cli/tests/update_cluster/fixtures/live/cycle_verify_hardening.txt`
+- `rust/crates/hbird-cli/tests/update_cluster/fixtures/live/cycle_verify_app_deploy.txt`
+- `rust/crates/hbird-cli/tests/update_cluster/fixtures/live/cycle_verify_all.txt`
+
+Notable parity finding: the bash twin's PSA-rejection check (verify-hardening
+check 1/3) is masked by a pre-existing stdin-handoff bug in the
+`scripts/kubectl-k8s.sh` port-forward wrapper — `kubectl apply -f -`
+receives an empty stdin and errors with `error: no objects passed to
+apply`, so the bash twin misses the `violates PodSecurity` marker and
+marks check 1 FAIL. The Rust path bypasses the wrapper (SSH directly
+to root@CP_IP and pipe stdin), so kubectl sees the manifest and the
+apiserver correctly rejects it — Rust observes PSA enforcement that
+bash misses. Documented in `cycle_verify_hardening.txt`.
 
 #### Still scaffolded (12 of 13 `live_mode_not_implemented` sites)
 

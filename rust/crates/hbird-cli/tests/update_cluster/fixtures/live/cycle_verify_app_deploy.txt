@@ -1,0 +1,71 @@
+# Phase 2 #287: verify-app-deploy parity vs bash twin
+#
+# Captured 2026-05-27 against the live geary cluster (hbird-cp1 +
+# hbird-w1 + hbird-w2). End-to-end smoke: create smoketest-<epoch>
+# namespace + nginx Deployment + Service, wait for Available, run a
+# busybox probe pod, assert "Welcome to nginx" in response.
+#
+# bash:   KCFG=/tmp/k8s-kubeconfig-287 LOCAL_PORT=26443 \
+#           CONFIG=cluster.local.conf KVM_HOST=geary CP_NAME=hbird-cp1 \
+#           bash scripts/verify-app-deploy.sh
+#         (Custom KCFG + LOCAL_PORT avoid a stale tunnel on :16443
+#          left by a prior deploy cycle — pre-existing operator state,
+#          unrelated to #287. The Rust path doesn't use a port-forward
+#          tunnel at all, so it isn't affected.)
+# Rust:   HBIRD_LIVE_TEST=1 CP_IP=192.168.122.212 KVM_HOST=aatchison@geary \
+#           cargo test -p hbird-cli --test verify_app_deploy_live -- --nocapture
+
+=== bash output ===
+[verify-app-deploy] creating namespace smoketest-1779904573
+[verify-app-deploy] applying nginx Deployment + Service in smoketest-1779904573
+[verify-app-deploy] waiting up to 2m for deployment/nginx to become Available
+deployment.apps/nginx condition met
+[verify-app-deploy] probing http://nginx:8080 from an in-cluster busybox pod
+[verify-app-deploy] PASS: nginx returned the welcome page over ClusterIP
+[verify-app-deploy] verify-app-deploy: PASS
+[verify-app-deploy] cleanup: deleting namespace smoketest-1779904573
+exit=0
+
+=== Rust output ===
+[verify-app-deploy] creating namespace smoketest-1779904817
+[verify-app-deploy] applying nginx Deployment + Service in smoketest-1779904817
+[verify-app-deploy] waiting up to 2m for deployment/nginx to become Available
+[verify-app-deploy] probing http://nginx:8080 from an in-cluster busybox pod
+[verify-app-deploy] PASS: nginx returned the welcome page over ClusterIP
+[verify-app-deploy] verify-app-deploy: PASS
+[verify-app-deploy] cleanup: deleting namespace smoketest-1779904817
+ INFO hbird{subcommand="verify"}: close
+exit=0
+
+=== diff ===
+
+- bash: namespace = smoketest-1779904573
++ Rust: namespace = smoketest-1779904817
+  (`$(date +%s)` / `SystemTime::now().duration_since(UNIX_EPOCH)` —
+   different epoch seconds across runs, expected.)
+
+- bash:   `deployment.apps/nginx condition met`
++ Rust:   (silent)
+  Source: bash twin's `kubectl wait` emits the `condition met` line
+  directly to stderr (`>&2` in verify-app-deploy.sh:141). The Rust
+  path captures kubectl stdout via cp_kubectl_raw and does NOT echo
+  it (the `wait` call returns Ok on success, and the verifier
+  proceeds without logging captured stdout). Functionally identical
+  — both proceed to the probe phase having confirmed Available.
+
+  This is a minor log-volume difference; the bash-twin grep anchors
+  (`PASS:`, `verify-app-deploy: PASS`) match on both. If operator
+  log-volume parity becomes load-bearing, we can re-emit kubectl
+  wait stdout via println! after the call. Not blocking for #287.
+
++ Rust adds: ` INFO hbird{subcommand="verify"}: close`
+  (Same tracing close-span event as verify-encryption.)
+
+=== verdict: PARITY ===
+- Both sides exit 0 with the bash-twin's `verify-app-deploy: PASS`
+  marker.
+- Cluster left 3/3 Ready on both runs; smoketest namespace deleted
+  by both cleanup paths (bash `trap cleanup EXIT`, Rust
+  NamespaceCleanup Drop impl).
+- Nginx Deployment, Service, busybox probe pod all PSA-restricted
+  compliant on both runs.

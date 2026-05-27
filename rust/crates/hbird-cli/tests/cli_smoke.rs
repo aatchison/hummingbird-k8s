@@ -154,45 +154,57 @@ fn update_cluster_dry_run_against_empty_config_fails_at_config_parse() {
     );
 }
 
+// PR #287 landed the verify-* implementations (Phase 2 of the Rust
+// rewrite). The four `returns_not_yet_implemented` tests that lived
+// here previously asserted the stub `Err("not yet implemented —
+// tracked by #287")` surface; they were replaced with the four tests
+// below, which assert that — invoked without any cluster reachability
+// — each subcommand now reaches the real implementation and exits
+// with the bash-twin-equivalent `resolve_cp_ip:` failure diagnostic.
+//
+// Live-mode parity (real cluster touched) is covered by the env-gated
+// `tests/verify_*_live.rs` suite. These smoke tests stay hermetic.
+
 #[test]
-fn verify_encryption_returns_not_yet_implemented() {
-    // `--config` is optional for verify-* (matches the bash twins),
-    // so we can invoke without any flag and still reach the stub.
+fn verify_encryption_no_cluster_surfaces_bash_resolve_cp_ip_diagnostic() {
+    // No --config, no --kvm-host, no --cp-ip → reaches the implementation,
+    // tries to resolve CP IP, hits the "no KVM_HOST" branch of
+    // resolve_cp_ip_via_kvm_host(), bails with the bash-twin diagnostic.
     let (status, _stdout, stderr) = run(&["verify", "encryption"]);
     assert!(!status.success());
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#287"),
-        "verify encryption stub error missing tracker. stderr:\n{stderr}"
+        stderr.contains("resolve_cp_ip"),
+        "expected bash-twin resolve_cp_ip diagnostic, got:\n{stderr}"
     );
 }
 
 #[test]
-fn verify_hardening_returns_not_yet_implemented() {
+fn verify_hardening_no_cluster_surfaces_bash_resolve_cp_ip_diagnostic() {
     let (status, _stdout, stderr) = run(&["verify", "hardening"]);
     assert!(!status.success());
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#287"),
-        "verify hardening stub error missing tracker. stderr:\n{stderr}"
+        stderr.contains("resolve_cp_ip"),
+        "expected bash-twin resolve_cp_ip diagnostic, got:\n{stderr}"
     );
 }
 
 #[test]
-fn verify_app_deploy_returns_not_yet_implemented() {
+fn verify_app_deploy_no_cluster_surfaces_bash_resolve_cp_ip_diagnostic() {
     let (status, _stdout, stderr) = run(&["verify", "app-deploy"]);
     assert!(!status.success());
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#287"),
-        "verify app-deploy stub error missing tracker. stderr:\n{stderr}"
+        stderr.contains("resolve_cp_ip"),
+        "expected bash-twin resolve_cp_ip diagnostic, got:\n{stderr}"
     );
 }
 
 #[test]
-fn verify_all_returns_not_yet_implemented() {
+fn verify_all_no_cluster_surfaces_bash_resolve_cp_ip_diagnostic() {
     let (status, _stdout, stderr) = run(&["verify", "all"]);
     assert!(!status.success());
     assert!(
-        stderr.contains("not yet implemented") && stderr.contains("#287"),
-        "verify all stub error missing tracker. stderr:\n{stderr}"
+        stderr.contains("resolve_cp_ip"),
+        "expected bash-twin resolve_cp_ip diagnostic, got:\n{stderr}"
     );
 }
 

@@ -1,0 +1,109 @@
+# Phase 2 #287: verify-hardening parity vs bash twin
+#
+# Captured 2026-05-27 against the live geary cluster (hbird-cp1 +
+# hbird-w1 + hbird-w2). Four checks: PSA-restricted rejects a
+# privileged pod; apiserver audit log non-empty; kubelet
+# --protect-kernel-defaults=true; kubelet --rotate-certificates=true.
+#
+# bash:   CONFIG=cluster.local.conf KVM_HOST=geary CP_NAME=hbird-cp1 \
+#           bash scripts/verify-hardening.sh
+# Rust:   HBIRD_LIVE_TEST=1 CP_IP=192.168.122.212 KVM_HOST=aatchison@geary \
+#           cargo test -p hbird-cli --test verify_hardening_live -- --nocapture
+
+=== bash output ===
+[verify-hardening] CP_IP not set, trying resolve_cp_ip hbird-cp1
+[verify-hardening] CP_IP=192.168.122.212
+[verify-hardening] check 1/3: PodSecurity restricted rejects a privileged pod
+[verify-hardening]   FAIL: privileged pod was not rejected by PodSecurity
+[verify-hardening]   apiserver output: Starting tunnel: localhost:6443 -> 192.168.122.212:6443 via geary
+error: no objects passed to apply
+[verify-hardening] check 2/3: apiserver audit log is non-empty on the CP host
+[verify-hardening]   PASS: audit log present (/var/log/kubernetes/k8s-audit.log)
+[verify-hardening] check 3/4: kubelet running with --protect-kernel-defaults=true
+[verify-hardening]   PASS: kubelet has --protect-kernel-defaults=true
+[verify-hardening] check 4/4: kubelet running with --rotate-certificates=true (#121)
+[verify-hardening]   PASS: kubelet has --rotate-certificates=true
+
+[verify-hardening] summary
+  PodSecurity restricted    : FAIL
+  apiserver audit log       : PASS
+  kubelet protect-kernel    : PASS
+  kubelet rotate-certs      : PASS
+[verify-hardening] one or more checks FAILED
+exit=1
+
+=== Rust output ===
+[verify-hardening] CP_IP=192.168.122.212
+[verify-hardening] check 1/3: PodSecurity restricted rejects a privileged pod
+ERROR hbird{subcommand="verify"}: error=NonZeroExit { host: "192.168.122.212", status: ExitStatus(unix_wait_status(256)), stdout: "", stderr: "Error from server (Forbidden): error when creating \"STDIN\": pods \"verify-hardening-privileged-probe\" is forbidden: violates PodSecurity \"restricted:latest\": host namespaces (hostPID=true), ..." }
+[verify-hardening]   PASS: privileged pod rejected by PodSecurity
+[verify-hardening] check 2/3: apiserver audit log is non-empty on the CP host
+[verify-hardening]   PASS: audit log present (/var/log/kubernetes/k8s-audit.log)
+[verify-hardening] check 3/4: kubelet running with --protect-kernel-defaults=true
+[verify-hardening]   PASS: kubelet has --protect-kernel-defaults=true
+[verify-hardening] check 4/4: kubelet running with --rotate-certificates=true (#121)
+[verify-hardening]   PASS: kubelet has --rotate-certificates=true
+
+[verify-hardening] summary
+  PodSecurity restricted    : PASS
+  apiserver audit log       : PASS
+  kubelet protect-kernel    : PASS
+  kubelet rotate-certs      : PASS
+[verify-hardening] all checks PASSED
+ INFO hbird{subcommand="verify"}: close
+exit=0
+
+=== diff ===
+Three categories of divergence:
+
+(1) Check 1/3 (PodSecurity) — Rust PASSes, bash FAILs.
+    Root cause: bash twin's `kc apply -f - <<EOF` heredoc has a
+    pre-existing stdin-handoff bug. The kc() wrapper invokes
+    scripts/kubectl-k8s.sh which sets up a port-forward tunnel via
+    `ssh -fNL …` BEFORE exec'ing kubectl. The setup phase reads
+    from stdin (or otherwise consumes the heredoc) before kubectl
+    sees it, so `kubectl apply -f -` gets an empty stdin and errors
+    with `error: no objects passed to apply`. Bash's regex
+    `printf '%s' "$ps_out" | grep -q 'violates PodSecurity'` then
+    misses, and the check is marked FAIL.
+
+    The Rust path SSHes the manifest directly through
+    `hbird_ssh::Client::run_with_stdin` (no port-forward wrapper)
+    so kubectl receives the heredoc verbatim and the apiserver
+    correctly rejects it with the `violates PodSecurity` marker
+    Rust's check 1 is looking for.
+
+    Rust path is MORE correct than bash. Operator action:
+    - Short-term: trust the Rust verifier when it disagrees.
+    - Follow-up: fix bash twin's kc-via-kubectl-k8s.sh stdin
+      handling — separate issue (verify-hardening + verify-app-deploy
+      both rely on kc apply -f -).
+
+(2) Rust emits one ERROR span event with the kubectl-stderr
+    payload, between the `check 1/3` log line and the `PASS:` log
+    line. Source: `#[tracing::instrument(... err(Debug))]` on
+    `hbird_ssh::Client::run_inner`. When the remote kubectl exits
+    non-zero (which IS the PASS condition here — PSA rejection
+    surfaces as exit-1), hbird-ssh fires the instrument's `err`
+    span event at ERROR level even though the verify-hardening
+    callsite folds the NonZeroExit into a successful
+    CpExecOutput { success: false, … } via
+    `cp_kubectl_with_stdin_lenient`.
+
+    Cosmetic only — interleaves with operator-grep-anchor lines on
+    stderr. Tracked for a hbird-ssh tracing-level follow-up
+    (consider demoting `err(Debug)` to `debug!(error = …)` so
+    callers can decide their own ERROR-vs-debug policy).
+
+(3) Bash has the `[verify-hardening] CP_IP not set, trying
+    resolve_cp_ip hbird-cp1` line; Rust skips it because the live
+    test passes `--cp-ip` explicitly. Both end up at the same
+    CP_IP=192.168.122.212.
+
+=== verdict: PARITY (Rust strictly more correct) ===
+- Cluster left 3/3 Ready on both runs.
+- Operator-grep anchors (`PASS:`, `FAIL:`, `all checks PASSED`,
+  `one or more checks FAILED`) preserved verbatim in both.
+- Rust correctly observes PSA enforcement; bash's existing
+  kc-wrapper-stdin bug masks the same observation. Both checks
+  2-4 reach identical PASS results.
