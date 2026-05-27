@@ -15,6 +15,32 @@ The rationale: a single-CP cluster suffers a full apiserver outage
 during the CP reboot, so auto-update on the CP needs to be an explicit
 operator choice (#48).
 
+### Where the CP/worker split is enforced (#225)
+
+The per-flavor preset files (`containers/k8s/10-k8s.preset` and
+`containers/k8s-worker/10-k8s-worker.preset`) are **deliberately
+identical** in their `bootc-semver-update.timer` / `bootc-fetch-apply-updates.timer`
+policy: both disable the legacy timer and both enable the semver timer.
+The CP/worker auto-update posture split described above is **not**
+enforced at the preset layer — it's enforced at deploy time by
+`scripts/deploy-cluster.sh` via the `AUTO_UPDATE_CP` cloud-init knob,
+which emits a `systemctl disable --now bootc-semver-update.timer`
+runcmd into the CP's cloud-init when `AUTO_UPDATE_CP=false` (the
+default). Workers have no equivalent knob: their reboot only drains a
+single node, so the preset-enabled timer wins unmodified.
+
+This design keeps both presets a single source of truth (a host
+promoted between roles keeps a consistent on-disk timer state) and
+moves the operator-controlled posture choice into the deploy-time
+runcmd, where it can be audited per-deployment in cloud-init.
+
+A future maintainer noticing that both presets enable the timer and
+"aligning" them with the docs by deleting the enable line from the
+CP preset would silently break the worker fleet (workers depend on
+the preset alone). The header comments in both preset files spell
+this out; the contract is also pinned by
+`tests/lib/preset_contract.bats`.
+
 ## Why semver instead of `:latest`
 
 `:latest` is a mutable pointer. A bad push to `:latest` rolls every VM in
