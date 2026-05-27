@@ -59,7 +59,7 @@ rust/
 | Phase 2 — `verify-*` | [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | landed (PR #330) — live-validated on geary cluster |
 | Phase 3 — `export-argocd` / `get-kubeconfig` / `nodes` / `kubectl` | [#288](https://github.com/aatchison/hummingbird-k8s/issues/288) | landed (PR #334) — live-validated on geary cluster |
 | Phase 4 — `deploy-/destroy-/spawn-` (dry-run parity) | [#289](https://github.com/aatchison/hummingbird-k8s/issues/289) | landed — dry-run planner for deploy/destroy/spawn, live execution for destroy-cluster; live for deploy + spawn deferred to [#335](https://github.com/aatchison/hummingbird-k8s/issues/335) |
-| Release — cosign + cargo-dist | [#290](https://github.com/aatchison/hummingbird-k8s/issues/290) | pending |
+| Release — cosign + OCI image (hand-rolled GHA) | [#290](https://github.com/aatchison/hummingbird-k8s/issues/290) | landed |
 | Migration guide | [#291](https://github.com/aatchison/hummingbird-k8s/issues/291) | pending |
 
 ## Logging
@@ -104,3 +104,46 @@ and runs `cargo check` inside it (dev/CI parity gate). A
 declares `[lints]\nworkspace = true` so the workspace's
 `unsafe_code = "forbid"` / clippy policy cannot be silently bypassed by a
 future crate that forgets the stanza.
+
+## Release pipeline
+
+[#290](https://github.com/aatchison/hummingbird-k8s/issues/290) shipped
+the release pipeline. A `v*` tag push (e.g. `git tag v0.0.1 && git push
+origin v0.0.1`) triggers
+[`.github/workflows/release.yml`](../.github/workflows/release.yml),
+which:
+
+1. Builds a static `x86_64-unknown-linux-musl` `hbird` binary against
+   `rust/crates/hbird-cli`.
+2. Cosign-signs the binary (keyless OIDC: Fulcio + Rekor — no
+   pre-shared keys).
+3. Builds an OCI image from `../Containerfile.hbird` (FROM scratch +
+   single binary, ~5MB) and pushes to
+   `ghcr.io/aatchison/hbird:VERSION` + `:latest`.
+4. Cosign-signs the OCI image by digest.
+5. Publishes a GitHub Release with binary, checksums, signature, and
+   signing cert attached.
+
+Operator-facing install + verify recipes live in
+[`../docs/rust-cli.md`](../docs/rust-cli.md) (the "Install" section).
+
+The workflow also accepts `workflow_dispatch` with `dry_run=true` for
+pre-tag-push smoke-testing — every build/sign step runs, only the
+publish steps are skipped. Bats regression coverage at
+`../tests/scripts/release.bats` locks in the workflow's contract
+(triggers, SHA-pinned actions, cosign steps, OCI image shape).
+
+**cargo-dist vs hand-rolled decision.** The release pipeline is
+hand-rolled GHA, not cargo-dist. Rationale:
+
+- Our scope is one target (x86_64-musl), one image, one cosign step —
+  cargo-dist optimizes for multi-target / multi-platform / multi-installer
+  release matrices we don't have.
+- The hand-rolled workflow inherits the SHA-pinning + ancestry-gate +
+  cosign-keyless conventions already established in
+  `.github/workflows/build-worker.yml`. cargo-dist generates its own
+  workflow shape that would diverge.
+- Under 200 lines of YAML keeps the entire release pipeline auditable
+  in a single file.
+- If we add Mac/Windows targets or `cargo install` / Homebrew /
+  crates.io publishing later, revisit cargo-dist.

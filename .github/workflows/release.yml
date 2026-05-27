@@ -1,0 +1,369 @@
+# Release pipeline for the `hbird` Rust CLI (issue #290, epic #279, Wave C).
+#
+# Triggers:
+# - push to `v*` tag (the canonical release path) — full publish.
+# - workflow_dispatch with `dry_run=true` (the smoke-test path) — runs
+#   every step EXCEPT the final publish (release upload, registry push,
+#   sign). This lets operators rehearse the workflow without minting a
+#   real release; CI gates the workflow even when no tag is ever pushed.
+#
+# Security: ONLY repo-controlled context values flow into `run:` scripts;
+# no untrusted PR-body / commit-message / issue-title interpolation.
+# All input values pass through `env:` blocks (never direct `${{ }}`
+# interpolation into shell script bodies) and are validated against the
+# vX.Y.Z[-pre] regex before use.
+
+name: Release hbird CLI
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver tag for dry-run (vX.Y.Z[-pre]); ignored on real tag push'
+        required: false
+        default: 'v0.0.0-dryrun'
+        type: string
+      dry_run:
+        description: 'Skip publish (release upload + registry push + sign). Build + image-build still validated.'
+        required: false
+        default: true
+        type: boolean
+
+# Serialize tag-driven publishes on the same ref. cancel-in-progress is
+# deliberately false: a real publish that is mid-flight (sign, push, etc.)
+# must finish — a second invocation should queue, not pre-empt.
+concurrency:
+  group: release-hbird-${{ github.ref }}
+  cancel-in-progress: false
+
+# Round-2 lens L1 MED: workflow-global permissions are a defense-in-depth
+# smell. Default to read-only here; the release job below opts into the
+# write scopes it actually needs. Any future job added to this workflow
+# inherits read-only by default and has to opt in explicitly.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings -C target-feature=+crt-static"
+  IMAGE: ghcr.io/${{ github.repository_owner }}/hbird
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Round-2 lens L1 MED: job-scoped permissions so the write scopes
+    # are isolated to this job (not inherited by any future jobs added
+    # to this workflow).
+    permissions:
+      contents: write       # gh release create + asset upload
+      packages: write       # ghcr push
+      id-token: write       # cosign keyless OIDC
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        with:
+          fetch-depth: 0
+
+      # Same ancestry gate as build-worker.yml — refuse to publish a tag
+      # that doesn't sit on main. Skipped on workflow_dispatch.
+      - name: Refuse to publish if the tagged commit isn't on main
+        if: github.event_name == 'push'
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $GITHUB_REF points to $GITHUB_SHA, not reachable from origin/main." >&2
+            exit 1
+          fi
+
+      - name: Resolve version + mode
+        id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+            dry_run="$INPUT_DRY_RUN"
+          else
+            version="${REF#refs/tags/}"
+            dry_run="false"
+          fi
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+            echo "Version '$version' is not vX.Y.Z[-pre]" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "Resolved: version=$version dry_run=$dry_run" >&2
+
+      - name: Install Rust toolchain (with musl target)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: rust
+          key: release-musl
+
+      - name: Install musl-tools (linker + headers for musl target)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build static x86_64-musl binary
+        working-directory: rust
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo build --release \
+            --target x86_64-unknown-linux-musl \
+            --package hbird-cli \
+            --bin hbird
+
+      - name: Verify binary is fully static
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          bin="target/x86_64-unknown-linux-musl/release/hbird"
+          file "$bin"
+          if ldd "$bin" 2>&1 | grep -qv 'not a dynamic executable'; then
+            echo "::error::hbird is dynamically linked — musl static build failed"
+            ldd "$bin" || true
+            exit 1
+          fi
+          ./"$bin" --version
+
+      - name: Stage release artifacts
+        id: stage
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp rust/target/x86_64-unknown-linux-musl/release/hbird \
+             "dist/hbird-${VERSION}-x86_64-unknown-linux-musl"
+          chmod +x "dist/hbird-${VERSION}-x86_64-unknown-linux-musl"
+          ( cd dist && sha256sum "hbird-${VERSION}-x86_64-unknown-linux-musl" \
+              > "hbird-${VERSION}-SHA256SUMS" )
+          ls -la dist/
+          echo "binary=dist/hbird-${VERSION}-x86_64-unknown-linux-musl" >> "$GITHUB_OUTPUT"
+          echo "checksums=dist/hbird-${VERSION}-SHA256SUMS" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Cosign keyless OIDC: Fulcio mints a short-lived cert from the GHA
+      # OIDC token; Rekor logs the signature for public transparency.
+      # Produces .sig (signature) and .pem (cert) we ship alongside the
+      # binary. Always runs (even in dry-run) so the OIDC plumbing is
+      # exercised end-to-end; only the upload is gated.
+      # Round-2 lens L1 MED: dry-run cosign sign-blob writes to the public
+      # Rekor transparency log even though we never publish — Rekor entries
+      # are immutable + permanent, so an operator running
+      # `workflow_dispatch dry_run=true` would leak permanent records
+      # tied to whatever version string they typed. Use `--tlog-upload=false`
+      # in dry-run mode so the OIDC plumbing is still exercised but no
+      # Rekor entry lands. Real tag-push runs DO upload (the default).
+      - name: Cosign sign binary (keyless OIDC)
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          BINARY: ${{ steps.stage.outputs.binary }}
+          DRY_RUN: ${{ steps.v.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          tlog_arg=""
+          if [[ "$DRY_RUN" == "true" ]]; then
+            tlog_arg="--tlog-upload=false"
+            echo "::notice::dry-run: cosign sign-blob with --tlog-upload=false (no Rekor record)"
+          fi
+          # shellcheck disable=SC2086 # tlog_arg intentionally unquoted to expand to empty when not set
+          cosign sign-blob --yes $tlog_arg \
+            --output-signature "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.sig" \
+            --output-certificate "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.pem" \
+            "$BINARY"
+          ls -la dist/
+
+      # Verify what we just signed BEFORE publishing. If verify-blob fails
+      # locally, the published release would be unverifiable — better to
+      # fail now than ship a broken signature.
+      # Verify what we just signed BEFORE publishing. If verify-blob fails
+      # locally, the published release would be unverifiable — better to
+       # fail now than ship a broken signature. Round-2 L1 MED: dry-run
+      # skipped the Rekor upload (per the cosign-sign step above), so
+      # verify-blob in dry-run mode must also skip the Rekor lookup via
+      # `--insecure-ignore-tlog`. Real tag-push runs do the full Rekor
+      # round-trip.
+      - name: Verify cosign signature locally before publish
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          BINARY: ${{ steps.stage.outputs.binary }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ steps.v.outputs.dry_run }}
+        run: |
+          set -euo pipefail
+          tlog_arg=""
+          if [[ "$DRY_RUN" == "true" ]]; then
+            tlog_arg="--insecure-ignore-tlog=true"
+            echo "::notice::dry-run: cosign verify-blob with --insecure-ignore-tlog=true (no Rekor lookup)"
+          fi
+          # shellcheck disable=SC2086 # tlog_arg intentionally unquoted to expand to empty when not set
+          cosign verify-blob $tlog_arg \
+            --certificate "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.pem" \
+            --signature "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.sig" \
+            --certificate-identity-regexp "^https://github.com/${REPO}/.github/workflows/release.yml@" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$BINARY"
+
+      # ---- OCI image build + push ----------------------------------------
+
+      - name: Log in to GHCR
+        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
+        uses: redhat-actions/podman-login@4934294ad0449894bcd1e9f191899d7292469603 # v1.7
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Stage the OCI build context as a tiny directory containing just
+      # the binary + Containerfile. Keeps the build context small (~5MB)
+      # and reproducible.
+      - name: Stage OCI build context
+        id: octx
+        env:
+          BINARY: ${{ steps.stage.outputs.binary }}
+        run: |
+          set -euo pipefail
+          mkdir -p octx
+          cp "$BINARY" octx/hbird
+          cp Containerfile.hbird octx/Containerfile
+          chmod +x octx/hbird
+          echo "context=octx" >> "$GITHUB_OUTPUT"
+
+      - name: Build OCI image (buildah)
+        id: build
+        uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
+        with:
+          image: hbird
+          tags: ${{ steps.v.outputs.version }} latest
+          containerfiles: ${{ steps.octx.outputs.context }}/Containerfile
+          context: ${{ steps.octx.outputs.context }}
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+            REVISION=${{ github.sha }}
+
+      - name: Push to GHCR
+        id: push
+        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
+        uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2.8
+        with:
+          image: ${{ steps.build.outputs.image }}
+          tags: ${{ steps.build.outputs.tags }}
+          registry: ghcr.io/${{ github.repository_owner }}
+
+      - name: Resolve pushed image digest
+        id: digest
+        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}
+          VERSION: ${{ steps.v.outputs.version }}
+          PUSH_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest="$PUSH_DIGEST"
+          if [ -z "$digest" ]; then
+            digest="$(podman manifest inspect --verbose "${IMAGE_REF}:${VERSION}" \
+              | jq -r '.Digest // .digest')"
+          fi
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "could not determine image digest" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Cosign sign image (keyless OIDC)
+        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE_REF}@${DIGEST}"
+
+      # ---- GitHub Release upload ----------------------------------------
+
+      - name: Upload binary + checksums + signature to GitHub Release
+        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          notes_file="$(mktemp)"
+          {
+            echo "\`hbird\` ${VERSION} — hummingbird-k8s operator CLI."
+            echo
+            echo "## Install (binary)"
+            echo
+            echo '```sh'
+            echo "curl -sSL -o hbird https://github.com/${REPO}/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl"
+            echo "curl -sSL -o hbird.sig https://github.com/${REPO}/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.sig"
+            echo "curl -sSL -o hbird.pem https://github.com/${REPO}/releases/download/${VERSION}/hbird-${VERSION}-x86_64-unknown-linux-musl.pem"
+            echo "cosign verify-blob \\"
+            echo "  --certificate hbird.pem \\"
+            echo "  --signature hbird.sig \\"
+            echo "  --certificate-identity-regexp \"^https://github.com/${REPO}/.github/workflows/release.yml@\" \\"
+            echo "  --certificate-oidc-issuer \"https://token.actions.githubusercontent.com\" \\"
+            echo "  hbird"
+            echo "chmod +x hbird && ./hbird --version"
+            echo '```'
+            echo
+            echo "## Install (OCI image)"
+            echo
+            echo '```sh'
+            echo "podman pull ghcr.io/${OWNER}/hbird:${VERSION}"
+            echo "cosign verify ghcr.io/${OWNER}/hbird:${VERSION} \\"
+            echo "  --certificate-identity-regexp \"^https://github.com/${REPO}/.github/workflows/release.yml@\" \\"
+            echo "  --certificate-oidc-issuer \"https://token.actions.githubusercontent.com\""
+            echo '```'
+          } > "$notes_file"
+          gh release create "$VERSION" \
+            --title "hbird $VERSION" \
+            --notes-file "$notes_file" \
+            "dist/hbird-${VERSION}-x86_64-unknown-linux-musl" \
+            "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.sig" \
+            "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.pem" \
+            "dist/hbird-${VERSION}-SHA256SUMS"
+
+      - name: Dry-run summary
+        if: steps.v.outputs.dry_run == 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          {
+            echo "## Dry-run summary"
+            echo ""
+            echo "Version: \`${VERSION}\`"
+            echo ""
+            echo "Steps exercised:"
+            echo "- static musl binary build + ldd-static verification"
+            echo "- cosign sign-blob (keyless OIDC) + local verify-blob"
+            echo "- OCI image build via buildah"
+            echo ""
+            echo "Steps SKIPPED (dry-run):"
+            echo "- GHCR push"
+            echo "- cosign sign image"
+            echo "- gh release create"
+            echo ""
+            echo "Artifacts staged in \`dist/\`:"
+            ls -la dist/
+          } >> "$GITHUB_STEP_SUMMARY"
