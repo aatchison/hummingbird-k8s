@@ -91,6 +91,23 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 - `bootc rollback` swaps to the prior deployment; reboot finalizes.
 - As of #181 the canonical timer is **`bootc-semver-update.timer`** (enabled by default in the `k8s` and `k8s-worker` flavors). It resolves the highest `vMAJOR.MINOR.PATCH` tag at the flavor's GHCR repo via `skopeo list-tags` and `bootc switch`es to it daily — so a bad push to `:latest` no longer rolls the fleet. The stock `bootc-fetch-apply-updates.timer` is still on the image (disabled in the preset) for operators who explicitly want `:latest`-tracking. See `docs/auto-updates.md` for the full mechanism + per-host schedule/REPO overrides.
 
+## How bootc-os base-image bumps land (build-time, not runtime)
+
+Distinct from the runtime auto-update above: the `FROM` base in our Containerfiles is **digest-pinned** to a specific `quay.io/hummingbird-community/bootc-os@sha256:…`. Upstream rebuilds `:latest` every 1–4 days (see #298), so a digest pin is what keeps our builds reproducible.
+
+Three files carry the same digest in lockstep:
+- `containers/k8s/Containerfile`
+- `containers/k8s-worker/Containerfile`
+- `lib/build-common.sh` (the `BASE_IMAGE` default if env-var is unset)
+
+Renovate watches all three via a `customManagers` regex rule in `.github/renovate.json` and opens a **single grouped PR** (`bootc-os-base` group) when the upstream `:latest` digest moves. The grouped PR is **never auto-merged** — `pr-validate.yml` only runs `podman build`, which can't catch a base-image drift that breaks first boot (systemd unit rename, kernel module drop, RPM removal). Operator workflow on each bump PR:
+
+1. Read the upstream changelog via `org.opencontainers.image.revision` label diff at `gitlab.com/redhat/hummingbird/containers/-/compare/<old-revision>...<new-revision>` (find each side's revision with `skopeo inspect docker://quay.io/hummingbird-community/bootc-os@<digest> | jq -r '.Labels[\"org.opencontainers.image.revision\"]'`).
+2. Boot-test by hand on a KVM host before merge (until the #32-class self-hosted boot test lands).
+3. Merge; the next image release will roll the new base layer to the fleet via `bootc-semver-update.timer`.
+
+Tracked under #298 (umbrella) / #304 (Renovate-config implementation).
+
 ## Install style: upstream kubeadm (`containers/k8s/Containerfile`)
 
 - Adds Fedora Rawhide as a secondary repo (Hummingbird's curated set lacks `iptables-nft`, `socat`, `conntrack-tools`, `ethtool`). The Fedora GPG keyring bundle is imported at build time and the repo is configured with `gpgcheck=1`, so Rawhide RPMs are signature-verified during install (#70).
