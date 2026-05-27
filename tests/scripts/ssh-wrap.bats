@@ -51,7 +51,7 @@ setup() {
         WORKER_NAMES POOL_DIR \
         VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS \
         HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_OPERATOR_PUBKEY_FILE \
-        HBIRD_SSH_WRAP_DRY_RUN_SCP
+        HBIRD_SSH_WRAP_DRY_RUN_SCP HBIRD_REMOTE_NO_SUDO
 
   LOCAL_HOST="$(hostname -s 2>/dev/null || hostname)"
 }
@@ -461,6 +461,53 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# #269 — HBIRD_REMOTE_NO_SUDO=1 drops the `sudo` prefix from the remote exec
+#
+# Operators in the `libvirt` group on the KVM host don't need `sudo` for
+# update-cluster.sh (see Phase 1, same issue). Setting HBIRD_REMOTE_NO_SUDO=1
+# locally tells the shim to emit `env HBIRD_REMOTE_REEXEC=1 ... bash <script>`
+# on the remote — no `sudo` prefix. Default keeps `sudo` so the other three
+# wrapped scripts (deploy/destroy/spawn) are unaffected until Phase 3.
+# ---------------------------------------------------------------------------
+
+@test "ssh-wrap: HBIRD_REMOTE_NO_SUDO=1 drops sudo from the remote exec (#269)" {
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_REMOTE_NO_SUDO=1 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [ -n "$ssh_cmd_line" ]
+  # The rendered remote command must NOT contain `sudo env` (the previous
+  # default shape). It must contain plain `env HBIRD_REMOTE_REEXEC=1`
+  # instead.
+  [[ "$ssh_cmd_line" != *"sudo env HBIRD_REMOTE_REEXEC=1"* ]]
+  [[ "$ssh_cmd_line" == *"&& env HBIRD_REMOTE_REEXEC=1"* ]]
+}
+
+@test "ssh-wrap: HBIRD_REMOTE_NO_SUDO unset -> sudo prefix preserved (default) (#269)" {
+  # Belt-and-suspenders against an accidental regression: the default
+  # behavior must be unchanged when HBIRD_REMOTE_NO_SUDO is not set.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [ -n "$ssh_cmd_line" ]
+  [[ "$ssh_cmd_line" == *"sudo env HBIRD_REMOTE_REEXEC=1"* ]]
+}
+
+@test "ssh-wrap: HBIRD_REMOTE_NO_SUDO=0 keeps sudo (explicit opt-out is not opt-in) (#269)" {
+  # HBIRD_REMOTE_NO_SUDO=0 must NOT drop sudo — only the literal string `1`
+  # opts in (mirrors the SKIP_DRAIN / DRY_RUN convention in the wrapped scripts).
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_REMOTE_NO_SUDO=0 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  ssh_cmd_line="$(printf '%s\n' "$output" | grep '^SSH_WRAP_CMD:')"
+  [ -n "$ssh_cmd_line" ]
+  [[ "$ssh_cmd_line" == *"sudo env HBIRD_REMOTE_REEXEC=1"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # The pinned allowlist itself
 # ---------------------------------------------------------------------------
 #
@@ -486,6 +533,7 @@ EOF
     VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS
     HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_REMOTE_REPO
     HBIRD_OPERATOR_PUBKEY_FILE
+    HBIRD_REMOTE_NO_SUDO
   )
   # Sorted compare so reordering doesn't trip the test (the contract is
   # the set, not the order).
