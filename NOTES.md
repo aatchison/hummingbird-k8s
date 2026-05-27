@@ -168,3 +168,45 @@ so `/etc/hostname` is already set by the time `worker-init.service`
 runs. A bats drift fence (`tests/containers/worker-init-no-cloud-init-wait.bats`)
 now blocks the `cloud-init status --wait` string from re-landing in
 `worker-init.sh`.
+
+### `update-cluster` k8s-node resolver jsonpath (#263 → #267)
+
+PR #263 introduced `resolve_k8s_node_name` in
+`scripts/update-cluster.sh` so the script could translate libvirt
+domain names (`hbird-w1`) to the actual k8s node names that
+`kubectl drain`/`uncordon`/wait gates need. The resolver used a
+nested-filter JSONPath:
+
+```
+{range .items[?(@.status.addresses[?(@.address=="<ip>")])]}{.metadata.name}{end}
+```
+
+kubectl's JSONPath does not support `[?(...)]` inside another
+`[?(...)]`; it errors with `unterminated filter` at parse time. The
+script swallowed the kubectl error with `2>/dev/null || true` and
+fell through to a generic "node may not be joined, or apiserver
+unreachable" diagnostic — so `make update-cluster` failed at the
+CP-resolve step on **every** cluster post-#263, including ones
+where the libvirt domain and the k8s node name were identical.
+
+PR #267 replaces the nested filter with a list-and-grep pattern:
+
+```
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' \
+  | awk -F= -v ip="$ip" '$2 == ip { print $1; exit }'
+```
+
+One round-trip, single-level filter (`type=InternalIP`), awk picks the
+matching row client-side. The fix also stops silencing kubectl
+stderr: future jsonpath bugs surface as `WARN: kubectl call failed
+during k8s node resolution …` instead of presenting as the misleading
+"node may not be joined" diagnostic. A bats drift fence
+(`#267 resolve_k8s_node_name uses list-and-grep, not nested-filter
+jsonpath`) static-greps `scripts/update-cluster.sh` to block the
+nested-filter shape from re-landing.
+
+`pr-validate only builds, doesn't boot` (see issue #32) bit hard
+here: #263's source-only bats suite mocked `cp_kubectl` and never
+exercised the actual JSONPath against kubectl. Only the live
+`make update-cluster` on 2026-05-26 against a v0.1.43 cluster caught
+it. Self-hosted-runner boot-tests remain the real gate.

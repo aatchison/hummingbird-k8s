@@ -869,10 +869,16 @@ set -euo pipefail
 DRY_RUN=0
 declare -A NODE_NAME_OVERRIDE_MAP=()
 log() { :; }
-# Stub cp_kubectl: return what an apiserver would return when an address
-# matches. We don't care about the exact request shape — just that the
-# helper passes the stdout through.
-cp_kubectl() { echo "humbird-worker-748f4cf5"; }
+# Stub cp_kubectl: emulate the list-and-grep response shape introduced
+# by #267 — one "<name>=<internal-ip>" row per node. The resolver does
+# the client-side grep against this output.
+cp_kubectl() {
+  cat <<'ROWS'
+hbird-cp1=192.168.122.206
+humbird-worker-748f4cf5=192.168.122.11
+humbird-worker-baef476c=192.168.122.12
+ROWS
+}
 # shellcheck disable=SC1090
 source "${BATS_TEST_TMPDIR}/resolver.snippet"
 out="\$(resolve_k8s_node_name hbird-w1 192.168.122.11)"
@@ -916,8 +922,9 @@ DRY_RUN=0
 declare -A NODE_NAME_OVERRIDE_MAP=()
 # Capture the log-line argument so the test can grep for it.
 log() { printf 'LOG: %s\n' "\$*" >&2; }
-# Empty apiserver response = no node has that IP.
-cp_kubectl() { printf ''; }
+# Apiserver response that does NOT include the searched-for IP: the
+# awk filter finds no match, resolver returns empty + rc 1.
+cp_kubectl() { echo "hbird-cp1=192.168.122.206"; }
 # shellcheck disable=SC1090
 source "${BATS_TEST_TMPDIR}/resolver.snippet"
 set +e
@@ -942,7 +949,9 @@ EOF
 @test "#260 resolve_k8s_node_name trims whitespace from kubectl jsonpath output" {
   # kubectl jsonpath has been observed to append a trailing newline on
   # some apiserver versions; the resolver must strip it so callers don't
-  # compose `kubectl drain $name\n`.
+  # compose `kubectl drain $name\n`. Post-#267 the rows themselves come
+  # newline-separated, so this test now drives the awk-extracted name
+  # through the same whitespace-stripping pass.
   _extract_resolver_snippet "${BATS_TEST_TMPDIR}/resolver.snippet"
   driver="${BATS_TEST_TMPDIR}/resolve-trim.sh"
   cat > "$driver" <<EOF
@@ -951,8 +960,9 @@ set -euo pipefail
 DRY_RUN=0
 declare -A NODE_NAME_OVERRIDE_MAP=()
 log() { :; }
-# Trailing newline + leading whitespace.
-cp_kubectl() { printf '  humbird-worker-abc\n'; }
+# Trailing newline on the row (awk strips the row newline, the
+# resolver's tr-style strip catches any residual whitespace).
+cp_kubectl() { printf 'humbird-worker-abc=192.168.122.11\n'; }
 # shellcheck disable=SC1090
 source "${BATS_TEST_TMPDIR}/resolver.snippet"
 out="\$(resolve_k8s_node_name hbird-w1 192.168.122.11)"
@@ -962,4 +972,93 @@ EOF
   run bash "$driver"
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
   echo "$output" | grep -q "RESOLVED=\\[humbird-worker-abc\\]"
+}
+
+# ---------------------------------------------------------------------------
+# #267 — kubectl JSONPath does NOT support nested filters
+#
+# PR #263 introduced a resolver that used:
+#   {range .items[?(@.status.addresses[?(@.address=="<ip>")])]}{.metadata.name}{end}
+# kubectl rejects the inner `[?(...)]` with "unterminated filter" and the
+# resolver returned empty on EVERY call, breaking update-cluster against
+# every cluster. The fix uses a single-level filter on `.type=="InternalIP"`
+# plus an awk client-side grep. These tests defend against the bug
+# returning by reproducing both the contract AND the syntactic shape.
+# ---------------------------------------------------------------------------
+
+@test "#267 resolve_k8s_node_name uses list-and-grep, not nested-filter jsonpath" {
+  # Static grep against the script: the offending nested-filter shape
+  # MUST NOT appear in the resolver source. Pattern matches
+  # `jsonpath=...items[?(...[?(`, which is the unsupported construct.
+  ! grep -E "jsonpath=.*items\[\?\([^]]*\[\?\(" "$REPO_ROOT/scripts/update-cluster.sh"
+}
+
+@test "#267 resolve_k8s_node_name picks the right node from a multi-row response" {
+  # Exercises the awk client-side grep over a realistic 3-node response.
+  # If the resolver short-circuited or matched the wrong row, this fails.
+  _extract_resolver_snippet "${BATS_TEST_TMPDIR}/resolver.snippet"
+  driver="${BATS_TEST_TMPDIR}/resolve-267.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+DRY_RUN=0
+declare -A NODE_NAME_OVERRIDE_MAP=()
+log() { :; }
+cp_kubectl() {
+  cat <<'ROWS'
+hbird-cp1=192.168.122.206
+hbird-w1=192.168.122.28
+hbird-w2=192.168.122.178
+ROWS
+}
+# shellcheck disable=SC1090
+source "${BATS_TEST_TMPDIR}/resolver.snippet"
+out_cp="\$(resolve_k8s_node_name hbird-cp1 192.168.122.206)"
+out_w1="\$(resolve_k8s_node_name hbird-w1  192.168.122.28)"
+out_w2="\$(resolve_k8s_node_name hbird-w2  192.168.122.178)"
+echo "CP=\$out_cp"
+echo "W1=\$out_w1"
+echo "W2=\$out_w2"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  echo "$output" | grep -q "CP=hbird-cp1"
+  echo "$output" | grep -q "W1=hbird-w1"
+  echo "$output" | grep -q "W2=hbird-w2"
+}
+
+@test "#267 resolve_k8s_node_name surfaces kubectl rc!=0 as WARN (not silent miss)" {
+  # Pre-#267 the resolver swallowed kubectl errors with `2>/dev/null ||
+  # true` so a parse error read as an empty result + the misleading
+  # "node may not be joined" diagnostic. The fix lets the kubectl failure
+  # bubble up as a WARN with the captured stderr.
+  _extract_resolver_snippet "${BATS_TEST_TMPDIR}/resolver.snippet"
+  driver="${BATS_TEST_TMPDIR}/resolve-kubectl-fail.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+DRY_RUN=0
+declare -A NODE_NAME_OVERRIDE_MAP=()
+log() { printf 'LOG: %s\n' "\$*" >&2; }
+# Emulate "kubectl exits non-zero with a parse error on stderr".
+cp_kubectl() { echo "error: error parsing jsonpath ..., unterminated filter" >&2; return 1; }
+# shellcheck disable=SC1090
+source "${BATS_TEST_TMPDIR}/resolver.snippet"
+set +e
+out="\$(resolve_k8s_node_name hbird-w1 192.168.122.11)"
+rc=\$?
+set -e
+echo "RC=\$rc"
+echo "OUT=[\${out}]"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  echo "$output" | grep -q "RC=1"
+  echo "$output" | grep -q "OUT=\\[\\]"
+  # WARN log includes the kubectl stderr fragment so the failure mode is
+  # obvious next time, instead of the misleading "node may not be joined".
+  echo "$output" | grep -q "LOG: WARN: kubectl call failed"
+  echo "$output" | grep -q "unterminated filter"
 }
