@@ -1,0 +1,71 @@
+# Dev/CI parity image for the hummingbird-k8s Rust rewrite (#280, epic #279).
+#
+# Base: Microsoft's prebuilt Rust devcontainer image — gives us rustup +
+# cargo + a non-root `vscode` user with sudo. We layer in the cargo tools
+# the operator brief calls for so dev + CI (#281) consume the same
+# toolchain + tool versions. (Strict byte-for-bit reproducibility lands
+# with cargo-dist + lockfile-pinned binstall in #290; today the base tag
+# and `cargo binstall` are both mutable.)
+#
+# When bumping VARIANT, regenerate the pinned cargo-binstall manifest by
+# running the install step locally and committing the resulting Cargo.lock
+# from the workspace (not done here yet — placeholder crate doesn't pull
+# external deps).
+ARG VARIANT=1-bookworm
+FROM mcr.microsoft.com/devcontainers/rust:${VARIANT}
+
+# System packages: musl-tools for the eventual #290 static binaries (the
+# bash project ships scripts; the Rust binaries will be cosign-signed musl
+# statics per the epic). clang + libssl-dev are usually needed for native
+# deps (openssl-sys, ring). pre-commit is the framework rustfmt + clippy
+# hooks plug into.
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       clang \
+       libssl-dev \
+       musl-tools \
+       pkg-config \
+       pre-commit \
+  && rm -rf /var/lib/apt/lists/*
+
+# cargo-binstall fetches prebuilt cargo-* binaries when available (much
+# faster + more reliable than `cargo install` for image builds). Falls
+# back to `cargo install` on miss, so the spec stays unchanged.
+#
+# Notes:
+# - The mcr rust image installs rustup/cargo system-wide via
+#   CARGO_HOME=/usr/local/cargo + PATH=/usr/local/cargo/bin, NOT in
+#   /home/vscode/.cargo. We rely on `cargo` being on PATH (it is, for
+#   both root and vscode) rather than hardcoding any homedir path. The
+#   vscode user has group write on /usr/local/cargo via the base image's
+#   `rustlang` group membership, which is what lets binstall land tools
+#   there as a non-root user.
+# - Install script is pinned to a tagged release (not `main`) so the
+#   foundation image's trust base doesn't depend on a mutable branch.
+#   Bump CARGO_BINSTALL_VER alongside the base image VARIANT when needed.
+USER vscode
+ARG CARGO_BINSTALL_VER=v1.15.10
+RUN curl --proto '=https' --tlsv1.2 -sSfL \
+      "https://raw.githubusercontent.com/cargo-bins/cargo-binstall/${CARGO_BINSTALL_VER}/install-from-binstall-release.sh" \
+    | bash
+
+# Cargo tools per the operator brief — one tool per RUN so a single
+# upstream rename/yank/network blip surfaces the failing tool by name
+# AND layer caching survives per-tool churn (rebuilding just dist after
+# a cargo-dist bump won't reinstall the other four). cargo-tree omitted —
+# `cargo tree` ships with cargo since 1.44.
+#
+# Supply-chain note: binstall's default policy accepts unsigned prebuilt
+# binaries when no signed release is published. As of 2026-05, only some
+# of these crates publish signed binaries (rejected by --only-signed:
+# cargo-dist, cargo-watch, cargo-expand). Adding --only-signed across
+# the board fell through to source-compile, which doesn't currently
+# build for cargo-dist (compile error). Trade-off accepted for the
+# foundation; revisit when more tools ship signed releases. The pin on
+# the binstall install script itself (above) is the more important
+# trust anchor.
+RUN cargo binstall --no-confirm --no-symlinks cargo-nextest
+RUN cargo binstall --no-confirm --no-symlinks cargo-deny
+RUN cargo binstall --no-confirm --no-symlinks cargo-dist
+RUN cargo binstall --no-confirm --no-symlinks cargo-watch
+RUN cargo binstall --no-confirm --no-symlinks cargo-expand

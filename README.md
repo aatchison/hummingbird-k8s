@@ -16,6 +16,14 @@ Both derive from `quay.io/hummingbird-community/bootc-os`, are built with
 under libvirt. Design notes and gotchas live in [`NOTES.md`](NOTES.md); this
 README is the operator-facing entry point.
 
+> **Rust rewrite in progress** — the client-side bash tooling under
+> [`scripts/`](scripts/) is being rewritten in Rust over several phases per
+> epic [#279](https://github.com/aatchison/hummingbird-k8s/issues/279). The
+> workspace lives at [`rust/`](rust/) and currently holds only the foundation
+> ([#280](https://github.com/aatchison/hummingbird-k8s/issues/280)). **No
+> operator-facing change yet** — every `make` target still invokes the bash
+> scripts. See [`docs/rust-cli.md`](docs/rust-cli.md) for status.
+
 ## Topology
 
 A single KVM host runs one control plane + N workers:

@@ -1,0 +1,59 @@
+# pre-commit hooks for the Rust client-side rewrite (#280).
+#
+# Installed by the devcontainer's postCreateCommand (`pre-commit install
+# --hook-type pre-commit`). To install manually outside the devcontainer:
+#   pre-commit install --hook-type pre-commit
+# To run all hooks across the tree:
+#   pre-commit run --all-files
+#
+# Scope: hooks only fire when files under `rust/` change. Bash files under
+# scripts/ have their own bats/shellcheck coverage via the existing CI;
+# duplicating it here would conflict with the staged-migration approach
+# (bash stays canonical until each Rust subcommand reaches parity).
+repos:
+  - repo: local
+    hooks:
+      # Both hooks defensively check that (a) `cargo` is on PATH and
+      # (b) the `rust/` directory exists. Without (a), a dev who commits
+      # from the host (outside the devcontainer) gets a clear "use the
+      # devcontainer" hint instead of opaque "cargo: command not found".
+      # Without (b), a `git revert` of this PR leaves these hooks in
+      # `.git/hooks/pre-commit` and they'd block every future commit
+      # trying to `cd rust` into a non-existent dir (round-2 review
+      # convergence: L2 + L3 + L5 + L7).
+      - id: cargo-fmt
+        name: cargo fmt --check (rust/)
+        entry: |
+          bash -c '
+            command -v cargo >/dev/null || {
+              echo "[pre-commit] cargo not on PATH — run inside the devcontainer (.devcontainer/README.md) or install rustup on the host";
+              exit 1;
+            };
+            [ -d rust ] || {
+              echo "[pre-commit] rust/ not present; cargo-fmt hook is a no-op";
+              exit 0;
+            };
+            cd rust && cargo fmt --all -- --check
+          '
+        language: system
+        files: ^rust/.*\.rs$
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy -D warnings (rust/)
+        entry: |
+          bash -c '
+            command -v cargo >/dev/null || {
+              echo "[pre-commit] cargo not on PATH — run inside the devcontainer (.devcontainer/README.md) or install rustup on the host";
+              exit 1;
+            };
+            [ -d rust ] || {
+              echo "[pre-commit] rust/ not present; cargo-clippy hook is a no-op";
+              exit 0;
+            };
+            cd rust && cargo clippy --workspace --all-targets -- -D warnings
+          '
+        language: system
+        # Trigger on rust files OR Cargo.toml/lock changes (a dep bump can
+        # surface new clippy lints even without a .rs edit).
+        files: ^rust/.*\.(rs|toml|lock)$
+        pass_filenames: false
