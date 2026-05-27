@@ -13,6 +13,11 @@
     {
       "matchPackageNames": ["kubernetes/kubernetes", "cilium/cilium-cli"],
       "groupName": "kubernetes-tooling"
+    },
+    {
+      "matchPackageNames": ["quay.io/hummingbird-community/bootc-os"],
+      "groupName": "bootc-os-base",
+      "automerge": false
     }
   ],
   "customManagers": [
@@ -33,6 +38,17 @@
       ],
       "depNameTemplate": "kubernetes/kubernetes",
       "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["^containers/.*/Containerfile$", "^lib/build-common\\.sh$"],
+      "matchStrings": [
+        "quay\\.io/hummingbird-community/bootc-os@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "depNameTemplate": "quay.io/hummingbird-community/bootc-os",
+      "packageNameTemplate": "quay.io/hummingbird-community/bootc-os",
+      "datasourceTemplate": "docker",
+      "currentValueTemplate": "latest"
     }
   ]
 }
