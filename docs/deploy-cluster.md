@@ -213,6 +213,21 @@ default. `spawn-workers.sh` still requires root on the remote (that's
 the remaining bit of #269's original scope, not yet folded into the
 no-sudo path).
 
+**Pre-#310 hosts:** if a host ever ran `sudo bash scripts/deploy-cluster.sh`
+before PR for #310 landed, the BIB config files
+(`bib-config-deploy-{cp,worker}.toml`) were left behind in the
+operator's checkout owned `root:root` mode `0644`. Subsequent no-sudo
+deploys would fail at the rewrite with `Permission denied`. Post-#310
+these files are written to `mktemp` paths (no REPO_ROOT side-effect), so
+new operators never hit this — but existing hosts may need a one-time
+cleanup of the leftover files:
+
+```bash
+ssh $KVM_HOST 'sudo rm -f ~/hummingbird-k8s/bib-config-deploy-{cp,worker}.toml'
+```
+
+See #310 for the rationale (sibling bug to #305's POOL_DIR migration).
+
 ### Reusing pre-built qcow2 templates (#311)
 
 `bootc-image-builder` (bib) — invoked by `build_qcow2` in

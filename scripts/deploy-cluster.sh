@@ -253,14 +253,29 @@ CONFIG_PATH="${1:-${REPO_ROOT}/cluster.local.conf}"
 # Track seed ISOs we create so the failure-trap can clean them up without
 # touching VMs the operator might still want to debug.
 SEED_ISOS=()
+# Track BIB config tempfiles (#310) so the failure-trap can clean them up
+# too. These are tiny TOMLs build_qcow2 consumes once; persisting them
+# would just be litter — and pre-#310 they were written into REPO_ROOT
+# where root-owned leftovers blocked subsequent non-root deploys (the
+# whole reason for routing through mktemp).
+BIB_CFG_TEMPS=()
 cleanup_on_failure() {
   local rc=$?
-  if (( rc != 0 )) && (( ${#SEED_ISOS[@]} > 0 )); then
-    log "deploy failed (rc=${rc}); cleaning up half-built seed ISOs."
-    local s
-    for s in "${SEED_ISOS[@]}"; do
-      [[ -e "$s" ]] && rm -f "$s"
-    done
+  if (( rc != 0 )); then
+    if (( ${#SEED_ISOS[@]} > 0 )); then
+      log "deploy failed (rc=${rc}); cleaning up half-built seed ISOs."
+      local s
+      for s in "${SEED_ISOS[@]}"; do
+        [[ -e "$s" ]] && rm -f "$s"
+      done
+    fi
+    if (( ${#BIB_CFG_TEMPS[@]} > 0 )); then
+      log "deploy failed (rc=${rc}); cleaning up BIB config tempfiles."
+      local t
+      for t in "${BIB_CFG_TEMPS[@]}"; do
+        [[ -e "$t" ]] && rm -f "$t"
+      done
+    fi
   fi
 }
 trap cleanup_on_failure EXIT
@@ -440,9 +455,21 @@ esac
 # Reuse lib/build-common.sh's render_bib_config + build_qcow2. We render
 # once per flavor; the resulting qcow2 lives under POOL_DIR/<NAME>.qcow2
 # and gets cloned per-VM below.
-
-BIB_CFG_CP="${REPO_ROOT}/bib-config-deploy-cp.toml"
-BIB_CFG_WORKER="${REPO_ROOT}/bib-config-deploy-worker.toml"
+#
+# #310: route both BIB config files through mktemp instead of REPO_ROOT.
+# Pre-#310 these were written to ${REPO_ROOT}/bib-config-deploy-{cp,worker}.toml,
+# which (a) leaked deploy state into the operator's git checkout (showed
+# up in `git status` every deploy) and (b) on any host that had previously
+# run `sudo bash scripts/deploy-cluster.sh` left the files owned by
+# root:root mode 0644 — which then blocked subsequent non-root deploys
+# (HBIRD_REMOTE_NO_SUDO=1, the no-sudo libvirt-group operator path #305
+# added) at the rewrite with Permission denied. mktemp paths sidestep
+# both problems: per-deploy fresh paths owned by the invoking user, no
+# REPO_ROOT side-effects. Tracked in cleanup_on_failure + rm -f'd after
+# build_qcow2 consumes them (they aren't needed past that point).
+BIB_CFG_CP="$(mktemp -t bib-config-deploy-cp.XXXXXX.toml)"
+BIB_CFG_WORKER="$(mktemp -t bib-config-deploy-worker.XXXXXX.toml)"
+BIB_CFG_TEMPS+=("$BIB_CFG_CP" "$BIB_CFG_WORKER")
 
 # The bib config bakes ONE static pubkey set; render once and reuse.
 render_bib_config > "$BIB_CFG_CP"
@@ -458,6 +485,13 @@ build_qcow2 "$CP_IMAGE_REF" "$CP_TEMPLATE_NAME" "$BIB_CFG_CP"
 
 log "building worker qcow2 template"
 build_qcow2 "$WORKER_IMAGE_REF" "$WORKER_TEMPLATE_NAME" "$BIB_CFG_WORKER"
+
+# #310: BIB config tempfiles have served their purpose (build_qcow2
+# consumed them; they aren't read again). Drop them now so a successful
+# deploy doesn't leave litter in $TMPDIR. The failure-trap above covers
+# the abnormal-exit path.
+rm -f "$BIB_CFG_CP" "$BIB_CFG_WORKER"
+BIB_CFG_TEMPS=()
 
 CP_TEMPLATE_QCOW="${POOL_DIR}/${CP_TEMPLATE_NAME}.qcow2"
 WORKER_TEMPLATE_QCOW="${POOL_DIR}/${WORKER_TEMPLATE_NAME}.qcow2"
