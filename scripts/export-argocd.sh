@@ -271,12 +271,19 @@ SSH_PRIVKEY_FILE="$(derive_ssh_privkey_file "$SSH_PUBKEY_FILE")" \
 
 # ---- resolve CP_IP ----------------------------------------------------------
 # CP_IP can come from the config directly (operator pinned), or be resolved
-# via libvirt against CP_NAME on the local KVM host (resolve_vm_ip helper).
-
-if [[ -z "${CP_IP:-}" ]] && command -v virsh >/dev/null 2>&1; then
-  CP_IP="$(resolve_vm_ip "$CP_NAME" 2>/dev/null || true)"
+# via libvirt — either over SSH to KVM_HOST (workstation operator with no
+# local libvirt) or against a local virsh (operator on the KVM host).
+# resolve_cp_ip (lib/build-common.sh) picks the right path. The operator
+# can pin CP_IP in their CONFIG to skip resolution entirely. (issue #270)
+#
+# resolve_cp_ip prints its own diagnostic to stderr on failure (so the
+# operator sees the full "set CP_IP or KVM_HOST" sentence verbatim); we
+# only need a short post-check + secondary fail() in case it returned an
+# empty string with rc=0 (shouldn't happen, but defense in depth).
+if ! CP_IP="$(resolve_cp_ip "$CP_NAME" "${CP_IP:-}")"; then
+  fail "could not resolve CP_IP for '$CP_NAME' (set CP_IP=<ip> in $CONFIG, or export KVM_HOST=<ssh-alias>; see diagnostic above)"
 fi
-[[ -n "${CP_IP:-}" ]] || fail "could not resolve CP_IP — set CP_IP=<ip> in $CONFIG or run from the KVM host with libvirt access to '$CP_NAME'"
+[[ -n "${CP_IP:-}" ]] || fail "resolve_cp_ip returned empty CP_IP for '$CP_NAME'"
 
 # ---- derive defaults --------------------------------------------------------
 
