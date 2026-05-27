@@ -1510,17 +1510,103 @@ fn run_one_worker(plan: &Plan, w: &str, results: &mut Results) -> Result<()> {
 
 // ---- cp_kubectl shim -------------------------------------------------------
 
-/// Run a kubectl command via the CP. Mirrors `cp_kubectl` (line 425).
-/// Dry-run emits the bash log shape.
-fn cp_kubectl(plan: &Plan, command: &str) -> Result<()> {
+/// Run a kubectl command via the CP. Mirrors `cp_kubectl`
+/// (`scripts/update-cluster.sh:425`). First live helper wired by #322
+/// cycle 1; [`cp_ssh_opts`] is the shared SSH-options builder reused by
+/// cycles 2–4 (`wait_apiserver_back`, `wait_node_ready`,
+/// `capture_node_bootid`).
+///
+/// Live execution path (Phase 1B, #322): builds an `hbird_ssh::Client`
+/// per call against `root@plan.cp_ip` with `--proxy-jump` set to
+/// `plan.kvm_host` when present. Emits kubectl stdout to operator stdout
+/// via the prefix-aware [`log`] helper (matches bash twin's `ssh -t`
+/// channel choice). On success, *also* emits any kubectl stderr via
+/// [`log_err`] so warnings like `Warning: ignoring DaemonSet-managed
+/// Pods: ...` from `drain` reach operators who grep stderr for `Warning:`
+/// (round-2 lens L8 HIGH + CodeRabbit comment on #325).
+///
+/// Returns the captured kubectl stdout as a `String` so callers like
+/// `capture_node_bootid` / `wait_node_bootid_changed` /
+/// `wait_node_daemonsets_ready` (bash lines 894, 937, 1013, 1032, 1042)
+/// can parse jsonpath / pod-count output. Round-2 lens L2 HIGH —
+/// returning `Result<()>` would have blocked cycle 2 wait helpers.
+///
+/// Drain/uncordon callers (block #5 + part of update_worker) discard
+/// the returned string; the same `Ok("")` shape works for them.
+// TODO(#323): #[tracing::instrument(skip(plan), fields(cp_ip = %plan.cp_ip, command = %command))]
+//             once tracing-subscriber lands.
+fn cp_kubectl(plan: &Plan, command: &str) -> Result<String> {
     if plan.dry_run {
         log(&format!("DRY-RUN cp_kubectl -- {command}"));
-        return Ok(());
+        return Ok(String::new());
     }
-    Err(live_mode_not_implemented(
-        "cp_kubectl",
-        &format!("ssh root@{} kubectl ... {command}", plan.cp_ip),
-    ))
+    // Round-2 L1 HIGH (defense-in-depth): the command is forwarded as a
+    // single argv element to `ssh root@CP_IP`, which executes it via
+    // `/bin/sh -c`. kubectl invocations don't need shell metacharacters;
+    // a metachar in `command` would indicate an upstream bug or
+    // injection. Reject before the SSH layer rather than relying on
+    // every caller to allowlist k8s_name / namespace / field-selector
+    // values themselves.
+    if let Some(bad) = command
+        .chars()
+        .find(|c| matches!(c, ';' | '&' | '|' | '`' | '\n' | '\r'))
+    {
+        bail!(
+            "cp_kubectl: refusing command with shell metacharacter '{bad}' \
+             (commands are forwarded to remote /bin/sh -c; metachars would \
+             execute as root on the CP). command={command:?}"
+        );
+    }
+    if command.contains("$(") {
+        bail!(
+            "cp_kubectl: refusing command with `$(` substitution (executes \
+             as root on the CP). command={command:?}"
+        );
+    }
+    let opts = cp_ssh_opts(plan);
+    let client = hbird_ssh::Client::new(opts);
+    let remote = format!("kubectl --kubeconfig=/etc/kubernetes/admin.conf {command}");
+    let output = client.run(&remote).with_context(|| {
+        format!(
+            "cp_kubectl: ssh-run failed for `kubectl ... {command}` against {}",
+            plan.cp_ip
+        )
+    })?;
+    let stdout = output.stdout_lossy();
+    if !stdout.trim().is_empty() {
+        for line in stdout.lines() {
+            log(line);
+        }
+    }
+    // Round-2 L8 HIGH: surface non-empty stderr on success too. kubectl
+    // emits Warnings (e.g. "Warning: ignoring DaemonSet-managed Pods")
+    // on stderr even when exit 0; bash twin's `ssh -t` interleaves these
+    // onto the terminal, so dropping them in Rust silently breaks
+    // log-grep parity.
+    let stderr = output.stderr_lossy();
+    if !stderr.trim().is_empty() {
+        for line in stderr.lines() {
+            log_err(line);
+        }
+    }
+    Ok(stdout)
+}
+
+/// Build the SSH options for a CP-targeted call — bash twin's
+/// `CP_SSH_OPTS` array shape (`scripts/lib/build-common.sh`'s
+/// `ssh_opts_array CP_SSH_OPTS`). Pulls `cp_ip` from the plan and
+/// ProxyJump from `kvm_host` when set.
+///
+/// Strict-host-key-checking stays off (default) — VM IPs rotate per
+/// deploy; pinning is left to `~/.ssh/config` if the operator opts in
+/// (see issue #320). The name mirrors bash's `cp_ssh_opts` grep-anchor
+/// (round-2 lens L9 MEDIUM).
+fn cp_ssh_opts(plan: &Plan) -> hbird_ssh::SshOptions {
+    let mut opts = hbird_ssh::SshOptions::new(plan.cp_ip.clone()).with_user("root");
+    if let Some(jump) = plan.kvm_host.as_deref() {
+        opts = opts.with_proxy_jump(jump.to_string());
+    }
+    opts
 }
 
 // ---- block #15 + dispatch: run() ------------------------------------------
