@@ -146,7 +146,11 @@ pub struct ClusterConfig {
     /// # Ok::<(), hbird_config::Error>(())
     /// ```
     ///
-    /// Tracking: [#316](https://github.com/aatchison/hummingbird-k8s/issues/316).
+    /// # Ordering invariant
+    ///
+    /// Sorted by `(line_no, key)` — operator tooling can print warnings
+    /// top-to-bottom without re-sorting, and tie-breaking is total
+    /// (HashMap iteration order does not leak into the public API).
     pub warnings: Vec<Warning>,
 }
 

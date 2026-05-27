@@ -130,16 +130,22 @@ pub enum Error {
 
     /// A field's RHS was the wrong shape for its declared type — e.g.
     /// `WORKER_NAMES=foo` (scalar where an array is expected) or
-    /// `CP_MEMORY=(1 2)` (array where a scalar is expected). The
-    /// pre-#316 code silently coerced these to `None` / default, which
-    /// hid operator typos until the deploy reached `virsh`/`kubeadm`
-    /// and produced a confusing downstream failure. (#316.)
+    /// `CP_MEMORY=(1 2)` (array where a scalar is expected).
     ///
-    /// The bash twin is also silent here (`source` doesn't validate
-    /// scalar-vs-array), but bash operators *expect* shell-style silence;
-    /// the Rust API gets to be tighter without breaking any *valid*
-    /// config because every shipping `cluster.example.conf` uses the
-    /// correct shape per field.
+    /// # Bool-field asymmetry (intentional)
+    ///
+    /// For bool fields, shape and value validation are split between two
+    /// variants — be deliberate about which one fires:
+    ///
+    /// - **Shape mismatch** (`RUN_VERIFY=(a b)` — array assigned to a
+    ///   bool field) → `TypeMismatch` (loud, hard error). #316.
+    /// - **Invalid scalar value** (`RUN_VERIFY=banana` — lenient bool
+    ///   gets an unknown spelling) → silently uses default. #315 design.
+    ///
+    /// Strict bools (`AUTO_UPDATE_CP`, `SWITCH_TO_GHCR`) error on bad
+    /// values via `Error::InvalidBool`; lenient bools (`RUN_VERIFY`)
+    /// do not. See `take_bool_or_default` in `parser.rs` for the
+    /// per-field rationale.
     #[error("type mismatch for {field} at line {line_no}: expected {expected}, got {got}")]
     TypeMismatch {
         /// Field name whose declared type didn't match the assigned shape.
@@ -163,7 +169,12 @@ pub enum Error {
 /// parity with the bash twin. Operators who want fail-on-typo behavior
 /// can opt in by treating a non-empty `warnings` vec as a hard failure.
 ///
-/// (#316.)
+/// # Derive invariant
+///
+/// All variants must remain `Clone + PartialEq + Eq`. Operator-tooling
+/// callers compare and clone `Warning` values when grouping diagnostics
+/// (e.g. dedup across a multi-file batch); adding a variant that breaks
+/// these bounds is a SemVer-major change.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Warning {

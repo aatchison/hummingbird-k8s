@@ -314,15 +314,25 @@ fn build_config(
 
     // Any keys still sitting in `raw` are unknown — no field consumed
     // them. Surface each as a `Warning::UnknownKey` so operator tooling
-    // can print the typo near its source line. Sort by line number so
-    // multi-warning output stays deterministic (bash silently ignores
-    // unknown keys, so we don't error — see Warning::UnknownKey docs).
+    // can print the typo near its source line. Sort by `(line_no, key)`
+    // so multi-warning output stays deterministic — sort_by_key alone
+    // leaves tie-breaking up to HashMap iteration order (non-deterministic
+    // across runs), which makes failure-mode tests flaky. Adding the key
+    // as a tiebreaker gives a total order regardless of HashMap state.
     let mut warnings: Vec<Warning> = raw
         .into_iter()
         .map(|(key, (line_no, _value))| Warning::UnknownKey { key, line_no })
         .collect();
-    warnings.sort_by_key(|w| match w {
-        Warning::UnknownKey { line_no, .. } => *line_no,
+    warnings.sort_by(|a, b| {
+        let Warning::UnknownKey {
+            line_no: a_line,
+            key: a_key,
+        } = a;
+        let Warning::UnknownKey {
+            line_no: b_line,
+            key: b_key,
+        } = b;
+        a_line.cmp(b_line).then_with(|| a_key.cmp(b_key))
     });
 
     Ok(ClusterConfig {
