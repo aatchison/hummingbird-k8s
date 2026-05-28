@@ -35,6 +35,11 @@
 #   podman run --rm -v "$PWD:/repo:Z" -w /repo \
 #     docker.io/bats/bats:latest tests/scripts/ssh-wrap.bats
 
+# `run --separate-stderr` (used in the round-2 M5 stream-separation test)
+# requires bats >= 1.5.0. The pinned BATS_IMAGE is 1.13.0 so this is a
+# silence-the-BW02-warning declaration, not a real gate.
+bats_require_minimum_version 1.5.0
+
 setup() {
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
   LIB="${REPO_ROOT}/scripts/lib/ssh-wrap.sh"
@@ -52,7 +57,16 @@ setup() {
         WORKER_NAMES POOL_DIR POOL_NAME \
         VM_USER STORAGE_DRIVER PODMAN_ROOT PODMAN_RUNROOT APISERVER_EXTRA_SANS \
         HBIRD_AUTOLOAD_CONFIG_LOCAL HBIRD_OPERATOR_PUBKEY_FILE \
-        HBIRD_SSH_WRAP_DRY_RUN_SCP HBIRD_REMOTE_NO_SUDO
+        HBIRD_SSH_WRAP_DRY_RUN_SCP HBIRD_REMOTE_NO_SUDO \
+        HBIRD_REMOTE_FRESHNESS_CHECK HBIRD_REMOTE_STRICT \
+        HBIRD_REMOTE_LAG_THRESHOLD HBIRD_SSH_WRAP_FRESHNESS_CACHE \
+        HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA \
+        HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT
+
+  # Disable the freshness cache for all tests by default so per-test SHA
+  # assertions don't bleed into one another via the cache file.
+  # Individual tests opt back in to exercise cache behavior.
+  export HBIRD_SSH_WRAP_FRESHNESS_CACHE=0
 
   LOCAL_HOST="$(hostname -s 2>/dev/null || hostname)"
 }
@@ -599,4 +613,441 @@ EOF
   [ -n "$shim_line" ]
   [ -n "$euid_line" ]
   [ "$shim_line" -lt "$euid_line" ]
+}
+
+# ---------------------------------------------------------------------------
+# #365 — remote-checkout freshness check
+# ---------------------------------------------------------------------------
+#
+# Background: ssh-wrap re-execs scripts on the KVM host using the host's
+# local checkout (HBIRD_REMOTE_REPO, default ~/hummingbird-k8s). When that
+# checkout is behind the operator's local repo, merged fixes silently do
+# NOT apply on re-exec — operator + agent see pre-merge behavior on a
+# post-merge tree, with no warning.
+#
+# Surfaced after a cycle-2 dispatch where geary's checkout was missing the
+# #364 merge and silently ran the pre-fix verify-app-deploy.sh. Operator
+# had to `ssh geary git pull` manually before recovery.
+#
+# The check WARNs by default (does not auto-pull); HBIRD_REMOTE_STRICT=1
+# upgrades the warning to a hard fail (exit 1).
+#
+# The bats container has no git, so freshness tests drive both the local
+# SHA (HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=...) and the remote SHA branch
+# (HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=equal|behind|diverged|missing) through
+# dry-run hooks. The shim treats DRY_RUN_FRESHNESS being set as the
+# trigger to run the check even when the SSH-preflight dry-run is on.
+
+@test "ssh-wrap: freshness equal SHA -> no warning emitted (#365)" {
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=equal \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  # No staleness warning.
+  [[ "$output" != *"WARN:"* ]]
+  # And the re-exec still fires.
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: freshness behind -> WARN with recovery hint (#365)" {
+  # Use a behind-count above the default lag threshold so the WARN fires.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  # Warning surfaces the BEHIND case + the new fetch+reset recovery hint.
+  [[ "$output" == *"WARN: otherhost checkout"* ]]
+  [[ "$output" == *"is BEHIND local"* ]]
+  [[ "$output" == *"by 10 commit(s)"* ]]
+  # Round-2 M1: hint is fetch+reset, not pull (safe form for a
+  # deployment-tracking checkout). bats container has no git so the
+  # branch name resolves to 'main' via the fallback in the helper.
+  [[ "$output" == *"git -C ~/hummingbird-k8s fetch"* ]]
+  [[ "$output" == *"reset --hard origin/main"* ]]
+  [[ "$output" == *"will NOT auto-pull"* ]]
+  # The re-exec still fires (warn-only, not strict).
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: freshness diverged -> WARN with diverge message (#365)" {
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=diverged \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN: otherhost checkout"* ]]
+  [[ "$output" == *"diverges from local"* ]]
+  # Diverged path must NOT print the BEHIND-specific recovery hint —
+  # `git reset --hard origin/main` on a divergent branch would discard
+  # the divergent commits.
+  [[ "$output" != *"is BEHIND local"* ]]
+  [[ "$output" != *"reset --hard"* ]]
+  # Re-exec still fires.
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: freshness missing remote checkout -> WARN about missing path (#365)" {
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=missing \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  # Round-2 H1 + M11: distinguished from network-unreachable. The
+  # preflight already validated scripts/ exists, so this is the .git-
+  # missing / extracted-tarball case.
+  [[ "$output" == *"WARN: otherhost:~/hummingbird-k8s exists but is not a git checkout"* ]]
+  [[ "$output" == *"preflight passed"* ]]
+  # M12: WARN must tell the operator the re-exec will likely run mystery
+  # code, and offer both the re-clone recovery AND the FRESHNESS_CHECK=0
+  # override.
+  [[ "$output" == *"re-exec will likely run mystery code"* ]]
+  [[ "$output" == *"HBIRD_REMOTE_FRESHNESS_CHECK=0 to override"* ]]
+  # Default = warn-only, re-exec still fires.
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: HBIRD_REMOTE_STRICT=1 -> hard-fail on behind (#365)" {
+  # behind-count above lag threshold so the WARN actually fires under
+  # the round-2 M9 lag-threshold default of 5.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10 \
+    HBIRD_REMOTE_STRICT=1 \
+    run invoke_shim
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"is BEHIND local"* ]]
+  [[ "$output" == *"HBIRD_REMOTE_STRICT=1 — refusing to re-exec"* ]]
+  # Critically, the re-exec MUST NOT fire on strict + stale.
+  [[ "$output" != *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: HBIRD_REMOTE_STRICT=1 -> hard-fail on diverged (#365)" {
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=diverged \
+    HBIRD_REMOTE_STRICT=1 \
+    run invoke_shim
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"diverges from local"* ]]
+  [[ "$output" == *"HBIRD_REMOTE_STRICT=1"* ]]
+  [[ "$output" != *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: HBIRD_REMOTE_STRICT=1 -> hard-fail on missing (#365)" {
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=missing \
+    HBIRD_REMOTE_STRICT=1 \
+    run invoke_shim
+  [ "$status" -ne 0 ]
+  # Round-2 H1 / M11 wording: distinguished from network-unreachable.
+  [[ "$output" == *"is not a git checkout"* ]]
+  [[ "$output" == *"HBIRD_REMOTE_STRICT=1 — refusing to re-exec on a missing remote checkout"* ]]
+  [[ "$output" != *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: HBIRD_REMOTE_STRICT=1 -> still re-execs on equal (no false fail) (#365)" {
+  # STRICT must NOT block the happy path — only stale.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=equal \
+    HBIRD_REMOTE_STRICT=1 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARN:"* ]]
+  [[ "$output" != *"refusing to re-exec"* ]]
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: HBIRD_REMOTE_FRESHNESS_CHECK=0 -> skip check entirely, no WARN on stale (#365)" {
+  # Operator opt-out: even with a known-stale state, no warning fires
+  # and the re-exec proceeds. Used by callers who knowingly want to
+  # exercise an older remote checkout (release-train rollback drill,
+  # bisect across nodes, etc.).
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_REMOTE_FRESHNESS_CHECK=0 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARN:"* ]]
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: freshness warning honors HBIRD_REMOTE_REPO override in the recovery hint (#365)" {
+  # When the operator overrides the remote checkout location, the
+  # recovery hint MUST point at the actual path — not the default — so
+  # the operator can copy/paste the fix.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_REMOTE_REPO=/opt/hummingbird-k8s \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  # Round-2 M1: hint is fetch + reset, both pointing at the override path.
+  [[ "$output" == *"git -C /opt/hummingbird-k8s fetch"* ]]
+  [[ "$output" == *"git -C /opt/hummingbird-k8s reset --hard origin/main"* ]]
+}
+
+@test "ssh-wrap: freshness check stays silent when default preflight skip is on and no FRESHNESS hook set (#365)" {
+  # Round-2 M3 tightening: explicitly set DRY_RUN_LOCAL_SHA + DRY_RUN_
+  # FRESHNESS=behind in this test's environment but ALSO unset
+  # DRY_RUN_FRESHNESS via the gate — actually wait, that's contradictory.
+  # The intent is to prove the gate: when PREFLIGHT=1 + no DRY_RUN_FRESH,
+  # the helper must not fire even if DRY_RUN_LOCAL_SHA is set (which it
+  # might be if a developer plumbed it through). Set LOCAL_SHA but NOT
+  # FRESHNESS — the gate in maybe_reexec keys off FRESHNESS, so the check
+  # should be skipped entirely. (round-1 only checked the absence of
+  # inputs; this version proves the gate.)
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARN:"* ]]
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# #365 round-2 — new findings (H1 ssh-vs-rev-parse distinction, M2 cache,
+# M4 prod-leak guard, M5 stream separation, M7 boolish, M9 lag threshold,
+# M12 missing-checkout messaging)
+# ---------------------------------------------------------------------------
+
+@test "ssh-wrap: round-2 H1 — unreachable host WARN distinct from missing-repo (#365)" {
+  # Round-2 H1: network failure (ssh exit non-zero) must produce a
+  # distinct WARN from the "ssh OK but rev-parse empty" case so the
+  # operator can tell network/auth issues from a broken remote checkout.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=unreachable \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN: cannot reach otherhost"* ]]
+  [[ "$output" == *"ssh exit 255"* ]]
+  # Must NOT use the missing-repo wording.
+  [[ "$output" != *"is not a git checkout"* ]]
+  # Re-exec still fires (warn-only) — the real ssh below will surface
+  # the genuine network error.
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: round-2 H1 — unreachable under STRICT still does NOT hard-fail (#365)" {
+  # The "cannot reach" case is a transient network issue. Hard-failing
+  # under STRICT would block legitimate work over a flaky link. Operator
+  # gets the WARN but the re-exec still tries.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=unreachable \
+    HBIRD_REMOTE_STRICT=1 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN: cannot reach"* ]]
+  [[ "$output" != *"refusing to re-exec"* ]]
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: round-2 M9 — small behind lag (<= default threshold) is silent (#365)" {
+  # Default lag threshold is 5. A 1-commit-behind checkout is normal
+  # (release-train rebase happened mid-session) and must not WARN.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=3 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARN:"* ]]
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: round-2 M9 — lag threshold 0 makes any lag noisy (#365)" {
+  # Operator opt-in to strict lag tracking: threshold=0 warns even on 1.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=1 \
+    HBIRD_REMOTE_LAG_THRESHOLD=0 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"is BEHIND local"* ]]
+  [[ "$output" == *"by 1 commit(s)"* ]]
+}
+
+@test "ssh-wrap: round-2 M9 — non-numeric lag threshold falls back to default (#365)" {
+  # Defensive: a typo'd threshold ("five") must not crash the helper.
+  # Falls back to 5; behind-count=3 stays silent.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=3 \
+    HBIRD_REMOTE_LAG_THRESHOLD=five \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARN:"* ]]
+}
+
+@test "ssh-wrap: round-2 M7 — FRESHNESS_CHECK boolish accepts 'false' / 'no' / 'off' (#365)" {
+  # Round-2 M7: parity with rust-cli boolish parser
+  # (docs/rust-cli-migration.md:90). All three values must disable the
+  # check — round-1 only honored literal '0'.
+  for off_val in false no off FALSE No OFF; do
+    KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+      HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+      HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+      HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10 \
+      HBIRD_REMOTE_FRESHNESS_CHECK="$off_val" \
+      run invoke_shim
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"WARN:"* ]] || { echo "off_val=$off_val produced WARN: $output"; false; }
+  done
+}
+
+@test "ssh-wrap: round-2 M7 — STRICT boolish accepts 'true' / 'yes' / 'on' (#365)" {
+  for on_val in true yes on TRUE Yes ON; do
+    KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+      HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+      HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+      HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10 \
+      HBIRD_REMOTE_STRICT="$on_val" \
+      run invoke_shim
+    [ "$status" -ne 0 ] || { echo "on_val=$on_val did not hard-fail: $output"; false; }
+    [[ "$output" == *"refusing to re-exec"* ]] || { echo "on_val=$on_val no refuse msg: $output"; false; }
+  done
+}
+
+@test "ssh-wrap: round-2 M4 — test-only hooks WARN when set outside bats (#365)" {
+  # Unset BATS_TEST_FILENAME inside the invocation to simulate a prod
+  # shell that accidentally exported HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS.
+  # We do this in a wrapper subshell so the bats harness still sees
+  # the var for its own bookkeeping.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=equal \
+    run env -u BATS_TEST_FILENAME bash -c "source $LIB; hbird_ssh_wrap_maybe_reexec /fake/path/scripts/foo.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN: HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS"* ]]
+  [[ "$output" == *"test-only hooks"* ]]
+}
+
+@test "ssh-wrap: round-2 M4 — no prod-leak WARN when bats context is detected (#365)" {
+  # Sanity: under bats, BATS_TEST_FILENAME is set and the WARN must
+  # NOT fire (otherwise every freshness test would produce extra
+  # noise).
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=equal \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"test-only hooks"* ]]
+}
+
+@test "ssh-wrap: round-2 M5 — WARN goes to stderr, SSH_WRAP_CMD goes to stdout (#365)" {
+  # Stream-separation pin: if a future refactor accidentally moves the
+  # WARN to stdout (or the SSH_WRAP_CMD to stderr), CI noise filters
+  # downstream of the shim would break. `run --separate-stderr` puts
+  # stderr into $stderr and stdout into $output.
+  run --separate-stderr bash -c "
+    export KVM_HOST=otherhost
+    export HBIRD_SSH_WRAP_DRY_RUN=1
+    export HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1
+    export HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    export HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind
+    export HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10
+    export HBIRD_SSH_WRAP_FRESHNESS_CACHE=0
+    source $LIB
+    hbird_ssh_wrap_maybe_reexec /fake/path/scripts/foo.sh
+  "
+  [ "$status" -eq 0 ]
+  # stdout: only the SSH_WRAP_CMD line.
+  [[ "$output" == *"SSH_WRAP_CMD:"* ]]
+  [[ "$output" != *"WARN:"* ]]
+  # stderr: the BEHIND WARN + re-execing log line.
+  [[ "$stderr" == *"WARN:"* ]]
+  [[ "$stderr" == *"is BEHIND local"* ]]
+  [[ "$stderr" != *"SSH_WRAP_CMD:"* ]]
+}
+
+@test "ssh-wrap: round-2 M2 — cache hit replays WARN without re-probing (#365)" {
+  # Smoke test for the per-session cache. First invocation writes the
+  # cache; second invocation (same KVM_HOST + local_sha + STRICT) must
+  # replay the WARN even when the DRY_RUN_FRESHNESS hook is removed.
+  # The cache key embeds local_sha, so changing the SHA invalidates.
+  #
+  # Use a fresh cache dir under BATS_TEST_TMPDIR so we don't collide
+  # with concurrent test runs.
+  export XDG_RUNTIME_DIR="${BATS_TEST_TMPDIR}"
+  rm -rf "${XDG_RUNTIME_DIR}/hbird-freshness"
+  export HBIRD_SSH_WRAP_FRESHNESS_CACHE=1
+
+  # First invocation populates the cache (BEHIND, count 10 -> WARN).
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=cacheabc1cacheabc1cacheabc1cacheabc1cccc \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"is BEHIND local"* ]]
+
+  # Verify cache file exists.
+  cache_files=$(ls "${XDG_RUNTIME_DIR}/hbird-freshness/" 2>/dev/null | wc -l)
+  [ "$cache_files" -gt 0 ]
+
+  # Second invocation: same local_sha + KVM_HOST, BUT NO DRY_RUN_FRESHNESS
+  # hook. Without the cache, the helper would either skip (no hook +
+  # PREFLIGHT=1 means no probe) or hit real ssh. With the cache, the
+  # WARN must replay verbatim.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=cacheabc1cacheabc1cacheabc1cacheabc1cccc \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"is BEHIND local"* ]]
+}
+
+@test "ssh-wrap: round-2 M2 — cache key embeds local_sha (SHA change invalidates) (#365)" {
+  # Different local_sha => different cache key => fresh probe.
+  export XDG_RUNTIME_DIR="${BATS_TEST_TMPDIR}"
+  rm -rf "${XDG_RUNTIME_DIR}/hbird-freshness"
+  export HBIRD_SSH_WRAP_FRESHNESS_CACHE=1
+
+  # Populate cache as "ok" with one SHA.
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=equal \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARN:"* ]]
+
+  # Different SHA + behind hook => new probe + WARN (proves cache key
+  # change forces a new probe).
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"is BEHIND local"* ]]
+}
+
+@test "ssh-wrap: round-2 M2 — HBIRD_SSH_WRAP_FRESHNESS_CACHE=0 disables cache (#365)" {
+  # Operator (or tests) can force re-probe per invocation.
+  export XDG_RUNTIME_DIR="${BATS_TEST_TMPDIR}"
+  rm -rf "${XDG_RUNTIME_DIR}/hbird-freshness"
+  export HBIRD_SSH_WRAP_FRESHNESS_CACHE=0
+
+  KVM_HOST=otherhost HBIRD_SSH_WRAP_DRY_RUN=1 HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
+    HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=cccccccccccccccccccccccccccccccccccccccc \
+    HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=behind \
+    HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=10 \
+    run invoke_shim
+  [ "$status" -eq 0 ]
+
+  # No cache file written.
+  cache_files=$(ls "${XDG_RUNTIME_DIR}/hbird-freshness/" 2>/dev/null | wc -l)
+  [ "$cache_files" -eq 0 ]
 }
