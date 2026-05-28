@@ -77,6 +77,21 @@ EOF
   SCRIPT="${FAKE_REPO_ROOT}/scripts/${SCRIPT_NAME}"
 }
 
+# Stub `hostname` on PATH to print a fixed value, so on-KVM_HOST
+# detection tests are hermetic and don't couple to the runner's actual
+# hostname. Honors `hostname -s` (the form the script invokes) by
+# printing the same fixed value either way. Tests that want to assert
+# "no match" deliberately pass a synthetic KVM_HOST and don't need this.
+_stub_hostname() {
+  local fake="${1:-geary}"
+  cat > "${STUB_DIR}/hostname" <<EOF
+#!/usr/bin/env bash
+# Stub: always prints the fixed test hostname, ignoring flags.
+printf '%s\n' '${fake}'
+EOF
+  chmod +x "${STUB_DIR}/hostname"
+}
+
 # Invoke the script with the stubs in PATH. Each test passes the env it
 # cares about (KVM_HOST, KUBECTL, CONFIG).
 _invoke() {
@@ -189,11 +204,11 @@ EOF
 # ---------------------------------------------------------------------------
 
 @test "verify-app-deploy: on KVM_HOST (hostname match) -> skips with exit 0 and warning (#362)" {
-  local_short="$(hostname -s 2>/dev/null || hostname)"
-  # Use the running host's short hostname as KVM_HOST so the in-script
-  # detection (also short-hostname comparison) fires.
+  # Hermetic: stub hostname so the test passes deterministically on any
+  # CI runner / workstation regardless of the real hostname.
+  _stub_hostname geary
   run env -i HOME="$HOME" PATH="${STUB_DIR}:${PATH}" \
-      KVM_HOST="${local_short}" KCTL_LOG="$KCTL_LOG" \
+      KVM_HOST=geary KCTL_LOG="$KCTL_LOG" \
       bash "$SCRIPT"
   [ "$status" -eq 0 ]
   # Confirm NEITHER kubectl path ran — the skip must fire BEFORE any
@@ -211,11 +226,13 @@ EOF
 }
 
 @test "verify-app-deploy: on KVM_HOST FQDN form (hostname.example.com) also skips (#362)" {
-  local_short="$(hostname -s 2>/dev/null || hostname)"
+  # Hermetic stub: real hostname doesn't matter, only the stubbed value.
+  _stub_hostname geary
   # The detection strips KVM_HOST to its short form (everything before
-  # the first dot), so an FQDN like "geary.lan" still matches "geary".
+  # the first dot), so an FQDN like "geary.example.com" still matches
+  # the stubbed "geary".
   run env -i HOME="$HOME" PATH="${STUB_DIR}:${PATH}" \
-      KVM_HOST="${local_short}.example.com" KCTL_LOG="$KCTL_LOG" \
+      KVM_HOST=geary.example.com KCTL_LOG="$KCTL_LOG" \
       bash "$SCRIPT"
   [ "$status" -eq 0 ]
   if grep -q '^WRAPPER \|^PLAIN ' "$KCTL_LOG"; then
@@ -234,6 +251,15 @@ EOF
       bash "$SCRIPT"
   [ "$status" -eq 0 ]
   grep -q '^WRAPPER ' "$KCTL_LOG"
+  # Positive marker: the script must have progressed past the on-host
+  # skip-guard into the smoketest body. Both apply/create are issued by
+  # the WRAPPER stub's logger; without this assertion the test would
+  # pass even if the script bailed early, since `bash $SCRIPT` returns
+  # the stub's exit 0. Grep for evidence of real execution.
+  if ! grep -qE 'WRAPPER (apply|create) ' "$KCTL_LOG"; then
+    printf 'FAIL: kubectl-k8s.sh wrapper never saw apply/create — script did not progress past skip-guard\n%s\n' "$(cat "$KCTL_LOG")"
+    return 1
+  fi
   if [[ "$output" == *"already on KVM_HOST"* ]]; then
     printf 'FAIL: false-positive skip when KVM_HOST != local hostname\n%s\n' "$output"
     return 1

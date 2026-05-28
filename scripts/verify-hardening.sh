@@ -106,6 +106,12 @@ kc() {
 # libvirt NAT subnet IS already routable (we're on it), so we can ssh
 # directly to root@CP_IP without a ProxyJump. Hostname detection
 # mirrors scripts/lib/ssh-wrap.sh.
+#
+# Divergence note: sibling verify-app-deploy.sh exits 0 with a hint
+# message instead of unsetting — it has no direct-ssh path, only
+# kubectl-via-wrapper, which would self-loop on KVM_HOST. This script
+# (and verify-encryption.sh) DO have a direct root@CP_IP ssh path, so
+# dropping ProxyJump and continuing is the correct shape here.
 _vh_local_host="$(hostname -s 2>/dev/null || hostname)"
 if [[ -n "${KVM_HOST:-}" && "${_vh_local_host}" == "${KVM_HOST%%.*}" ]]; then
   log "already on KVM_HOST (${KVM_HOST}); dropping ProxyJump for direct CP SSH (#362)"

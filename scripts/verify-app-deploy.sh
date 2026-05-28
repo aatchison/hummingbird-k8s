@@ -87,6 +87,13 @@ log() { printf '[verify-app-deploy] %s\n' "$*" >&2; }
 #
 # This keeps `deploy-cluster.sh`'s "informational" verify tail honest
 # (#353 cutover blocker — bash exit code must reflect deploy success).
+#
+# Divergence note: sibling verify-{hardening,encryption}.sh unset KVM_HOST
+# instead of exiting — they have a direct root@CP_IP ssh path that works
+# from the KVM host (ProxyJump is dropped, SSH goes straight to CP). This
+# script does kubectl-only and has no equivalent fallback: the wrapper
+# would self-loop on KVM_HOST, and plain `kubectl` is generally not
+# wired up on the hypervisor. Skip-with-exit-0 is the correct shape here.
 if [[ -n "${KVM_HOST:-}" ]]; then
   _vad_local_host="$(hostname -s 2>/dev/null || hostname)"
   if [[ "${_vad_local_host}" == "${KVM_HOST%%.*}" ]]; then

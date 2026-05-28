@@ -71,6 +71,21 @@ EOF
   chmod +x "$STUB_DIR/ssh"
 }
 
+# Stub `hostname` on PATH to print a fixed value, so on-KVM_HOST
+# detection tests are hermetic and don't couple to the runner's actual
+# hostname. Honors `hostname -s` (the form the script invokes) by
+# printing the same fixed value either way. Tests that want to assert
+# "no match" deliberately pass a synthetic KVM_HOST and don't need this.
+_stub_hostname() {
+  local fake="${1:-geary}"
+  cat > "${STUB_DIR}/hostname" <<EOF
+#!/usr/bin/env bash
+# Stub: always prints the fixed test hostname, ignoring flags.
+printf '%s\n' '${fake}'
+EOF
+  chmod +x "${STUB_DIR}/hostname"
+}
+
 # Helper: emit one line per arg of the Nth ssh invocation (1-indexed).
 _ssh_argv_file() {
   local n="$1"
@@ -217,10 +232,11 @@ _ssh_call_count() {
 # ---------------------------------------------------------------------------
 
 @test "#362: on KVM_HOST (hostname match) + explicit CP_IP -> no ProxyJump in ssh argv" {
-  local_short="$(hostname -s 2>/dev/null || hostname)"
+  # Hermetic: stub hostname so detection fires on any CI runner.
+  _stub_hostname geary
 
   run env PATH="${STUB_DIR}:${PATH}" \
-    KVM_HOST="${local_short}" \
+    KVM_HOST=geary \
     CP_IP=192.0.2.42 \
     bash "$SCRIPT"
   [ "$status" -eq 0 ]
@@ -241,8 +257,11 @@ _ssh_call_count() {
   fi
 
   # And the warning line must have been emitted (operator visibility).
-  [[ "$output" == *"already on KVM_HOST"* ]] || \
-    [[ "$stderr" == *"already on KVM_HOST"* ]] || true
+  # NOTE: do NOT chain `|| true` onto this assertion — that defangs the
+  # check and the test would pass even if the warning never fired. bats
+  # merges stderr into `$output` under `run` by default, matching the
+  # sibling shape in verify-app-deploy.bats / verify-hardening.bats.
+  [[ "$output" == *"already on KVM_HOST"* ]]
 }
 
 @test "#362: KVM_HOST set to a DIFFERENT host -> ProxyJump still applied (no false-positive)" {
