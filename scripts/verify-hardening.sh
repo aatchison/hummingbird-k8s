@@ -97,6 +97,21 @@ kc() {
 # set without `-i SSH_PRIVKEY_FILE`, which is exactly what we want.
 # KVM_HOST (when set) adds ProxyJump so the libvirt NAT subnet doesn't
 # need to be routable from the dev machine.
+#
+# #362: when we're already on the KVM host (e.g. deploy-cluster re-exec,
+# or operator running the verifier directly on the hypervisor as root),
+# ProxyJump=$KVM_HOST would become `ssh root@KVM_HOST` from KVM_HOST
+# itself — sshd typically denies root login and the call hangs on a
+# password prompt that never satisfies (exit 255). In that case the
+# libvirt NAT subnet IS already routable (we're on it), so we can ssh
+# directly to root@CP_IP without a ProxyJump. Hostname detection
+# mirrors scripts/lib/ssh-wrap.sh.
+_vh_local_host="$(hostname -s 2>/dev/null || hostname)"
+if [[ -n "${KVM_HOST:-}" && "${_vh_local_host}" == "${KVM_HOST%%.*}" ]]; then
+  log "already on KVM_HOST (${KVM_HOST}); dropping ProxyJump for direct CP SSH (#362)"
+  unset KVM_HOST
+fi
+unset _vh_local_host
 if [[ -n "${KVM_HOST:-}" ]]; then
   ssh_opts_array_no_identity SSH_OPTS --proxy-jump="${KVM_HOST}"
 else

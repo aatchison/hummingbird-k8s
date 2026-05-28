@@ -179,3 +179,63 @@ EOF
     return 1
   fi
 }
+
+# ---------------------------------------------------------------------------
+# #362: when we're already on the KVM host, the verifier MUST NOT route
+# through scripts/kubectl-k8s.sh — that would resolve to `ssh root@<KVM>`
+# from <KVM> itself, hanging on a password prompt sshd will never accept.
+# Instead the script should log a skip + exit 0, so deploy-cluster.sh's
+# trailing verify step reports honest exit codes (gates epic #353).
+# ---------------------------------------------------------------------------
+
+@test "verify-app-deploy: on KVM_HOST (hostname match) -> skips with exit 0 and warning (#362)" {
+  local_short="$(hostname -s 2>/dev/null || hostname)"
+  # Use the running host's short hostname as KVM_HOST so the in-script
+  # detection (also short-hostname comparison) fires.
+  run env -i HOME="$HOME" PATH="${STUB_DIR}:${PATH}" \
+      KVM_HOST="${local_short}" KCTL_LOG="$KCTL_LOG" \
+      bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  # Confirm NEITHER kubectl path ran — the skip must fire BEFORE any
+  # smoketest namespace is created.
+  if grep -q '^WRAPPER ' "$KCTL_LOG"; then
+    printf 'FAIL: on-KVM_HOST run still invoked kubectl-k8s.sh wrapper\n%s\n' "$(cat "$KCTL_LOG")"
+    return 1
+  fi
+  if grep -q '^PLAIN ' "$KCTL_LOG"; then
+    printf 'FAIL: on-KVM_HOST run still invoked plain kubectl\n%s\n' "$(cat "$KCTL_LOG")"
+    return 1
+  fi
+  [[ "$output" == *"already on KVM_HOST"* ]]
+  [[ "$output" == *"#362"* ]]
+}
+
+@test "verify-app-deploy: on KVM_HOST FQDN form (hostname.example.com) also skips (#362)" {
+  local_short="$(hostname -s 2>/dev/null || hostname)"
+  # The detection strips KVM_HOST to its short form (everything before
+  # the first dot), so an FQDN like "geary.lan" still matches "geary".
+  run env -i HOME="$HOME" PATH="${STUB_DIR}:${PATH}" \
+      KVM_HOST="${local_short}.example.com" KCTL_LOG="$KCTL_LOG" \
+      bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  if grep -q '^WRAPPER \|^PLAIN ' "$KCTL_LOG"; then
+    printf 'FAIL: FQDN-form on-KVM_HOST run did not skip\n%s\n' "$(cat "$KCTL_LOG")"
+    return 1
+  fi
+  [[ "$output" == *"already on KVM_HOST"* ]]
+}
+
+@test "verify-app-deploy: KVM_HOST set to a DIFFERENT host -> still uses wrapper (no false-positive skip) (#362)" {
+  # Sanity check: a hostname that does NOT match ours must not trigger
+  # the skip path. Use a synthetic name that can't collide with any
+  # real local hostname.
+  run env -i HOME="$HOME" PATH="${STUB_DIR}:${PATH}" \
+      KVM_HOST=definitely-not-this-host-xyzzy KCTL_LOG="$KCTL_LOG" \
+      bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  grep -q '^WRAPPER ' "$KCTL_LOG"
+  if [[ "$output" == *"already on KVM_HOST"* ]]; then
+    printf 'FAIL: false-positive skip when KVM_HOST != local hostname\n%s\n' "$output"
+    return 1
+  fi
+}

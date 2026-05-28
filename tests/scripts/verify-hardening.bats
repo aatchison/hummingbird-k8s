@@ -240,6 +240,74 @@ EOF
 # PATH), kubectl-fallback fires, on_cp does NOT carry ProxyJump.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# #362: when we're already on the KVM host, the verifier must NOT set
+# `-o ProxyJump=$KVM_HOST` — that would resolve to `ssh root@<KVM>` from
+# <KVM> itself, hanging on a never-answered password prompt sshd will
+# never accept. The detection drops KVM_HOST so the direct-CP SSH path
+# fires instead. Gates epic #353 (bash exit code must be honest).
+# ---------------------------------------------------------------------------
+
+@test "#362: on KVM_HOST (hostname match) -> no ProxyJump in any ssh argv" {
+  _make_ssh_stub
+  _make_kubectl_stub
+
+  local_short="$(hostname -s 2>/dev/null || hostname)"
+
+  run env -u CONFIG \
+    KVM_HOST="${local_short}" \
+    KUBECTL=kubectl \
+    CP_NAME=hbird-cp1 \
+    CP_IP=192.168.99.42 \
+    PATH="${STUB_DIR}:${PATH}" \
+    bash "$SCRIPT"
+
+  # No ssh argv should carry ProxyJump=… — the on-KVM-host detection
+  # must have unset KVM_HOST before SSH_OPTS was built.
+  for f in "${SSH_ARGV_DIR}"/argv-*; do
+    [ -f "$f" ] || continue
+    if grep -qE '^ProxyJump=' "$f"; then
+      echo "FAIL: ssh argv contains ProxyJump= despite on-KVM_HOST run: $f" >&2
+      cat "$f" >&2
+      return 1
+    fi
+  done
+
+  # And the warning line must have been emitted (operator visibility).
+  [[ "$output" == *"already on KVM_HOST"* ]]
+  [[ "$output" == *"#362"* ]]
+}
+
+@test "#362: KVM_HOST set to a DIFFERENT host -> ProxyJump still applied (no false-positive)" {
+  _make_ssh_stub
+  _make_kubectl_stub
+
+  # Synthetic alias that can't collide with any real hostname.
+  run env -u CONFIG \
+    KVM_HOST=definitely-not-this-host-xyzzy \
+    KUBECTL=kubectl \
+    CP_NAME=hbird-cp1 \
+    CP_IP=192.168.99.42 \
+    PATH="${STUB_DIR}:${PATH}" \
+    bash "$SCRIPT"
+
+  # At least one ssh argv must carry ProxyJump=… — the wrapper guard
+  # must NOT fire when KVM_HOST is a different host.
+  local found_proxy=0
+  for f in "${SSH_ARGV_DIR}"/argv-*; do
+    [ -f "$f" ] || continue
+    if grep -qxF 'ProxyJump=definitely-not-this-host-xyzzy' "$f"; then
+      found_proxy=1
+      break
+    fi
+  done
+  [ "$found_proxy" -eq 1 ]
+  if [[ "$output" == *"already on KVM_HOST"* ]]; then
+    echo "FAIL: false-positive #362 skip with non-matching KVM_HOST" >&2
+    return 1
+  fi
+}
+
 @test "F4: without KVM_HOST, no ProxyJump option appears in any ssh argv" {
   _make_ssh_stub
 

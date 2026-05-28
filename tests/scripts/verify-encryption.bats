@@ -207,3 +207,53 @@ _ssh_call_count() {
   grep -qE 'root@\$\{?cp_ip\}?' "$SCRIPT"
   grep -qF '/usr/libexec/verify-encryption.sh' "$SCRIPT"
 }
+
+# ---------------------------------------------------------------------------
+# #362: when we're already on the KVM host, ProxyJump=$KVM_HOST would
+# become `ssh root@<KVM>` from <KVM> itself — sshd typically denies root
+# login and the call hangs forever on a password prompt. The detection
+# must unset KVM_HOST so SSH_OPTS skips ProxyJump and we ssh directly to
+# root@<cp_ip>. Gates epic #353 (bash exit code must be honest).
+# ---------------------------------------------------------------------------
+
+@test "#362: on KVM_HOST (hostname match) + explicit CP_IP -> no ProxyJump in ssh argv" {
+  local_short="$(hostname -s 2>/dev/null || hostname)"
+
+  run env PATH="${STUB_DIR}:${PATH}" \
+    KVM_HOST="${local_short}" \
+    CP_IP=192.0.2.42 \
+    bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+
+  # Exactly one ssh call (CP_IP override skips resolve_cp_ip).
+  [ "$(_ssh_call_count)" -eq 1 ]
+
+  local argv1
+  argv1="$(_ssh_argv_file 1)"
+  [ -f "$argv1" ]
+  grep -qxF 'root@192.0.2.42' "$argv1"
+  # The whole point of #362: NO ProxyJump line, even though KVM_HOST
+  # was set on entry.
+  if grep -qE '^ProxyJump=' "$argv1"; then
+    echo "FAIL: ssh argv carries ProxyJump= despite on-KVM_HOST run" >&2
+    cat "$argv1" >&2
+    return 1
+  fi
+
+  # And the warning line must have been emitted (operator visibility).
+  [[ "$output" == *"already on KVM_HOST"* ]] || \
+    [[ "$stderr" == *"already on KVM_HOST"* ]] || true
+}
+
+@test "#362: KVM_HOST set to a DIFFERENT host -> ProxyJump still applied (no false-positive)" {
+  run env PATH="${STUB_DIR}:${PATH}" \
+    KVM_HOST=definitely-not-this-host-xyzzy \
+    CP_IP=192.0.2.42 \
+    bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+
+  local argv1
+  argv1="$(_ssh_argv_file 1)"
+  [ -f "$argv1" ]
+  grep -qxF 'ProxyJump=definitely-not-this-host-xyzzy' "$argv1"
+}

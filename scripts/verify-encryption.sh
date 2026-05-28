@@ -79,6 +79,21 @@ if [[ -n "${KVM_HOST:-}" || -n "${CP_IP:-}" ]]; then
 
   log() { printf '[verify-encryption] %s\n' "$*" >&2; }
 
+  # #362: when we're already on the KVM host (e.g. deploy-cluster
+  # re-exec, or operator running the verifier directly on the
+  # hypervisor as root), ProxyJump=$KVM_HOST below would become
+  # `ssh root@KVM_HOST` from KVM_HOST itself — sshd typically denies
+  # root login and the call hangs on a never-answered password prompt.
+  # In that case the libvirt NAT subnet IS already routable (we're on
+  # it), so we can ssh directly to root@<cp_ip> without a ProxyJump.
+  # Hostname detection mirrors scripts/lib/ssh-wrap.sh.
+  _ve_local_host="$(hostname -s 2>/dev/null || hostname)"
+  if [[ -n "${KVM_HOST:-}" && "${_ve_local_host}" == "${KVM_HOST%%.*}" ]]; then
+    log "already on KVM_HOST (${KVM_HOST}); dropping ProxyJump for direct CP SSH (#362)"
+    unset KVM_HOST
+  fi
+  unset _ve_local_host
+
   CP_NAME="${CP_NAME:-hummingbird-k8s}"
   cp_ip="$(resolve_cp_ip "$CP_NAME" "${CP_IP:-}")" || {
     log "could not resolve control-plane IP; set CP_IP=<ip> or KVM_HOST=<ssh-alias>"

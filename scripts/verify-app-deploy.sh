@@ -64,6 +64,40 @@ if [[ -n "${CONFIG:-}" ]]; then
   source "$CONFIG"
 fi
 
+log() { printf '[verify-app-deploy] %s\n' "$*" >&2; }
+
+# #362: when we're already running on the KVM host (e.g. inside a
+# deploy-cluster re-exec, or when the operator drives `make
+# verify-app-deploy` directly on the hypervisor), KVM_HOST=<this-host>
+# would route `kubectl-k8s.sh` through `ssh "$KVM_HOST"` from this host
+# — i.e. `ssh root@geary` from geary. The KVM host's sshd typically
+# denies root login, so the call hangs on a never-answered password
+# prompt and exits 255. The cleanup trap then fires the same wrapper
+# again, multiplying the password prompts. Net effect: `make
+# deploy-cluster` reports a non-zero exit on a successful deploy.
+#
+# Detection mirrors scripts/lib/ssh-wrap.sh's hostname-short comparison.
+# On hit: there is no usable in-place verifier path (plain `kubectl` is
+# generally not on the KVM host's PATH; setting up a tunnel-to-self is
+# the bug). Skip with a friendly log and exit 0 — the cluster is up,
+# the verify can be re-run from a workstation that has SSH access to
+# the KVM host:
+#
+#     make verify-app-deploy CONFIG=cluster.local.conf KVM_HOST=<alias>
+#
+# This keeps `deploy-cluster.sh`'s "informational" verify tail honest
+# (#353 cutover blocker — bash exit code must reflect deploy success).
+if [[ -n "${KVM_HOST:-}" ]]; then
+  _vad_local_host="$(hostname -s 2>/dev/null || hostname)"
+  if [[ "${_vad_local_host}" == "${KVM_HOST%%.*}" ]]; then
+    log "already on KVM_HOST (${KVM_HOST}); skipping in-place verify to avoid ssh-to-self loop (#362)"
+    log "  hint: re-run from a workstation with: make verify-app-deploy CONFIG=<conf> KVM_HOST=${KVM_HOST}"
+    unset _vad_local_host
+    exit 0
+  fi
+  unset _vad_local_host
+fi
+
 # Default KUBECTL: pick the tunneled wrapper when KVM_HOST is set, so
 # workstation operators don't have to spell out KUBECTL=… on every call.
 # When the operator IS on the CP host (or otherwise has a local kubectl
@@ -79,8 +113,6 @@ fi
 
 NS="smoketest-$(date +%s)"
 KCTL="$KUBECTL"
-
-log() { printf '[verify-app-deploy] %s\n' "$*" >&2; }
 
 cleanup() {
   log "cleanup: deleting namespace $NS"
