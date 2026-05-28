@@ -8,7 +8,7 @@
 # -----------------------
 # Hummingbird pins two versions that move on independent schedules:
 #
-#   * Cilium 1.16.5  in containers/k8s/k8s-init.sh  (`cilium install --version …`)
+#   * Cilium 1.17.16 in containers/k8s/k8s-init.sh  (`cilium install --version …`)
 #   * K8s    v1.31   in containers/k8s/Containerfile (`ARG K8S_VERSION=v1.31`)
 #
 # Each Cilium minor (1.14, 1.15, …) only e2e-tests against a window of

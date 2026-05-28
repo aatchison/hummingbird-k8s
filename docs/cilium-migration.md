@@ -45,7 +45,7 @@ because both edit the same kubeadm `extraVolumes` region of
   cilium-cli binary baked into the image:
   ```bash
   KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
-    --version 1.16.5 \
+    --version 1.17.16 \
     --set kubeProxyReplacement=true \
     --set k8sServiceHost=auto \
     --set k8sServicePort=6443 \
@@ -93,7 +93,7 @@ How it's installed:
   `/usr/bin/cilium`. The version is pinned via the
   `CILIUM_CLI_VERSION` build-arg (default `v0.16.16`).
 - On first boot `k8s-init.sh` calls `cilium install` with
-  `--version 1.16.5`, `--set kubeProxyReplacement=true` (#94),
+  `--version 1.17.16`, `--set kubeProxyReplacement=true` (#94),
   `--set k8sServiceHost=auto --set k8sServicePort=6443` (required
   companions to kpr=true), `--set hubble.enabled=true --set
   hubble.relay.enabled=true --set hubble.ui.enabled=false` (#78), and
@@ -334,7 +334,7 @@ Two versions are pinned independently:
 
 - `CILIUM_CLI_VERSION` (build-arg, default `v0.16.16`) — the version
   of the cilium-cli binary baked into the image.
-- `--version 1.16.5` in the `cilium install` call — the version of
+- `--version 1.17.16` in the `cilium install` call — the version of
   the Cilium agent/operator images that get deployed into the
   cluster. The CLI version and the Cilium version do not have to
   move in lockstep.
