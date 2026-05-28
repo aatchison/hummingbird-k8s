@@ -81,6 +81,37 @@
 #                               CONFIG-rewrite path without a working
 #                               remote. Also used by the operator-pubkey
 #                               scp branch (#248).
+#   HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=<state>
+#                             — Stub the remote git rev-parse used by the
+#                               freshness check (#365). Recognized values:
+#                                 equal     — remote SHA == local SHA
+#                                 behind    — remote SHA is an ancestor of local
+#                                 diverged  — remote SHA is neither ancestor nor equal
+#                                 missing   — remote rev-parse returns empty
+#                                             (simulates a missing checkout)
+#                               When unset, the real `ssh ... git rev-parse`
+#                               runs (skipped entirely if the SSH-preflight
+#                               dry-run hook is also set and no freshness
+#                               state was requested).
+#   HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=<sha>
+#                             — Inject the local-side SHA the freshness
+#                               check would otherwise read from `git
+#                               rev-parse`. Lets bats run in environments
+#                               without git (the pinned bats container has
+#                               no git). Production callers leave this
+#                               unset.
+#
+# Remote-checkout freshness (#365):
+#   Before re-exec, the shim compares the local repo's HEAD SHA to the
+#   remote checkout's HEAD SHA. Stale remotes (behind, diverged, or
+#   missing) WARN to stderr — they do NOT auto-pull. Equal SHAs print
+#   nothing. Surfaced after the cycle-2 dispatch where geary's checkout
+#   was missing a merged fix (#364) and silently re-execed the buggy
+#   pre-merge script.
+#
+#   Env toggles:
+#     HBIRD_REMOTE_FRESHNESS_CHECK=0  — disable the check entirely (default ON)
+#     HBIRD_REMOTE_STRICT=1           — exit 1 on stale (default = warn-only)
 #
 # Operator workstation pubkey (#248):
 #   When the local CONFIG declares `SSH_PUBKEY_FILE=`, that path is
@@ -121,6 +152,122 @@ HBIRD_SSH_WRAP_ALLOWED_ENV=(
   HBIRD_OPERATOR_PUBKEY_FILE
   HBIRD_REMOTE_NO_SUDO
 )
+
+# hbird_ssh_wrap_check_remote_freshness <local_repo_dir> <script_basename>
+# Compare the local repo's HEAD SHA to the remote checkout's HEAD SHA and
+# emit a WARN to stderr when the remote is stale (behind, diverged, or
+# missing). Returns 0 (warn-only) by default; returns 1 if
+# HBIRD_REMOTE_STRICT=1 is set AND the remote is stale.
+#
+# Equal SHAs print nothing (silent good path).
+#
+# Honors HBIRD_REMOTE_FRESHNESS_CHECK=0 to skip entirely.
+# Honors HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=<state> to stub the remote
+# rev-parse for bats coverage; see header comment for recognized states.
+#
+# This function does NOT exec; it is a pure check called from the shim
+# just before the ssh re-exec.
+hbird_ssh_wrap_check_remote_freshness() {
+  local local_repo_dir="$1"
+  local script_basename="$2"
+
+  # Opt-out: operator disabled the check.
+  [[ "${HBIRD_REMOTE_FRESHNESS_CHECK:-1}" == 1 ]] || return 0
+
+  # Resolve local SHA from the script's own repo (works regardless of cwd
+  # or worktree layout). If we cannot get it (script lives outside a git
+  # checkout — e.g. installed to /usr/local), silently skip: there is
+  # nothing to compare against. The DRY_RUN_LOCAL_SHA hook lets bats
+  # inject a value without depending on git being installed.
+  local local_sha=""
+  if [[ -n "${HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA:-}" ]]; then
+    local_sha="${HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA}"
+  else
+    local_sha="$(git -C "$local_repo_dir" rev-parse HEAD 2>/dev/null || true)"
+  fi
+  [[ -n "$local_sha" ]] || return 0
+
+  # Resolve the remote SHA. The dry-run-freshness hook lets bats simulate
+  # each case without a working SSH path.
+  local remote_sha=""
+  local dryrun_state="${HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS:-}"
+  if [[ -n "$dryrun_state" ]]; then
+    case "$dryrun_state" in
+      equal)    remote_sha="$local_sha" ;;
+      missing)  remote_sha="" ;;
+      behind|diverged)
+        # Synthesize a distinct fake SHA — the ancestry decision below
+        # is also driven off the same hook, so the literal value is
+        # only used for the warning text.
+        remote_sha="0000000000000000000000000000000000000000"
+        ;;
+      *)
+        # Unrecognized state — treat as no-op rather than risk a false
+        # warning that masks a real bug. The bats suite enumerates the
+        # valid states; production callers should never set this var.
+        return 0
+        ;;
+    esac
+  else
+    # Real path: query the remote. BatchMode=yes prevents a password
+    # prompt if key auth fails (we already passed the same check in the
+    # pre-flight, but be defensive). ConnectTimeout=5 matches preflight.
+    remote_sha="$(
+      ssh -o BatchMode=yes -o ConnectTimeout=5 "$KVM_HOST" \
+        "git -C ${HBIRD_REMOTE_REPO} rev-parse HEAD 2>/dev/null" 2>/dev/null \
+      | tr -d '[:space:]'
+    )" || true
+  fi
+
+  # Missing remote checkout (rev-parse failed / returned empty).
+  if [[ -z "$remote_sha" ]]; then
+    echo "[${script_basename}] WARN: remote checkout at ${KVM_HOST}:${HBIRD_REMOTE_REPO} missing or not a git repo — re-exec may fail" >&2
+    if [[ "${HBIRD_REMOTE_STRICT:-0}" == 1 ]]; then
+      echo "[${script_basename}] HBIRD_REMOTE_STRICT=1 — refusing to re-exec on a missing remote checkout" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  # Equal — silent good path.
+  if [[ "$local_sha" == "$remote_sha" ]]; then
+    return 0
+  fi
+
+  # Different. Decide behind vs diverged. In dry-run-freshness mode we
+  # already know which case to take from the hook; otherwise we ask the
+  # remote (since the remote is the only side that can see whether
+  # $remote_sha is an ancestor of $local_sha in ITS object DB — the
+  # operator's workstation may not even have fetched $remote_sha).
+  local is_ancestor=0
+  if [[ -n "$dryrun_state" ]]; then
+    [[ "$dryrun_state" == behind ]] && is_ancestor=1
+  else
+    # Try the local side first — if our git knows both SHAs (operator
+    # just pulled before dispatch, common case), we do not need a
+    # second SSH round-trip. Fall back to asking the remote.
+    if git -C "$local_repo_dir" merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+      is_ancestor=1
+    elif ssh -o BatchMode=yes -o ConnectTimeout=5 "$KVM_HOST" \
+           "git -C ${HBIRD_REMOTE_REPO} merge-base --is-ancestor ${remote_sha} ${local_sha}" \
+           >/dev/null 2>&1; then
+      is_ancestor=1
+    fi
+  fi
+
+  if [[ "$is_ancestor" == 1 ]]; then
+    echo "[${script_basename}] WARN: ${KVM_HOST} checkout (${remote_sha}) is BEHIND local (${local_sha}) — fixes from local will not apply on re-exec" >&2
+    echo "[${script_basename}] WARN: run 'ssh ${KVM_HOST} git -C ${HBIRD_REMOTE_REPO} pull' to sync (will NOT auto-pull)" >&2
+  else
+    echo "[${script_basename}] WARN: ${KVM_HOST} checkout (${remote_sha}) diverges from local (${local_sha}) — re-exec semantics may surprise you" >&2
+  fi
+
+  if [[ "${HBIRD_REMOTE_STRICT:-0}" == 1 ]]; then
+    echo "[${script_basename}] HBIRD_REMOTE_STRICT=1 — refusing to re-exec on a stale remote checkout" >&2
+    return 1
+  fi
+  return 0
+}
 
 # hbird_ssh_wrap_maybe_reexec "$0" "$@"
 # If we should re-exec on the KVM host, `exec`s ssh (does not return).
@@ -163,6 +310,23 @@ hbird_ssh_wrap_maybe_reexec() {
       echo "[${script_basename}] remote repo not found at ${KVM_HOST}:${HBIRD_REMOTE_REPO}/scripts" >&2
       echo "  fix: ssh ${KVM_HOST} 'git clone https://github.com/aatchison/hummingbird-k8s ${HBIRD_REMOTE_REPO}'" >&2
       echo "  (or override HBIRD_REMOTE_REPO env var)" >&2
+      exit 1
+    fi
+  fi
+
+  # Freshness check (#365): warn (or hard-fail under STRICT) when the
+  # remote checkout's HEAD SHA differs from the local repo's HEAD SHA.
+  # Surfaced after a cycle-2 dispatch silently re-execed a buggy
+  # pre-merge script because the KVM host's checkout had not been
+  # pulled. The check is skipped when the SSH-preflight dry-run hook is
+  # set AND no dry-run-freshness state was explicitly requested — that
+  # keeps existing bats cases (which only stub SSH reachability)
+  # passing unchanged. Bats cases that exercise the freshness branch
+  # set HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=<state> to drive the helper.
+  if [[ "${HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT:-0}" != 1 || -n "${HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS:-}" ]]; then
+    local local_repo_dir
+    local_repo_dir="$(cd "$(dirname "$self")/.." && pwd)"
+    if ! hbird_ssh_wrap_check_remote_freshness "$local_repo_dir" "$script_basename"; then
       exit 1
     fi
   fi
