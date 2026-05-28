@@ -69,7 +69,7 @@ because both edit the same kubeadm `extraVolumes` region of
 - The cilium-cli binary is pre-baked into the image at `/usr/bin/cilium`
   via a `curl + tar` extraction from the upstream GitHub release tarball.
   The version is controlled by the `CILIUM_CLI_VERSION` build-arg
-  (default `v0.16.16`). Baking the binary in keeps `k8s-init.sh`'s
+  (default `v0.19.4`). Baking the binary in keeps `k8s-init.sh`'s
   first-boot path offline-friendly: it does not need to fetch a CLI
   tarball before installing the CNI.
 
@@ -91,7 +91,7 @@ How it's installed:
 - The `cilium-cli` single static binary is downloaded during
   `containers/k8s/Containerfile` build (`curl` + `tar -xzf`) and placed at
   `/usr/bin/cilium`. The version is pinned via the
-  `CILIUM_CLI_VERSION` build-arg (default `v0.16.16`).
+  `CILIUM_CLI_VERSION` build-arg (default `v0.19.4`).
 - On first boot `k8s-init.sh` calls `cilium install` with
   `--version 1.17.16`, `--set kubeProxyReplacement=true` (#94),
   `--set k8sServiceHost=auto --set k8sServicePort=6443` (required
@@ -247,6 +247,47 @@ in-place flannel→Cilium swap in this round (Cilium does ship a
 `cilium-cli upgrade` story, but cross-CNI migration is brittle and
 out of scope for a lab image).
 
+### Upgrading Cilium on an existing cluster (same-CNI minor bump)
+
+The previous section covers the cross-CNI (flannel → Cilium) case.
+A **same-CNI** Cilium minor bump (e.g. `1.16.5 → 1.17.16`) lands in
+the image when `containers/k8s/k8s-init.sh`'s `--version` flag and
+`containers/k8s/Containerfile`'s `CILIUM_CLI_VERSION` are both bumped
+(PR #367 is the canonical example). However:
+
+- `make deploy-cluster` is **destructive**: it builds, virt-installs,
+  joins, and re-runs first-boot. It picks up the new Cilium version
+  on fresh deployments. It does **not** upgrade an already-running
+  cluster.
+- `make update-cluster` and `make update-workers` perform a rolling
+  `bootc upgrade` across nodes. They **do not** re-run `k8s-init.sh`
+  (still gated by `/var/lib/k8s-init.done`), so the new
+  `cilium install --version 1.17.16` invocation never fires on an
+  existing cluster — only the cilium-cli binary on disk gets refreshed.
+
+To pick up the new Cilium agent/operator on an existing cluster after
+the image rebuild lands, the operator must explicitly run
+`cilium upgrade` from the new cilium-cli binary on the control plane:
+
+```bash
+# After `make update-cluster` has rolled the new image onto the CP,
+# SSH to the CP and run the new cilium-cli's upgrade flow:
+ssh <cp-ip>
+KUBECONFIG=/etc/kubernetes/admin.conf cilium upgrade --version 1.17.16
+KUBECONFIG=/etc/kubernetes/admin.conf cilium status --wait
+```
+
+`cilium upgrade` re-renders the embedded Helm chart with the new
+version and applies the diff (DaemonSet image bump, new defaults,
+schema changes). It is **not** wrapped by a Makefile target today — a
+`make upgrade-cilium` would need to thread CONFIG, ProxyJump, and the
+target version, and is tracked as a follow-up. Until then, do the
+upgrade by hand per the snippet above. After upgrade, see
+"Post-deploy verification" in PR #367 and memory note
+`project_hubble_relay_cni_race.md` (#259) for the Hubble-relay /
+metrics-server re-bounce that occasionally needs to follow a
+Cilium-vs-podman-CNI restart race on first reconvergence.
+
 ### Kernel feature requirements
 
 Cilium needs a BPF filesystem mount and a kernel built with the
@@ -328,21 +369,103 @@ loses any workload state created after the swap. The labeled
 snapshot above is the only way to preserve that state across the
 rollback.
 
-### Version pinning is explicit
+### Version pinning is explicit (and coupled)
 
-Two versions are pinned independently:
+Two versions are pinned in two separate files, but they are **not**
+independent:
 
-- `CILIUM_CLI_VERSION` (build-arg, default `v0.16.16`) — the version
-  of the cilium-cli binary baked into the image.
-- `--version 1.17.16` in the `cilium install` call — the version of
-  the Cilium agent/operator images that get deployed into the
-  cluster. The CLI version and the Cilium version do not have to
-  move in lockstep.
+- `CILIUM_CLI_VERSION` (build-arg in `containers/k8s/Containerfile`,
+  default `v0.19.4`) — the version of the cilium-cli binary baked
+  into the image.
+- `--version 1.17.16` in `containers/k8s/k8s-init.sh`'s `cilium install`
+  call — the version of the Cilium agent/operator images that get
+  deployed into the cluster.
 
-Bumping either version is a deliberate edit to `containers/k8s/Containerfile` or
-`k8s-init.sh`. There is no `latest` / `main` fetch at first boot, so
+**cilium-cli embeds a per-minor Helm chart.** A given cilium-cli
+release (e.g. `v0.19.x`) knows the schema of the Cilium minors it was
+released against. Telling `v0.16.x` to install `--version 1.17.16`
+silently renders the 1.16 chart against 1.17 container images — same
+class of latent breakage as schema drift in any Helm chart. **Rule:
+the cilium-cli minor (`v0.<N>.x`) must be ≥ the Cilium agent minor
+(`1.<N>.x`) being installed.** See upstream's compatibility note at
+<https://github.com/cilium/cilium-cli#compatibility-with-cilium>.
+
+In practice that means bumping the Cilium agent line in `k8s-init.sh`
+**also requires** bumping `CILIUM_CLI_VERSION` in the Containerfile to
+a cilium-cli release whose embedded chart knows the new Cilium minor.
+v0.19.x is the current maintained line; older `v0.16.x` (the previous
+pin in this repo) reached EOL and only knows Cilium 1.16's chart
+schema.
+
+Bumping either version is a deliberate edit to `containers/k8s/Containerfile`
+or `k8s-init.sh`. There is no `latest` / `main` fetch at first boot, so
 two VMs built from the same image are reproducible regardless of when
 they are provisioned.
+
+### Bumping Cilium minor versions
+
+Bumping the Cilium pin past a minor boundary (e.g. `1.16.x → 1.17.x`,
+or `1.17.x → 1.18.x`) is more involved than a patch bump. The upstream
+release process drops or default-flips Helm values across minors;
+check the upstream `UPGRADE.md` and the release notes for the new
+minor before bumping.
+
+**1.16 → 1.17 specifically** (the bump landed in PR #367) includes:
+
+- `bpf.masquerade=true` is now the default. 1.16 defaulted this to
+  `false`. The visible effect is that pod-to-cluster-external traffic
+  is now masqueraded in eBPF instead of by iptables (or by the host
+  routing stack with kpr=true and bpf.masquerade=false). For a
+  single-node lab this is a no-op in the steady state, but operators
+  rolling **back** to 1.16 from a 1.17-installed cluster will see
+  asymmetric NAT behavior on existing flows until pods recycle. The
+  Cilium docs flag this as a roll-forward-only knob in practice.
+- `wireguard.userspaceFallback` was removed. The repo does not set
+  this flag (transparent encryption is off in this image), so the
+  removal is a no-op here, but a downstream consumer overriding it
+  will see "unknown field" rejections from the 1.17 chart.
+- `bgp.enabled` and `bgp.announce.*` were removed in favor of
+  `bgpControlPlane.enabled`. Not used by this image; flagged so a
+  future consumer running BGP for service announcements doesn't get
+  caught.
+- `tls.secretsBackend` is deprecated (still accepted, but logs a
+  warning).
+- Hubble `tls.auto.certValidityDuration` default dropped from 1095d to
+  365d. The image doesn't override this, so the visible effect is
+  Hubble's internal TLS certs now rotate roughly yearly instead of
+  every three years. Cilium handles the rotation automatically;
+  noted here so the operator running `openssl x509` against the
+  Hubble cert isn't surprised by the shorter remaining lifetime.
+- External Workloads (`externalWorkloads.*`) support was removed.
+  Not used by this image.
+
+The canonical upstream reference is
+<https://docs.cilium.io/en/v1.17/operations/upgrade/> — read it
+end-to-end before any future minor bump. The list above is the subset
+that matters for this repo's `cilium install` invocation and the
+Helm-value surface it currently exercises; downstream consumers with
+their own `--set` overrides should re-walk the full UPGRADE notes.
+
+### cilium-cli version vs Cilium version compatibility
+
+Restated from "Version pinning is explicit (and coupled)" above so it
+shows up in a per-section sweep: **cilium-cli minor must be ≥ Cilium
+agent minor.** When bumping `--version` in `k8s-init.sh`, bump
+`CILIUM_CLI_VERSION` in the Containerfile to a cilium-cli release on
+or after the new Cilium minor's release date. Concrete pairings as of
+PR #367:
+
+| Cilium agent | minimum cilium-cli |
+|--------------|--------------------|
+| 1.16.x       | v0.16.x            |
+| 1.17.x       | v0.17.x (current image pin: **v0.19.4**) |
+| 1.18.x (future) | v0.18.x or later |
+
+v0.19.x is the latest maintained cilium-cli line at the time of the
+bump and is forward-compatible with Cilium 1.16+ — pinning the latest
+maintained line (rather than the bare minimum) keeps the image
+buildable on Sigstore/Helm schema fixes that upstream lands in
+cilium-cli patch releases independent of Cilium itself.
 
 ## Verifying the install
 

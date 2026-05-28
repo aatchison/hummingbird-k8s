@@ -93,7 +93,7 @@ EOF
 }
 
 @test "check-cilium-k8s-compat: known mismatch warns + exit 0 by default" {
-  # Cilium 1.16 + K8s 1.31 — the live mismatch.
+  # Cilium 1.16 + K8s 1.31 — historical mismatch (pre-PR #367 live pin).
   run bash "$SCRIPT" --cilium=1.16.5 --k8s=v1.31
   [ "$status" -eq 0 ]
   [[ "$output" == *"WARN"* ]]

@@ -184,18 +184,18 @@ RUN chmod +x /usr/libexec/bootc-semver-update.sh \
 # manifests in the multi-arch index. Closes #111.
 #
 # Integrity floor: sha256 from the upstream-published .sha256sum (verified below).
-# Cosign verification is NOT applied here: cilium-cli releases through v0.16.x do
-# not publish detached .sig/.pem artifacts in their GitHub release assets (only
-# .sha256sum). When the cilium-cli release stream starts shipping Sigstore
-# signatures (or moves to a Rekor-bundle workflow), this block should grow a
-# `cosign verify-blob` step. Tracked in #72.
+# Cosign verification is NOT applied here: cilium-cli releases through v0.19.x
+# still do not publish detached .sig/.pem artifacts in their GitHub release
+# assets (only .sha256sum, re-verified for v0.19.4). When the cilium-cli release
+# stream starts shipping Sigstore signatures (or moves to a Rekor-bundle
+# workflow), this block should grow a `cosign verify-blob` step. Tracked in #72.
 #
 # Network resilience: each curl uses --retry to ride out transient GitHub
 # blips. There is no independent third-party mirror for cilium-cli release
 # artifacts (the project distributes only via github.com), so the "fallback"
 # here is in-attempt retry rather than a second host. Tracked in #97.
 ARG TARGETARCH
-ARG CILIUM_CLI_VERSION=v0.16.16
+ARG CILIUM_CLI_VERSION=v0.19.4
 RUN curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/cilium-linux-${TARGETARCH}.tar.gz" \
       "https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${TARGETARCH}.tar.gz" \
  && curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/cilium-linux-${TARGETARCH}.tar.gz.sha256sum" \
