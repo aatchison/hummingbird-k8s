@@ -200,7 +200,7 @@ chmod 0644 /etc/kubernetes/admin.conf
 # to keep the install lean — operators reach Hubble via
 # `cilium hubble port-forward` + `hubble observe`.
 KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
-  --version 1.16.5 \
+  --version 1.17.16 \
   --set kubeProxyReplacement=true \
   --set k8sServiceHost=auto \
   --set k8sServicePort=6443 \

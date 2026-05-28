@@ -317,8 +317,8 @@ make check-cilium-k8s-compat STRICT=1         # exit 1 on mismatch (pre-merge ga
 ```
 
 The embedded matrix mirrors the per-minor pages at
-<https://docs.cilium.io/en/v1.16/network/kubernetes/compatibility/>
-(swap the `v1.16` segment to consult another release). Refresh it in
+<https://docs.cilium.io/en/v1.17/network/kubernetes/compatibility/>
+(swap the `v1.17` segment to consult another release). Refresh it in
 `scripts/check-cilium-k8s-compat.sh` when bumping the Cilium pin past
 the highest known minor, **or when upstream adds K8s minors to an
 existing Cilium row** (check the per-minor page even between Cilium
