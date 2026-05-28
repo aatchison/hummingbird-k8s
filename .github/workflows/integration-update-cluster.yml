@@ -135,6 +135,21 @@ jobs:
           sudo rm -rf "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
           sudo mkdir -p "${PODMAN_ROOT}" "${PODMAN_RUNROOT}"
 
+      # PR #366 round-2 H4 + M8: build hbird CLI before any test step
+      # invokes `hbird update-cluster --dry-run`. The bash twin was
+      # removed in #353, so without this build the
+      # assert-dry-run-sequence step below fails with command-not-found
+      # on the next tag-driven workflow_run fire. Mirrors verify-weekly.yml.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build hbird CLI (v0.1.0 cutover, #353)
+        run: |
+          set -euo pipefail
+          ( cd rust && cargo build --release -p hbird-cli )
+          # Surface on PATH so the bash test helpers can call `hbird` directly.
+          echo "$PWD/rust/target/release" >> "$GITHUB_PATH"
+
       - name: Deploy 1-CP + 2-worker cluster
         run: |
           set -euo pipefail

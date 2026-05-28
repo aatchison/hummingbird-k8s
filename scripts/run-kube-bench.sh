@@ -61,11 +61,12 @@ REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 : "${KUBE_BENCH_NS:=default}"
 : "${KUBE_BENCH_TARGETS:=master node}"
 # Cross-runtime dependency (v0.1.0 cutover, #353):
-# `hbird` CLI is required at runtime as the default KUBECTL.
-# scripts/kubectl-k8s.sh was removed in v0.1.0; the Rust twin
-# (`hbird kubectl`) is the canonical implementation. If `hbird` is not
-# on PATH, the operator must override with KUBECTL=kubectl (or a path).
-: "${KUBECTL:=hbird kubectl}"
+# `hbird` CLI is preferred at runtime as the default KUBECTL because
+# scripts/kubectl-k8s.sh was removed in v0.1.0. PR #366 round-2 M2:
+# fall back to plain `kubectl` if `hbird` is not on PATH, so the script
+# stays useful for operators who already have a working kubectl set up
+# (e.g. native install with an exported KUBECONFIG).
+: "${KUBECTL:=$(command -v hbird >/dev/null && echo 'hbird kubectl' || echo kubectl)}"
 
 BASE_URL="https://raw.githubusercontent.com/aquasecurity/kube-bench/${KUBE_BENCH_VERSION}"
 
@@ -74,9 +75,20 @@ log() { printf '[run-kube-bench] %s\n' "$*" >&2; }
 # Run kubectl. The KUBECTL value may be `hbird kubectl` (default,
 # v0.1.0+ post-#353 cutover), a bare `kubectl`, or a path. Word-split
 # so multi-word commands like `hbird kubectl` work.
+#
+# PR #366 round-2 H2: `hbird kubectl` uses clap with `trailing_var_arg`
+# but clap still rejects leading-dash positionals as "unexpected
+# argument" without an explicit `--` separator. Inject `--` only for
+# the hbird path so a plain `kubectl` invocation (operator override
+# via `KUBECTL=kubectl`) keeps working unchanged.
 kc() {
-  # shellcheck disable=SC2086
-  $KUBECTL "$@"
+  if [[ "$KUBECTL" == "hbird kubectl"* ]]; then
+    # shellcheck disable=SC2086
+    $KUBECTL -- "$@"
+  else
+    # shellcheck disable=SC2086
+    $KUBECTL "$@"
+  fi
 }
 
 # We track the set of Jobs we created so the EXIT trap can clean them

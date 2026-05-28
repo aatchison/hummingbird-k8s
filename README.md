@@ -89,7 +89,9 @@ A single KVM host runs one control plane + N workers:
 ```text
         client laptop
               |
-              | ssh -L 6443:127.0.0.1:6443  (via kubectl-k8s.sh)
+              | ssh -J $KVM_HOST root@$CP_IP  (via `hbird kubectl`,
+              |                                post-#353; was a port-forward
+              |                                in the deleted kubectl-k8s.sh)
               v
    +-------------------------------------------------+
    |  KVM host  (qemu:///system, default NAT net)    |
@@ -543,7 +545,7 @@ is the template. The build scripts (`scripts/build-*.sh`) source it when
 | `POOL_DIR` | `/var/lib/libvirt/images` | libvirt pool for qcow2. | Larger volume. |
 | `BASE_IMAGE` | `quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1…` (digest-pinned) | Upstream bootc base. | Bumping to a newer digest. |
 | `BIB` | `quay.io/centos-bootc/bootc-image-builder:latest` | OCI-to-qcow2 builder. | Pinning bib. |
-| `KVM_HOST` | unset | SSH alias of KVM host (client-side). | Always on client running `kubectl-k8s.sh`. |
+| `KVM_HOST` | unset | SSH alias of KVM host (client-side). | Always on client running `hbird kubectl` (post-#353, was `scripts/kubectl-k8s.sh`). |
 | `APISERVER_EXTRA_SANS` | `127.0.0.1,localhost` | Extra SANs in apiserver cert. | Adding client host/IP for tunnel. |
 
 ## Consuming the published images

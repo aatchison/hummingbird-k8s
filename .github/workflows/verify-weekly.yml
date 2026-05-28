@@ -77,6 +77,14 @@ jobs:
           chmod 600 "$KUBECONFIG"
           kubectl --kubeconfig="$KUBECONFIG" get nodes
 
+      # PR #366 round-2 M8: declare the rustup dependency explicitly.
+      # The self-hosted runner had `rustup` pre-installed in practice,
+      # but relying on undeclared-runner-state breaks reproducibility +
+      # blocks fresh runners from running this workflow. Pin to the
+      # same `dtolnay/rust-toolchain@stable` shape used elsewhere.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Build hbird CLI (v0.1.0 cutover, #353)
         id: hbird_build
         # Cross-runtime dependency: scripts/verify-*.sh were removed in

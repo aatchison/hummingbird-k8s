@@ -364,6 +364,13 @@ recommended for muscle memory consistency.
 
 **Status:** Phase 3 ([PR #334]) — byte-for-byte parity.
 
+`hbird kubectl` resolves CP_IP automatically via virsh-domifaddr (same
+shape as the deleted `scripts/kubectl-k8s.sh`'s `ssh $KVM_HOST virsh -c
+qemu:///system domifaddr $CP_NAME | awk /ipv4/...` pipeline) when CP_IP
+isn't pinned in `--config`. Workstation operators only need `KVM_HOST`
+set; no need to pin `CP_IP=` for day-to-day kubectl. PR #366 round-2 H1
+closed the previously-deferred placeholder.
+
 ### Still bash-only (not yet on `hbird`)
 
 A handful of operator targets remain bash-only by design — these run

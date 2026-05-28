@@ -15,6 +15,9 @@
 #               control-plane node (via `hbird kubectl get nodes`).
 #               # Cross-runtime dependency (v0.1.0 cutover, #353):
 #               # `hbird` CLI replaced scripts/kubectl-k8s.sh.
+#               # `hbird kubectl` auto-resolves CP_IP via
+#               # `ssh $KVM_HOST virsh ... domifaddr $CP_NAME` (PR #366
+#               # round-2 H1); workstation operators only need KVM_HOST.
 #   KVM_HOST  — Optional SSH ProxyJump host (see backup-etcd.sh).
 #
 # Caveats:
@@ -36,6 +39,16 @@
 # cwd the operator runs it from. See issue #271 F6.
 set -euo pipefail
 
+# PR #366 round-2 M1: hbird-PATH preflight. `hbird kubectl` is the
+# canonical kubectl entry point after #353; without it on PATH the
+# CP_IP probe + final verify below fail with a less-actionable
+# "command not found".
+command -v hbird >/dev/null || {
+  echo "ERROR: hbird CLI required for ${0##*/} (post-#353 cutover)" >&2
+  echo "       Install per docs/rust-cli.md" >&2
+  exit 2
+}
+
 # Resolve repo root from this script's location so relative siblings
 # work from any cwd. Matches the pattern established by
 # scripts/run-kube-bench.sh.
@@ -51,10 +64,11 @@ SNAP="${1:?Usage: $0 <snapshot.db>}"
 # Cross-runtime dependency (v0.1.0 cutover, #353):
 # `hbird` CLI is required at runtime to resolve CP_IP from the cluster.
 # scripts/kubectl-k8s.sh was removed in v0.1.0; the Rust twin
-# (`hbird kubectl`) is the canonical kubectl entry point. If `hbird`
-# is not on PATH this step will fail with command-not-found; export
-# CP_IP=<ip> ahead of time (or set it in cluster.local.conf) to skip
-# kubectl resolution entirely.
+# (`hbird kubectl`) is the canonical kubectl entry point. `hbird` is
+# preflight-checked at the top of this script, so this step won't fail
+# with command-not-found. `hbird kubectl` auto-resolves CP_IP via
+# virsh-domifaddr on KVM_HOST (PR #366 round-2 H1) when CP_IP isn't
+# pinned in CONFIG.
 CP_IP="${CP_IP:-$(hbird kubectl get nodes \
   -l node-role.kubernetes.io/control-plane \
   -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')}"

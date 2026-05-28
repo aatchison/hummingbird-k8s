@@ -400,7 +400,7 @@ The full set is in `cluster.example.conf`; the essentials:
 | `WORKER_MEMORY` / `WORKER_VCPUS` | no | `4096` / `2` | Per-worker sizing. |
 | `POOL_DIR` | no | `/var/lib/libvirt/images` | Where qcow2s + seed ISOs land. |
 | `RUN_VERIFY` | no | `false` | Run `hbird verify app-deploy` (post-#353, was `scripts/verify-app-deploy.sh`) after Ready. |
-| `KVM_HOST` | no | unset | Recorded in the summary for downstream `scripts/kubectl-k8s.sh` use. |
+| `KVM_HOST` | no | unset | Recorded in the summary for downstream `hbird kubectl` use (post-#353, was `scripts/kubectl-k8s.sh`). |
 | `BOOTC_UPDATE_SCHEDULE` | no | unset (use image default) | Override the `bootc-semver-update.timer` `OnCalendar=` on every node. Any systemd `OnCalendar=` value. See [Customizing auto-update](#customizing-auto-update). |
 | `BOOTC_UPDATE_REPO_K8S` | no | unset (use image-baked default) | OCI ref without tag — overrides the CP's tracked semver-update repo (e.g. point at a fork). |
 | `BOOTC_UPDATE_REPO_WORKER` | no | unset (use image-baked default) | OCI ref without tag — overrides workers' tracked semver-update repo. |

@@ -28,11 +28,11 @@
 #               # Cross-runtime dependency (v0.1.0 cutover, #353):
 #               # `hbird` CLI is required at runtime when CP_IP is
 #               # unset; the Rust twin replaced scripts/kubectl-k8s.sh.
-#               # Workstation operators on the partial-cutover path
-#               # must either set CP_IP=<ip> in cluster.local.conf
-#               # OR have `hbird` on PATH AND CP_IP set in env / CONFIG
-#               # (the Rust kubectl shim does not yet resolve CP_IP via
-#               # virsh-domifaddr — tracked by #289 / Phase 4).
+#               # `hbird kubectl` auto-resolves CP_IP via
+#               # `ssh $KVM_HOST virsh -c qemu:///system domifaddr
+#               # $CP_NAME` (PR #366 round-2 H1), so workstation
+#               # operators only need KVM_HOST set — same shape as the
+#               # deleted scripts/kubectl-k8s.sh.
 #   KVM_HOST  — Optional SSH ProxyJump host. If set, the SSH/SCP to
 #               the CP routes through this host. Useful when the CP
 #               VM's IP is only reachable from inside the KVM host's
@@ -47,6 +47,15 @@
 # script references; today every kubectl call routes through `hbird
 # kubectl` directly. See issue #271 F6 and #353 cutover.
 set -euo pipefail
+
+# PR #366 round-2 M1: hbird-PATH preflight. `hbird kubectl` is the
+# canonical kubectl entry point after #353; without it on PATH the
+# CP_IP probe below fails with a less-actionable "command not found".
+command -v hbird >/dev/null || {
+  echo "ERROR: hbird CLI required for ${0##*/} (post-#353 cutover)" >&2
+  echo "       Install per docs/rust-cli.md" >&2
+  exit 2
+}
 
 # Resolve repo root from this script's location so relative siblings
 # work from any cwd. Matches the pattern established by
@@ -110,10 +119,11 @@ DST="$OUTDIR/etcd-snapshot-$TS$SUFFIX.db"
 # Cross-runtime dependency (v0.1.0 cutover, #353):
 # `hbird` CLI is required at runtime to resolve CP_IP from the cluster.
 # scripts/kubectl-k8s.sh was removed in v0.1.0; the Rust twin
-# (`hbird kubectl`) is the canonical kubectl entry point. If `hbird`
-# is not on PATH this step will fail with command-not-found; export
-# CP_IP=<ip> ahead of time (or set it in cluster.local.conf) to skip
-# kubectl resolution entirely.
+# (`hbird kubectl`) is the canonical kubectl entry point. `hbird` is
+# preflight-checked at the top of this script, so this step won't fail
+# with command-not-found. `hbird kubectl` auto-resolves CP_IP via
+# virsh-domifaddr on KVM_HOST (PR #366 round-2 H1) when CP_IP isn't
+# pinned in CONFIG.
 CP_IP="${CP_IP:-$(hbird kubectl get nodes \
   -l node-role.kubernetes.io/control-plane \
   -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')}"

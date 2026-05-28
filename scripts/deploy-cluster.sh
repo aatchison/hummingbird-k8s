@@ -657,9 +657,20 @@ if [[ "$RUN_VERIFY" = "true" ]]; then
   # scripts/verify-app-deploy.sh was removed in v0.1.0; the Rust twin
   # (`hbird verify app-deploy`) is the canonical implementation.
   # If hbird is not on PATH, this step will fail with command-not-found.
+  #
+  # PR #366 round-2 H3: pass --config / --cp-ip / --kvm-host explicitly
+  # rather than relying on env propagation (CP_IP isn't exported from
+  # the local block scope above, and a bare `hbird verify app-deploy`
+  # would re-resolve via virsh-domifaddr — slower + relies on KVM_HOST
+  # being a usable SSH alias from this host). Explicit flags also make
+  # the intent grep-able in the deploy log.
   if command -v hbird >/dev/null 2>&1; then
     log "running hbird verify app-deploy"
-    hbird verify app-deploy || log "hbird verify app-deploy exited non-zero (cluster is up; verifier failure is informational)"
+    hbird verify app-deploy \
+      --config "$CONFIG_PATH" \
+      --cp-ip "$CP_IP" \
+      --kvm-host "${KVM_HOST:-}" \
+      || log "hbird verify app-deploy exited non-zero (cluster is up; verifier failure is informational)"
   else
     log "RUN_VERIFY=true but \`hbird\` CLI not found on PATH; skipping (install per docs/rust-cli.md)"
   fi

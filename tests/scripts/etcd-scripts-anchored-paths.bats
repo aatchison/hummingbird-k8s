@@ -156,6 +156,16 @@ EOF
 printf '0\t%s\n' "$2"
 EOF
   chmod +x "$STUB_DIR/du"
+  # PR #366 round-2 M1 added a `command -v hbird` preflight to
+  # backup-etcd.sh. Stub `hbird` so the preflight passes; CP_IP is
+  # already pinned via env so the kubectl fallback is never reached.
+  cat > "$STUB_DIR/hbird" <<'EOF'
+#!/usr/bin/env bash
+# Stub: preflight only checks for presence on PATH; never invoked
+# with CP_IP pinned.
+exit 0
+EOF
+  chmod +x "$STUB_DIR/hbird"
 
   run env -i \
     PATH="${STUB_DIR}:/usr/bin:/bin" \
