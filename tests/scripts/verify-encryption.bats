@@ -71,6 +71,21 @@ EOF
   chmod +x "$STUB_DIR/ssh"
 }
 
+# Stub `hostname` on PATH to print a fixed value, so on-KVM_HOST
+# detection tests are hermetic and don't couple to the runner's actual
+# hostname. Honors `hostname -s` (the form the script invokes) by
+# printing the same fixed value either way. Tests that want to assert
+# "no match" deliberately pass a synthetic KVM_HOST and don't need this.
+_stub_hostname() {
+  local fake="${1:-geary}"
+  cat > "${STUB_DIR}/hostname" <<EOF
+#!/usr/bin/env bash
+# Stub: always prints the fixed test hostname, ignoring flags.
+printf '%s\n' '${fake}'
+EOF
+  chmod +x "${STUB_DIR}/hostname"
+}
+
 # Helper: emit one line per arg of the Nth ssh invocation (1-indexed).
 _ssh_argv_file() {
   local n="$1"
@@ -206,4 +221,58 @@ _ssh_call_count() {
 @test "verify-encryption source: remote exec targets /usr/libexec verifier on root@CP_IP" {
   grep -qE 'root@\$\{?cp_ip\}?' "$SCRIPT"
   grep -qF '/usr/libexec/verify-encryption.sh' "$SCRIPT"
+}
+
+# ---------------------------------------------------------------------------
+# #362: when we're already on the KVM host, ProxyJump=$KVM_HOST would
+# become `ssh root@<KVM>` from <KVM> itself — sshd typically denies root
+# login and the call hangs forever on a password prompt. The detection
+# must unset KVM_HOST so SSH_OPTS skips ProxyJump and we ssh directly to
+# root@<cp_ip>. Gates epic #353 (bash exit code must be honest).
+# ---------------------------------------------------------------------------
+
+@test "#362: on KVM_HOST (hostname match) + explicit CP_IP -> no ProxyJump in ssh argv" {
+  # Hermetic: stub hostname so detection fires on any CI runner.
+  _stub_hostname geary
+
+  run env PATH="${STUB_DIR}:${PATH}" \
+    KVM_HOST=geary \
+    CP_IP=192.0.2.42 \
+    bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+
+  # Exactly one ssh call (CP_IP override skips resolve_cp_ip).
+  [ "$(_ssh_call_count)" -eq 1 ]
+
+  local argv1
+  argv1="$(_ssh_argv_file 1)"
+  [ -f "$argv1" ]
+  grep -qxF 'root@192.0.2.42' "$argv1"
+  # The whole point of #362: NO ProxyJump line, even though KVM_HOST
+  # was set on entry.
+  if grep -qE '^ProxyJump=' "$argv1"; then
+    echo "FAIL: ssh argv carries ProxyJump= despite on-KVM_HOST run" >&2
+    cat "$argv1" >&2
+    return 1
+  fi
+
+  # And the warning line must have been emitted (operator visibility).
+  # NOTE: do NOT chain `|| true` onto this assertion — that defangs the
+  # check and the test would pass even if the warning never fired. bats
+  # merges stderr into `$output` under `run` by default, matching the
+  # sibling shape in verify-app-deploy.bats / verify-hardening.bats.
+  [[ "$output" == *"already on KVM_HOST"* ]]
+}
+
+@test "#362: KVM_HOST set to a DIFFERENT host -> ProxyJump still applied (no false-positive)" {
+  run env PATH="${STUB_DIR}:${PATH}" \
+    KVM_HOST=definitely-not-this-host-xyzzy \
+    CP_IP=192.0.2.42 \
+    bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+
+  local argv1
+  argv1="$(_ssh_argv_file 1)"
+  [ -f "$argv1" ]
+  grep -qxF 'ProxyJump=definitely-not-this-host-xyzzy' "$argv1"
 }

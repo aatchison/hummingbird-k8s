@@ -37,6 +37,21 @@ setup() {
   export SSH_ARGV_DIR
 }
 
+# Stub `hostname` on PATH to print a fixed value, so on-KVM_HOST
+# detection tests are hermetic and don't couple to the runner's actual
+# hostname. Honors `hostname -s` (the form the script invokes) by
+# printing the same fixed value either way. Tests that want to assert
+# "no match" deliberately pass a synthetic KVM_HOST and don't need this.
+_stub_hostname() {
+  local fake="${1:-geary}"
+  cat > "${STUB_DIR}/hostname" <<EOF
+#!/usr/bin/env bash
+# Stub: always prints the fixed test hostname, ignoring flags.
+printf '%s\n' '${fake}'
+EOF
+  chmod +x "${STUB_DIR}/hostname"
+}
+
 # Build the canonical ssh stub: each invocation appends an `argv-N` file
 # (one arg per line) for grep assertions. Branches stdout based on the
 # remote command:
@@ -239,6 +254,84 @@ EOF
 # Without KVM_HOST: resolve_cp_ip falls through (no virsh locally in test
 # PATH), kubectl-fallback fires, on_cp does NOT carry ProxyJump.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# #362: when we're already on the KVM host, the verifier must NOT set
+# `-o ProxyJump=$KVM_HOST` — that would resolve to `ssh root@<KVM>` from
+# <KVM> itself, hanging on a never-answered password prompt sshd will
+# never accept. The detection drops KVM_HOST so the direct-CP SSH path
+# fires instead. Gates epic #353 (bash exit code must be honest).
+# ---------------------------------------------------------------------------
+
+@test "#362: on KVM_HOST (hostname match) -> no ProxyJump in any ssh argv" {
+  _make_ssh_stub
+  _make_kubectl_stub
+  # Hermetic: stub hostname so detection fires on any CI runner.
+  _stub_hostname geary
+
+  run env -u CONFIG \
+    KVM_HOST=geary \
+    KUBECTL=kubectl \
+    CP_NAME=hbird-cp1 \
+    CP_IP=192.168.99.42 \
+    PATH="${STUB_DIR}:${PATH}" \
+    bash "$SCRIPT"
+
+  # Guard against vacuous truth: if zero argv files were produced (script
+  # exited before any ssh ran), the absence-loop below would pass with
+  # no actual evidence. Require at least one captured ssh invocation.
+  local argv_count
+  argv_count="$(find "${SSH_ARGV_DIR}" -maxdepth 1 -name 'argv-*' -type f | wc -l)"
+  if [ "$argv_count" -lt 1 ]; then
+    echo "FAIL: no ssh invocations captured — the absence-of-ProxyJump check would vacuously pass" >&2
+    return 1
+  fi
+
+  # No ssh argv should carry ProxyJump=… — the on-KVM-host detection
+  # must have unset KVM_HOST before SSH_OPTS was built.
+  for f in "${SSH_ARGV_DIR}"/argv-*; do
+    [ -f "$f" ] || continue
+    if grep -qE '^ProxyJump=' "$f"; then
+      echo "FAIL: ssh argv contains ProxyJump= despite on-KVM_HOST run: $f" >&2
+      cat "$f" >&2
+      return 1
+    fi
+  done
+
+  # And the warning line must have been emitted (operator visibility).
+  [[ "$output" == *"already on KVM_HOST"* ]]
+  [[ "$output" == *"#362"* ]]
+}
+
+@test "#362: KVM_HOST set to a DIFFERENT host -> ProxyJump still applied (no false-positive)" {
+  _make_ssh_stub
+  _make_kubectl_stub
+
+  # Synthetic alias that can't collide with any real hostname.
+  run env -u CONFIG \
+    KVM_HOST=definitely-not-this-host-xyzzy \
+    KUBECTL=kubectl \
+    CP_NAME=hbird-cp1 \
+    CP_IP=192.168.99.42 \
+    PATH="${STUB_DIR}:${PATH}" \
+    bash "$SCRIPT"
+
+  # At least one ssh argv must carry ProxyJump=… — the wrapper guard
+  # must NOT fire when KVM_HOST is a different host.
+  local found_proxy=0
+  for f in "${SSH_ARGV_DIR}"/argv-*; do
+    [ -f "$f" ] || continue
+    if grep -qxF 'ProxyJump=definitely-not-this-host-xyzzy' "$f"; then
+      found_proxy=1
+      break
+    fi
+  done
+  [ "$found_proxy" -eq 1 ]
+  if [[ "$output" == *"already on KVM_HOST"* ]]; then
+    echo "FAIL: false-positive #362 skip with non-matching KVM_HOST" >&2
+    return 1
+  fi
+}
 
 @test "F4: without KVM_HOST, no ProxyJump option appears in any ssh argv" {
   _make_ssh_stub

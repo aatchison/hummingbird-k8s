@@ -77,6 +77,21 @@ EOF
   SCRIPT="${FAKE_REPO_ROOT}/scripts/${SCRIPT_NAME}"
 }
 
+# Stub `hostname` on PATH to print a fixed value, so on-KVM_HOST
+# detection tests are hermetic and don't couple to the runner's actual
+# hostname. Honors `hostname -s` (the form the script invokes) by
+# printing the same fixed value either way. Tests that want to assert
+# "no match" deliberately pass a synthetic KVM_HOST and don't need this.
+_stub_hostname() {
+  local fake="${1:-geary}"
+  cat > "${STUB_DIR}/hostname" <<EOF
+#!/usr/bin/env bash
+# Stub: always prints the fixed test hostname, ignoring flags.
+printf '%s\n' '${fake}'
+EOF
+  chmod +x "${STUB_DIR}/hostname"
+}
+
 # Invoke the script with the stubs in PATH. Each test passes the env it
 # cares about (KVM_HOST, KUBECTL, CONFIG).
 _invoke() {
@@ -176,6 +191,77 @@ EOF
   # fine; an assignment is not).
   if grep -qE '^[^#]*KUBECTL=["'\'']?\./scripts/kubectl-k8s\.sh' "$REAL_SCRIPT"; then
     printf 'FAIL: verify-app-deploy.sh assigns KUBECTL=./scripts/kubectl-k8s.sh (relative)\n'
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# #362: when we're already on the KVM host, the verifier MUST NOT route
+# through scripts/kubectl-k8s.sh — that would resolve to `ssh root@<KVM>`
+# from <KVM> itself, hanging on a password prompt sshd will never accept.
+# Instead the script should log a skip + exit 0, so deploy-cluster.sh's
+# trailing verify step reports honest exit codes (gates epic #353).
+# ---------------------------------------------------------------------------
+
+@test "verify-app-deploy: on KVM_HOST (hostname match) -> skips with exit 0 and warning (#362)" {
+  # Hermetic: stub hostname so the test passes deterministically on any
+  # CI runner / workstation regardless of the real hostname.
+  _stub_hostname geary
+  run env -i HOME="$HOME" PATH="${STUB_DIR}:${PATH}" \
+      KVM_HOST=geary KCTL_LOG="$KCTL_LOG" \
+      bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  # Confirm NEITHER kubectl path ran — the skip must fire BEFORE any
+  # smoketest namespace is created.
+  if grep -q '^WRAPPER ' "$KCTL_LOG"; then
+    printf 'FAIL: on-KVM_HOST run still invoked kubectl-k8s.sh wrapper\n%s\n' "$(cat "$KCTL_LOG")"
+    return 1
+  fi
+  if grep -q '^PLAIN ' "$KCTL_LOG"; then
+    printf 'FAIL: on-KVM_HOST run still invoked plain kubectl\n%s\n' "$(cat "$KCTL_LOG")"
+    return 1
+  fi
+  [[ "$output" == *"already on KVM_HOST"* ]]
+  [[ "$output" == *"#362"* ]]
+}
+
+@test "verify-app-deploy: on KVM_HOST FQDN form (hostname.example.com) also skips (#362)" {
+  # Hermetic stub: real hostname doesn't matter, only the stubbed value.
+  _stub_hostname geary
+  # The detection strips KVM_HOST to its short form (everything before
+  # the first dot), so an FQDN like "geary.example.com" still matches
+  # the stubbed "geary".
+  run env -i HOME="$HOME" PATH="${STUB_DIR}:${PATH}" \
+      KVM_HOST=geary.example.com KCTL_LOG="$KCTL_LOG" \
+      bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  if grep -q '^WRAPPER \|^PLAIN ' "$KCTL_LOG"; then
+    printf 'FAIL: FQDN-form on-KVM_HOST run did not skip\n%s\n' "$(cat "$KCTL_LOG")"
+    return 1
+  fi
+  [[ "$output" == *"already on KVM_HOST"* ]]
+}
+
+@test "verify-app-deploy: KVM_HOST set to a DIFFERENT host -> still uses wrapper (no false-positive skip) (#362)" {
+  # Sanity check: a hostname that does NOT match ours must not trigger
+  # the skip path. Use a synthetic name that can't collide with any
+  # real local hostname.
+  run env -i HOME="$HOME" PATH="${STUB_DIR}:${PATH}" \
+      KVM_HOST=definitely-not-this-host-xyzzy KCTL_LOG="$KCTL_LOG" \
+      bash "$SCRIPT"
+  [ "$status" -eq 0 ]
+  grep -q '^WRAPPER ' "$KCTL_LOG"
+  # Positive marker: the script must have progressed past the on-host
+  # skip-guard into the smoketest body. Both apply/create are issued by
+  # the WRAPPER stub's logger; without this assertion the test would
+  # pass even if the script bailed early, since `bash $SCRIPT` returns
+  # the stub's exit 0. Grep for evidence of real execution.
+  if ! grep -qE 'WRAPPER (apply|create) ' "$KCTL_LOG"; then
+    printf 'FAIL: kubectl-k8s.sh wrapper never saw apply/create — script did not progress past skip-guard\n%s\n' "$(cat "$KCTL_LOG")"
+    return 1
+  fi
+  if [[ "$output" == *"already on KVM_HOST"* ]]; then
+    printf 'FAIL: false-positive skip when KVM_HOST != local hostname\n%s\n' "$output"
     return 1
   fi
 }
