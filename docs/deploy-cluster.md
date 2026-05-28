@@ -382,6 +382,50 @@ content. See issue #248 for the full design discussion.
 | --- | --- | --- |
 | `HBIRD_REMOTE_REPO` | `~/hummingbird-k8s` | Absolute path on `$KVM_HOST` to the remote git checkout the shim execs from. Override when you keep the repo somewhere non-standard (e.g. `/opt/hummingbird-k8s` or `/srv/repos/hummingbird-k8s`). Tilde expansion happens on the remote shell's word-splitting pass — start with `/` or `~/` only. |
 
+### Remote-checkout freshness (#365)
+
+The shim execs `bash scripts/<name>.sh` from the **remote checkout's
+filesystem**, not from the local repo's. If the remote checkout is
+behind a fix you just merged on your workstation, the re-exec silently
+runs the pre-merge code. Surfaced in cycle 2 when `geary`'s checkout
+was missing the #364 merge and silently ran the pre-fix
+`verify-app-deploy.sh`.
+
+The shim now does a `git rev-parse HEAD` on `$KVM_HOST:$HBIRD_REMOTE_REPO`
+before re-exec and WARNs to stderr when the remote is BEHIND, DIVERGED,
+or unreadable. Equal SHAs print nothing (silent good path). The check
+runs only on the operator's workstation — when CI workflows run on the
+KVM host directly (`runs-on: [self-hosted, kvm, libvirt]`), the shim
+itself doesn't fire, so the check is a no-op in CI today.
+
+| Var | Default | Effect |
+| --- | --- | --- |
+| `HBIRD_REMOTE_FRESHNESS_CHECK` | `1` (on) | Boolish opt-out (`0`/`false`/`no`/`off`). Disables the freshness check entirely. Useful for release-train rollback drills or any case where running a known-older remote checkout is intentional. Client-side only — never forwarded to the remote. |
+| `HBIRD_REMOTE_STRICT`          | `0` (warn-only) | Boolish opt-in (`1`/`true`/`yes`/`on`). Upgrades stale-remote WARN into a hard fail (exit 1, no re-exec). Network-unreachable still only WARNs — that's transient, the real ssh below will surface the actual error. Suggested for any future CI workflow that drives the shim from a non-KVM-host runner. |
+| `HBIRD_REMOTE_LAG_THRESHOLD`   | `5`             | Maximum number of commits the remote may be BEHIND before WARN fires. Default `5` swallows release-train rebase noise. Set to `0` to WARN on any lag. Non-numeric values fall back to the default. |
+
+The check distinguishes four failure modes so the operator gets
+actionable text:
+
+| Case | Trigger | WARN text | STRICT behavior |
+| --- | --- | --- | --- |
+| (a) Network/auth | `ssh` exit code non-zero | "cannot reach $KVM_HOST … ssh exit N — proceeding" | Still WARNs only; does NOT hard-fail (transient) |
+| (b) Bad checkout | `ssh` OK, `git rev-parse HEAD` returns empty | "$KVM_HOST:$HBIRD_REMOTE_REPO exists but is not a git checkout … looks like a tarball extract or a corrupted .git" + re-clone recovery hint | Hard-fail under STRICT |
+| (c) Behind | `merge-base --is-ancestor remote local` succeeds | "BEHIND local by N commit(s)" + `fetch && reset --hard origin/main` recovery hint (when local is on `main`; manual reconcile hint when on a topic branch) | Hard-fail under STRICT |
+| (d) Diverged | Not equal, not ancestor | "diverges from local — re-exec semantics may surprise you" | Hard-fail under STRICT |
+
+When the operator's local branch is NOT `main`, the WARN text appends a
+"local on topic branch '$BRANCH' — diverge is expected" hint so a
+feature-branch developer doesn't get misled into force-pushing main on
+the KVM host.
+
+Per-session caching: results are memoized in `$XDG_RUNTIME_DIR/hbird-freshness/`
+(falls back to `$TMPDIR` then `/tmp`) for 60 seconds, keyed by
+`$KVM_HOST + $HBIRD_REMOTE_REPO + local_sha + strict_flag`. A Make
+pipeline that runs deploy + update + spawn-workers back-to-back pays
+the SSH round-trip cost once. Set
+`HBIRD_SSH_WRAP_FRESHNESS_CACHE=0` to disable.
+
 ## Config surface
 
 The full set is in `cluster.example.conf`; the essentials:

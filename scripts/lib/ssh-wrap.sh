@@ -84,15 +84,24 @@
 #   HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=<state>
 #                             — Stub the remote git rev-parse used by the
 #                               freshness check (#365). Recognized values:
-#                                 equal     — remote SHA == local SHA
-#                                 behind    — remote SHA is an ancestor of local
-#                                 diverged  — remote SHA is neither ancestor nor equal
-#                                 missing   — remote rev-parse returns empty
-#                                             (simulates a missing checkout)
+#                                 equal        — remote SHA == local SHA
+#                                 behind       — remote SHA is an ancestor of local
+#                                 diverged     — remote SHA is neither ancestor nor equal
+#                                 missing      — ssh OK but rev-parse returns
+#                                                empty (corrupt .git / tarball)
+#                                 unreachable  — ssh failed (network/auth);
+#                                                helper must NOT treat as stale
+#                                                even under STRICT (round-2 H1)
 #                               When unset, the real `ssh ... git rev-parse`
 #                               runs (skipped entirely if the SSH-preflight
 #                               dry-run hook is also set and no freshness
-#                               state was requested).
+#                               state was requested). These hooks are bats-
+#                               only — the helper emits a WARN if either is
+#                               set outside a BATS_TEST_FILENAME context.
+#   HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT=<int>
+#                             — Synthesize the commits-behind count used by
+#                               the lag-threshold check (M9). Defaults to 1
+#                               when unset. Only consulted with FRESHNESS=behind.
 #   HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA=<sha>
 #                             — Inject the local-side SHA the freshness
 #                               check would otherwise read from `git
@@ -104,14 +113,65 @@
 # Remote-checkout freshness (#365):
 #   Before re-exec, the shim compares the local repo's HEAD SHA to the
 #   remote checkout's HEAD SHA. Stale remotes (behind, diverged, or
-#   missing) WARN to stderr — they do NOT auto-pull. Equal SHAs print
-#   nothing. Surfaced after the cycle-2 dispatch where geary's checkout
-#   was missing a merged fix (#364) and silently re-execed the buggy
-#   pre-merge script.
+#   missing/unreadable) WARN to stderr — they do NOT auto-pull. Equal
+#   SHAs print nothing. Surfaced after the cycle-2 dispatch where geary's
+#   checkout was missing a merged fix (#364) and silently re-execed the
+#   buggy pre-merge script.
 #
-#   Env toggles:
-#     HBIRD_REMOTE_FRESHNESS_CHECK=0  — disable the check entirely (default ON)
-#     HBIRD_REMOTE_STRICT=1           — exit 1 on stale (default = warn-only)
+#   Failure mode distinction (round-2 H1): network-unreachable, missing-
+#   git-repo, and genuine behind/diverged are three different operator
+#   stories. The helper now distinguishes:
+#     (a) ssh failed (network/auth)        — WARN, mention "cannot reach"
+#                                            + ssh exit code; do NOT
+#                                            treat as stale.
+#     (b) ssh OK but rev-parse empty       — WARN, mention "not a git
+#                                            repo" (preflight already
+#                                            confirmed scripts/ exists,
+#                                            so this is a corrupted .git
+#                                            or extracted tarball).
+#     (c) SHAs differ                      — WARN BEHIND or DIVERGED per
+#                                            ancestry decision.
+#
+#   Topic-branch handling (round-2 H2): when the operator's local branch
+#   is NOT main, the freshness comparison is inherently noisy (a topic
+#   branch has commits main doesn't, and main has commits the topic
+#   doesn't — DIVERGED is the expected state). The helper still runs the
+#   check (operator may want to know if their remote has REGRESSED) but
+#   prepends a softer "this is expected if on a topic branch" hint to the
+#   WARN text so a developer working on a feature branch isn't misled into
+#   force-pushing main on the KVM host.
+#
+#   Lag threshold (M9): even on the BEHIND ancestor case, a remote a few
+#   commits behind is usually fine (release-train rebases, etc). The
+#   WARN is skipped when behind by <= HBIRD_REMOTE_LAG_THRESHOLD commits
+#   (default 5). Set the threshold to 0 to warn on any lag.
+#
+#   Per-session cache (M2): the rev-parse + ancestry probe costs 1-3 SSH
+#   round-trips per shim invocation. A Make pipeline that runs deploy
+#   + update + spawn-workers back-to-back pays this 3x. The helper caches
+#   the freshness decision in $TMPDIR/hbird-freshness/$KVM_HOST-$sha for
+#   60s. Cache file content: 'ok' (no warn) or 'warn:<text>' (replay
+#   warn). Local SHA changing (operator pulled mid-session) invalidates
+#   automatically because the cache key embeds the local SHA.
+#
+#   Env toggles (CLIENT-SIDE ONLY — NOT forwarded to the remote):
+#     HBIRD_REMOTE_FRESHNESS_CHECK=0  — disable the check entirely
+#                                       (default ON). Accepts boolish
+#                                       0/1/true/false/yes/no/on/off
+#                                       per parity with rust-cli boolish
+#                                       parser (rust-cli-migration.md:90).
+#     HBIRD_REMOTE_STRICT=1           — exit 1 on stale (default = warn-
+#                                       only). Same boolish parser.
+#     HBIRD_REMOTE_LAG_THRESHOLD=N    — skip WARN if BEHIND by <= N
+#                                       commits (default 5; set to 0 to
+#                                       warn on any lag).
+#
+#   CI vs operator defaults: CI workflows currently run ON the KVM host
+#   (runs-on: [self-hosted, kvm, libvirt]), so the shim never fires in
+#   CI — the freshness check is operator-workstation only. If a future
+#   CI workflow drives the shim from a non-KVM-host runner, set
+#   HBIRD_REMOTE_STRICT=1 in that workflow's `env:` block (CI = STRICT
+#   by default; operators = WARN by default).
 #
 # Operator workstation pubkey (#248):
 #   When the local CONFIG declares `SSH_PUBKEY_FILE=`, that path is
@@ -153,15 +213,74 @@ HBIRD_SSH_WRAP_ALLOWED_ENV=(
   HBIRD_REMOTE_NO_SUDO
 )
 
+# _hbird_ssh_wrap_boolish <varname> <default-0-or-1>
+# Internal: parse a boolish env-var value with parity to the rust-cli
+# boolish parser (rust-cli-migration.md:90). Accepts 0/1, true/false,
+# yes/no, on/off (case-insensitive). Empty/unset -> default. Unknown
+# value -> default (silently — do not break the shim on operator typo).
+# Prints '0' or '1' to stdout.
+_hbird_ssh_wrap_boolish() {
+  local var="$1" def="$2"
+  local raw="${!var:-}"
+  if [[ -z "$raw" ]]; then
+    printf '%s' "$def"; return 0
+  fi
+  case "$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on)   printf '1' ;;
+    0|false|no|off)  printf '0' ;;
+    *)               printf '%s' "$def" ;;
+  esac
+}
+
+# _hbird_ssh_wrap_cache_dir
+# Internal: derive a per-user cache dir, preferring XDG_RUNTIME_DIR (tmpfs,
+# user-private) then TMPDIR then /tmp. mkdir -p is idempotent.
+# Returns failure (so caching is disabled) when
+# HBIRD_SSH_WRAP_FRESHNESS_CACHE=0 — bats uses this to pin freshness
+# probe behavior deterministically per-test.
+_hbird_ssh_wrap_cache_dir() {
+  [[ "$(_hbird_ssh_wrap_boolish HBIRD_SSH_WRAP_FRESHNESS_CACHE 1)" == 1 ]] || return 1
+  local base="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+  local dir="${base}/hbird-freshness"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  printf '%s' "$dir"
+}
+
 # hbird_ssh_wrap_check_remote_freshness <local_repo_dir> <script_basename>
 # Compare the local repo's HEAD SHA to the remote checkout's HEAD SHA and
 # emit a WARN to stderr when the remote is stale (behind, diverged, or
-# missing). Returns 0 (warn-only) by default; returns 1 if
-# HBIRD_REMOTE_STRICT=1 is set AND the remote is stale.
+# missing/unreachable). Returns 0 (warn-only) by default; returns 1 if
+# HBIRD_REMOTE_STRICT=1 is set AND the remote is genuinely stale (not
+# just unreachable — see distinction below).
 #
 # Equal SHAs print nothing (silent good path).
 #
-# Honors HBIRD_REMOTE_FRESHNESS_CHECK=0 to skip entirely.
+# Failure-mode distinction (round-2 H1):
+#   (a) ssh-unreachable      — WARN only ("cannot reach … ssh exit N"),
+#                              do NOT treat as stale, do NOT hard-fail
+#                              under STRICT (network blip is not the
+#                              operator's "I forgot to git pull"
+#                              problem; the subsequent re-exec ssh will
+#                              fail with a clearer error).
+#   (b) rev-parse returns "" — WARN "not a git repo" (preflight already
+#                              confirmed scripts/ dir exists, so this is
+#                              a corrupted .git or an extracted tarball).
+#                              Hard-fail under STRICT (re-exec will
+#                              succeed but run mystery code).
+#   (c) SHAs differ          — Real ancestry comparison (BEHIND vs
+#                              DIVERGED). Hard-fail under STRICT.
+#
+# Topic-branch handling (round-2 H2):
+#   If the operator's local branch is NOT main, prepend a softer "this is
+#   expected if on a topic branch" hint to the WARN so a feature-branch
+#   developer isn't misled. Still run the check (operator may want to
+#   know if the remote has REGRESSED below their topic branch's merge
+#   base).
+#
+# Honors HBIRD_REMOTE_FRESHNESS_CHECK boolish (default ON).
+# Honors HBIRD_REMOTE_STRICT boolish (default OFF).
+# Honors HBIRD_REMOTE_LAG_THRESHOLD (default 5) — skip BEHIND WARN if
+# behind by <= N commits.
 # Honors HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS=<state> to stub the remote
 # rev-parse for bats coverage; see header comment for recognized states.
 #
@@ -171,8 +290,21 @@ hbird_ssh_wrap_check_remote_freshness() {
   local local_repo_dir="$1"
   local script_basename="$2"
 
-  # Opt-out: operator disabled the check.
-  [[ "${HBIRD_REMOTE_FRESHNESS_CHECK:-1}" == 1 ]] || return 0
+  # Opt-out: operator disabled the check (boolish — 0/false/no/off).
+  [[ "$(_hbird_ssh_wrap_boolish HBIRD_REMOTE_FRESHNESS_CHECK 1)" == 1 ]] || return 0
+
+  local strict
+  strict="$(_hbird_ssh_wrap_boolish HBIRD_REMOTE_STRICT 0)"
+
+  # M4: warn loudly if test-only dry-run hooks are set outside a bats
+  # context. Operator-shell pollution of these vars would cause silent
+  # divergence from production behavior. BATS_TEST_FILENAME is set by
+  # the bats harness for every test (and by `run` inside a test).
+  if [[ -z "${BATS_TEST_FILENAME:-}" ]]; then
+    if [[ -n "${HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS:-}" || -n "${HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA:-}" ]]; then
+      echo "[${script_basename}] WARN: HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS / DRY_RUN_LOCAL_SHA are test-only hooks; unset them in operator shells" >&2
+    fi
+  fi
 
   # Resolve local SHA from the script's own repo (works regardless of cwd
   # or worktree layout). If we cannot get it (script lives outside a git
@@ -187,19 +319,68 @@ hbird_ssh_wrap_check_remote_freshness() {
   fi
   [[ -n "$local_sha" ]] || return 0
 
+  # H2: detect topic-branch case. local_branch == 'main' is the common
+  # operator path; anything else gets a softer WARN prefix. Dry-run
+  # mode skips the git call (bats container has no git).
+  local local_branch="main"
+  if [[ -z "${HBIRD_SSH_WRAP_DRY_RUN_LOCAL_SHA:-}" ]]; then
+    local_branch="$(git -C "$local_repo_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+  fi
+  local topic_hint=""
+  if [[ "$local_branch" != "main" && "$local_branch" != "HEAD" ]]; then
+    topic_hint=" (local on topic branch '${local_branch}' — diverge is expected)"
+  fi
+
+  # M2: per-session cache. Skip re-probe if cache hit and fresh.
+  local cache_dir cache_file cache_age cache_ttl=60
+  cache_dir="$(_hbird_ssh_wrap_cache_dir 2>/dev/null || true)"
+  if [[ -n "$cache_dir" ]]; then
+    # Cache key embeds local_sha (operator pulling invalidates) +
+    # KVM_HOST + REMOTE_REPO (different remotes don't collide) +
+    # STRICT (strict-mode failure must not be cached as ok).
+    local cache_key="${KVM_HOST//\//_}__${HBIRD_REMOTE_REPO//\//_}__${local_sha}__strict${strict}"
+    cache_file="${cache_dir}/${cache_key}"
+    if [[ -f "$cache_file" ]]; then
+      cache_age=$(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
+      if (( cache_age < cache_ttl )); then
+        local cached
+        cached="$(cat "$cache_file" 2>/dev/null || true)"
+        if [[ "$cached" == "ok" ]]; then
+          return 0
+        elif [[ "$cached" == warn:* ]]; then
+          # Replay the cached WARN text verbatim. If strict, return 1
+          # (cache key includes strict so a strict-mode failure was
+          # already cached as warn:... — see strict handling below).
+          printf '%s\n' "${cached#warn:}" >&2
+          if [[ "$strict" == 1 ]]; then
+            return 1
+          fi
+          return 0
+        elif [[ "$cached" == strictfail:* ]]; then
+          printf '%s\n' "${cached#strictfail:}" >&2
+          return 1
+        fi
+      fi
+    fi
+  fi
+
   # Resolve the remote SHA. The dry-run-freshness hook lets bats simulate
   # each case without a working SSH path.
   local remote_sha=""
+  local ssh_rc=0
+  local remote_state=""  # empty | ok | unreachable | not_a_repo
   local dryrun_state="${HBIRD_SSH_WRAP_DRY_RUN_FRESHNESS:-}"
   if [[ -n "$dryrun_state" ]]; then
     case "$dryrun_state" in
-      equal)    remote_sha="$local_sha" ;;
-      missing)  remote_sha="" ;;
+      equal)        remote_sha="$local_sha"; remote_state=ok ;;
+      missing)      remote_sha=""; remote_state=not_a_repo ;;
+      unreachable)  remote_sha=""; remote_state=unreachable; ssh_rc=255 ;;
       behind|diverged)
         # Synthesize a distinct fake SHA — the ancestry decision below
         # is also driven off the same hook, so the literal value is
         # only used for the warning text.
         remote_sha="0000000000000000000000000000000000000000"
+        remote_state=ok
         ;;
       *)
         # Unrecognized state — treat as no-op rather than risk a false
@@ -210,27 +391,67 @@ hbird_ssh_wrap_check_remote_freshness() {
     esac
   else
     # Real path: query the remote. BatchMode=yes prevents a password
-    # prompt if key auth fails (we already passed the same check in the
-    # pre-flight, but be defensive). ConnectTimeout=5 matches preflight.
-    remote_sha="$(
-      ssh -o BatchMode=yes -o ConnectTimeout=5 "$KVM_HOST" \
-        "git -C ${HBIRD_REMOTE_REPO} rev-parse HEAD 2>/dev/null" 2>/dev/null \
-      | tr -d '[:space:]'
-    )" || true
+    # prompt if key auth fails. ConnectTimeout=5 matches preflight.
+    # H1: capture ssh exit code separately so we can distinguish network
+    # failure from "ssh OK but git rev-parse empty" (corrupted/tarball
+    # remote checkout).
+    local remote_sha_raw
+    remote_sha_raw="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$KVM_HOST" \
+      "git -C ${HBIRD_REMOTE_REPO} rev-parse HEAD 2>/dev/null" 2>/dev/null)"
+    ssh_rc=$?
+    if (( ssh_rc != 0 )); then
+      remote_state=unreachable
+    else
+      remote_sha="$(printf '%s' "$remote_sha_raw" | tr -d '[:space:]')"
+      if [[ -z "$remote_sha" ]]; then
+        remote_state=not_a_repo
+      else
+        remote_state=ok
+      fi
+    fi
   fi
 
-  # Missing remote checkout (rev-parse failed / returned empty).
-  if [[ -z "$remote_sha" ]]; then
-    echo "[${script_basename}] WARN: remote checkout at ${KVM_HOST}:${HBIRD_REMOTE_REPO} missing or not a git repo — re-exec may fail" >&2
-    if [[ "${HBIRD_REMOTE_STRICT:-0}" == 1 ]]; then
-      echo "[${script_basename}] HBIRD_REMOTE_STRICT=1 — refusing to re-exec on a missing remote checkout" >&2
-      return 1
-    fi
+  # Helper: cache the outcome. Captures the printed message so future
+  # invocations replay the same WARN without re-probing.
+  local _cache_msg=""
+  _cache_outcome() {
+    [[ -n "$cache_dir" && -n "$cache_file" ]] || return 0
+    printf '%s' "$1" >"$cache_file" 2>/dev/null || true
+  }
+
+  # (a) Network/auth failure: WARN only — never hard-fail under STRICT.
+  if [[ "$remote_state" == unreachable ]]; then
+    local msg="[${script_basename}] WARN: cannot reach ${KVM_HOST} to check remote checkout freshness (ssh exit ${ssh_rc}) — proceeding; the re-exec ssh will surface the real error"
+    echo "$msg" >&2
+    _cache_outcome "warn:${msg}"
     return 0
   fi
 
+  # (b) ssh OK but rev-parse returned empty — directory exists (preflight
+  # already validated $HBIRD_REMOTE_REPO/scripts) but .git is missing or
+  # corrupted (e.g. extracted from a tarball). Recovery is operator-
+  # specific (re-clone). Reword vs round-1: distinguish from the
+  # network-failure case.
+  if [[ "$remote_state" == not_a_repo ]]; then
+    local msg1="[${script_basename}] WARN: ${KVM_HOST}:${HBIRD_REMOTE_REPO} exists but is not a git checkout (preflight passed, but 'git rev-parse HEAD' returned empty — looks like a tarball extract or a corrupted .git)"
+    local msg2="[${script_basename}] WARN: re-exec will likely run mystery code; recover with 'ssh ${KVM_HOST} rm -rf ${HBIRD_REMOTE_REPO} && ssh ${KVM_HOST} git clone https://github.com/aatchison/hummingbird-k8s ${HBIRD_REMOTE_REPO}' OR rerun with HBIRD_REMOTE_FRESHNESS_CHECK=0 to override"
+    echo "$msg1" >&2
+    echo "$msg2" >&2
+    if [[ "$strict" == 1 ]]; then
+      local msg3="[${script_basename}] HBIRD_REMOTE_STRICT=1 — refusing to re-exec on a missing remote checkout"
+      echo "$msg3" >&2
+      _cache_outcome "strictfail:${msg1}"$'\n'"${msg2}"$'\n'"${msg3}"
+      return 1
+    fi
+    _cache_outcome "warn:${msg1}"$'\n'"${msg2}"
+    return 0
+  fi
+
+  # (c) ssh OK + non-empty remote_sha — real ancestry comparison.
+
   # Equal — silent good path.
   if [[ "$local_sha" == "$remote_sha" ]]; then
+    _cache_outcome "ok"
     return 0
   fi
 
@@ -240,32 +461,79 @@ hbird_ssh_wrap_check_remote_freshness() {
   # $remote_sha is an ancestor of $local_sha in ITS object DB — the
   # operator's workstation may not even have fetched $remote_sha).
   local is_ancestor=0
+  local commits_behind=0
   if [[ -n "$dryrun_state" ]]; then
-    [[ "$dryrun_state" == behind ]] && is_ancestor=1
+    if [[ "$dryrun_state" == behind ]]; then
+      is_ancestor=1
+      # Lets the lag-threshold path be tested without git: synthesize
+      # a commits-behind count from a dedicated hook.
+      commits_behind="${HBIRD_SSH_WRAP_DRY_RUN_BEHIND_COUNT:-1}"
+    fi
   else
     # Try the local side first — if our git knows both SHAs (operator
     # just pulled before dispatch, common case), we do not need a
     # second SSH round-trip. Fall back to asking the remote.
     if git -C "$local_repo_dir" merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
       is_ancestor=1
+      commits_behind="$(git -C "$local_repo_dir" rev-list --count "${remote_sha}..${local_sha}" 2>/dev/null || echo 1)"
     elif ssh -o BatchMode=yes -o ConnectTimeout=5 "$KVM_HOST" \
            "git -C ${HBIRD_REMOTE_REPO} merge-base --is-ancestor ${remote_sha} ${local_sha}" \
            >/dev/null 2>&1; then
       is_ancestor=1
+      commits_behind="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$KVM_HOST" \
+        "git -C ${HBIRD_REMOTE_REPO} rev-list --count ${remote_sha}..${local_sha} 2>/dev/null" 2>/dev/null \
+        | tr -d '[:space:]')"
+      [[ -n "$commits_behind" ]] || commits_behind=1
     fi
   fi
 
+  local lag_threshold="${HBIRD_REMOTE_LAG_THRESHOLD:-5}"
+  # Non-numeric -> default 5 (defensive).
+  [[ "$lag_threshold" =~ ^[0-9]+$ ]] || lag_threshold=5
+
   if [[ "$is_ancestor" == 1 ]]; then
-    echo "[${script_basename}] WARN: ${KVM_HOST} checkout (${remote_sha}) is BEHIND local (${local_sha}) — fixes from local will not apply on re-exec" >&2
-    echo "[${script_basename}] WARN: run 'ssh ${KVM_HOST} git -C ${HBIRD_REMOTE_REPO} pull' to sync (will NOT auto-pull)" >&2
-  else
-    echo "[${script_basename}] WARN: ${KVM_HOST} checkout (${remote_sha}) diverges from local (${local_sha}) — re-exec semantics may surprise you" >&2
+    # M9: silence the WARN when behind by <= threshold commits AND not
+    # on a topic branch (topic-branch WARN is informational and small
+    # lag is normal — but keep the WARN if the topic-branch hint is
+    # firing because that's a different signal).
+    if (( commits_behind <= lag_threshold )) && [[ -z "$topic_hint" ]]; then
+      _cache_outcome "ok"
+      return 0
+    fi
+    local msg1="[${script_basename}] WARN: ${KVM_HOST} checkout (${remote_sha}) is BEHIND local (${local_sha}) by ${commits_behind} commit(s)${topic_hint} — fixes from local will not apply on re-exec"
+    # M1: recovery hint depends on local branch. On main, the operator
+    # almost certainly wants `fetch && reset --hard origin/main`
+    # (the remote checkout is meant to mirror main; `pull` could merge
+    # if origin diverged). On a topic branch, just `fetch` + manual
+    # decision (don't suggest a destructive reset).
+    local msg2
+    if [[ "$local_branch" == "main" ]]; then
+      msg2="[${script_basename}] WARN: to sync, run 'ssh ${KVM_HOST} git -C ${HBIRD_REMOTE_REPO} fetch && ssh ${KVM_HOST} git -C ${HBIRD_REMOTE_REPO} reset --hard origin/main' (will NOT auto-pull; fetch+reset is the safe form for a deployment-tracking checkout — see docs/deploy-cluster.md)"
+    else
+      msg2="[${script_basename}] WARN: local on '${local_branch}'; run 'ssh ${KVM_HOST} git -C ${HBIRD_REMOTE_REPO} fetch' and reconcile manually (will NOT auto-pull; reset --hard would be destructive on a topic-branch checkout)"
+    fi
+    echo "$msg1" >&2
+    echo "$msg2" >&2
+    if [[ "$strict" == 1 ]]; then
+      local msg3="[${script_basename}] HBIRD_REMOTE_STRICT=1 — refusing to re-exec on a stale remote checkout"
+      echo "$msg3" >&2
+      _cache_outcome "strictfail:${msg1}"$'\n'"${msg2}"$'\n'"${msg3}"
+      return 1
+    fi
+    _cache_outcome "warn:${msg1}"$'\n'"${msg2}"
+    return 0
   fi
 
-  if [[ "${HBIRD_REMOTE_STRICT:-0}" == 1 ]]; then
-    echo "[${script_basename}] HBIRD_REMOTE_STRICT=1 — refusing to re-exec on a stale remote checkout" >&2
+  # Diverged.
+  local msg1="[${script_basename}] WARN: ${KVM_HOST} checkout (${remote_sha}) diverges from local (${local_sha})${topic_hint} — re-exec semantics may surprise you"
+  echo "$msg1" >&2
+  if [[ "$strict" == 1 ]]; then
+    local msg2="[${script_basename}] HBIRD_REMOTE_STRICT=1 — refusing to re-exec on a stale remote checkout"
+    echo "$msg2" >&2
+    _cache_outcome "strictfail:${msg1}"$'\n'"${msg2}"
     return 1
   fi
+  _cache_outcome "warn:${msg1}"
   return 0
 }
 
