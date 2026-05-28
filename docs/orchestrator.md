@@ -14,12 +14,12 @@ runner on geary:
    the server URL to the CP IP so `kubectl` works from the runner.
 3. Runs three verifiers in sequence (each with `continue-on-error`, so a
    single failure doesn't mask the others):
-   - `scripts/verify-encryption.sh` — streamed to the CP and executed
+   - `hbird verify encryption` (post-#353, was `scripts/verify-encryption.sh`) — streamed to the CP and executed
      there (needs `etcdctl`/`crictl` on the etcd container's host).
-   - `scripts/verify-hardening.sh` — executed on the runner with
+   - `hbird verify hardening` (post-#353, was `scripts/verify-hardening.sh`) — executed on the runner with
      `CP_IP` and `KUBECONFIG` set; SSHes into the CP for the
      audit-log/kubelet-flag probes.
-   - `scripts/verify-app-deploy.sh` — executed on the runner with
+   - `hbird verify app-deploy` (post-#353, was `scripts/verify-app-deploy.sh`) — executed on the runner with
      `KUBECONFIG` set; deploys an ephemeral PSA-restricted nginx +
      probe pod, asserts pod-to-pod via the ClusterIP, cleans up.
 4. If any verifier failed, posts a comment to issue #15 with the list

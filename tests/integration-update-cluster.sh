@@ -99,10 +99,14 @@ cp_ip() {
 cmd_assert_dry_run_sequence() {
   local out
   out="$(mktemp)"
-  # update-cluster.sh's log() writes to stderr (scripts/update-cluster.sh:52),
-  # so capture both streams. Without 2>&1 every assertion below would see
-  # an empty file and emit a spurious "got 0" error.
-  ( cd "$REPO_ROOT" && CONFIG="$CONFIG" bash scripts/update-cluster.sh --dry-run 2>&1 ) \
+  # Cross-runtime dependency (v0.1.0 cutover, #353):
+  # scripts/update-cluster.sh was removed; the Rust twin
+  # `hbird update-cluster` is the canonical implementation.
+  # The dry-run-sequence assertions below match the same log shape the
+  # bash twin emitted (the Rust twin preserves the verbatim "DRY-RUN ..."
+  # operator-grep lines for parity per epic #279). hbird logs go to
+  # stderr; we capture both streams.
+  ( cd "$REPO_ROOT" && CONFIG="$CONFIG" hbird update-cluster --dry-run 2>&1 ) \
     | tee "$out"
 
   local fail=0

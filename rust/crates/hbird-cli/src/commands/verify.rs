@@ -47,6 +47,74 @@ use clap::{Args, Subcommand};
 use crate::cp_kubectl::{CpTarget, cp_kubectl_raw, cp_kubectl_with_stdin_lenient, cp_ssh_lenient};
 use hbird_config::ClusterConfig;
 
+// ---- on-KVM-host detection (#353 cutover; mirrors bash #362 fix) ----------
+//
+// When verify-* runs on the KVM host itself (e.g. inside deploy-cluster
+// re-exec, or operator running directly on the hypervisor as root),
+// `KVM_HOST=<this-host>` would route ssh through `ssh root@<this-host>`
+// — sshd typically denies root login and the call hangs on a
+// never-answered password prompt. Detection here matches `hostname -s`
+// against `KVM_HOST` (stripped of any `.domain` suffix); on hit, the
+// caller drops ProxyJump (verify-hardening / verify-encryption) or
+// skips outright (verify-app-deploy).
+//
+// Known limitation (carried over from the bash fix's L1-MEDIUM finding
+// in PR #364): when `KVM_HOST` is an IP literal or a `~/.ssh/config`
+// alias whose `Host` name does not match the short hostname,
+// detection misses. Operators on such setups should leave `KVM_HOST`
+// unset on the KVM host itself (the bash twin had the same limitation).
+
+/// Read the current host's short hostname. Mirrors bash's
+/// `hostname -s 2>/dev/null || hostname`. Returns `None` if both
+/// invocations fail to produce a non-empty value.
+fn current_short_hostname() -> Option<String> {
+    use std::process::Command;
+    // Prefer `hostname -s` (short form) to match the bash twin.
+    if let Ok(out) = Command::new("hostname").arg("-s").output()
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    // Fallback: plain `hostname`. Same fallback shape as the bash twin
+    // (`hostname -s 2>/dev/null || hostname`).
+    if let Ok(out) = Command::new("hostname").output()
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Return `true` when `local_hostname` matches `kvm_host`'s short form.
+/// Stripping `.domain` suffix mirrors bash's `${KVM_HOST%%.*}` parameter
+/// expansion. Empty inputs return `false`.
+///
+/// This is the testable seam — call sites use [`running_on_kvm_host`]
+/// (which sources the local hostname via [`current_short_hostname`]).
+fn hostname_matches_kvm_host(local_hostname: &str, kvm_host: &str) -> bool {
+    if kvm_host.is_empty() || local_hostname.is_empty() {
+        return false;
+    }
+    let kvm_short = kvm_host.split('.').next().unwrap_or(kvm_host);
+    local_hostname == kvm_short
+}
+
+/// Convenience: read the current short hostname and compare against
+/// the supplied `kvm_host`. Returns `false` when either the hostname
+/// read fails or `kvm_host` is empty / does not match.
+fn running_on_kvm_host(kvm_host: &str) -> bool {
+    let Some(local) = current_short_hostname() else {
+        return false;
+    };
+    hostname_matches_kvm_host(&local, kvm_host)
+}
+
 /// Top-level `hbird verify` — dispatches to one of four sub-subcommands.
 #[derive(Debug, Args)]
 pub struct VerifyArgs {
@@ -146,6 +214,14 @@ impl VerifyPlan {
     /// Bash twin: the env-var precedence sourced from `CONFIG` then
     /// shell env, applied across `verify-encryption.sh:82-83`,
     /// `verify-hardening.sh:62-72`, `verify-app-deploy.sh:61-78`.
+    ///
+    /// On-KVM-host detection (#353 cutover, mirrors bash #362 fix in
+    /// PR #364): when the resolved `kvm_host` matches the current
+    /// host's short hostname, drop ProxyJump from `target.kvm_host`
+    /// so `ssh root@CP_IP` goes direct (the libvirt NAT subnet is
+    /// already routable since we're on the KVM host). The app-deploy
+    /// path short-circuits in `run` before this code runs (it can't
+    /// fall back — plain kubectl is not on the KVM host PATH).
     fn from_args(args: &VerifyCommonArgs) -> Result<Self> {
         let config: Option<ClusterConfig> =
             if let Some(path) = args.config.as_ref() {
@@ -164,11 +240,26 @@ impl VerifyPlan {
             .unwrap_or_else(|| "hummingbird-k8s".to_string());
 
         // KVM_HOST resolution — explicit flag > config.
-        let kvm_host = args
+        let resolved_kvm_host = args
             .kvm_host
             .clone()
             .or_else(|| config.as_ref().and_then(|c| c.kvm_host.clone()))
             .filter(|s| !s.is_empty());
+
+        // #353/#362: drop ProxyJump when we're on the KVM host itself.
+        // Plain `ssh root@CP_IP` goes direct from the KVM host (which
+        // sits on the libvirt NAT subnet) and works. Keeping the
+        // ProxyJump would loop back as `ssh root@<this-host>` and hang
+        // on sshd's root-login denial.
+        let kvm_host = match resolved_kvm_host.as_ref() {
+            Some(h) if running_on_kvm_host(h) => {
+                eprintln!(
+                    "[verify] already on KVM_HOST ({h}); dropping ProxyJump for direct CP SSH (#353/#362)"
+                );
+                None
+            }
+            _ => resolved_kvm_host,
+        };
 
         // CP_IP resolution — explicit flag > config > virsh-via-ssh.
         // Bash twin: `verify-hardening.sh:131-148`.
@@ -746,6 +837,15 @@ spec:
 /// encryption → hardening → app-deploy and short-circuits on the first
 /// failure (bash twin: `make verify-all` — recipe is the three Make
 /// targets chained, which inherit Make's first-failure semantics).
+///
+/// On-KVM-host detection (#353 cutover, mirrors bash #362 fix in
+/// PR #364): for `app-deploy` (and `all` which includes it), short-circuit
+/// with skip-exit-0 when we're already on KVM_HOST. Plain kubectl is
+/// not usually on the KVM host's PATH and there is no clean local-mode
+/// fallback for the smoketest; the cluster is up, the verify can be
+/// re-run from a workstation. For `encryption` / `hardening`, the plan
+/// builder drops the ProxyJump (see [`VerifyPlan::from_args`]) and the
+/// verifier runs to completion via direct ssh to root@CP_IP.
 pub fn run(args: VerifyArgs) -> Result<()> {
     match args.command {
         VerifySubcommand::Encryption(c) => {
@@ -757,6 +857,13 @@ pub fn run(args: VerifyArgs) -> Result<()> {
             run_verify_hardening(&plan)
         }
         VerifySubcommand::AppDeploy(c) => {
+            // #353/#362: skip when on KVM_HOST — see [`run`] doc.
+            if let Some(kvm) = resolved_kvm_host_for_onhost_skip(&c)
+                && running_on_kvm_host(&kvm)
+            {
+                log_app_deploy_onhost_skip(&kvm);
+                return Ok(());
+            }
             let plan = VerifyPlan::from_args(&c)?;
             run_verify_app_deploy(&plan)
         }
@@ -767,9 +874,43 @@ pub fn run(args: VerifyArgs) -> Result<()> {
             // at the top of the error, not just the inner FAIL message.
             run_verify_encryption(&plan).context("verify-all step 1/3: encryption")?;
             run_verify_hardening(&plan).context("verify-all step 2/3: hardening")?;
+            // App-deploy step: same skip-on-KVM_HOST short-circuit as
+            // the standalone `AppDeploy` arm above. We check the raw
+            // common-args kvm-host (NOT the plan's, which had it
+            // dropped by from_args's on-host detection).
+            if let Some(kvm) = resolved_kvm_host_for_onhost_skip(&c)
+                && running_on_kvm_host(&kvm)
+            {
+                log_app_deploy_onhost_skip(&kvm);
+                return Ok(());
+            }
             run_verify_app_deploy(&plan).context("verify-all step 3/3: app-deploy")
         }
     }
+}
+
+/// Resolve the `kvm_host` value that the on-host-skip check should
+/// compare against, without yet building a [`VerifyPlan`] (which would
+/// drop the value via the detection in [`VerifyPlan::from_args`]). We
+/// repeat the lookup order — explicit flag > config — so the skip
+/// decision matches what the plan would have built from.
+fn resolved_kvm_host_for_onhost_skip(args: &VerifyCommonArgs) -> Option<String> {
+    if let Some(h) = args.kvm_host.clone().filter(|s| !s.is_empty()) {
+        return Some(h);
+    }
+    let path = args.config.as_ref()?;
+    let config = hbird_config::parse(path).ok()?;
+    config.kvm_host.filter(|s| !s.is_empty())
+}
+
+/// Verbatim parity with bash twin's log lines from PR #364 (verify-app-deploy.sh).
+fn log_app_deploy_onhost_skip(kvm_host: &str) {
+    eprintln!(
+        "[verify-app-deploy] already on KVM_HOST ({kvm_host}); skipping in-place verify to avoid ssh-to-self loop (#353/#362)"
+    );
+    eprintln!(
+        "[verify-app-deploy]   hint: re-run from a workstation with: hbird verify app-deploy --config <conf> --kvm-host {kvm_host}"
+    );
 }
 
 #[cfg(test)]
@@ -864,5 +1005,117 @@ mod tests {
         };
         let plan = VerifyPlan::from_args(&args).expect("default cp_name resolves");
         assert_eq!(plan.cp_name, "hummingbird-k8s");
+    }
+
+    // ---- on-KVM-host detection (#353 cutover / mirrors bash #362) ----
+
+    #[test]
+    fn hostname_matches_kvm_host_short_form() {
+        // Short hostname matches short KVM_HOST.
+        assert!(hostname_matches_kvm_host("geary", "geary"));
+    }
+
+    #[test]
+    fn hostname_matches_kvm_host_fqdn_form() {
+        // Short hostname matches KVM_HOST FQDN's leading label.
+        // Mirrors bash `${KVM_HOST%%.*}` parameter expansion.
+        assert!(hostname_matches_kvm_host("geary", "geary.lan"));
+        assert!(hostname_matches_kvm_host("geary", "geary.example.com"));
+    }
+
+    #[test]
+    fn hostname_matches_kvm_host_no_match() {
+        // Different hostnames — no match.
+        assert!(!hostname_matches_kvm_host("workstation", "geary"));
+        assert!(!hostname_matches_kvm_host("workstation", "geary.lan"));
+    }
+
+    #[test]
+    fn hostname_matches_kvm_host_empty_inputs() {
+        // Empty either side — no match (defensive).
+        assert!(!hostname_matches_kvm_host("", "geary"));
+        assert!(!hostname_matches_kvm_host("geary", ""));
+        assert!(!hostname_matches_kvm_host("", ""));
+    }
+
+    #[test]
+    fn hostname_matches_kvm_host_partial_prefix_does_not_match() {
+        // Bash `${KVM_HOST%%.*}` splits at the FIRST dot only — a host
+        // named "geary-cp1" should NOT match KVM_HOST=geary.
+        assert!(!hostname_matches_kvm_host("geary-cp1", "geary"));
+        // And a host named "ge" should NOT match KVM_HOST=geary
+        // (substring is not a prefix relationship the bash twin honors).
+        assert!(!hostname_matches_kvm_host("ge", "geary"));
+    }
+
+    #[test]
+    fn from_args_drops_kvm_host_when_on_kvm_host() {
+        // Build args with KVM_HOST set to whatever our current short
+        // hostname is. The plan builder must drop it so subsequent SSH
+        // calls go direct to root@CP_IP. This is the #353/#362 fix.
+        let Some(local) = current_short_hostname() else {
+            // CI environment without `hostname` — skip (test is
+            // best-effort; the lower-level hostname_matches_kvm_host
+            // tests cover the comparison logic without needing the OS).
+            eprintln!("skipping: no hostname binary available");
+            return;
+        };
+        let args = VerifyCommonArgs {
+            config: None,
+            cp_name: Some("hbird-cp1".into()),
+            kvm_host: Some(local.clone()),
+            cp_ip: Some("10.0.0.1".into()),
+            kubectl: None,
+        };
+        let plan = VerifyPlan::from_args(&args).expect("on-host plan resolves");
+        assert!(
+            plan.target.kvm_host.is_none(),
+            "expected kvm_host dropped when running on KVM_HOST={local}, got {:?}",
+            plan.target.kvm_host
+        );
+    }
+
+    #[test]
+    fn from_args_preserves_kvm_host_when_not_on_kvm_host() {
+        // KVM_HOST set to a value that cannot match the local hostname
+        // → should be preserved on the plan.
+        let bogus_kvm = "zzz-this-host-does-not-exist-anywhere-12345";
+        let args = VerifyCommonArgs {
+            config: None,
+            cp_name: Some("hbird-cp1".into()),
+            kvm_host: Some(bogus_kvm.to_string()),
+            cp_ip: Some("10.0.0.1".into()),
+            kubectl: None,
+        };
+        let plan = VerifyPlan::from_args(&args).expect("off-host plan resolves");
+        assert_eq!(plan.target.kvm_host.as_deref(), Some(bogus_kvm));
+    }
+
+    #[test]
+    fn resolved_kvm_host_for_onhost_skip_prefers_explicit_flag() {
+        let args = VerifyCommonArgs {
+            config: None,
+            cp_name: None,
+            kvm_host: Some("from-flag".into()),
+            cp_ip: None,
+            kubectl: None,
+        };
+        assert_eq!(
+            resolved_kvm_host_for_onhost_skip(&args).as_deref(),
+            Some("from-flag")
+        );
+    }
+
+    #[test]
+    fn resolved_kvm_host_for_onhost_skip_returns_none_when_unset() {
+        // No flag, no config — None.
+        let args = VerifyCommonArgs {
+            config: None,
+            cp_name: None,
+            kvm_host: None,
+            cp_ip: None,
+            kubectl: None,
+        };
+        assert_eq!(resolved_kvm_host_for_onhost_skip(&args), None);
     }
 }

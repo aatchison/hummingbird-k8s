@@ -13,16 +13,17 @@ upstream `kubeadm` Kubernetes layered into the bootc image.
 | `containers/shared/kubernetes/{admission-control-config,audit-policy}.yaml` | Apiserver hardening configs COPYd into the k8s image |
 | `scripts/build-k8s.sh` | `hummingbird-k8s` control plane image build |
 | `scripts/build-worker.sh` | `hummingbird-k8s-worker` template image build |
-| `scripts/deploy-cluster.sh` / `scripts/destroy-cluster.sh` / `scripts/update-cluster.sh` | Cluster lifecycle (1 CP + N workers) driven from `cluster.local.conf` |
-| `scripts/spawn-workers.sh` | Clone worker template qcow2, mint per-VM kubeadm join tokens, virt-install N workers |
-| `scripts/kubectl-k8s.sh` | SSH-tunnel-through-KVM-host kubectl wrapper |
-| `Makefile` | Canonical operator entry point — every target wraps a `scripts/` script. `make help` lists them. |
+| `scripts/deploy-cluster.sh` / `scripts/destroy-cluster.sh` | Cluster deploy / teardown (bash; retained in v0.1.0 partial cutover, full removal blocked on #289 / v0.2.0). Driven from `cluster.local.conf`. |
+| `hbird update-cluster` (Rust) | Rolling bootc upgrade across CP + workers (Rust twin replaced `scripts/update-cluster.sh` in v0.1.0 cutover, #353) |
+| `scripts/spawn-workers.sh` | Clone worker template qcow2, mint per-VM kubeadm join tokens, virt-install N workers (bash; Phase 4 retained in v0.1.0) |
+| `hbird kubectl` (Rust) | SSH kubectl wrapper (Rust twin replaced `scripts/kubectl-k8s.sh` in v0.1.0 cutover, #353) |
+| `Makefile` | Operator entry point — `image-*` and Phase 4 targets wrap bash scripts; Phase 1-3 targets delegate to `hbird`. `make help` lists them. |
 | `worker-join.env` | Cached kubeadm join command. `spawn-workers.sh` mints one per-VM at qcow2 build time. |
 | `bib-config.toml` | Generated at build time — initial user, SSH keys, hashed sudo password |
 | `cluster.example.conf` | Operator-edited config template: copy to `cluster.local.conf` and edit. Drives `make deploy-cluster` / `make update-cluster`. |
 | `config.example.sh` | Optional per-host build-input overrides (VM_USER, SSH_PUBKEY_FILES, POOL_DIR, etc.). |
 | `references/k8s-bootc-talk.transcript.txt` | KubeCon India 2025 talk transcript (Berkus + Kumar) |
-| `rust/` + `.devcontainer/` | Rust client-side rewrite — all phases landed (epic #279). `hbird` binary mirrors every operator-facing Makefile target; see [`docs/rust-cli-migration.md`](docs/rust-cli-migration.md). Bash scripts stay canonical until per-target Makefile dispatch flips. |
+| `rust/` + `.devcontainer/` | Rust client-side rewrite — all phases landed (epic #279); Phase 1-3 bash scripts removed in v0.1.0 partial cutover (#353). `hbird` binary mirrors every operator-facing Makefile target; see [`docs/rust-cli-migration.md`](docs/rust-cli-migration.md). Phase 4 bash scripts retained pending #289 (full removal in v0.2.0). |
 
 ## Host setup (<kvm-host>)
 
@@ -56,7 +57,10 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 4. `ssh -fNL 6443:<vm-ip>:6443 <kvm-host>`.
 5. `podman run --rm --net=host -v /tmp/k8s-kubeconfig:/kc:ro,Z -e KUBECONFIG=/kc docker.io/bitnami/kubectl:latest get nodes`.
 
-`./scripts/kubectl-k8s.sh <args>` (or `make kubectl ARGS='<args>'`) wraps all of this — auto-discovers the VM IP, sets up the tunnel if missing, runs kubectl in a container with the right kubeconfig.
+`hbird kubectl <args>` (or `make kubectl ARGS='<args>'`) wraps all of
+this — the Rust twin SSHes through the KVM-host ProxyJump and runs
+kubectl on the CP against `/etc/kubernetes/admin.conf`. Replaced the
+bash `scripts/kubectl-k8s.sh` in the v0.1.0 cutover (#353).
 
 ## Gotchas hit along the way
 
@@ -69,8 +73,8 @@ libvirt's default network (typically `192.168.122.0/24`) is its NAT, inside <kvm
 - **`bib-config.toml` `key =` accepts multi-line strings** for multiple authorized_keys entries (verified working). Hashed password works in `password =`.
 - **First SSH from <kvm-host> to a freshly-recreated VM** trips on stale host keys (libvirt re-issues IPs from its NAT pool) from prior VMs. `ssh-keygen -R <ip>` clears it.
 - **bib produces all formats** (qcow2, vmdk, vpc, ovf, archive, gce) even when you only ask for one — just `mv` the qcow2 you care about.
-- **`scripts/kubectl-k8s.sh` swallows stdin during its port-forward bootstrap.** Anything piped on stdin (including `<<EOF … EOF` heredocs) is consumed by the tunnel-setup phase before kubectl ever runs, so kubectl reports `no objects passed to apply`. `verify-hardening.sh`'s PSA-rejection check tripped on this and silently FAILed against a correctly-hardened cluster. Workaround for verify-* scripts: bypass the wrapper and ssh direct to root@CP, e.g. `ssh root@$CP_IP "kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -" <<EOF … EOF` — the heredoc then flows through SSH untouched. Tracked in #332 (bash twin fix) and #330 (Rust twin's `cp_kubectl_with_stdin_lenient` which already had it right).
-- **Rust rewrite shipped (epic #279).** Every operator-facing Makefile target has an `hbird` counterpart in `rust/crates/hbird-cli/`. Foundation crates + Phase 1A/1B/2/3/4 + tracing all landed (PRs #321 #325 #326 #330 #334 #337 #344 #346 #347). The bash scripts under `scripts/` stay canonical until the per-target Makefile dispatch flips (a separate operator decision). The `hbird` binary's deferred work: `hbird deploy-cluster` + `hbird spawn-workers` live execution (tracked by #335) and `update-cluster`'s `timer_stop` / `timer_start` helpers (block #4, deferred because the geary cluster doesn't run scheduled-update timers). See [`docs/rust-cli-migration.md`](docs/rust-cli-migration.md) for the operator-facing `make → hbird` lookup table and [`docs/rust-cli.md`](docs/rust-cli.md) for the per-phase tracking table.
+- **`scripts/kubectl-k8s.sh` swallowed stdin during its port-forward bootstrap (historical, fixed by removal in #353).** Anything piped on stdin (including `<<EOF … EOF` heredocs) was consumed by the tunnel-setup phase before kubectl ever ran, so kubectl reported `no objects passed to apply`. The (also removed) `verify-hardening.sh`'s PSA-rejection check tripped on this and silently FAILed against a correctly-hardened cluster. The Rust twin's `cp_kubectl_with_stdin_lenient` (PR #330) had the right shape from the start; the bug class is now moot since both scripts were deleted in the v0.1.0 cutover (#353). Originally tracked in #332.
+- **Rust rewrite shipped (epic #279); v0.1.0 partial cutover landed in #353.** Every operator-facing Makefile target has an `hbird` counterpart in `rust/crates/hbird-cli/`. Foundation crates + Phase 1A/1B/2/3/4 + tracing all landed (PRs #321 #325 #326 #330 #334 #337 #344 #346 #347). v0.1.0 cutover (#353) **removed** the bash twins for update-cluster / verify-* / export-argocd / kubectl-k8s; the Makefile recipes now delegate to `hbird` directly (cross-runtime dependency: `hbird` must be on PATH). Phase 4 bash scripts (`scripts/{deploy,destroy,spawn-workers}-cluster.sh`) are **retained** in v0.1.0 — full removal blocked on #289 (Rust destructive impl), scheduled for v0.2.0. See [`docs/rust-cli-migration.md`](docs/rust-cli-migration.md) for the operator-facing `make → hbird` lookup table and [`docs/rust-cli.md`](docs/rust-cli.md) for the per-phase tracking table.
 
 ## `POOL_DIR` — libvirt storage pool location
 

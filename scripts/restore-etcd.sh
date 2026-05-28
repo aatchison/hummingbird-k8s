@@ -12,7 +12,9 @@
 #
 # Env:
 #   CP_IP     — CP node IP. Defaults to the InternalIP of the first
-#               control-plane node (via scripts/kubectl-k8s.sh).
+#               control-plane node (via `hbird kubectl get nodes`).
+#               # Cross-runtime dependency (v0.1.0 cutover, #353):
+#               # `hbird` CLI replaced scripts/kubectl-k8s.sh.
 #   KVM_HOST  — Optional SSH ProxyJump host (see backup-etcd.sh).
 #
 # Caveats:
@@ -35,14 +37,25 @@
 set -euo pipefail
 
 # Resolve repo root from this script's location so relative siblings
-# (notably scripts/kubectl-k8s.sh) work from any cwd. Matches the
-# pattern established by scripts/run-kube-bench.sh.
+# work from any cwd. Matches the pattern established by
+# scripts/run-kube-bench.sh.
+# (Cross-runtime dependency, v0.1.0 cutover, #353: every kubectl call
+# now routes through `hbird kubectl` directly; REPO_ROOT is preserved
+# as preamble boilerplate for any future sibling-script references.)
+# shellcheck disable=SC2034  # preserved for future sibling-script use
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
 SNAP="${1:?Usage: $0 <snapshot.db>}"
 [[ -f "$SNAP" ]] || { echo "Snapshot not found: $SNAP" >&2; exit 1; }
 
-CP_IP="${CP_IP:-$("${REPO_ROOT}/scripts/kubectl-k8s.sh" get nodes \
+# Cross-runtime dependency (v0.1.0 cutover, #353):
+# `hbird` CLI is required at runtime to resolve CP_IP from the cluster.
+# scripts/kubectl-k8s.sh was removed in v0.1.0; the Rust twin
+# (`hbird kubectl`) is the canonical kubectl entry point. If `hbird`
+# is not on PATH this step will fail with command-not-found; export
+# CP_IP=<ip> ahead of time (or set it in cluster.local.conf) to skip
+# kubectl resolution entirely.
+CP_IP="${CP_IP:-$(hbird kubectl get nodes \
   -l node-role.kubernetes.io/control-plane \
   -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')}"
 [[ -n "$CP_IP" ]] || { echo "Could not resolve control-plane IP" >&2; exit 1; }
@@ -99,4 +112,5 @@ REMOTE
 
 echo "Verifying cluster (after a 30s warm-up)..."
 sleep 30
-"${REPO_ROOT}/scripts/kubectl-k8s.sh" get nodes
+# Cross-runtime dependency (v0.1.0 cutover, #353): hbird CLI required.
+hbird kubectl get nodes

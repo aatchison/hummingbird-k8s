@@ -77,11 +77,14 @@ jobs:
 
       - name: Install runner deps (CNI + virtinst + genisoimage + kubectl + yq)
         # kubectl is added for the "kubeconfig usable" assertion. yq (Go
-        # flavor, mikefarah) is the variant scripts/export-argocd.sh
-        # expects on the canonical path; if absent, the script silently
-        # falls back to its sed path. We install the Go yq explicitly to
-        # exercise the canonical path here. (Note: Debian's `yq` package
-        # ships kislyuk/yq, the Python variant — wrong tool.)
+        # flavor, mikefarah) is the variant the historical
+        # scripts/export-argocd.sh expected on the canonical path; the
+        # post-v0.1.0-cutover (#353) `hbird export-argocd` (Rust twin)
+        # uses serde_yaml internally and does not depend on a yq binary,
+        # but we keep yq installed to exercise the integration-tests.sh
+        # rewrite-roundtrip assertions that still parse the output YAML.
+        # (Note: Debian's `yq` package ships kislyuk/yq, the Python
+        # variant — wrong tool.)
         run: |
           set -euo pipefail
           need=()

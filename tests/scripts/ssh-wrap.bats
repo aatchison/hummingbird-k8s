@@ -564,10 +564,8 @@ EOF
   grep -q 'hbird_ssh_wrap_maybe_reexec "$0" "$@"' "${REPO_ROOT}/scripts/destroy-cluster.sh"
 }
 
-@test "ssh-wrap: update-cluster.sh sources lib/ssh-wrap.sh + invokes the shim" {
-  grep -q 'source "${SCRIPT_DIR}/lib/ssh-wrap.sh"' "${REPO_ROOT}/scripts/update-cluster.sh"
-  grep -q 'hbird_ssh_wrap_maybe_reexec "$0" "$@"' "${REPO_ROOT}/scripts/update-cluster.sh"
-}
+# update-cluster.sh removed in v0.1.0 partial bash->Rust cutover (#353);
+# Rust twin `hbird update-cluster` is the canonical implementation.
 
 @test "ssh-wrap: spawn-workers.sh sources lib/ssh-wrap.sh + invokes the shim" {
   grep -q 'source "${SCRIPT_DIR}/lib/ssh-wrap.sh"' "${REPO_ROOT}/scripts/spawn-workers.sh"

@@ -59,7 +59,7 @@ rewrite roundtrips:
   URL validation (newline / quote / command-substitution rejected) and
   `--force` refuse-to-clobber.
 
-`scripts/export-argocd.sh` is structured so the rewrite logic is callable
+`hbird export-argocd` (post-#353, was `scripts/export-argocd.sh`) is structured so the rewrite logic is callable
 when the script is sourced (sourced-mode short-circuit near the top
 returns 0 before any SSH activity), which is what lets the bats suite
 unit-test the YAML rewrite without a real cluster.
@@ -95,9 +95,9 @@ posture is healthy.
   - `workflow_dispatch` — for ad-hoc runs against any tag or `latest`.
 - **What it exercises:** bib → qcow2 → virt-install → wait for
   `/var/lib/k8s-init.done` → assert exactly one Ready node → run
-  `scripts/verify-hardening.sh` (PodSecurity restricted, apiserver audit log,
+  `hbird verify hardening` (post-#353, was `scripts/verify-hardening.sh`) (PodSecurity restricted, apiserver audit log,
   kubelet `--protect-kernel-defaults=true`) → NetworkPolicy enforcement
-  (deny-all blocks, removal restores) → `scripts/verify-app-deploy.sh`
+  (deny-all blocks, removal restores) → `hbird verify app-deploy` (post-#353, was `scripts/verify-app-deploy.sh`)
   (nginx Deployment + Service + PSA-restricted probe).
 - **Driver:** `tests/integration-boot.sh <tag>`.
 
@@ -179,7 +179,7 @@ this path.
 
 ### `integration-update-cluster.yml` (#196 — rolling cluster update)
 
-End-to-end exercise of `scripts/update-cluster.sh` (PR #187) against a real
+End-to-end exercise of `hbird update-cluster` (post-#353, was `scripts/update-cluster.sh`) (PR #187) against a real
 1-CP + 2-worker cluster. The headline assertion is that PR #187's
 `wait_node_ready` regex fix (`$2 ~ /^Ready(,|$)/`) actually keeps working:
 the script must successfully wait through a worker rejoining as
@@ -219,7 +219,7 @@ gh workflow run integration-update-cluster.yml
 
 ### `integration-export-argocd.yml` (#196 — export-argocd kubeconfig)
 
-End-to-end exercise of `scripts/export-argocd.sh` (PR #188) against the
+End-to-end exercise of `hbird export-argocd` (post-#353, was `scripts/export-argocd.sh`) (PR #188) against the
 same 1-CP + 2-worker fixture. Validates the full operator-facing surface
 of `make export-argocd`.
 
@@ -234,7 +234,7 @@ of `make export-argocd`.
   - **T3 refuse-to-clobber** — a second invocation without `FORCE=1`
     exits non-zero and surfaces `already exists` / `--force`.
   - **T4 force overwrite** — `FORCE=1` advances mtime cleanly.
-  - **T5 hostile --server** — calls `scripts/export-argocd.sh` directly
+  - **T5 hostile --server** — calls `hbird export-argocd` (post-#353, was `scripts/export-argocd.sh`) directly
     (NOT via `make`, because Make's recipe substitutes `$(SERVER)`
     literally into the shell — a payload containing `";rm -rf /;\n` would
     run on the runner BEFORE the script's regex validator saw it). The

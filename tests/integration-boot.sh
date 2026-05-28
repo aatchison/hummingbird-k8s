@@ -366,15 +366,14 @@ if [[ "${node_count}" -ne 1 ]] || [[ "${ready_count}" -lt 1 ]]; then
   exit 1
 fi
 
-log "assert: verify-hardening.sh PASS (run on CP via SSH)"
-# Run the in-tree verifier from the CP itself — it expects kubectl + SSH
-# access to root@CP_IP, which from the VM's perspective is localhost.
-# Copy it in so we don't depend on whatever's baked into the image.
-scp "${ssh_opts[@]}" \
-  "$(dirname "$0")/../scripts/verify-hardening.sh" \
-  "root@${VM_IP}:/tmp/verify-hardening.sh" >/dev/null
-ssh "${ssh_opts[@]}" "root@${VM_IP}" \
-  'chmod +x /tmp/verify-hardening.sh && KUBECONFIG=/etc/kubernetes/admin.conf CP_IP=127.0.0.1 /tmp/verify-hardening.sh'
+# Cross-runtime dependency (v0.1.0 cutover, #353):
+# scripts/verify-hardening.sh was removed; the Rust twin
+# `hbird verify hardening` is the canonical implementation.
+# rust/crates/hbird-cli/tests/verify_hardening_live.rs provides the
+# equivalent assertion against a live cluster from the runner side
+# (the bash scp-and-run-on-CP path is dropped here since the Rust
+# test doesn't need the script copied into the VM).
+log "assert: verify-hardening — covered by rust/crates/hbird-cli/tests/verify_hardening_live.rs (#353)"
 
 # --- C. NetworkPolicy enforcement (#6, #94) --------------------------------
 #
@@ -523,15 +522,12 @@ unset NP_CLEANUP_REGISTERED
 
 # --- D. App-deploy smoke (#NEW) --------------------------------------------
 #
-# Run scripts/verify-app-deploy.sh against the test VM. This exercises a
-# normal nginx Deployment + Service + busybox probe under PSA-restricted —
-# i.e. the realistic happy path for a tenant workload.
-log "assert: verify-app-deploy.sh PASS (run on CP via SSH)"
-scp "${ssh_opts[@]}" \
-  "$(dirname "$0")/../scripts/verify-app-deploy.sh" \
-  "root@${VM_IP}:/tmp/verify-app-deploy.sh" >/dev/null
-ssh "${ssh_opts[@]}" "root@${VM_IP}" \
-  'chmod +x /tmp/verify-app-deploy.sh && KUBECONFIG=/etc/kubernetes/admin.conf /tmp/verify-app-deploy.sh'
+# Cross-runtime dependency (v0.1.0 cutover, #353):
+# scripts/verify-app-deploy.sh was removed; the Rust twin
+# `hbird verify app-deploy` is the canonical implementation.
+# rust/crates/hbird-cli/tests/verify_app_deploy_live.rs provides the
+# equivalent end-to-end PSA-restricted nginx assertion.
+log "assert: verify-app-deploy — covered by rust/crates/hbird-cli/tests/verify_app_deploy_live.rs (#353)"
 
 log "ALL CHECKS PASSED"
 exit 0

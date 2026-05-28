@@ -1,8 +1,10 @@
 # App-deploy smoke test
 
-`scripts/verify-app-deploy.sh` is a post-deploy verifier that confirms the
-cluster can actually run a workload the way an operator would — not just
-that the apiserver answers and nodes report Ready.
+`hbird verify app-deploy` is a post-deploy verifier that confirms the
+cluster can actually run a workload the way an operator would — not
+just that the apiserver answers and nodes report Ready. It replaced
+the bash twin `scripts/verify-app-deploy.sh` in the v0.1.0 cutover
+([#353]).
 
 ## What it verifies
 
@@ -23,48 +25,49 @@ that the apiserver answers and nodes report Ready.
 ### From a workstation through the KVM host (recommended)
 
 This is the common topology — your laptop reaches the cluster only via
-SSH through the KVM host. Set `KVM_HOST` and the verifier auto-defaults
-`KUBECTL` to the in-repo `scripts/kubectl-k8s.sh` wrapper, which tunnels
-kubectl through the KVM host's libvirt NAT. No local kubectl context
-required (issue #271 F3):
+SSH through the KVM host. Set `KVM_HOST` and `hbird verify
+app-deploy` SSHes through it as ProxyJump to `root@CP_IP`:
 
 ```bash
-KVM_HOST=geary make verify-app-deploy
-# ...or, via CONFIG (kubectl-k8s.sh-style: pulls CP_NAME / KVM_HOST from
-# the cluster.local.conf you generated at deploy time):
-make verify-app-deploy CONFIG=cluster.local.conf
+KVM_HOST=geary make verify-app-deploy CONFIG=cluster.local.conf
+# ...or, directly via hbird:
+KVM_HOST=geary hbird verify app-deploy --config cluster.local.conf
 ```
 
-The Makefile recipe forwards `CONFIG` and the operator's `KVM_HOST` to
-the script, which sources `CONFIG` and then sets `KUBECTL` to the
-tunneled wrapper when `KVM_HOST` is set. The wrapper in turn uses
-`ssh -t` to `$KVM_HOST` for the `sudo virsh domifaddr` IP probe so a
-cold sudo cache on the KVM host can still prompt for your password
-(issue #249).
+The Makefile recipe forwards `CONFIG` and the operator's `KVM_HOST`
+to the Rust verifier, which sources `CONFIG` and uses `KVM_HOST` as
+ProxyJump for the SSH chain.
 
-### From the CP host (kubectl on `PATH`)
+### From the KVM host directly (on-host detection skip)
 
-When the script is running on the control-plane node itself (e.g. the
-self-hosted runner copies it onto the VM and execs it there — see
-`tests/integration-boot.sh`), no `KVM_HOST` is set and the script falls
-back to plain `kubectl`:
+When `hbird verify app-deploy` runs on the KVM host itself (e.g.
+inside `make deploy-cluster`'s `RUN_VERIFY=true` re-exec, or operator
+driving the verifier directly on the hypervisor), the Rust path
+detects that `hostname -s` matches `KVM_HOST` and **skips with
+exit 0** — there is no usable in-place verifier path (plain `kubectl`
+is generally not on the KVM host's PATH; setting up a tunnel-to-self
+is the bug). The skip is logged so operators see:
+
+```
+[verify-app-deploy] already on KVM_HOST (geary); skipping in-place verify to avoid ssh-to-self loop (#353/#362)
+[verify-app-deploy]   hint: re-run from a workstation with: hbird verify app-deploy --config <conf> --kvm-host geary
+```
+
+This detection mirrors the bash #362 fix (PR #364) ported to the
+Rust path; known limitation: when `KVM_HOST` is an IP literal or
+a `~/.ssh/config` alias whose `Host` name does not match the short
+hostname, detection misses. The cluster is up either way; the
+verifier can be re-run from a workstation.
+
+### Explicit overrides
+
+You can still spell out `--cp-ip` or `--cp-name` to bypass config
+discovery:
 
 ```bash
-./scripts/verify-app-deploy.sh
-# or, via the Makefile from a checkout on the CP host:
-make verify-app-deploy
+hbird verify app-deploy --cp-ip 192.168.122.42
+hbird verify app-deploy --config cluster.local.conf --cp-name hbird-cp1
 ```
-
-### Explicit kubectl override
-
-You can still spell out `KUBECTL=` for any wrapper or path:
-
-```bash
-KUBECTL=./scripts/kubectl-k8s.sh ./scripts/verify-app-deploy.sh
-KUBECTL=kubectl ./scripts/verify-app-deploy.sh   # force plain kubectl
-```
-
-An explicit `KUBECTL=` always wins over the `KVM_HOST`-derived default.
 
 ## Expected output
 
@@ -78,8 +81,9 @@ An explicit `KUBECTL=` always wins over the `KVM_HOST`-derived default.
 [verify-app-deploy] cleanup: deleting namespace smoketest-1716396200
 ```
 
-A `trap` ensures the `smoketest-<timestamp>` namespace is deleted on
-both success and failure paths.
+A RAII cleanup guard ensures the `smoketest-<timestamp>` namespace
+is deleted on both success and failure paths (mirroring the bash
+twin's `trap cleanup EXIT`).
 
 ## What it does not cover
 
@@ -91,15 +95,17 @@ These are intentionally out of scope and tracked as follow-ups:
 - NetworkPolicy enforcement (`restricted` PSS does not imply NetPol).
 
 If any of these become a supported feature of `hummingbird-k8s`, file a
-follow-up issue and extend this script (or add a sibling verifier).
+follow-up issue and extend the Rust verifier (`rust/crates/hbird-cli/src/commands/verify.rs`).
 
-## Rust counterpart
+## Implementation
 
-`hbird verify app-deploy --config cluster.local.conf` is the Rust twin
+`hbird verify app-deploy --config cluster.local.conf` lives at
+`rust/crates/hbird-cli/src/commands/verify.rs::run_verify_app_deploy`
 (Phase 2, [PR #330]) — same PSA-restricted nginx deploy +
-pod-to-pod-connectivity probe sequence. Live-validated against the
-geary cluster. See
-[`docs/rust-cli-migration.md`](rust-cli-migration.md#verify-encryption--verify-hardening--verify-app-deploy--verify-all)
+pod-to-pod-connectivity probe sequence as the (now removed) bash
+twin. Live-validated against the geary cluster. See
+[`docs/rust-cli-migration.md`](rust-cli-migration.md#tldr--side-by-side)
 for the per-flag map.
 
 [PR #330]: https://github.com/aatchison/hummingbird-k8s/pull/330
+[#353]: https://github.com/aatchison/hummingbird-k8s/issues/353

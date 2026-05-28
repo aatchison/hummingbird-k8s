@@ -90,8 +90,10 @@ sudo bash scripts/deploy-cluster.sh cluster.local.conf
 > `update-node`.
 
 When the script finishes, it prints the CP IP and a one-liner for
-`kubectl` access. `make nodes` (which uses `scripts/kubectl-k8s.sh` to
-SSH-tunnel the apiserver) works against the deployed CP.
+`kubectl` access. `make nodes` (which delegates to `hbird kubectl` —
+the Rust twin that replaced `scripts/kubectl-k8s.sh` in the v0.1.0
+cutover [#353]) works against the deployed CP. Cross-runtime
+dependency: `hbird` CLI must be on PATH.
 
 ## Remote KVM-host operation (`KVM_HOST=`)
 
@@ -397,7 +399,7 @@ The full set is in `cluster.example.conf`; the essentials:
 | `CP_MEMORY` / `CP_VCPUS` | no | `8192` / `4` | CP sizing. |
 | `WORKER_MEMORY` / `WORKER_VCPUS` | no | `4096` / `2` | Per-worker sizing. |
 | `POOL_DIR` | no | `/var/lib/libvirt/images` | Where qcow2s + seed ISOs land. |
-| `RUN_VERIFY` | no | `false` | Run `scripts/verify-app-deploy.sh` after Ready. |
+| `RUN_VERIFY` | no | `false` | Run `hbird verify app-deploy` (post-#353, was `scripts/verify-app-deploy.sh`) after Ready. |
 | `KVM_HOST` | no | unset | Recorded in the summary for downstream `scripts/kubectl-k8s.sh` use. |
 | `BOOTC_UPDATE_SCHEDULE` | no | unset (use image default) | Override the `bootc-semver-update.timer` `OnCalendar=` on every node. Any systemd `OnCalendar=` value. See [Customizing auto-update](#customizing-auto-update). |
 | `BOOTC_UPDATE_REPO_K8S` | no | unset (use image-baked default) | OCI ref without tag — overrides the CP's tracked semver-update repo (e.g. point at a fork). |
@@ -445,7 +447,7 @@ for `SWITCH_TO_GHCR=false`.
 9. **virt-install workers in parallel.** Each gets its own seed ISO.
 10. **Wait for `N+1` nodes Ready.**
 11. **Optional verify.** `RUN_VERIFY=true` runs
-    `scripts/verify-app-deploy.sh`. Non-zero is informational — the
+    `hbird verify app-deploy` (post-#353, was `scripts/verify-app-deploy.sh`). Non-zero is informational — the
     cluster is up regardless.
 12. **Summary.** Prints CP IP, kubeconfig path, kubectl command.
 
@@ -468,17 +470,24 @@ for `SWITCH_TO_GHCR=false`.
 ## Verifying the deploy
 
 The standard verifiers all work against a deploy-cluster cluster.
-From a workstation, set `KVM_HOST` so the scripts tunnel through the
-KVM host (`verify-encryption.sh` resolves CP_IP via `resolve_cp_ip`
-from `lib/build-common.sh`; the others use ProxyJump for SSH and
-`scripts/kubectl-k8s.sh` for kubectl):
+From a workstation, set `KVM_HOST` so the Rust verifiers tunnel
+through the KVM host (`hbird verify <sub>` resolves CP_IP via
+`hbird-config` / `--cp-ip` and uses ProxyJump=$KVM_HOST for SSH).
+Cross-runtime dependency: `hbird` CLI must be on PATH after the
+v0.1.0 cutover ([#353]).
 
 ```bash
-KVM_HOST=geary bash scripts/verify-hardening.sh
-KVM_HOST=geary bash scripts/verify-app-deploy.sh
-KVM_HOST=geary bash scripts/verify-encryption.sh
-KVM_HOST=geary make verify-all
+KVM_HOST=geary hbird verify hardening --config cluster.local.conf
+KVM_HOST=geary hbird verify app-deploy --config cluster.local.conf
+KVM_HOST=geary hbird verify encryption --config cluster.local.conf
+KVM_HOST=geary make verify-all CONFIG=cluster.local.conf
 ```
+
+When the verifier runs on the KVM host itself (e.g. inside `make
+deploy-cluster`'s RUN_VERIFY re-exec, or operator on the hypervisor),
+the Rust path drops ProxyJump (for hardening/encryption) or skips
+with exit 0 (for app-deploy) — see [`docs/app-deploy-verify.md`](app-deploy-verify.md)
+"From the KVM host directly" for details.
 
 On the KVM host itself, drop `KVM_HOST=` and the scripts use local
 libvirt directly.
@@ -678,3 +687,4 @@ lookup table see [`docs/rust-cli-migration.md`](rust-cli-migration.md).
 
 [PR #337]: https://github.com/aatchison/hummingbird-k8s/pull/337
 [#335]: https://github.com/aatchison/hummingbird-k8s/issues/335
+[#353]: https://github.com/aatchison/hummingbird-k8s/issues/353

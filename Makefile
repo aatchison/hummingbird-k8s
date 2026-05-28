@@ -258,90 +258,95 @@ destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs +
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	bash scripts/destroy-cluster.sh "$(CONFIG)"
 
-# update-cluster delegates to scripts/update-cluster.sh. FLAGS= is a
-# passthrough for extra flags so operators don't have to drop down to the
-# raw script invocation for things like --dry-run, --parallel=N,
-# --start-from=NAME, --continue-on-error, --no-delete-emptydir-data, or
-# --skip-drain. Example:
+# update-cluster delegates to the Rust twin `hbird update-cluster`
+# (v0.1.0 cutover, #353). FLAGS= is a passthrough for extra flags so
+# operators don't have to drop down to the raw `hbird` invocation for
+# things like --dry-run, --parallel=N, --start-from=NAME,
+# --continue-on-error, --no-delete-emptydir-data, or --skip-drain.
+# Example:
 #   make update-cluster CONFIG=cluster.local.conf FLAGS='--dry-run --parallel=2'
+#
+# Cross-runtime dependency: `hbird` CLI must be on PATH. See
+# docs/rust-cli.md for install. scripts/update-cluster.sh was removed
+# in v0.1.0.
 update-cluster: ## Rolling bootc upgrade across CP + workers (with bootID + daemonset gates) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" bash scripts/update-cluster.sh $(FLAGS)
+	@CONFIG="$(CONFIG)" hbird update-cluster $(FLAGS)
 
 update-workers: ## Rolling bootc upgrade across workers only (with bootID + daemonset gates) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" bash scripts/update-cluster.sh --workers-only $(FLAGS)
+	@CONFIG="$(CONFIG)" hbird update-cluster --workers-only $(FLAGS)
 
 update-node: ## Update a single node (NODE=name) (with bootID + daemonset gates) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@[ -n "$(NODE)" ]   || { echo 'NODE=<name> required (CP_NAME or one of WORKER_NAMES)' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" NODE="$(NODE)" bash scripts/update-cluster.sh --node="$(NODE)" $(FLAGS)
+	@CONFIG="$(CONFIG)" NODE="$(NODE)" hbird update-cluster --node="$(NODE)" $(FLAGS)
 
+# export-argocd / get-kubeconfig — delegate to the Rust twin
+# `hbird export-argocd` / `hbird get-kubeconfig` (v0.1.0 cutover, #353).
+# Cross-runtime dependency: `hbird` CLI must be on PATH.
+# scripts/export-argocd.sh was removed in v0.1.0.
 export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1, PROXY_JUMP=)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" bash scripts/export-argocd.sh \
+	@CONFIG="$(CONFIG)" hbird export-argocd \
 		$(if $(OUTPUT),--output "$(OUTPUT)",) \
 		$(if $(SERVER),--server "$(SERVER)",) \
 		$(if $(CONTEXT),--context-name "$(CONTEXT)",) \
 		$(if $(PROXY_JUMP),--proxy-jump="$(PROXY_JUMP)",) \
 		$(if $(FORCE),--force,)
 
-# Daily-use sibling of export-argocd (issue #195). Same fetch+rewrite
-# primitive in scripts/export-argocd.sh, but with operator-facing
-# defaults:
+# Daily-use sibling of export-argocd (issue #195). The Rust twin
+# `hbird get-kubeconfig` carries the same operator-friendly defaults:
 #   - OUTPUT=kubeconfig.yaml (not argocd-kubeconfig.yaml)
-#   - --context-name=$CP_NAME (no "hummingbird-" prefix — operators
-#     expect `kubectl --context=<CP_NAME>` to match the libvirt domain
-#     name, while export-argocd uses the prefixed form to avoid
-#     colliding with whatever ArgoCD already has registered).
+#   - --context-name=$CP_NAME (no "hummingbird-" prefix)
 # CONTEXT=/SERVER=/FORCE= still pass through.
-# Recipe sources CONFIG here to read CP_NAME for the default context name;
-# the script re-sources CONFIG itself, so this is read-only / advisory.
 get-kubeconfig: ## Fetch kubeconfig.yaml from CONFIG=<path> (OUTPUT=, SERVER=, CONTEXT=, FORCE=1, PROXY_JUMP=)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@[ -r "$(CONFIG)" ] || { echo '[get-kubeconfig] CONFIG not readable: $(CONFIG)' >&2; exit 2; }
-	@set -e; \
-	  source "$(CONFIG)"; \
-	  : "$${CP_NAME:?[get-kubeconfig] CP_NAME required in $(CONFIG)}"; \
-	  CONTEXT_FROM_CONF="$(if $(CONTEXT),$(CONTEXT),$${CP_NAME})"; \
-	  CONFIG="$(CONFIG)" bash scripts/export-argocd.sh \
-	    --output "$(if $(OUTPUT),$(OUTPUT),kubeconfig.yaml)" \
-	    --context-name "$$CONTEXT_FROM_CONF" \
-	    $(if $(SERVER),--server "$(SERVER)",) \
-	    $(if $(PROXY_JUMP),--proxy-jump="$(PROXY_JUMP)",) \
-	    $(if $(FORCE),--force,)
+	@CONFIG="$(CONFIG)" hbird get-kubeconfig \
+		$(if $(OUTPUT),--output "$(OUTPUT)",) \
+		$(if $(CONTEXT),--context-name "$(CONTEXT)",) \
+		$(if $(SERVER),--server "$(SERVER)",) \
+		$(if $(PROXY_JUMP),--proxy-jump="$(PROXY_JUMP)",) \
+		$(if $(FORCE),--force,)
 
 switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
 	bash scripts/switch-to-ghcr.sh
 
 # ---- convenience -------------------------------------------------------
+# nodes / kubectl — delegate to `hbird kubectl` (v0.1.0 cutover, #353).
+# Cross-runtime dependency: `hbird` CLI must be on PATH.
+# scripts/kubectl-k8s.sh was removed in v0.1.0.
 
-nodes: ## kubectl get nodes via the SSH-tunnel wrapper (CONFIG=<path> to read CP_NAME/KVM_HOST from cluster.local.conf)
-	@CONFIG="$(CONFIG)" bash scripts/kubectl-k8s.sh get nodes
+nodes: ## kubectl get nodes via hbird (CONFIG=<path> to read CP_NAME/KVM_HOST from cluster.local.conf)
+	@CONFIG="$(CONFIG)" hbird kubectl get nodes
 
 kubectl: ## kubectl pass-through; ARGS='get pods -A' (CONFIG=<path> to read CP_NAME/KVM_HOST from cluster.local.conf)
-	@CONFIG="$(CONFIG)" bash scripts/kubectl-k8s.sh $(ARGS)
+	@CONFIG="$(CONFIG)" hbird kubectl $(ARGS)
 
 # ---- verification ------------------------------------------------------
 # Every verify-* recipe forwards BOTH CONFIG and KVM_HOST so workstation
 # operators can run `make verify-XXX CONFIG=cluster.local.conf KVM_HOST=geary`
-# and have the scripts source the topology file + ProxyJump through the
-# KVM host. Dropping either one strands the scripts in a "CP_NAME unset"
+# and have the Rust twin source the topology file + ProxyJump through the
+# KVM host. Dropping either one strands the verifier in a "CP_NAME unset"
 # / "no SSH route" failure mode (#333). Mirrors the update-cluster /
 # get-kubeconfig pattern that already does this.
+#
+# Cross-runtime dependency (v0.1.0 cutover, #353): `hbird` CLI must be
+# on PATH. scripts/verify-{encryption,hardening,app-deploy}.sh were
+# removed in v0.1.0; the Rust twins (`hbird verify <sub>`) are the
+# canonical implementations.
 
 verify-encryption: ## Verify etcd encryption-at-rest on the control plane (CONFIG=<path>, KVM_HOST=<alias>)
-	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" bash scripts/verify-encryption.sh
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" hbird verify encryption
 
-verify-hardening: ## Verify PSA + audit + kubelet protect-kernel-defaults (CONFIG=<path>, KVM_HOST=<alias>; honors KUBECTL=)
-	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" \
-	  KUBECTL="$${KUBECTL:-$(CURDIR)/scripts/kubectl-k8s.sh}" \
-	  bash scripts/verify-hardening.sh
+verify-hardening: ## Verify PSA + audit + kubelet protect-kernel-defaults (CONFIG=<path>, KVM_HOST=<alias>)
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" hbird verify hardening
 
 verify-app-deploy: ## End-to-end PSA-restricted nginx + pod-to-pod test (CONFIG=<path>, KVM_HOST=<alias> for workstation operation)
-	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" bash scripts/verify-app-deploy.sh
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" hbird verify app-deploy
 
-verify-all: verify-encryption verify-hardening verify-app-deploy ## All three verifiers in sequence (CONFIG=<path>, KVM_HOST=<alias>)
+verify-all: ## All three verifiers in sequence (CONFIG=<path>, KVM_HOST=<alias>)
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" hbird verify all
 
 # Pre-flight: warn (or fail with STRICT=1) when the pinned Cilium version
 # doesn't cover the pinned (or target) K8s minor. See issue #303 and

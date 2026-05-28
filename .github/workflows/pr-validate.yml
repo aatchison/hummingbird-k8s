@@ -66,11 +66,11 @@ jobs:
             tests/lib/
 
   unit-tests-scripts:
-    # bats-core unit tests for scripts/update-cluster.sh + scripts/export-argocd.sh
-    # (issue #189). Codifies the assertion patterns integration-update-cluster
-    # .yml::assert-dry-run-sequence keys on — regression protection at
-    # pr-validate time, not just on the self-hosted runner. Same pinned bats
-    # container as unit-tests-lib.
+    # bats-core unit tests for the remaining scripts/ shell scripts
+    # post-v0.1.0 cutover (#353; scripts/update-cluster.sh +
+    # scripts/export-argocd.sh + scripts/verify-*.sh + scripts/kubectl-k8s.sh
+    # were removed, their Rust twins are canonical). Issue #189 origin.
+    # Same pinned bats container as unit-tests-lib.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

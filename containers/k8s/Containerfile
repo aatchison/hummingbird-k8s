@@ -116,10 +116,16 @@ RUN mkdir -p /etc/hummingbird \
 COPY containers/k8s/k8s-init.sh /usr/libexec/k8s-init.sh
 RUN chmod +x /usr/libexec/k8s-init.sh
 
-# Ship the etcd encryption verifier in the image so the deploy verifier can
-# run it directly over SSH: `ssh root@<cp> /usr/libexec/verify-encryption.sh`
+# Ship the etcd encryption verifier in the image so the deploy verifier
+# can run it directly over SSH: `ssh root@<cp> /usr/libexec/verify-encryption.sh`
 # — no scp from the host repo needed after every redeploy.
-COPY scripts/verify-encryption.sh /usr/libexec/verify-encryption.sh
+#
+# Post-v0.1.0 cutover (#353): the on-image script lives at
+# containers/k8s/verify-encryption-local.sh (extracted from the
+# now-deleted scripts/verify-encryption.sh's local-mode branch). The
+# client-side bash twin was replaced by `hbird verify encryption` (Rust),
+# which ssh-execs this on-image script via the cp_ssh_lenient shim.
+COPY containers/k8s/verify-encryption-local.sh /usr/libexec/verify-encryption.sh
 RUN chmod +x /usr/libexec/verify-encryption.sh
 
 COPY containers/k8s/k8s-init.service /etc/systemd/system/k8s-init.service

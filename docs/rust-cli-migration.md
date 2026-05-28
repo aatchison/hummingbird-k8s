@@ -5,32 +5,32 @@ status table) and [`rust/README.md`](../rust/README.md) (workspace
 layout). This doc is the lookup index for "I know the `make` target —
 what's the equivalent `hbird` invocation?".
 
-> **Status (2026-05-27):** every operator-facing Makefile target now has
-> a Rust counterpart in the `hbird` binary. Bash scripts under
-> `scripts/` remain canonical until per-target Makefile dispatch flips
-> (a separate operator decision, tracked outside this PR). You can run
-> either side today.
+> **Status (v0.1.0 partial cutover, [#353]):** `make` recipes for
+> update-cluster / verify-* / export-argocd / get-kubeconfig / nodes /
+> kubectl now delegate to `hbird` directly (the underlying bash scripts
+> were **removed**). Phase 4 (deploy-cluster / destroy-cluster /
+> spawn-workers) bash scripts are **retained** in v0.1.0 — full removal
+> blocked on [#289] (Rust destructive impl), scheduled for v0.2.0.
 >
-> See [`docs/rust-cli.md`](rust-cli.md#operator-facing-status-today) for
-> the per-phase landing table and the (small) list of stubs that haven't
-> been wired yet.
+> **Cross-runtime dependency:** the post-cutover Makefile recipes
+> require `hbird` CLI on PATH. See "Install the binary" below.
 
 ## TL;DR — side-by-side
 
-| Workflow | `make` (canonical today) | `hbird` (Rust) | Phase / PR |
-|----------|--------------------------|----------------|-----------|
-| Deploy cluster | `make deploy-cluster CONFIG=cluster.local.conf` | `hbird deploy-cluster --config cluster.local.conf` (dry-run live; live execution tracked by [#335]) | Phase 4 ([PR #337]) |
-| Tear down cluster | `make destroy-cluster CONFIG=cluster.local.conf` | `hbird destroy-cluster --config cluster.local.conf` | Phase 4 ([PR #337], live) |
-| Rolling upgrade | `make update-cluster CONFIG=cluster.local.conf` | `hbird update-cluster --config cluster.local.conf` | Phase 1A ([PR #321]) + Phase 1B cycles 1–4 ([PRs #325 #344 #346 #347]) |
-| Spawn N workers | `make spawn-workers CONFIG=cluster.local.conf COUNT=2` | `hbird spawn-workers --config cluster.local.conf --count 2` (dry-run only; live tracked by [#335]) | Phase 4 ([PR #337]) |
-| Verify encryption | `make verify-encryption CONFIG=cluster.local.conf` | `hbird verify encryption --config cluster.local.conf` | Phase 2 ([PR #330]) |
-| Verify hardening | `make verify-hardening CONFIG=cluster.local.conf` | `hbird verify hardening --config cluster.local.conf` | Phase 2 ([PR #330]) |
-| Verify app-deploy | `make verify-app-deploy CONFIG=cluster.local.conf` | `hbird verify app-deploy --config cluster.local.conf` | Phase 2 ([PR #330]) |
-| Verify all | `make verify-all CONFIG=cluster.local.conf` | `hbird verify all --config cluster.local.conf` | Phase 2 ([PR #330]) |
-| Fetch admin kubeconfig | `make get-kubeconfig CONFIG=cluster.local.conf` | `hbird get-kubeconfig --config cluster.local.conf` | Phase 3 ([PR #334]) |
-| Export ArgoCD kubeconfig | `make export-argocd CONFIG=cluster.local.conf` | `hbird export-argocd --config cluster.local.conf` | Phase 3 ([PR #334]) |
-| `kubectl get nodes` via SSH tunnel | `make nodes` | `hbird nodes --config cluster.local.conf` | Phase 3 ([PR #334]) |
-| Arbitrary `kubectl` via SSH tunnel | `make kubectl ARGS='get pods -A'` | `hbird kubectl --config cluster.local.conf -- get pods -A` | Phase 3 ([PR #334]) |
+| Workflow | `make` (delegates to hbird in v0.1.0) | `hbird` (Rust, canonical) | Status |
+|----------|----------------------------------------|----------------------------|--------|
+| Deploy cluster | `make deploy-cluster CONFIG=cluster.local.conf` | `hbird deploy-cluster --config cluster.local.conf` (dry-run only; live tracked by [#289]) | **Bash retained** in v0.1.0 (Phase 4 deferred to v0.2.0) |
+| Tear down cluster | `make destroy-cluster CONFIG=cluster.local.conf` | `hbird destroy-cluster --config cluster.local.conf` (dry-run only; live tracked by [#289]) | **Bash retained** in v0.1.0 (Phase 4 deferred to v0.2.0) |
+| Rolling upgrade | `make update-cluster CONFIG=cluster.local.conf` | `hbird update-cluster --config cluster.local.conf` | **Rust canonical** (bash `scripts/update-cluster.sh` removed in v0.1.0 [#353]) |
+| Spawn N workers | `make spawn-workers CONFIG=cluster.local.conf COUNT=2` | `hbird spawn-workers --config cluster.local.conf --count 2` (dry-run only; live tracked by [#289]) | **Bash retained** in v0.1.0 (Phase 4 deferred to v0.2.0) |
+| Verify encryption | `make verify-encryption CONFIG=cluster.local.conf` | `hbird verify encryption --config cluster.local.conf` | **Rust canonical** (bash `scripts/verify-encryption.sh` removed in v0.1.0 [#353]) |
+| Verify hardening | `make verify-hardening CONFIG=cluster.local.conf` | `hbird verify hardening --config cluster.local.conf` | **Rust canonical** (bash `scripts/verify-hardening.sh` removed in v0.1.0 [#353]) |
+| Verify app-deploy | `make verify-app-deploy CONFIG=cluster.local.conf` | `hbird verify app-deploy --config cluster.local.conf` | **Rust canonical** (bash `scripts/verify-app-deploy.sh` removed in v0.1.0 [#353]) |
+| Verify all | `make verify-all CONFIG=cluster.local.conf` | `hbird verify all --config cluster.local.conf` | **Rust canonical** (bash removed in v0.1.0 [#353]) |
+| Fetch admin kubeconfig | `make get-kubeconfig CONFIG=cluster.local.conf` | `hbird get-kubeconfig --config cluster.local.conf` | **Rust canonical** (bash `scripts/export-argocd.sh` removed in v0.1.0 [#353]) |
+| Export ArgoCD kubeconfig | `make export-argocd CONFIG=cluster.local.conf` | `hbird export-argocd --config cluster.local.conf` | **Rust canonical** (bash `scripts/export-argocd.sh` removed in v0.1.0 [#353]) |
+| `kubectl get nodes` via SSH tunnel | `make nodes` | `hbird nodes --config cluster.local.conf` | **Rust canonical** (bash `scripts/kubectl-k8s.sh` removed in v0.1.0 [#353]) |
+| Arbitrary `kubectl` via SSH tunnel | `make kubectl ARGS='get pods -A'` | `hbird kubectl --config cluster.local.conf -- get pods -A` | **Rust canonical** (bash `scripts/kubectl-k8s.sh` removed in v0.1.0 [#353]) |
 
 ## Install the binary
 
@@ -249,13 +249,12 @@ hbird verify hardening   --config cluster.local.conf --kvm-host geary
 ```
 
 **Status:** Phase 2 ([PR #330]) — live-validated against the geary
-cluster 2026-05-27. The Rust path bypasses
-`scripts/kubectl-k8s.sh`'s port-forward wrapper (which swallows stdin —
-see [#332]) and SSHes directly to `root@CP_IP`, so PSA-rejection
-checks see the manifest correctly. The bash twin's check 1/3 misses
-the `violates PodSecurity` marker on a correctly-hardened cluster
-because of that wrapper bug; the Rust twin observes enforcement
-correctly.
+cluster 2026-05-27, bash twin removed in v0.1.0 cutover ([#353]). The
+Rust path SSHes directly to `root@CP_IP` (the removed
+`scripts/kubectl-k8s.sh`'s port-forward wrapper had a stdin-swallowing
+bug — [#332] — so PSA-rejection checks in the bash twin missed the
+`violates PodSecurity` marker on a correctly-hardened cluster; the
+Rust twin observes enforcement correctly).
 
 See [`docs/security-hardening.md`](security-hardening.md),
 [`docs/etcd-encryption.md`](etcd-encryption.md), and
@@ -434,20 +433,24 @@ hbird destroy-cluster  --config cluster.local.conf                          # fu
 `KVM_HOST` is read from the env by both sides — no per-invocation
 spelling change for the SSH-via-KVM-host path.
 
-## Where the canonical implementation lives
+## Where the canonical implementation lives (post v0.1.0 partial cutover, [#353])
 
-| Concern | Canonical today | Rust counterpart |
-|---------|-----------------|-------------------|
-| Cluster lifecycle (deploy/destroy/update/spawn) | `scripts/{deploy,destroy,update,spawn-workers}-cluster.sh` | `rust/crates/hbird-cli/src/commands/{deploy,destroy,update,spawn_workers}.rs` |
-| Verifiers | `scripts/verify-{encryption,hardening,app-deploy}.sh` | `rust/crates/hbird-cli/src/commands/verify.rs` |
-| Kubeconfig export | `scripts/export-argocd.sh` (driven by both `make get-kubeconfig` and `make export-argocd`) | `rust/crates/hbird-cli/src/commands/{export_argocd,get_kubeconfig}.rs` (shared core) |
-| kubectl SSH-tunnel wrapper | `scripts/kubectl-k8s.sh` | `rust/crates/hbird-cli/src/commands/{nodes,kubectl}.rs` + `rust/crates/hbird-cli/src/cp_kubectl.rs` |
-| SSH transport | `scripts/lib/ssh-wrap.sh` + `ssh_opts_array{,_no_identity}` | `rust/crates/hbird-ssh/` |
-| libvirt verbs | inline `virsh` invocations across scripts | `rust/crates/hbird-virt/` |
-| Cluster config parse | inline `source $CONFIG` across scripts | `rust/crates/hbird-config/` |
+| Concern | Canonical today | Status |
+|---------|-----------------|--------|
+| Cluster lifecycle — update | `rust/crates/hbird-cli/src/commands/update_cluster.rs` | Bash removed in v0.1.0 [#353] |
+| Cluster lifecycle — deploy/destroy/spawn | `scripts/{deploy,destroy,spawn-workers}-cluster.sh` (bash); Rust dry-run only in `rust/crates/hbird-cli/src/commands/{deploy_cluster,destroy_cluster,spawn_workers}.rs` | **Bash retained** in v0.1.0; live Rust tracked by [#289] / Phase 4 deferred to v0.2.0 |
+| Verifiers | `rust/crates/hbird-cli/src/commands/verify.rs` | Bash removed in v0.1.0 [#353] |
+| Kubeconfig export | `rust/crates/hbird-cli/src/commands/{export_argocd,get_kubeconfig}.rs` (shared core) | Bash `scripts/export-argocd.sh` removed in v0.1.0 [#353] |
+| kubectl SSH-tunnel wrapper | `rust/crates/hbird-cli/src/commands/{nodes,kubectl}.rs` + `rust/crates/hbird-cli/src/cp_kubectl.rs` | Bash `scripts/kubectl-k8s.sh` removed in v0.1.0 [#353] |
+| SSH transport (bash-side) | `scripts/lib/ssh-wrap.sh` + `ssh_opts_array{,_no_identity}` | Retained for kept Phase 4 bash scripts (deploy/destroy/spawn) |
+| SSH transport (Rust-side) | `rust/crates/hbird-ssh/` | Used by every Rust subcommand |
+| libvirt verbs | `rust/crates/hbird-virt/` (Rust) + inline `virsh` in retained Phase 4 bash | Mixed; Rust canonical for Phase 1-3, bash retained for Phase 4 |
+| Cluster config parse | `rust/crates/hbird-config/` (Rust) + inline `source $CONFIG` in retained Phase 4 bash | Mixed |
 
 [#279]: https://github.com/aatchison/hummingbird-k8s/issues/279
+[#289]: https://github.com/aatchison/hummingbird-k8s/issues/289
 [#290]: https://github.com/aatchison/hummingbird-k8s/issues/290
+[#353]: https://github.com/aatchison/hummingbird-k8s/issues/353
 [#306]: https://github.com/aatchison/hummingbird-k8s/issues/306
 [#307]: https://github.com/aatchison/hummingbird-k8s/issues/307
 [#322]: https://github.com/aatchison/hummingbird-k8s/issues/322

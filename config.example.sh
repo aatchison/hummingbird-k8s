@@ -6,7 +6,7 @@
 # HBIRD_AUTOLOAD_CONFIG_LOCAL=1 is set. This tunes image-build inputs only;
 # cluster-topology knobs (CP_NAME, WORKER_NAMES, IMAGE_SOURCE, etc.) live in
 # cluster.local.conf (see cluster.example.conf) and are consumed by
-# scripts/deploy-cluster.sh / scripts/update-cluster.sh.
+# scripts/deploy-cluster.sh / `hbird update-cluster` (Rust twin, post-#353).
 
 # Initial user account inside the VM.
 # export VM_USER=core
@@ -48,7 +48,9 @@ export ENABLE_ROOT_SSH=1                # 1 = bake same pubkeys into root@ (defa
 # Add the hostname/IP of any client that will hit the cluster via SSH tunnel.
 # export APISERVER_EXTRA_SANS=127.0.0.1,localhost
 
-# For scripts/kubectl-k8s.sh (run from a client): the KVM host SSH alias to tunnel through.
+# For `hbird kubectl` (run from a client; Rust twin of the removed
+# scripts/kubectl-k8s.sh, v0.1.0 cutover #353): the KVM host SSH alias
+# to tunnel through.
 # export KVM_HOST=kvm.example.com
 
 # ---- Restoring pre-#17 "classic lab" defaults ---------------------------------

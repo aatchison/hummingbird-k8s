@@ -35,7 +35,7 @@ hand-rolled the same SSH option array, `virsh domifaddr` IP resolution, and
 
 #### Adding a new SSH-driven script
 
-The canonical pattern, mirroring `scripts/export-argocd.sh`:
+The canonical pattern, mirroring `hbird export-argocd` (post-#353, was `scripts/export-argocd.sh`):
 
 ```bash
 #!/usr/bin/env bash
