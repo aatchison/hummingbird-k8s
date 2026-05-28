@@ -1,10 +1,18 @@
 # Live-validate fixtures for `hbird update-cluster`
 
-This directory holds **destructive live-validate diffs** captured by
-running `scripts/update-cluster.sh` (the bash twin) against a real
-hummingbird-k8s cluster, rolling back via `bootc rollback`, then running
-`hbird update-cluster` (the Rust twin) with identical args and diffing
-the post-state.
+This directory holds **destructive live-validate diffs** historically
+captured (pre-v0.1.0, when both runtimes coexisted) by running
+`scripts/update-cluster.sh` (the bash twin, removed in #353) against a
+real hummingbird-k8s cluster, rolling back via `bootc rollback`, then
+running `hbird update-cluster` (the Rust twin) with identical args and
+diffing the post-state.
+
+Post-#353 the bash twin is gone; any future re-captures pin Rust-vs-
+Rust behavior (run-to-run + across versions) rather than Rust-vs-bash
+parity. See "Capture procedure" below — step 2 / step 4 / step 5 are
+now historical (bash invocation + bootc rollback dance + Rust re-run)
+and a fresh capture procedure for the Rust-only world should be
+defined as part of #322's live-execution slice landing.
 
 ## Scope of the live-validate corpus
 

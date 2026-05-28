@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# integration-export-argocd.sh — drive scripts/export-argocd.sh assertions.
+# integration-export-argocd.sh — drive `hbird export-argocd` assertions
+# (post-v0.1.0 cutover #353; was `scripts/export-argocd.sh`).
 #
 # Used by .github/workflows/integration-export-argocd.yml. Outside the
 # YAML so shellcheck can lint it and the test logic can be reviewed as

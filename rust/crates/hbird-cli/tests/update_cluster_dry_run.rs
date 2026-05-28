@@ -17,9 +17,11 @@
 //! One fixture per major flag combo catches drift in the per-block log
 //! shape that a single end-to-end fixture would miss.
 //!
-//! # How to regenerate fixtures (after an intentional bash-twin change)
+//! # How to regenerate fixtures (after an intentional output-shape change)
 //!
-//! From the repo root:
+//! Post-v0.1.0 (#353) the bash twin `scripts/update-cluster.sh` was
+//! removed; fixtures now pin Rust-twin output directly. From the repo
+//! root:
 //!
 //! ```bash
 //! cp cluster.local.conf rust/cluster.local.conf  # one-time
@@ -29,7 +31,7 @@
 //!                dry_run_skip_gates dry_run_no_empty_dir dry_run_parallel2 \
 //!                dry_run_override; do
 //!   # mirror the FLAGS column from the table in this file
-//!   CONFIG=cluster.local.conf bash ../scripts/update-cluster.sh \
+//!   CONFIG=cluster.local.conf cargo run --quiet -p hbird-cli -- update-cluster --dry-run \
 //!     <flags> > crates/hbird-cli/tests/update_cluster/fixtures/$fixture.txt 2>&1
 //! done
 //! ```
