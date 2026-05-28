@@ -1,7 +1,8 @@
 name: Integration — export-argocd kubeconfig (#196)
 
-# End-to-end exercise of scripts/export-argocd.sh (PR #188) against a
-# real 1-CP + 2-worker cluster on the self-hosted kvm/libvirt runner.
+# End-to-end exercise of `hbird export-argocd` (post-v0.1.0 cutover #353;
+# was `scripts/export-argocd.sh` PR #188) against a real 1-CP + 2-worker
+# cluster on the self-hosted kvm/libvirt runner.
 #
 # Asserts the full feature surface of `make export-argocd`:
 #   - basic export emits a 0600 kubeconfig with rewritten server URL +

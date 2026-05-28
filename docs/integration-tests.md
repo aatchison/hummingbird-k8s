@@ -191,9 +191,10 @@ the script must successfully wait through a worker rejoining as
   - `workflow_dispatch` — for ad-hoc manual replays.
 - **What it exercises:** deploy a CP + 2 workers via `make deploy-cluster`
   → assert all three are Ready by name (not just by count) → drive
-  `scripts/update-cluster.sh --dry-run` and validate the expected per-target
-  log lines (CP timer-stop, drain, uncordon, etc.) appear with the expected
-  multiplicity → install a `/usr/local/bin/bootc` shim on one worker to
+  `hbird update-cluster --dry-run` (post-#353, was `scripts/update-cluster.sh
+  --dry-run`) and validate the expected per-target log lines (CP timer-stop,
+  drain, uncordon, etc.) appear with the expected multiplicity → install a
+  `/usr/local/bin/bootc` shim on one worker to
   force the real reboot codepath (the no-update short-circuit would
   otherwise bypass `wait_node_ready` entirely) → run
   `make update-node NODE=<worker>` and assert the worker reached

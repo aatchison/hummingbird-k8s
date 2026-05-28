@@ -1,7 +1,8 @@
 name: Integration — update-cluster rolling upgrade (#196)
 
-# End-to-end exercise of scripts/update-cluster.sh (PR #187) against a real
-# 1-CP + 2-worker cluster on the self-hosted kvm/libvirt runner.
+# End-to-end exercise of `hbird update-cluster` (post-v0.1.0 cutover #353;
+# was `scripts/update-cluster.sh` PR #187) against a real 1-CP + 2-worker
+# cluster on the self-hosted kvm/libvirt runner.
 #
 # The most important assertion: `make update-node` against a worker that
 # we've coerced into actually rebooting must exercise wait_node_ready —

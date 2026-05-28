@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# integration-update-cluster.sh — drive scripts/update-cluster.sh assertions.
+# integration-update-cluster.sh — drive `hbird update-cluster` assertions
+# (post-v0.1.0 cutover #353; was `scripts/update-cluster.sh`).
 #
 # Used by .github/workflows/integration-update-cluster.yml. Lives outside
 # the YAML so shellcheck can lint it and so the logic is reviewable as
