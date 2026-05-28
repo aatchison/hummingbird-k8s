@@ -45,6 +45,7 @@ use tracing_subscriber::EnvFilter;
 
 mod commands;
 mod cp_kubectl;
+mod cp_resolve;
 
 use commands::{
     deploy_cluster::DeployClusterArgs, destroy_cluster::DestroyClusterArgs,

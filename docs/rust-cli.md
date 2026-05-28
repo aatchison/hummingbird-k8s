@@ -1,8 +1,18 @@
-# Rust CLI (work in progress — epic [#279])
+# Rust CLI (epic [#279]; v0.1.0 partial cutover landed in [#353])
 
-The bash client-side tooling under [`../scripts/`](../scripts/) is being
+The bash client-side tooling under [`../scripts/`](../scripts/) was
 rewritten in Rust over several phases. See [`rust/README.md`](../rust/README.md)
 for the workspace layout and the epic for the architectural plan.
+
+> **v0.1.0 partial cutover status:** Phase 1-3 bash scripts
+> (update-cluster, verify-*, export-argocd, kubectl-k8s, etc.) were
+> **removed** in [#353]. The Rust twins are now canonical and the
+> Makefile recipes delegate to `hbird` directly (cross-runtime
+> dependency: `hbird` CLI must be on PATH).
+>
+> Phase 4 bash scripts (`scripts/{deploy,destroy,spawn-workers}-cluster.sh`)
+> are **retained** in v0.1.0 — full removal blocked on [#289] (the
+> Rust destructive impl is dry-run-only today), scheduled for v0.2.0.
 
 ## Install (from a tagged release)
 
@@ -312,13 +322,14 @@ The canonical pattern is `rust/crates/hbird-cli/tests/update_cluster/fixtures/li
    values, and bootID-after) = block validated. Commit the side-by-side
    capture as the cycle's fixture file.
 
-### Phase 2 (`verify-*`) — landed in PR #287
+### Phase 2 (`verify-*`) — landed in PR #287; bash removed in v0.1.0 cutover (#353)
 
 The four `hbird verify <sub>` subcommands (`encryption`, `hardening`,
-`app-deploy`, `all`) replace the bash twins in
-`scripts/verify-encryption.sh`, `scripts/verify-hardening.sh`,
-`scripts/verify-app-deploy.sh`. Each Rust verifier function carries the
-bash twin's grep-anchor name (e.g.
+`app-deploy`, `all`) are the canonical implementations.
+The historical bash twins (`scripts/verify-encryption.sh`,
+`scripts/verify-hardening.sh`, `scripts/verify-app-deploy.sh`) were
+removed in the v0.1.0 partial cutover (#353). Each Rust verifier
+function carries the bash twin's grep-anchor name (e.g.
 `check_podsecurity_rejects_privileged`, `check_apiserver_audit_log_nonempty`)
 to preserve the operator-mental-model contract from the epic.
 
@@ -337,15 +348,18 @@ Live-validate fixtures from the geary cluster:
 - `rust/crates/hbird-cli/tests/update_cluster/fixtures/live/cycle_verify_app_deploy.txt`
 - `rust/crates/hbird-cli/tests/update_cluster/fixtures/live/cycle_verify_all.txt`
 
-Notable parity finding: the bash twin's PSA-rejection check (verify-hardening
-check 1/3) is masked by a pre-existing stdin-handoff bug in the
-`scripts/kubectl-k8s.sh` port-forward wrapper — `kubectl apply -f -`
-receives an empty stdin and errors with `error: no objects passed to
-apply`, so the bash twin misses the `violates PodSecurity` marker and
-marks check 1 FAIL. The Rust path bypasses the wrapper (SSH directly
-to root@CP_IP and pipe stdin), so kubectl sees the manifest and the
-apiserver correctly rejects it — Rust observes PSA enforcement that
-bash misses. Documented in `cycle_verify_hardening.txt`.
+Notable parity finding from the cycle-1 live-validate: the (now
+removed) bash twin's PSA-rejection check (verify-hardening check 1/3)
+was masked by a pre-existing stdin-handoff bug in the (also now
+removed) `scripts/kubectl-k8s.sh` port-forward wrapper — `kubectl apply
+-f -` received an empty stdin and errored with `error: no objects
+passed to apply`, so the bash twin missed the `violates PodSecurity`
+marker and marked check 1 FAIL. The Rust path bypasses the wrapper
+(SSH directly to root@CP_IP and pipe stdin), so kubectl sees the
+manifest and the apiserver correctly rejects it — Rust observes PSA
+enforcement that bash missed. Documented in
+`cycle_verify_hardening.txt`; the bug class is now moot since the bash
+twins have been deleted in the v0.1.0 cutover (#353).
 
 #### Still scaffolded (2 of 13 `live_mode_not_implemented` sites)
 
@@ -373,5 +387,7 @@ concurrency lands when block #13 ships.
 [#279]: https://github.com/aatchison/hummingbird-k8s/issues/279
 [#286]: https://github.com/aatchison/hummingbird-k8s/issues/286
 [#288]: https://github.com/aatchison/hummingbird-k8s/issues/288
+[#289]: https://github.com/aatchison/hummingbird-k8s/issues/289
 [#291]: https://github.com/aatchison/hummingbird-k8s/issues/291
 [#322]: https://github.com/aatchison/hummingbird-k8s/issues/322
+[#353]: https://github.com/aatchison/hummingbird-k8s/issues/353

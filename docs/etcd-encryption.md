@@ -36,23 +36,27 @@ ssh root@<cp> /usr/libexec/verify-encryption.sh
 ```
 
 Or, from a workstation that doesn't have local libvirt / kubectl wiring,
-the repo copy will ssh through `$KVM_HOST` for you (see #271 F2):
+the Rust twin `hbird verify encryption` (which replaced bash
+`scripts/verify-encryption.sh` in the v0.1.0 cutover, [#353]) ssh's
+through `$KVM_HOST` for you (see #271 F2):
 
 ```
-KVM_HOST=geary make verify-encryption
-# equivalent to: KVM_HOST=geary bash scripts/verify-encryption.sh
+KVM_HOST=geary make verify-encryption CONFIG=cluster.local.conf
+# equivalent to: KVM_HOST=geary hbird verify encryption --config cluster.local.conf
 ```
 
-In workstation mode the script sources `lib/build-common.sh`, resolves
-the CP IP via `resolve_cp_ip` (explicit `CP_IP=…` wins, otherwise ssh
-to `$KVM_HOST` for `virsh -c qemu:///system domifaddr $CP_NAME`), then
-ssh-execs `/usr/libexec/verify-encryption.sh` on the CP with
-ProxyJump=$KVM_HOST. On the CP itself it falls through to the local
-flow below.
+In workstation mode the Rust verifier resolves the CP IP (explicit
+`CP_IP=…` wins, otherwise `ssh $KVM_HOST 'virsh -c qemu:///system
+domifaddr $CP_NAME'`), then ssh-execs `/usr/libexec/verify-encryption.sh`
+on the CP with ProxyJump=$KVM_HOST. When `hostname -s` matches
+`$KVM_HOST` (deploy-cluster re-exec, or operator on the hypervisor),
+the Rust path drops ProxyJump and ssh's direct to root@CP_IP per the
+on-host detection (mirrors bash #362 fix from PR #364).
 
-No `scp` from the host repo is needed — the script ships with every
-redeploy. The source of truth still lives at `scripts/verify-encryption.sh`
-in this repo; `containers/k8s/Containerfile` copies it into the image at build time.
+The on-image `/usr/libexec/verify-encryption.sh` ships with every
+redeploy — `containers/k8s/Containerfile` copies it into the image at
+build time. The client-side bash twin (`scripts/verify-encryption.sh`)
+was removed in v0.1.0 ([#353]); the on-image copy is unaffected.
 
 The script reads the probe Secret back out of etcd to confirm the
 on-disk envelope. It tries, in order:
@@ -261,3 +265,4 @@ grep-based health checks keep working. See
 for the per-flag map.
 
 [PR #330]: https://github.com/aatchison/hummingbird-k8s/pull/330
+[#353]: https://github.com/aatchison/hummingbird-k8s/issues/353

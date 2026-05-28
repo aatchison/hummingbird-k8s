@@ -10,8 +10,9 @@
 #   1. `jq` is present in the PRIMARY `dnf install -y` package list of
 #      containers/k8s/Containerfile and containers/k8s-worker/Containerfile.
 #      jq is required by:
-#        - scripts/update-cluster.sh's bootc_booted_digest() helper, which
-#          pipes `bootc status --json` to `jq -r '.status.booted.image.imageDigest // ...'`
+#        - `hbird update-cluster`'s bootc_booted_digest() helper (post-#353
+#          cutover; was scripts/update-cluster.sh), which pipes `bootc
+#          status --json` to `jq -r '.status.booted.image.imageDigest // ...'`
 #          to detect "no actual update available" and short-circuit the
 #          bootID-changed gate. Without jq the digest reads empty, both
 #          pre/post values look identical-but-<unknown>, and the bootID

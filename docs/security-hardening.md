@@ -132,26 +132,31 @@ apiserver static pod mounts them via `extraVolumes` in
 
 ## Verifying each control
 
-All three controls can be checked in one shot with
-[`scripts/verify-hardening.sh`](../scripts/verify-hardening.sh) — the
-recommended invocation is through `make verify-hardening`, which wires
-`KUBECTL=` through to the SSH-tunnel wrapper for free:
+All three controls can be checked in one shot with `hbird verify
+hardening` (the Rust twin that replaced
+`scripts/verify-hardening.sh` in the v0.1.0 cutover, [#353]) — the
+recommended invocation is through `make verify-hardening`:
 
 ```bash
-KVM_HOST=thegeary make verify-hardening CONFIG=cluster.local.conf
+make verify-hardening CONFIG=cluster.local.conf KVM_HOST=thegeary
 ```
 
-If `$KVM_HOST` is set, the script tunnels SSH through that host two
-ways: (1) `ssh -o ProxyJump=$KVM_HOST root@$CP_IP` for the on-CP audit
-log + kubelet checks **and the PodSecurity apply/delete probes**
-(`kubectl --kubeconfig=/etc/kubernetes/admin.conf …` running on the CP
-itself), and (2) `KUBECTL=scripts/kubectl-k8s.sh` only for the CP-node
-lookup fallback (`kubectl-k8s.sh` opens a local-port tunnel through
-`$KVM_HOST` to the apiserver). This lets you run the verifier from your
-dev machine without setting up a route to the libvirt NAT subnet.
-(#271 F4)
+If `$KVM_HOST` is set, the Rust verifier SSHes through that host as
+ProxyJump (`ssh -o ProxyJump=$KVM_HOST root@$CP_IP`) for the on-CP
+audit log + kubelet checks AND the PodSecurity apply/delete probes
+(`kubectl --kubeconfig=/etc/kubernetes/admin.conf …` running on the
+CP itself). This lets you run the verifier from your dev machine
+without setting up a route to the libvirt NAT subnet. (#271 F4 +
+v0.1.0 cutover [#353])
 
-The PodSecurity probes intentionally bypass the `kubectl-k8s.sh`
+If you run `make verify-hardening` from the KVM host directly
+(common during `make deploy-cluster`), the Rust verifier auto-drops
+the ProxyJump so `ssh root@$CP_IP` goes direct on the libvirt NAT
+subnet — the on-host detection mirrors the bash #362 fix (see PR
+#364), now ported to the Rust path.
+
+The PodSecurity probes intentionally bypass the (now-deleted)
+`kubectl-k8s.sh`
 wrapper: that wrapper's port-forward bootstrap phase consumes stdin
 before kubectl ever runs, so the `apply -f - <<EOF … EOF` heredoc was
 silently swallowed and the PSA-rejection check FAILed against a
@@ -377,15 +382,15 @@ kubectl get sa default -n default -o jsonpath='{.automountServiceAccountToken}'
 
 Should print `false`.
 
-## Rust counterpart
+## Rust implementation (canonical post-v0.1.0)
 
-`hbird verify hardening --config cluster.local.conf` is the Rust twin
-(Phase 2, [PR #330]) — and it observes PSA enforcement that the bash
-twin's check 1/3 misses on a correctly-hardened cluster, because the
-Rust path SSHes directly to `root@CP_IP` for the stdin handoff
-instead of routing through `scripts/kubectl-k8s.sh`'s port-forward
-wrapper (which swallows stdin — [#332]). Each verifier function
-carries the bash twin's grep-anchor name
+`hbird verify hardening --config cluster.local.conf` is now the
+canonical implementation (Phase 2, [PR #330]; bash twin removed in
+v0.1.0 cutover [#353]). The Rust path SSHes directly to `root@CP_IP`
+for the stdin handoff — the legacy `scripts/kubectl-k8s.sh`
+port-forward wrapper's stdin-swallowing bug ([#332]) is moot since
+both the wrapper and the bash verify twin were deleted. Each verifier
+function carries the bash twin's grep-anchor name
 (`check_podsecurity_rejects_privileged`,
 `check_apiserver_audit_log_nonempty`,
 `check_kubelet_protect_kernel_defaults`,
@@ -399,3 +404,4 @@ for the full map.
 
 [PR #330]: https://github.com/aatchison/hummingbird-k8s/pull/330
 [#332]: https://github.com/aatchison/hummingbird-k8s/issues/332
+[#353]: https://github.com/aatchison/hummingbird-k8s/issues/353

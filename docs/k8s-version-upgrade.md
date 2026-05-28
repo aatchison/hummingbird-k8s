@@ -165,10 +165,10 @@ After the new CP VM is up (rebuild path) or after `kubeadm upgrade` completes
 - `kubectl version` — server reports the new minor.
 - `kubectl get nodes -o wide` — `KUBELET` column shows the new version on
   every node.
-- `scripts/verify-app-deploy.sh` — end-to-end smoke test of a PSA-restricted
+- `hbird verify app-deploy` (post-#353, was `scripts/verify-app-deploy.sh`) — end-to-end smoke test of a PSA-restricted
   nginx deploy + pod-to-pod networking still passes (see
   [`docs/app-deploy-verify.md`](app-deploy-verify.md)).
-- `scripts/verify-hardening.sh` — PSA, apiserver audit policy, and kubelet
+- `hbird verify hardening` (post-#353, was `scripts/verify-hardening.sh`) — PSA, apiserver audit policy, and kubelet
   `--protect-kernel-defaults` flags are still applied (see
   [`docs/security-hardening.md`](security-hardening.md)).
 

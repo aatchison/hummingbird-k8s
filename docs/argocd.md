@@ -1,6 +1,6 @@
 # Registering a Hummingbird cluster with ArgoCD
 
-`scripts/export-argocd.sh` (also reachable as `make export-argocd`) produces
+`hbird export-argocd` (also reachable as `make export-argocd`) produces
 a kubeconfig you can hand to `argocd cluster add`. It exists because
 ArgoCD's "add cluster" flow is a one-shot bootstrap — it doesn't keep the
 credentials you give it; instead it uses them once to create its own
@@ -8,15 +8,22 @@ scoped ServiceAccount in the target cluster and then authenticates with
 that SA's token. So we don't need an ArgoCD-specific credential. We just
 need a valid, usable-once kubeconfig pointed at a reachable apiserver.
 
+> The Rust twin `hbird export-argocd` replaced the bash
+> `scripts/export-argocd.sh` in the v0.1.0 cutover ([#353]).
+> Cross-runtime dependency: `hbird` CLI must be on PATH.
+
 `make get-kubeconfig` (issue #195) wraps the same primitive for daily
-operator use — both targets call `scripts/export-argocd.sh`; the only
-differences are the defaults. `export-argocd` writes
-`argocd-kubeconfig.yaml` and prefixes the context with `hummingbird-` so
-it can sit alongside a regular kubeconfig without name collisions on
-`argocd cluster add`. `get-kubeconfig` writes `kubeconfig.yaml` and uses
-`CP_NAME` directly (no prefix), so `kubectl --context=<CP_NAME>` matches
-the libvirt domain name the operator already uses. The fetch+rewrite
-logic lives in one script — there is no separate `scripts/get-kubeconfig.sh`.
+operator use — both targets delegate to `hbird` Rust subcommands
+(`hbird export-argocd` / `hbird get-kubeconfig`); the only differences
+are the defaults. `export-argocd` writes `argocd-kubeconfig.yaml` and
+prefixes the context with `hummingbird-` so it can sit alongside a
+regular kubeconfig without name collisions on `argocd cluster add`.
+`get-kubeconfig` writes `kubeconfig.yaml` and uses `CP_NAME` directly
+(no prefix), so `kubectl --context=<CP_NAME>` matches the libvirt
+domain name the operator already uses. The shared fetch+rewrite logic
+lives in
+`rust/crates/hbird-cli/src/commands/{export_argocd,get_kubeconfig}.rs`
+— there is no separate `get-kubeconfig` script (and never was).
 
 ## Prerequisites
 
@@ -29,7 +36,7 @@ to mint a scoped ServiceAccount in the target cluster, then discards it.
 That workstation also needs **SSH access to the CP node** — either
 directly (its IP is routable from where you're running the script) or
 via a ProxyJump host (typically the KVM host that runs the CP VM —
-see the "ProxyJump via the KVM host" section below). `scripts/export-argocd.sh`
+see the "ProxyJump via the KVM host" section below). `hbird export-argocd` (post-#353, was `scripts/export-argocd.sh`)
 SSHes to the CP as root to read `/etc/kubernetes/admin.conf`; without
 SSH connectivity the script can't fetch the file. `argocd login` alone
 is not sufficient.
@@ -277,11 +284,11 @@ URL kubeadm put there.
 
 When the operator workstation can't directly reach the CP — most often
 because the CP is on a libvirt NAT subnet that's not routable outside
-the KVM host — `scripts/export-argocd.sh` can tunnel its SSH session
+the KVM host — `hbird export-argocd` (post-#353, was `scripts/export-argocd.sh`) can tunnel its SSH session
 through the KVM host. Two equivalent ways to enable it:
 
 ```bash
-# Env var (matches scripts/kubectl-k8s.sh and backup-etcd.sh):
+# Env var (matches `hbird kubectl` and backup-etcd.sh):
 KVM_HOST=geary make export-argocd CONFIG=cluster.local.conf
 
 # Explicit flag:
@@ -311,10 +318,10 @@ and you'd rather not pay the SSH-roundtrip — set `CP_IP=<ip>` in
 the resolver before any SSH happens.
 
 Two of these scripts honor `KVM_HOST` but the **mechanism is not the
-same**. `scripts/export-argocd.sh` and `scripts/backup-etcd.sh` add
+same**. `hbird export-argocd` (post-#353, was `scripts/export-argocd.sh`) and `scripts/backup-etcd.sh` add
 `-o ProxyJump=$KVM_HOST` to a single SSH session that goes from your
 workstation → KVM host → CP (one logical hop, tunneled through the
-KVM host's ssh daemon). `scripts/kubectl-k8s.sh` instead opens an
+KVM host's ssh daemon). `hbird kubectl` (post-#353, was `scripts/kubectl-k8s.sh`) instead opens an
 `ssh -L 6443:127.0.0.1:6443` **port-forward to `$KVM_HOST` itself** and
 runs `kubectl` against `127.0.0.1:6443` on the workstation; that's an
 entirely different connection topology (terminate the SSH at the KVM
@@ -353,3 +360,4 @@ for the full per-flag map.
 [PR #334]: https://github.com/aatchison/hummingbird-k8s/pull/334
 [#306]: https://github.com/aatchison/hummingbird-k8s/issues/306
 [#307]: https://github.com/aatchison/hummingbird-k8s/issues/307
+[#353]: https://github.com/aatchison/hummingbird-k8s/issues/353

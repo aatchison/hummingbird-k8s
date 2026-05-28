@@ -316,7 +316,7 @@ want drain/uncordon, a defined node ordering, and a clean abort
 surface.
 
 For that, the orchestrated complement is
-[`scripts/update-cluster.sh`](update-cluster.md), surfaced as
+[`hbird update-cluster` (post-#353, was `scripts/update-cluster.sh`)](update-cluster.md), surfaced as
 `make update-cluster`:
 
 ```bash

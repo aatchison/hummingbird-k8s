@@ -178,18 +178,22 @@ cmd_test_force_overwrite() {
 
 # ---- T5: hostile --server ---------------------------------------------------
 
-# Bypass `make` entirely. Make's recipe expands `$(SERVER)` LITERALLY into
-# the recipe shell, so a payload containing `";rm -rf /;\n` closes the
-# shell quoting of the recipe and runs `rm -rf /` BEFORE the script's
-# argument parser ever sees the value. Going around make exercises the
-# real validation surface (scripts/export-argocd.sh's regex at line 83)
-# without compromising the runner.
+# Bypass `make` entirely to exercise the validation surface directly.
+# Make's recipe expands `$(SERVER)` LITERALLY, so a hostile payload could
+# inject into the recipe shell. Going around make hits the script's own
+# argument parser unmediated.
+#
+# Cross-runtime dependency (v0.1.0 cutover, #353):
+# scripts/export-argocd.sh was removed; the Rust twin
+# `hbird export-argocd` is the canonical implementation. clap parses
+# --server as an opaque string; Rust-side regex validation lives in
+# rust/crates/hbird-cli/src/commands/export_argocd.rs.
 cmd_test_hostile_server() {
   rm -f /tmp/ci-bad.yaml
   set +e
   local out rc
   out="$(cd "$REPO_ROOT" && \
-         CONFIG="$CONFIG" bash scripts/export-argocd.sh \
+         CONFIG="$CONFIG" hbird export-argocd \
            --output /tmp/ci-bad.yaml \
            --server 'https://x";rm -rf /;\n' 2>&1)"
   rc=$?

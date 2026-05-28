@@ -368,18 +368,23 @@ fn plan_cluster_ready(plan: &Plan) -> Result<()> {
     ))
 }
 
-/// Plan the optional verify step. Mirrors lines 618-627.
+/// Plan the optional verify step. Mirrors lines 618-627. After the
+/// v0.1.0 cutover (#353) the bash twin's verify call is now
+/// `hbird verify app-deploy` (the Rust twin replaced
+/// `scripts/verify-app-deploy.sh`).
 fn plan_verify(plan: &Plan) -> Result<()> {
     if !plan.run_verify {
         return Ok(());
     }
     if plan.dry_run {
-        log("DRY-RUN RUN_VERIFY=true — would run 'scripts/verify-app-deploy.sh' after Ready");
+        log(
+            "DRY-RUN RUN_VERIFY=true — would run 'hbird verify app-deploy' after Ready (post-#353)",
+        );
         return Ok(());
     }
     Err(live_mode_not_implemented(
         "plan_verify",
-        "bash scripts/verify-app-deploy.sh",
+        "hbird verify app-deploy",
     ))
 }
 

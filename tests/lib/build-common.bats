@@ -631,15 +631,12 @@ EOF
   [[ "$result" == "<unset>" ]]
 }
 
-@test "verify-hardening.sh wires through ssh_opts_array_no_identity (no dead helper)" {
-  # Static grep — the helper was introduced for verify-hardening and
-  # must remain a live caller to justify its existence. If this fails,
-  # either restore the call site OR drop the helper from the lib +
-  # docs (see PR #202 review HIGH 1).
-  vh="${REPO_ROOT}/scripts/verify-hardening.sh"
-  [ -r "$vh" ]
-  grep -q 'ssh_opts_array_no_identity' "$vh"
-}
+# Test removed in v0.1.0 cutover (#353): scripts/verify-hardening.sh
+# was deleted; the Rust twin `hbird verify hardening` uses
+# hbird-ssh::SshOptions directly. `ssh_opts_array_no_identity` in
+# lib/build-common.sh is now orphaned — track its removal in a
+# follow-up issue if no future bash callers re-add it.
+# (Original test cited PR #202 review HIGH 1.)
 
 @test "HBIRD_AUTOLOAD_CONFIG_LOCAL=1: config.local.sh IS sourced" {
   marker_file="$BATS_TEST_TMPDIR/local.sh"

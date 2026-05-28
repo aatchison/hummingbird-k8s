@@ -29,8 +29,11 @@
 #   KUBECTL=kubectl bash scripts/run-kube-bench.sh
 #
 # Env:
-#   KUBECTL              — kubectl command to use. Default: scripts/kubectl-k8s.sh
-#                          (the SSH-tunnel-through-KVM-host wrapper).
+#   KUBECTL              — kubectl command to use. Default: `hbird kubectl`
+#                          (the Rust twin that replaced
+#                          scripts/kubectl-k8s.sh in the v0.1.0 cutover,
+#                          #353). Falls back to plain `kubectl` if the
+#                          operator overrides.
 #   KUBE_BENCH_VERSION   — kube-bench release tag. Default: v0.15.5.
 #   KUBE_BENCH_TIMEOUT   — `kubectl wait` timeout. Default: 5m.
 #   KUBE_BENCH_NS        — namespace to run the Jobs in. Default: default.
@@ -46,23 +49,42 @@
 
 set -euo pipefail
 
+# After the v0.1.0 cutover (#353), REPO_ROOT is no longer used to
+# locate sibling scripts (kubectl moved to `hbird kubectl`). Preserved
+# as preamble boilerplate so future sibling references don't have to
+# re-derive it.
+# shellcheck disable=SC2034  # preserved for future sibling-script use
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
 : "${KUBE_BENCH_VERSION:=v0.15.5}"
 : "${KUBE_BENCH_TIMEOUT:=5m}"
 : "${KUBE_BENCH_NS:=default}"
 : "${KUBE_BENCH_TARGETS:=master node}"
-: "${KUBECTL:=${REPO_ROOT}/scripts/kubectl-k8s.sh}"
+# Cross-runtime dependency (v0.1.0 cutover, #353):
+# `hbird` CLI is preferred at runtime as the default KUBECTL because
+# scripts/kubectl-k8s.sh was removed in v0.1.0. PR #366 round-2 M2:
+# fall back to plain `kubectl` if `hbird` is not on PATH, so the script
+# stays useful for operators who already have a working kubectl set up
+# (e.g. native install with an exported KUBECONFIG).
+: "${KUBECTL:=$(command -v hbird >/dev/null && echo 'hbird kubectl' || echo kubectl)}"
 
 BASE_URL="https://raw.githubusercontent.com/aquasecurity/kube-bench/${KUBE_BENCH_VERSION}"
 
 log() { printf '[run-kube-bench] %s\n' "$*" >&2; }
 
-# Run kubectl. If KUBECTL is the repo's wrapper, invoke it directly
-# (it manages its own podman/SSH-tunnel plumbing); otherwise word-split.
+# Run kubectl. The KUBECTL value may be `hbird kubectl` (default,
+# v0.1.0+ post-#353 cutover), a bare `kubectl`, or a path. Word-split
+# so multi-word commands like `hbird kubectl` work.
+#
+# PR #366 round-2 H2: `hbird kubectl` uses clap with `trailing_var_arg`
+# but clap still rejects leading-dash positionals as "unexpected
+# argument" without an explicit `--` separator. Inject `--` only for
+# the hbird path so a plain `kubectl` invocation (operator override
+# via `KUBECTL=kubectl`) keeps working unchanged.
 kc() {
-  if [[ -x "$KUBECTL" && "$KUBECTL" == *"/kubectl-k8s.sh" ]]; then
-    "$KUBECTL" "$@"
+  if [[ "$KUBECTL" == "hbird kubectl"* ]]; then
+    # shellcheck disable=SC2086
+    $KUBECTL -- "$@"
   else
     # shellcheck disable=SC2086
     $KUBECTL "$@"

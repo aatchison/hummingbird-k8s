@@ -200,8 +200,10 @@ impl QemuSshUri {
     /// This is the value passed to `virsh -c <here>` on the remote
     /// host — the `+ssh` transport is unwrapped on the SSH client
     /// side, so the remote `virsh` sees only the bare `qemu:///`
-    /// URI. Matches `scripts/kubectl-k8s.sh`'s
-    /// `virsh -c qemu:///system domifaddr` invocation.
+    /// URI. Matches the historical `scripts/kubectl-k8s.sh`
+    /// `virsh -c qemu:///system domifaddr` invocation (kubectl-k8s.sh
+    /// was removed in the v0.1.0 cutover #353; the Rust twin
+    /// `hbird kubectl` is now canonical).
     #[must_use]
     pub fn remote_uri(&self) -> String {
         format!("qemu:///{}", self.instance)

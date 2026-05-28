@@ -35,8 +35,9 @@ etc.):
 KVM_HOST=thegeary bash scripts/run-kube-bench.sh
 ```
 
-The script uses `scripts/kubectl-k8s.sh` under the hood (SSH tunnel + podman
-kubectl, no local kubectl install required).
+The script uses `hbird kubectl` under the hood (post-#353 cutover;
+replaced `scripts/kubectl-k8s.sh`'s SSH-tunnel + podman-kubectl
+wrapper). Cross-runtime dependency: `hbird` CLI must be on PATH.
 
 What it does:
 
@@ -77,8 +78,8 @@ KVM_HOST=thegeary bash scripts/run-kube-bench.sh > scripts/kube-bench-baseline.t
 | `KUBE_BENCH_TIMEOUT` | `5m`                 | `kubectl wait` budget per Job.           |
 | `KUBE_BENCH_NS`      | `default`            | Namespace to run the Jobs in.            |
 | `KUBE_BENCH_TARGETS` | `master node`        | Space-separated subset of `{master, node}`. Skip a half if you only want one. |
-| `KUBECTL`            | `scripts/kubectl-k8s.sh` | Override if you have a local kubectl.    |
-| `KVM_HOST`           | (none)               | Required by `scripts/kubectl-k8s.sh`. See `config.example.sh`. |
+| `KUBECTL`            | `hbird kubectl`      | Default after v0.1.0 cutover (#353). Override with a local kubectl path if you want to bypass hbird. |
+| `KVM_HOST`           | (none)               | Required by `hbird kubectl`. See `config.example.sh`. |
 
 ## How to read the output
 

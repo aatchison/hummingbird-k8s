@@ -2,29 +2,24 @@
 #
 # Unit tests for issue #271 finding F6 — `scripts/backup-etcd.sh`,
 # `scripts/restore-etcd.sh`, and `scripts/rotate-etcd-encryption-key.sh`
-# previously called `./scripts/kubectl-k8s.sh` with a **relative** path,
-# which broke when the operator invoked the script from any cwd other
-# than the repo root (e.g. `cd /tmp && bash /path/to/repo/scripts/...`).
+# need REPO_ROOT to anchor when sourced from any cwd.
 #
-# The fix anchors the kubectl-k8s.sh resolution via $REPO_ROOT derived
-# from the script's own `$(readlink -f "$0")` location — matching the
-# existing pattern in `scripts/run-kube-bench.sh`.
+# Originally these tests pinned that the etcd scripts called
+# `${REPO_ROOT}/scripts/kubectl-k8s.sh` (anchored via REPO_ROOT). After
+# the v0.1.0 partial bash->Rust cutover (#353), `kubectl-k8s.sh` was
+# removed and the etcd scripts now invoke `hbird kubectl` directly.
+# REPO_ROOT is still anchored for the (now smaller) set of sibling
+# script references the etcd scripts retain (none today, but the
+# preamble remains as boilerplate parity with run-kube-bench.sh).
 #
-# What these tests check:
-#   1. Source-level regression guard: no `./scripts/kubectl-k8s.sh`
-#      bareword remains in any of the three scripts; all references go
-#      through `${REPO_ROOT}/scripts/kubectl-k8s.sh`.
+# What these tests check (post-cutover):
+#   1. Source-level regression guard: no surviving reference to the
+#      deleted scripts/kubectl-k8s.sh; all kubectl calls go via `hbird
+#      kubectl` (Rust twin).
 #   2. Each script declares `REPO_ROOT=$(cd "$(dirname "$(readlink -f
-#      "$0")")/.." && pwd)` near the top of its body.
-#   3. Functional: invoke each script from /tmp (a deliberately-wrong
-#      cwd) and confirm it locates a STUBBED kubectl-k8s.sh via the
-#      anchored path. We use stubs so no real SSH / virsh / etcdctl runs.
-#
-# The stubbing pattern mirrors tests/scripts/kubectl-k8s.bats: every
-# external binary the scripts touch (`ssh`, `scp`, `read`, etc.) is
-# shimmed; the stubbed `kubectl-k8s.sh` is the SAME file at the SAME
-# repo location the script anchors to via REPO_ROOT, so we don't replace
-# the real script — we just gate its behavior with an env override.
+#      "$0")")/.." && pwd)` near the top of its body — preserved for
+#      future sibling-script references.
+#   3. Functional: REPO_ROOT preamble still resolves correctly from /tmp.
 
 setup() {
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
@@ -55,23 +50,27 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Source-level regression guards: no bare `./scripts/kubectl-k8s.sh` and
-# the REPO_ROOT anchor is in place.
+# Source-level regression guards: no surviving reference to the deleted
+# kubectl-k8s.sh; REPO_ROOT anchor preserved as preamble boilerplate.
 # ---------------------------------------------------------------------------
 
-@test "F6: backup-etcd.sh has no relative ./scripts/kubectl-k8s.sh" {
-  run grep -nE '(^|[^/])\./scripts/kubectl-k8s\.sh' "$BACKUP"
-  # grep exits 1 when there are no matches — that's the success case.
+# Source-level regression guards: the deleted kubectl-k8s.sh must not be
+# invoked anywhere. We allow comment references that document the
+# removal (lines starting with `#` are matched and excluded) but reject
+# any executable line that names the script.
+
+@test "#353 cutover: backup-etcd.sh does not invoke scripts/kubectl-k8s.sh" {
+  run grep -nE '^[^#]*scripts/kubectl-k8s\.sh' "$BACKUP"
   [ "$status" -ne 0 ]
 }
 
-@test "F6: restore-etcd.sh has no relative ./scripts/kubectl-k8s.sh" {
-  run grep -nE '(^|[^/])\./scripts/kubectl-k8s\.sh' "$RESTORE"
+@test "#353 cutover: restore-etcd.sh does not invoke scripts/kubectl-k8s.sh" {
+  run grep -nE '^[^#]*scripts/kubectl-k8s\.sh' "$RESTORE"
   [ "$status" -ne 0 ]
 }
 
-@test "F6: rotate-etcd-encryption-key.sh has no relative ./scripts/kubectl-k8s.sh" {
-  run grep -nE '(^|[^/])\./scripts/kubectl-k8s\.sh' "$ROTATE"
+@test "#353 cutover: rotate-etcd-encryption-key.sh does not invoke scripts/kubectl-k8s.sh" {
+  run grep -nE '^[^#]*scripts/kubectl-k8s\.sh' "$ROTATE"
   [ "$status" -ne 0 ]
 }
 
@@ -87,16 +86,16 @@ EOF
   grep -qE 'REPO_ROOT="\$\(cd "\$\(dirname "\$\(readlink -f "\$0"\)"\)/\.\." && pwd\)"' "$ROTATE"
 }
 
-@test "F6: backup-etcd.sh references \${REPO_ROOT}/scripts/kubectl-k8s.sh" {
-  grep -qF '${REPO_ROOT}/scripts/kubectl-k8s.sh' "$BACKUP"
+@test "#353 cutover: backup-etcd.sh references hbird kubectl" {
+  grep -qE 'hbird +kubectl' "$BACKUP"
 }
 
-@test "F6: restore-etcd.sh references \${REPO_ROOT}/scripts/kubectl-k8s.sh" {
-  grep -qF '${REPO_ROOT}/scripts/kubectl-k8s.sh' "$RESTORE"
+@test "#353 cutover: restore-etcd.sh references hbird kubectl" {
+  grep -qE 'hbird +kubectl' "$RESTORE"
 }
 
-@test "F6: rotate-etcd-encryption-key.sh references \${REPO_ROOT}/scripts/kubectl-k8s.sh" {
-  grep -qF '${REPO_ROOT}/scripts/kubectl-k8s.sh' "$ROTATE"
+@test "#353 cutover: rotate-etcd-encryption-key.sh references hbird kubectl" {
+  grep -qE 'hbird +kubectl' "$ROTATE"
 }
 
 # ---------------------------------------------------------------------------
@@ -157,6 +156,16 @@ EOF
 printf '0\t%s\n' "$2"
 EOF
   chmod +x "$STUB_DIR/du"
+  # PR #366 round-2 M1 added a `command -v hbird` preflight to
+  # backup-etcd.sh. Stub `hbird` so the preflight passes; CP_IP is
+  # already pinned via env so the kubectl fallback is never reached.
+  cat > "$STUB_DIR/hbird" <<'EOF'
+#!/usr/bin/env bash
+# Stub: preflight only checks for presence on PATH; never invoked
+# with CP_IP pinned.
+exit 0
+EOF
+  chmod +x "$STUB_DIR/hbird"
 
   run env -i \
     PATH="${STUB_DIR}:/usr/bin:/bin" \

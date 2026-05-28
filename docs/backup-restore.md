@@ -9,7 +9,7 @@ The scripts live at `scripts/backup-etcd.sh` and
 restore-etcd` targets are thin wrappers around them.
 
 Both scripts (and `scripts/rotate-etcd-encryption-key.sh`) anchor their
-internal references to `scripts/kubectl-k8s.sh` via the script's own
+internal references to `hbird kubectl` (post-#353, was `scripts/kubectl-k8s.sh`) via the script's own
 on-disk location, so invocation from any cwd works — including the
 absolute-path cron example below.
 

@@ -89,7 +89,9 @@ A single KVM host runs one control plane + N workers:
 ```text
         client laptop
               |
-              | ssh -L 6443:127.0.0.1:6443  (via kubectl-k8s.sh)
+              | ssh -J $KVM_HOST root@$CP_IP  (via `hbird kubectl`,
+              |                                post-#353; was a port-forward
+              |                                in the deleted kubectl-k8s.sh)
               v
    +-------------------------------------------------+
    |  KVM host  (qemu:///system, default NAT net)    |
@@ -208,9 +210,11 @@ make nodes
 make kubectl ARGS='get pods -A'
 ```
 
-`scripts/kubectl-k8s.sh` opens an SSH tunnel to the CP's apiserver on
-`127.0.0.1:6443` and runs `kubectl` in a container against the fetched
-admin kubeconfig.
+`hbird kubectl` (the Rust twin that replaced
+`scripts/kubectl-k8s.sh` in the v0.1.0 cutover, [#353]) SSHes through
+the KVM-host ProxyJump and runs `kubectl` on the CP against
+`/etc/kubernetes/admin.conf`. Cross-runtime dependency: `hbird` CLI
+must be on PATH; see [`docs/rust-cli.md`](docs/rust-cli.md) for install.
 
 ## Useful commands
 
@@ -386,10 +390,11 @@ make update-node          CONFIG=cluster.local.conf NODE=hbird-w1
 ```
 
 Heads-up: single-CP means the apiserver is unavailable for ~60-120s while
-the CP reboots. `scripts/update-cluster.sh` prints a warning before that
-window. Add `--dry-run` (calling the script directly) to preview actions
-without ssh/kubectl, or `--skip-drain` as an emergency-rollback escape
-hatch for a stuck drain.
+the CP reboots. `hbird update-cluster` (the Rust twin that replaced
+`scripts/update-cluster.sh` in the v0.1.0 cutover, [#353]) prints a
+warning before that window. Add `FLAGS='--dry-run'` (or call `hbird
+update-cluster --dry-run` directly) to preview actions without ssh/kubectl,
+or `--skip-drain` as an emergency-rollback escape hatch for a stuck drain.
 
 Readiness gates: between SSH-back and uncordon, the script also requires
 the node's `.status.nodeInfo.bootID` to change (proves a real reboot
@@ -433,11 +438,12 @@ sudo make rotate-etcd-key                          # walks 4-stage key rotation
 ### Fetch a working kubeconfig
 
 `make get-kubeconfig` is the daily-use sibling of `make export-argocd` — same
-SSH-and-rewrite primitive (`scripts/export-argocd.sh`), but with
-operator-facing defaults: writes to `./kubeconfig.yaml` and names the
-cluster/context/user after `CP_NAME` (no `hummingbird-` prefix) so
-`kubectl --context=<CP_NAME>` matches the libvirt domain name you already
-think in.
+SSH-and-rewrite primitive (the Rust twin `hbird get-kubeconfig` /
+`hbird export-argocd`; bash `scripts/export-argocd.sh` was removed in
+the v0.1.0 cutover [#353]), but with operator-facing defaults: writes
+to `./kubeconfig.yaml` and names the cluster/context/user after
+`CP_NAME` (no `hummingbird-` prefix) so `kubectl --context=<CP_NAME>`
+matches the libvirt domain name you already think in.
 
 > **Security model**: the file produced is `admin.conf` with the server URL
 > rewritten — full-cluster credentials. The client cert inside has a 1-year
@@ -539,7 +545,7 @@ is the template. The build scripts (`scripts/build-*.sh`) source it when
 | `POOL_DIR` | `/var/lib/libvirt/images` | libvirt pool for qcow2. | Larger volume. |
 | `BASE_IMAGE` | `quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1…` (digest-pinned) | Upstream bootc base. | Bumping to a newer digest. |
 | `BIB` | `quay.io/centos-bootc/bootc-image-builder:latest` | OCI-to-qcow2 builder. | Pinning bib. |
-| `KVM_HOST` | unset | SSH alias of KVM host (client-side). | Always on client running `kubectl-k8s.sh`. |
+| `KVM_HOST` | unset | SSH alias of KVM host (client-side). | Always on client running `hbird kubectl` (post-#353, was `scripts/kubectl-k8s.sh`). |
 | `APISERVER_EXTRA_SANS` | `127.0.0.1,localhost` | Extra SANs in apiserver cert. | Adding client host/IP for tunnel. |
 
 ## Consuming the published images
@@ -622,7 +628,7 @@ Day-2 documentation lives under [`docs/`](docs):
 - [`docs/self-hosted-runner.md`](docs/self-hosted-runner.md) — register a KVM-capable GitHub Actions runner.
 - [`docs/auto-updates.md`](docs/auto-updates.md) — semver-aware bootc auto-update timer (advances only on new immutable `vMAJOR.MINOR.PATCH` tags, replacing the upstream `:latest`-tracking unit).
 - [`docs/rollback.md`](docs/rollback.md) — manual + auto-rollback (`bootc rollback`, health-check timer).
-- [`docs/security-hardening.md`](docs/security-hardening.md) — PodSecurity restricted + apiserver audit + kubelet protect-kernel-defaults; run `make verify-hardening` (or `scripts/verify-hardening.sh`) after each redeploy.
+- [`docs/security-hardening.md`](docs/security-hardening.md) — PodSecurity restricted + apiserver audit + kubelet protect-kernel-defaults; run `make verify-hardening` (or `hbird verify hardening`) after each redeploy.
 - [`docs/app-deploy-verify.md`](docs/app-deploy-verify.md) — end-to-end smoke test of a PSA-restricted nginx deploy + pod-to-pod networking.
 - [`docs/cilium-migration.md`](docs/cilium-migration.md) — Cilium CNI (NetworkPolicy enforcement, eBPF datapath).
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — known failure modes and fixes from operating the cluster.
@@ -660,10 +666,10 @@ Makefile               canonical operator entry point; all targets call
 Common failures and the first thing to try. For deeper context, see
 [`NOTES.md`](NOTES.md) and the per-topic docs under [`docs/`](docs).
 
-- **`kubectl` context "connection refused" from the client.** The SSH tunnel
-  or fetched kubeconfig is stale. Re-run `make kubectl ARGS='get nodes'`
-  (which refreshes `/tmp/k8s-kubeconfig` and the tunnel via
-  [`scripts/kubectl-k8s.sh`](scripts/kubectl-k8s.sh)).
+- **`kubectl` context "connection refused" from the client.** The SSH
+  session to the CP is stale. Re-run `make kubectl ARGS='get nodes'`
+  (which delegates to `hbird kubectl` — the Rust twin that replaced
+  `scripts/kubectl-k8s.sh` in the v0.1.0 cutover, [#353]).
 - **Cilium pods `CrashLoopBackOff` on the CP.** Usually a kernel BPF
   capability gap — rare on the Hummingbird base, common on minimal Fedora
   hosts. Check `kubectl -n kube-system logs ds/cilium` and confirm

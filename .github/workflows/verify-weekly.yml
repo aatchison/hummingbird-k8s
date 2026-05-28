@@ -1,13 +1,18 @@
 name: Verify weekly (orchestrator)
 
-# Weekly orchestrator that iterates the verify-* scripts under scripts/
+# Weekly orchestrator that iterates the `hbird verify` subcommands
 # against the live geary cluster on the self-hosted runner. Closes #15.
 #
 # This is the minimum-viable form of "iterate open verify issues and run
-# each issue's test script": rather than reflecting on issue bodies, we
-# run the canonical verifiers that the verify-labeled issues converge on
-# (encryption + hardening + app-deploy). Adding a new check = drop a
-# script in scripts/ and add a step here.
+# each issue's test": rather than reflecting on issue bodies, we run the
+# canonical verifiers that the verify-labeled issues converge on
+# (encryption + hardening + app-deploy).
+#
+# Cross-runtime dependency (v0.1.0 cutover, #353):
+# scripts/verify-{encryption,hardening,app-deploy}.sh were removed in
+# v0.1.0; the Rust twins `hbird verify <sub>` are the canonical
+# implementations. The workflow builds hbird in-place since the
+# self-hosted runner has rustup but no pre-built binary.
 #
 # Triggers:
 #   - schedule: Monday 07:00 UTC (weekly cadence; matches the on-call rota)
@@ -72,30 +77,45 @@ jobs:
           chmod 600 "$KUBECONFIG"
           kubectl --kubeconfig="$KUBECONFIG" get nodes
 
-      - name: verify-encryption.sh
-        id: encryption
-        continue-on-error: true
-        # The encryption verifier needs etcdctl/crictl on the CP itself.
-        # Stream it over SSH so it runs in-cluster against local etcd.
+      # PR #366 round-2 M8: declare the rustup dependency explicitly.
+      # The self-hosted runner had `rustup` pre-installed in practice,
+      # but relying on undeclared-runner-state breaks reproducibility +
+      # blocks fresh runners from running this workflow. Pin to the
+      # same `dtolnay/rust-toolchain@stable` shape used elsewhere.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build hbird CLI (v0.1.0 cutover, #353)
+        id: hbird_build
+        # Cross-runtime dependency: scripts/verify-*.sh were removed in
+        # v0.1.0 (#353). The Rust twins `hbird verify <sub>` are now
+        # canonical. We build hbird in-place since the self-hosted runner
+        # has rustup but no pre-built hbird binary.
         run: |
           set -euo pipefail
-          scp -o StrictHostKeyChecking=no -o BatchMode=yes \
-            scripts/verify-encryption.sh "root@${CP_IP}:/tmp/verify-encryption.sh"
-          ssh -o StrictHostKeyChecking=no -o BatchMode=yes \
-            "root@${CP_IP}" "bash /tmp/verify-encryption.sh"
+          ( cd rust && cargo build --release -p hbird-cli )
+          echo "HBIRD=$PWD/rust/target/release/hbird" >> "$GITHUB_ENV"
 
-      - name: verify-hardening.sh
+      - name: hbird verify encryption
+        id: encryption
+        continue-on-error: true
+        # The encryption verifier runs the on-image /usr/libexec helper
+        # via SSH to the CP. Rust twin sources CP_IP from --cp-ip.
+        run: "$HBIRD verify encryption --cp-ip $CP_IP"
+
+      - name: hbird verify hardening
         id: hardening
         continue-on-error: true
-        # Hardening verifier knows how to ssh to the CP itself; CP_IP and
-        # KUBECONFIG are already in the job env via $GITHUB_ENV.
-        run: bash scripts/verify-hardening.sh
+        # Hardening verifier ssh's to the CP itself; CP_IP is already in
+        # the job env via $GITHUB_ENV.
+        run: "$HBIRD verify hardening --cp-ip $CP_IP"
 
-      - name: verify-app-deploy.sh
+      - name: hbird verify app-deploy
         id: appdeploy
         continue-on-error: true
-        # App-deploy verifier just needs kubectl with a working KUBECONFIG.
-        run: bash scripts/verify-app-deploy.sh
+        # App-deploy verifier runs an end-to-end PSA-restricted nginx
+        # smoke test via SSH to the CP.
+        run: "$HBIRD verify app-deploy --cp-ip $CP_IP"
 
       - name: Summarize results
         id: summary

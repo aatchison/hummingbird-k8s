@@ -24,7 +24,15 @@
 #
 # Env:
 #   CP_IP     — CP node IP. Defaults to the InternalIP of the first
-#               control-plane node (via scripts/kubectl-k8s.sh).
+#               control-plane node (via `hbird kubectl get nodes`).
+#               # Cross-runtime dependency (v0.1.0 cutover, #353):
+#               # `hbird` CLI is required at runtime when CP_IP is
+#               # unset; the Rust twin replaced scripts/kubectl-k8s.sh.
+#               # `hbird kubectl` auto-resolves CP_IP via
+#               # `ssh $KVM_HOST virsh -c qemu:///system domifaddr
+#               # $CP_NAME` (PR #366 round-2 H1), so workstation
+#               # operators only need KVM_HOST set — same shape as the
+#               # deleted scripts/kubectl-k8s.sh.
 #   KVM_HOST  — Optional SSH ProxyJump host. If set, the SSH/SCP to
 #               the CP routes through this host. Useful when the CP
 #               VM's IP is only reachable from inside the KVM host's
@@ -35,15 +43,27 @@
 #
 # See docs/backup-restore.md for cadence / restore guidance.
 #
-# Path-anchoring: this script resolves the sibling kubectl-k8s.sh via
-# $REPO_ROOT derived from its own location, so it works no matter what
-# cwd the operator runs it from (e.g. `cd /tmp && bash
-# /path/to/repo/scripts/backup-etcd.sh`). See issue #271 F6.
+# Path-anchoring: this script anchors REPO_ROOT for any future sibling
+# script references; today every kubectl call routes through `hbird
+# kubectl` directly. See issue #271 F6 and #353 cutover.
 set -euo pipefail
 
+# PR #366 round-2 M1: hbird-PATH preflight. `hbird kubectl` is the
+# canonical kubectl entry point after #353; without it on PATH the
+# CP_IP probe below fails with a less-actionable "command not found".
+command -v hbird >/dev/null || {
+  echo "ERROR: hbird CLI required for ${0##*/} (post-#353 cutover)" >&2
+  echo "       Install per docs/rust-cli.md" >&2
+  exit 2
+}
+
 # Resolve repo root from this script's location so relative siblings
-# (notably scripts/kubectl-k8s.sh) work from any cwd. Matches the
-# pattern established by scripts/run-kube-bench.sh.
+# work from any cwd. Matches the pattern established by
+# scripts/run-kube-bench.sh. After the v0.1.0 cutover (#353), this
+# script no longer references any sibling scripts (kubectl moved to
+# `hbird kubectl`); REPO_ROOT is preserved as preamble boilerplate so
+# future sibling references don't have to re-derive it.
+# shellcheck disable=SC2034  # preserved for future sibling-script use
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 
 OUTDIR=""
@@ -96,7 +116,15 @@ if [[ -n "$LABEL" ]]; then
 fi
 DST="$OUTDIR/etcd-snapshot-$TS$SUFFIX.db"
 
-CP_IP="${CP_IP:-$("${REPO_ROOT}/scripts/kubectl-k8s.sh" get nodes \
+# Cross-runtime dependency (v0.1.0 cutover, #353):
+# `hbird` CLI is required at runtime to resolve CP_IP from the cluster.
+# scripts/kubectl-k8s.sh was removed in v0.1.0; the Rust twin
+# (`hbird kubectl`) is the canonical kubectl entry point. `hbird` is
+# preflight-checked at the top of this script, so this step won't fail
+# with command-not-found. `hbird kubectl` auto-resolves CP_IP via
+# virsh-domifaddr on KVM_HOST (PR #366 round-2 H1) when CP_IP isn't
+# pinned in CONFIG.
+CP_IP="${CP_IP:-$(hbird kubectl get nodes \
   -l node-role.kubernetes.io/control-plane \
   -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')}"
 [[ -n "$CP_IP" ]] || { echo "Could not resolve control-plane IP" >&2; exit 1; }

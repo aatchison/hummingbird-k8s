@@ -154,7 +154,7 @@ schedules its agent pod there and the CNI plugin reports healthy.
 
 ### kubectl tunnel times out
 
-`scripts/kubectl-k8s.sh` runs a backgrounded `ssh -fNL 6443:127.0.0.1:6443`
+`hbird kubectl` (post-#353, was `scripts/kubectl-k8s.sh`) runs a backgrounded `ssh -fNL 6443:127.0.0.1:6443`
 to the KVM host. Re-running the script while a stale tunnel from a previous
 deploy is still alive (against a now-rebuilt VM) leaves you talking to the
 old endpoint.
@@ -172,7 +172,7 @@ old endpoint.
 
 ### Interactive SSH host-key prompt on KVM-host link-local IPv6
 
-`scripts/kubectl-k8s.sh` (and any other wrapper that ssh's to `$KVM_HOST`)
+`hbird kubectl` (post-#353, was `scripts/kubectl-k8s.sh`) (and any other wrapper that ssh's to `$KVM_HOST`)
 can drop into an interactive
 `The authenticity of host 'geary (fe80::…%enp…) ' can't be established`
 prompt when the KVM host advertises an AAAA record — typically a
@@ -192,7 +192,7 @@ the chained `verify-app-deploy` step.
   Are you sure you want to continue connecting (yes/no/[fingerprint])?
   ```
 
-- Fix (permanent, landed): `scripts/kubectl-k8s.sh` passes `-4` on every
+- Fix (permanent, landed): `hbird kubectl` (post-#353, was `scripts/kubectl-k8s.sh`) passes `-4` on every
   ssh to `$KVM_HOST`, forcing the IPv4 transport. Link-local IPv6
   isn't reachable off-LAN anyway, so the AAAA path is the wrong
   transport. See issue #320.
@@ -202,7 +202,7 @@ the chained `verify-app-deploy` step.
 
 ### `sudo: a terminal is required to read the password` from day-2 wrappers
 
-`scripts/kubectl-k8s.sh` and `scripts/export-argocd.sh` ssh to
+`hbird kubectl` (post-#353, was `scripts/kubectl-k8s.sh`) and `hbird export-argocd` (post-#353, was `scripts/export-argocd.sh`) ssh to
 `$KVM_HOST` / `root@$CP_IP` and run `sudo virsh …` / `sudo cat …` on the
 remote. Without `ssh -t` the remote sudo can't allocate a TTY to prompt
 for the operator's password when the remote sudo cache is cold — the

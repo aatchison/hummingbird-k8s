@@ -1,6 +1,7 @@
-//! Typed parser for `cluster.local.conf` — the operator-edited file that
-//! drives `scripts/deploy-cluster.sh`, `scripts/update-cluster.sh`, and
-//! `scripts/destroy-cluster.sh`.
+//! Typed parser for `cluster.local.conf` — the operator-edited file
+//! that drives `scripts/deploy-cluster.sh`, `scripts/destroy-cluster.sh`,
+//! and `hbird update-cluster` (the Rust twin of the removed
+//! `scripts/update-cluster.sh`, v0.1.0 cutover #353).
 //!
 //! # Why this crate exists
 //!

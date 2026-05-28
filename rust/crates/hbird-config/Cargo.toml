@@ -9,11 +9,13 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
-# Bash twin: scripts/deploy-cluster.sh + scripts/update-cluster.sh `source` the
-# config file and read shell variables. This crate parses the SAME file as
-# static text — no shell evaluation — so the operator can keep editing
-# cluster.local.conf with the documented `KEY=value` and `KEY=(array)` shapes
-# while Rust subcommands consume a typed `ClusterConfig`. (#282, epic #279.)
+# Bash twin: scripts/deploy-cluster.sh + the historical
+# scripts/update-cluster.sh (removed in v0.1.0 cutover #353; Rust twin
+# `hbird update-cluster` is canonical) `source` the config file and read
+# shell variables. This crate parses the SAME file as static text — no
+# shell evaluation — so the operator can keep editing cluster.local.conf
+# with the documented `KEY=value` and `KEY=(array)` shapes while Rust
+# subcommands consume a typed `ClusterConfig`. (#282, epic #279.)
 
 [dependencies]
 thiserror = "2"

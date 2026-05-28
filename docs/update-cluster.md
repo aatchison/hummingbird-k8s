@@ -1,9 +1,14 @@
 # `make update-cluster` — rolling bootc upgrade across a deployed cluster
 
-`scripts/update-cluster.sh` is the operator-facing "roll the cluster
-forward to a new image" entry point. It reads the same
-`cluster.local.conf` that `make deploy-cluster` consumes and walks the
-cluster one node at a time:
+`hbird update-cluster` (the Rust twin that replaced
+`scripts/update-cluster.sh` in the v0.1.0 cutover, [#353]) is the
+operator-facing "roll the cluster forward to a new image" entry point.
+It reads the same `cluster.local.conf` that `make deploy-cluster`
+consumes and walks the cluster one node at a time. The Makefile
+target `make update-cluster` delegates to it.
+
+> **Cross-runtime dependency (v0.1.0 cutover):** `hbird` CLI must be
+> on PATH. See [`docs/rust-cli.md`](rust-cli.md) for install.
 
 ```bash
 # From a client laptop (since C3 / #232) — re-execs on the KVM host
@@ -228,12 +233,13 @@ entirely so previews work for any user.
 
 ### Env-var validation (security)
 
-Operator-shell env vars reach `scripts/update-cluster.sh` directly on
-the client and survive the SSH re-exec to the KVM host via the
-allowlist in `scripts/lib/ssh-wrap.sh`; they ultimately reach the
-script as root. To prevent shell-injection and bash-arithmetic
-side-effects from hostile values, every env knob above is validated at
-startup with strict regexes before any privileged call:
+Operator-shell env vars reach `hbird update-cluster` directly on the
+client and survive the SSH re-exec to the KVM host via the allowlist
+in `scripts/lib/ssh-wrap.sh` (when the bash deploy-cluster path
+re-execs); they ultimately reach the binary as root. To prevent
+shell-injection and bash-arithmetic side-effects from hostile values,
+every env knob above is validated at startup with strict regexes
+before any privileged call:
 
 | Var | Accepted pattern |
 | --- | --- |
@@ -257,7 +263,7 @@ Skip the CP entirely; only roll workers.
 ```bash
 make update-workers CONFIG=cluster.local.conf
 # or directly:
-sudo -E bash scripts/update-cluster.sh --workers-only
+hbird update-cluster --workers-only --config cluster.local.conf
 ```
 
 Use when the CP is already on the target image (e.g. you upgraded it
@@ -275,10 +281,10 @@ Update exactly one node — either the CP or a single worker.
 make update-node CONFIG=cluster.local.conf NODE=hbird-w1
 
 # Or directly:
-sudo -E bash scripts/update-cluster.sh --node=hbird-w1
+hbird update-cluster --node=hbird-w1 --config cluster.local.conf
 
 # Update only the CP:
-sudo -E bash scripts/update-cluster.sh --node=hbird-cp1
+hbird update-cluster --node=hbird-cp1 --config cluster.local.conf
 ```
 
 Useful for:
@@ -300,7 +306,7 @@ appropriate when you're driving an upgrade manually and don't want the
 orchestrator touching the in-image timer.
 
 ```bash
-sudo -E bash scripts/update-cluster.sh --skip-drain
+hbird update-cluster --config cluster.local.conf --skip-drain
 ```
 
 Use sparingly — `kubectl drain` is the only thing keeping workloads
@@ -316,16 +322,16 @@ flag value.
 
 ```bash
 # Single override:
-sudo -E bash scripts/update-cluster.sh \
+hbird update-cluster --config cluster.local.conf \
   --node-name-override=hbird-w1=humbird-worker-748f4cf5
 
 # Multiple overrides via repeated flag:
-sudo -E bash scripts/update-cluster.sh \
+hbird update-cluster --config cluster.local.conf \
   --node-name-override=hbird-w1=humbird-worker-748f4cf5 \
   --node-name-override=hbird-w2=humbird-worker-baef476c
 
 # Equivalent via comma-separated value:
-sudo -E bash scripts/update-cluster.sh \
+hbird update-cluster --config cluster.local.conf \
   --node-name-override=hbird-w1=humbird-worker-748f4cf5,hbird-w2=humbird-worker-baef476c
 ```
 
@@ -352,7 +358,7 @@ gates added in PR #208. `wait_node_ready` alone is the post-reboot
 signal in this mode, which is what `update-cluster.sh` did pre-#208.
 
 ```bash
-sudo -E bash scripts/update-cluster.sh --skip-gates
+hbird update-cluster --config cluster.local.conf --skip-gates
 ```
 
 Use **only** if you've verified the cluster is healthy via other means
@@ -379,9 +385,9 @@ for IPs it would otherwise look up via `virsh domifaddr`. See
 for the non-dry-run unprivileged path.
 
 ```bash
-DRY_RUN=1 bash scripts/update-cluster.sh
+hbird update-cluster --config cluster.local.conf
 # or
-bash scripts/update-cluster.sh --dry-run
+hbird update-cluster --dry-run
 ```
 
 Useful for code review, CI smoke tests, and previewing a `--node=` /
@@ -395,7 +401,7 @@ processed and the loop continues from there.
 
 ```bash
 # Original run aborted after hbird-w1; pick up at hbird-w2:
-sudo -E bash scripts/update-cluster.sh --start-from=hbird-w2
+hbird update-cluster --config cluster.local.conf --start-from=hbird-w2
 ```
 
 Semantics:
@@ -419,7 +425,7 @@ remains **fail-fast** — a single drain failure or stuck `bootc upgrade`
 will abort the rest of the cluster's rollout.
 
 ```bash
-sudo -E bash scripts/update-cluster.sh --continue-on-error
+hbird update-cluster --config cluster.local.conf --continue-on-error
 ```
 
 Exit codes:
@@ -449,7 +455,7 @@ instance, is on `emptyDir` in many Helm charts and will lose pending
 samples on every roll.
 
 ```bash
-sudo -E bash scripts/update-cluster.sh --no-delete-emptydir-data
+hbird update-cluster --config cluster.local.conf --no-delete-emptydir-data
 ```
 
 Trade-off: drain will now **block** on any pod that has `emptyDir`
@@ -467,7 +473,7 @@ batch, replays each subshell's log in deterministic order, then moves
 to the next batch.
 
 ```bash
-sudo -E bash scripts/update-cluster.sh --parallel=2
+hbird update-cluster --config cluster.local.conf --parallel=2
 ```
 
 Defaults to `N=1` (serial; the historical behavior). The **CP is still
@@ -741,9 +747,11 @@ the WARN is now the only signal that bootc may have failed to reboot.
 Bounded by `SSH_DROP_TIMEOUT` (default 30s; 30 is generous for the
 typical ~5s systemd-run delay).
 
-Implementation: `wait_ssh_drop` in `scripts/update-cluster.sh`,
-inserted between `bootc_upgrade_apply` and `wait_ssh_back` in both
-`update_cp` and `update_worker`. The helper uses a fresh SSH probe
+Implementation: `wait_ssh_drop` in
+`rust/crates/hbird-cli/src/commands/update_cluster.rs` (post-#353
+cutover; bash twin removed), inserted between `bootc_upgrade_apply`
+and `wait_ssh_back` in both `update_cp` and `update_worker`. The
+helper uses a fresh SSH probe
 (`-o ControlPath=none -o ConnectTimeout=3 -o BatchMode=yes`) so each
 poll iteration actually attempts a new TCP handshake — without this,
 the persistent ControlMaster session would short-circuit on the
@@ -786,7 +794,8 @@ case where a worker times out at this gate — the node stays cordoned
 until the operator restores it.
 
 Implementation: `capture_node_bootid` + `wait_node_bootid_changed` in
-`scripts/update-cluster.sh`. The pre-bootid is captured **before**
+`rust/crates/hbird-cli/src/commands/update_cluster.rs` (post-#353
+cutover; bash twin removed). The pre-bootid is captured **before**
 `bootc_upgrade_apply` is called; `capture_node_bootid` retries up to
 3 times with a 2s sleep between attempts so a single transient
 apiserver flake doesn't silently regress the gate. If the capture is
@@ -995,7 +1004,7 @@ nodes via `--start-from=NAME`:
 ```bash
 # Original run made it through hbird-cp1 + hbird-w1, then failed on
 # hbird-w2 mid-drain. Operator hand-fixes hbird-w2's stuck pod, then:
-sudo -E bash scripts/update-cluster.sh \
+hbird update-cluster --config cluster.local.conf \
   --start-from=hbird-w2 \
   CONFIG=cluster.local.conf
 ```
@@ -1013,7 +1022,7 @@ Compose with `--continue-on-error` if you want a "best-effort resume"
 that doesn't re-abort on a different worker:
 
 ```bash
-sudo -E bash scripts/update-cluster.sh \
+hbird update-cluster --config cluster.local.conf \
   --start-from=hbird-w2 \
   --continue-on-error
 ```
@@ -1032,7 +1041,7 @@ it's worth tuning:
 
 ```bash
 # 5-worker cluster, PDBs allow 2 concurrent evictions:
-sudo -E bash scripts/update-cluster.sh --parallel=2
+hbird update-cluster --config cluster.local.conf --parallel=2
 ```
 
 The roughly-linear `5 × 5min ≈ 25min` worker time drops to
@@ -1091,7 +1100,8 @@ re-spread before the next eviction starts.
 ### `make` `FLAGS=` passthrough
 
 The Makefile targets honor a `FLAGS=` variable that's appended to the
-underlying `scripts/update-cluster.sh` invocation. This means you can
+underlying `hbird update-cluster` invocation (post-#353 cutover; the
+Rust twin replaced `scripts/update-cluster.sh`). This means you can
 stay in the `make` UX even for the operator-ergonomics flags:
 
 ```bash
@@ -1257,3 +1267,5 @@ for the full `make → hbird` flag map.
   `make → hbird` lookup table.
 - Upstream `bootc-upgrade(8)` — `man bootc-upgrade` on any node, or
   the bootc project README at <https://github.com/containers/bootc>.
+
+[#353]: https://github.com/aatchison/hummingbird-k8s/issues/353

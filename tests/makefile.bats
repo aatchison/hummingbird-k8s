@@ -9,8 +9,8 @@
 #   1.  `make help` exits 0 and lists at least 10 targets.
 #   2.  `make -n deploy-cluster CONFIG=…` -> bash scripts/deploy-cluster.sh
 #   3.  `make -n destroy-cluster CONFIG=…` -> bash scripts/destroy-cluster.sh
-#   4.  `make -n update-cluster CONFIG=…` -> bash scripts/update-cluster.sh
-#   5.  `make -n verify-all`     -> all three verify-* scripts in sequence
+#   4.  `make -n update-cluster CONFIG=…` -> hbird update-cluster (#353)
+#   5.  `make -n verify-all`     -> hbird verify all (#353)
 #   6.  `make -n backup-etcd`    -> bash scripts/backup-etcd.sh (no LABEL)
 #   7.  `make -n switch-to-ghcr` -> bash scripts/switch-to-ghcr.sh
 #   8.  `make -n clean`          -> includes clean-vms (scripts/clean-vms.sh) + clean-images
@@ -84,23 +84,20 @@ make_dry() {
   [[ "$output" == *"bash scripts/destroy-cluster.sh"* ]]
 }
 
-@test "4. make -n update-cluster CONFIG=… invokes scripts/update-cluster.sh" {
+@test "4. make -n update-cluster CONFIG=… invokes hbird update-cluster (#353)" {
+  # v0.1.0 cutover (#353): scripts/update-cluster.sh removed; Makefile
+  # now delegates to the Rust twin `hbird update-cluster`.
   make_dry update-cluster CONFIG=cluster.example.conf
-  [[ "$output" == *"bash scripts/update-cluster.sh"* ]]
+  [[ "$output" == *"hbird update-cluster"* ]]
 }
 
-@test "5. make -n verify-all runs verify-encryption, verify-hardening, verify-app-deploy in sequence" {
+@test "5. make -n verify-all invokes hbird verify all (#353)" {
+  # v0.1.0 cutover (#353): scripts/verify-*.sh removed; verify-all now
+  # delegates to the single Rust twin `hbird verify all` which chains
+  # encryption -> hardening -> app-deploy internally (with verify-all
+  # context labels per VerifySubcommand::All).
   make_dry verify-all
-  # Each verify-* script must appear, and in the documented order.
-  [[ "$output" == *"bash scripts/verify-encryption.sh"* ]]
-  [[ "$output" == *"bash scripts/verify-hardening.sh"* ]]
-  [[ "$output" == *"bash scripts/verify-app-deploy.sh"* ]]
-  # Sequence check: find line numbers and confirm ordering.
-  enc_line=$(printf '%s\n' "$output" | grep -n 'verify-encryption.sh'  | head -1 | cut -d: -f1)
-  hard_line=$(printf '%s\n' "$output" | grep -n 'verify-hardening.sh' | head -1 | cut -d: -f1)
-  app_line=$(printf '%s\n' "$output" | grep -n 'verify-app-deploy.sh' | head -1 | cut -d: -f1)
-  [ "$enc_line" -lt "$hard_line" ]
-  [ "$hard_line" -lt "$app_line" ]
+  [[ "$output" == *"hbird verify all"* ]]
 }
 
 @test "6. make -n backup-etcd invokes scripts/backup-etcd.sh with no LABEL" {
@@ -390,65 +387,47 @@ make_dry() {
   done
 }
 
-@test "21. verify-encryption forwards CONFIG + KVM_HOST to scripts/verify-encryption.sh (#333)" {
-  # Regression for #333: `make verify-encryption CONFIG=… KVM_HOST=…` must
-  # propagate BOTH env vars to the wrapped script. Pre-fix, the recipe
-  # was a bare `bash scripts/verify-encryption.sh` with no env prefix,
-  # so operator-supplied CONFIG/KVM_HOST were silently dropped and the
-  # script bailed with "CP_NAME unset / CONFIG not sourced". Dry-run
-  # rendering must show both vars exported on the script invocation.
+@test "21. verify-encryption forwards CONFIG + KVM_HOST to hbird verify encryption (#333/#353)" {
+  # Regression for #333 (carried into post-#353 Rust shape): `make
+  # verify-encryption CONFIG=… KVM_HOST=…` must propagate BOTH env
+  # vars to the wrapped command. Pre-#333 fix, the recipe was a bare
+  # invocation with no env prefix, so operator-supplied CONFIG/KVM_HOST
+  # were silently dropped and the verifier bailed with "CP_NAME unset".
+  # Dry-run rendering must show both vars exported on the hbird call.
   #
-  # Match-pattern note: the Makefile recipe renders CONFIG="…" / KVM_HOST="…"
-  # with the operator-supplied value double-quoted (so values with shell
-  # metacharacters are passed safely). Tests use a regex that tolerates
-  # both quoted and unquoted forms so a future un-quoting (or env-prefix
-  # refactor) doesn't false-fail.
+  # Match-pattern note: the Makefile recipe renders CONFIG="…" /
+  # KVM_HOST="…" with the operator-supplied value double-quoted. Tests
+  # use a regex that tolerates both quoted and unquoted forms so a
+  # future un-quoting refactor doesn't false-fail.
   make_dry verify-encryption CONFIG=cluster.example.conf KVM_HOST=geary
-  [[ "$output" == *"bash scripts/verify-encryption.sh"* ]]
+  [[ "$output" == *"hbird verify encryption"* ]]
   printf '%s\n' "$output" | grep -qE 'CONFIG="?cluster\.example\.conf"?'
   printf '%s\n' "$output" | grep -qE 'KVM_HOST="?geary"?'
 }
 
-@test "22. verify-hardening forwards CONFIG + KVM_HOST to scripts/verify-hardening.sh (#333)" {
+@test "22. verify-hardening forwards CONFIG + KVM_HOST to hbird verify hardening (#333/#353)" {
   make_dry verify-hardening CONFIG=cluster.example.conf KVM_HOST=geary
-  [[ "$output" == *"bash scripts/verify-hardening.sh"* ]]
+  [[ "$output" == *"hbird verify hardening"* ]]
   printf '%s\n' "$output" | grep -qE 'CONFIG="?cluster\.example\.conf"?'
   printf '%s\n' "$output" | grep -qE 'KVM_HOST="?geary"?'
 }
 
-@test "23. verify-app-deploy forwards CONFIG + KVM_HOST to scripts/verify-app-deploy.sh (#333)" {
+@test "23. verify-app-deploy forwards CONFIG + KVM_HOST to hbird verify app-deploy (#333/#353)" {
   make_dry verify-app-deploy CONFIG=cluster.example.conf KVM_HOST=geary
-  [[ "$output" == *"bash scripts/verify-app-deploy.sh"* ]]
+  [[ "$output" == *"hbird verify app-deploy"* ]]
   printf '%s\n' "$output" | grep -qE 'CONFIG="?cluster\.example\.conf"?'
   printf '%s\n' "$output" | grep -qE 'KVM_HOST="?geary"?'
 }
 
-@test "24. verify-all forwards CONFIG + KVM_HOST to all three sub-verifiers (#333)" {
-  # verify-all is the aggregate target operators invoke for a full
-  # post-deploy validation pass. Forwarding must reach every leg, not
-  # just the first one — so we assert each script's invocation carries
-  # both env vars in the rendered dry-run.
-  #
-  # `make -n` preserves recipe `\`-continuations as separate lines, so
-  # multi-line recipes (e.g. verify-hardening, which also sets KUBECTL)
-  # render across several stdout lines. We grab a 3-line preceding-context
-  # window for each script invocation and assert both env vars appear in
-  # that block — covering both single-line and continuation-line recipes.
+@test "24. verify-all forwards CONFIG + KVM_HOST to hbird verify all (#333/#353)" {
+  # Post-#353 cutover: verify-all is now a single `hbird verify all`
+  # call (the Rust twin chains the three sub-verifiers internally with
+  # verify-all step N/3 context labels), so the test just asserts the
+  # one delegated invocation carries CONFIG + KVM_HOST.
   make_dry verify-all CONFIG=cluster.example.conf KVM_HOST=geary
-  for script in verify-encryption.sh verify-hardening.sh verify-app-deploy.sh; do
-    block=$(printf '%s\n' "$output" | grep -B3 -E "bash scripts/${script}" | head -20)
-    [ -n "$block" ] || { echo "no invocation line for $script in dry-run output" >&2; echo "$output" >&2; return 1; }
-    printf '%s\n' "$block" | grep -qE 'CONFIG="?cluster\.example\.conf"?' || {
-      echo "verify-all leg for $script missing CONFIG forwarding:" >&2
-      echo "$block" >&2
-      return 1
-    }
-    printf '%s\n' "$block" | grep -qE 'KVM_HOST="?geary"?' || {
-      echo "verify-all leg for $script missing KVM_HOST forwarding:" >&2
-      echo "$block" >&2
-      return 1
-    }
-  done
+  [[ "$output" == *"hbird verify all"* ]]
+  printf '%s\n' "$output" | grep -qE 'CONFIG="?cluster\.example\.conf"?'
+  printf '%s\n' "$output" | grep -qE 'KVM_HOST="?geary"?'
 }
 
 @test "20. every Makefile ?= default has a row in docs/makefile.md Variables table (#271 F7)" {

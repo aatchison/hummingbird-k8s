@@ -206,7 +206,7 @@ the `make` command line for the targets that use them.
 | ---                 | ---                           | ---                           |
 | `CONFIG`            | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig`, `nodes`, `kubectl` (CONFIG is optional for `nodes`/`kubectl`; when set, the script reads CP_NAME/KVM_HOST from it) |
 | `NODE`              | (required for `update-node`)  | `update-node`                 |
-| `FLAGS`             | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to `scripts/update-cluster.sh`: `--dry-run`, `--parallel=N`, `--start-from=NAME`, `--continue-on-error`, `--no-delete-emptydir-data`, `--skip-drain`) |
+| `FLAGS`             | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to `hbird update-cluster` (post-#353, was `scripts/update-cluster.sh`): `--dry-run`, `--parallel=N`, `--start-from=NAME`, `--continue-on-error`, `--no-delete-emptydir-data`, `--skip-drain`) |
 | `ARGS`              | empty                         | `kubectl` (pass-through, e.g. `ARGS='get pods -A'`) |
 | `LABEL`             | empty                         | `backup-etcd` (optional `--label <text>` suffix on the snapshot filename) |
 | `SNAP`              | (required for `restore-etcd`) | `restore-etcd` (path to the `.db` snapshot to restore) |
