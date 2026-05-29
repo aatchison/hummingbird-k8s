@@ -28,7 +28,7 @@ issue() {
 }
 
 issue "Drop hardcoded sudo password from build scripts" "hardening,k8s,worker" \
-"\`build*.sh\` bake \`1234asdf\` as the sudo password via \`bib-config.toml\`. Switch to SSH-key-only (drop \`password =\` from the bib config) and require explicit key auth."
+"\`build*.sh\` bake a hardcoded sudo password into \`bib-config.toml\`. Switch to SSH-key-only (drop \`password =\` from the bib config) and require explicit key auth."
 
 issue "Disable sshd password authentication in images" "hardening" \
 "Drop a \`/etc/ssh/sshd_config.d/99-no-password.conf\` with \`PasswordAuthentication no\` and \`ChallengeResponseAuthentication no\` into every flavor's Containerfile."
