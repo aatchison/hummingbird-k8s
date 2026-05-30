@@ -306,6 +306,112 @@ the VM intentionally tracks the local build — there are two knobs:
   the timer. Use `systemctl mask` for a sticky disable, or rebuild the
   image with the timer dropped from the preset for a fleet-wide disable.
 
+## Long-term drift: deployed state vs operator-intended state
+
+The auto-update timer is *designed* to advance a deployed cluster over
+time — that's the whole point of unattended updates. The side effect
+worth naming explicitly is that **a cluster you deployed weeks ago is no
+longer running the image you deployed.** Each `BOOTC_UPDATE_SCHEDULE`
+tick (or the daily default) silently promotes every node to the highest
+semver tag published at GHCR since the last wake, with no operator action
+and no announcement. Over many releases this is *drift*: the live cluster
+diverges from whatever ref the operator last built, deployed, or reasoned
+about locally.
+
+`BOOTC_UPDATE_SCHEDULE` (set in `cluster.local.conf`, see
+`cluster.example.conf`) only changes the *cadence* of this — it writes the
+timer's `OnCalendar=` drop-in at first boot (see
+[Schedule customization](#schedule-customization)). A faster schedule
+(`hourly`, `*:0/15`) just makes the drift land sooner; it does not change
+the destination. The destination is the highest semver tag at the
+flavor's REPO. (If a host has been opted back into the legacy
+`bootc-fetch-apply-updates.timer` — see
+[Re-enabling the legacy timer](#re-enabling-the-legacy-timer) — the
+destination is instead the mutable `:latest` pointer, and the drift is
+both faster and unbounded by tagging.)
+
+### Why this surprises operators
+
+This is a different confusion class from the deploy-time
+false-positive boot-test mechanisms tracked under epic #378:
+
+| | Deploy-time false positive (#373/#374/#375/#377) | Long-term drift (this, #376) |
+|---|---|---|
+| When | During `make deploy-cluster` / `spawn-workers` | Days/weeks *after* a successful deploy |
+| Cause | A silent override points the boot test at the wrong image (stale cache, `SWITCH_TO_GHCR`, post-spawn switch, config clobber of CLI env) | The semver timer advances the live cluster on its own schedule |
+| Symptom | "The boot test passed but tested the wrong image" | "My cluster isn't running the image I deployed, and I never touched it" |
+| Intent | Unintended — a bug to fix | Intended — the auto-update design working as specified |
+
+The two interact: the override family (#373/#374/#375/#377) determines
+*what image a freshly-deployed node starts on*, and
+`BOOTC_UPDATE_SCHEDULE` then determines *how fast that node walks away
+from it.* An operator chasing "why did my `deploy-cluster` test behave
+unexpectedly" should check both — the deploy-time image selection **and**
+whether the timer has since moved the node. A node that booted on the
+intended image yesterday can be on a newer tag today purely because a
+release was tagged overnight and the timer fired.
+
+### Detecting drift
+
+Ask each node what it's actually booted on and compare against what you
+expect:
+
+```bash
+# what the node is running right now
+sudo bootc status --json | jq -r '.status.booted.image.image.image'
+# → ghcr.io/aatchison/hummingbird-k8s:v0.4.5   (timer has advanced it)
+
+# what the timer will move it to on its next wake
+sudo bash -c 'source /etc/hummingbird/bootc-update.env; \
+  skopeo list-tags "docker://${REPO}" \
+    | jq -r ".Tags[]" \
+    | grep -E "^${PREFIX-v}[0-9]+\.[0-9]+\.[0-9]+$" \
+    | sort -V | tail -1'
+# → v0.4.6   (next wake will stage this)
+
+# when that wake is
+systemctl list-timers bootc-semver-update.timer
+```
+
+If the booted tag is higher than the tag you last deployed/tested, the
+timer has drifted the node forward — expected, but now you know.
+
+### Pinning or disabling to stop drift
+
+When you need the cluster to *hold still* — during an investigation, a
+test session, or a maintenance freeze — stop the timer rather than
+fighting its schedule:
+
+```bash
+# Hold this node at its current deployment (sticky across bootc upgrade):
+sudo systemctl mask --now bootc-semver-update.timer
+
+# Lighter, NON-sticky pause (a bootc upgrade re-enables it from the preset):
+sudo systemctl disable --now bootc-semver-update.timer
+```
+
+`mask` is the durable choice — a plain `disable` is reverted by the
+preset on the next image upgrade (see the Operational caveats above and
+the `BOOTC_SWITCH_TO_GHCR` / per-host caveat). To freeze the **whole
+fleet** by policy rather than per host, simply stop tagging releases:
+with the semver timer, an untagged repo has nothing newer to advance to,
+so the fleet naturally holds at the last published tag (see
+[Why semver instead of `:latest`](#why-semver-instead-of-latest)).
+
+To *re-pin* a node to a specific older tag (e.g. roll a drifted node back
+to a known-good release and keep it there), `bootc switch` to the exact
+tag and then mask the timer so it can't advance again:
+
+```bash
+sudo bootc switch ghcr.io/aatchison/hummingbird-k8s:v0.4.2
+sudo systemctl mask --now bootc-semver-update.timer
+sudo reboot
+```
+
+For a *coordinated* freeze + controlled rollout instead of an
+unattended one, use `make update-cluster` (next section), which stops the
+in-image timer per node for the duration of its run.
+
 ## Operator-driven rolling upgrades
 
 The per-VM timer is the unattended path: each node wakes up
