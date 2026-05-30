@@ -205,6 +205,18 @@ RUN curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/cilium-linux-${TARGETARCH}.tar
  && rm -f "/tmp/cilium-linux-${TARGETARCH}.tar.gz" "/tmp/cilium-linux-${TARGETARCH}.tar.gz.sha256sum" \
  && /usr/bin/cilium version --client
 
+# org.opencontainers.image.revision stamps the building commit SHA so the
+# #373/#384 GHCR cache-freshness gate (lib/cache-utils.sh hbird_image_vcs_ref)
+# can detect a published image that predates the on-disk Containerfile (#385).
+# Declared here, at the very end of the build, so the per-commit REVISION value
+# only invalidates this trailing metadata layer — the expensive package/RUN
+# layers above stay cache-eligible against --cache-from in build-k8s.yml.
+# Defaults empty so local `make build-k8s` (scripts/build-k8s.sh) still builds
+# without a REVISION arg; the local cache path keys off the Containerfile hash,
+# not this label, so an empty value there is correct.
+ARG REVISION=""
+
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s
 LABEL org.opencontainers.image.description="Fedora Hummingbird bootc image with upstream Kubernetes (kubelet/kubeadm/cri-o), control plane"
+LABEL org.opencontainers.image.revision="${REVISION}"

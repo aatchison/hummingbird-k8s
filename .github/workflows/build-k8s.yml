@@ -84,6 +84,11 @@ jobs:
           # TARGETARCH to fetch the right cilium-cli tarball per arch.
           # Closes #107.
           platforms: linux/amd64
+          # Stamp the building commit SHA into org.opencontainers.image.revision
+          # (see the ARG/LABEL at the end of the Containerfile) so the #373/#384
+          # GHCR cache-freshness gate can detect a stale published image (#385).
+          build-args: |
+            REVISION=${{ github.sha }}
           # Reuse layers from the previously published :latest when available.
           # buildah tolerates a missing remote (first-time cache miss); no
           # --pull-always so a registry hiccup doesn't break a real publish.

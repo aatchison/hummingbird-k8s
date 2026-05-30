@@ -89,6 +89,11 @@ jobs:
           # Multi-arch: emit a manifest index containing both linux/amd64
           # and linux/arm64 child manifests. Closes #107.
           platforms: linux/amd64
+          # Stamp the building commit SHA into org.opencontainers.image.revision
+          # (see the ARG/LABEL at the end of the Containerfile) so the #373/#384
+          # GHCR cache-freshness gate can detect a stale published image (#385).
+          build-args: |
+            REVISION=${{ github.sha }}
           # Reuse layers from the previously published :latest when available.
           # buildah tolerates a missing remote (first-time cache miss); no
           # --pull-always so a registry hiccup doesn't break a real publish.
