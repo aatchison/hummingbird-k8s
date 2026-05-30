@@ -633,6 +633,42 @@ To disable auto-update entirely after deploy:
 ssh root@<vm-ip> systemctl disable --now bootc-fetch-apply-updates.timer
 ```
 
+### `FORCE_SWITCH` — force the GHCR switch under `FORCE_REBUILD`
+
+`FORCE_SWITCH` governs `scripts/switch-to-ghcr.sh`'s single-VM / post-spawn path. When a node
+was freshly rebuilt locally (`FORCE_REBUILD=1`), that path **skips** re-pointing it at GHCR so
+it keeps tracking the local image being boot-tested (#375/#382); `FORCE_SWITCH=1` overrides
+that skip and forces the switch anyway. Default is off, and it is allowlisted for `KVM_HOST=`
+forwarding (#383). It is *not* a way to re-point an already-on-GHCR node — for the hard "switch
+nothing" escape hatch use `BOOTC_SWITCH_TO_GHCR=0` (see [auto-updates.md](auto-updates.md)).
+The full boot-test knob family — `IMAGE_SOURCE`, `FORCE_REBUILD`, `STRICT_CACHE`,
+`SWITCH_TO_GHCR`, `FORCE_SWITCH`, `BOOTC_SWITCH_TO_GHCR` — is consolidated in
+[boot-test-overrides.md](boot-test-overrides.md).
+
+### `FORCE_SWITCH` — force the GHCR switch under `FORCE_REBUILD`
+
+`FORCE_SWITCH` governs `scripts/switch-to-ghcr.sh`'s single-VM / post-spawn path. When a node
+was freshly rebuilt locally (`FORCE_REBUILD=1`), that path **skips** re-pointing it at GHCR so
+it keeps tracking the local image being boot-tested (#375/#382); `FORCE_SWITCH=1` overrides
+that skip and forces the switch anyway. Default is off, and it is allowlisted for `KVM_HOST=`
+forwarding (#383). It is *not* a way to re-point an already-on-GHCR node — for the hard "switch
+nothing" escape hatch use `BOOTC_SWITCH_TO_GHCR=0` (see [auto-updates.md](auto-updates.md)).
+The full boot-test knob family — `IMAGE_SOURCE`, `FORCE_REBUILD`, `STRICT_CACHE`,
+`SWITCH_TO_GHCR`, `FORCE_SWITCH`, `BOOTC_SWITCH_TO_GHCR` — is consolidated in
+[boot-test-overrides.md](boot-test-overrides.md).
+
+### `FORCE_SWITCH` — force the GHCR switch under `FORCE_REBUILD`
+
+`FORCE_SWITCH` governs `scripts/switch-to-ghcr.sh`'s single-VM / post-spawn path. When a node
+was freshly rebuilt locally (`FORCE_REBUILD=1`), that path **skips** re-pointing it at GHCR so
+it keeps tracking the local image being boot-tested (#375/#382); `FORCE_SWITCH=1` overrides
+that skip and forces the switch anyway. Default is off, and it is allowlisted for `KVM_HOST=`
+forwarding (#383). It is *not* a way to re-point an already-on-GHCR node — for the hard "switch
+nothing" escape hatch use `BOOTC_SWITCH_TO_GHCR=0` (see [auto-updates.md](auto-updates.md)).
+The full boot-test knob family — `IMAGE_SOURCE`, `FORCE_REBUILD`, `STRICT_CACHE`,
+`SWITCH_TO_GHCR`, `FORCE_SWITCH`, `BOOTC_SWITCH_TO_GHCR` — is consolidated in
+[boot-test-overrides.md](boot-test-overrides.md).
+
 ## Customizing auto-update
 
 The image ships a `bootc-semver-update.timer` that fires daily with a
