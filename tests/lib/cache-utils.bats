@@ -273,3 +273,79 @@ _stub_image_ref() {  # $1 = revision the stubbed podman reports
   [[ "$output" == *"ERROR"* ]]
   [[ "$output" == *"cannot prove freshness"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Build-ID Scope tests (S8, #9b)
+# ---------------------------------------------------------------------------
+
+@test "cache_build_id: LOCAL build-id differs when BASE_IMAGE changes" {
+  # Mock render_bib_config to be stable
+  render_bib_config() { printf 'stable-config\n'; }
+  export -f render_bib_config
+
+  # Use a dummy Containerfile
+  printf 'FROM scratch' > "${BATS_TEST_TMPDIR}/CF"
+  
+  # Run 1: Base A
+  BASE_IMAGE="image-a" ENABLE_CLOUD_INIT=0 \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_a="$output"
+
+  # Run 2: Base B
+  BASE_IMAGE="image-b" ENABLE_CLOUD_INIT=0 \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_b="$output"
+
+  [ "$id_a" != "$id_b" ]
+}
+
+@test "cache_build_id: LOCAL build-id differs when bib-config (VM_USER/pubkeys) changes" {
+  render_bib_config() { printf "user=%s\n" "$VM_USER"; }
+  export -f render_bib_config
+  printf 'FROM scratch' > "${BATS_TEST_TMPDIR}/CF"
+
+  # Run 1: User A
+  VM_USER="alice" BASE_IMAGE="image-a" ENABLE_CLOUD_INIT=0 \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_a="$output"
+
+  # Run 2: User B
+  VM_USER="bob" BASE_IMAGE="image-a" ENABLE_CLOUD_INIT=0 \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_b="$output"
+
+  [ "$id_a" != "$id_b" ]
+}
+
+@test "cache_build_id: LOCAL build-id differs when ENABLE_CLOUD_INIT changes" {
+  render_bib_config() { printf 'stable-config\n'; }
+  export -f render_bib_config
+  printf 'FROM scratch' > "${BATS_TEST_TMPDIR}/CF"
+
+  # Run 1: Disabled
+  ENABLE_CLOUD_INIT=0 BASE_IMAGE="image-a" \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_0="$output"
+
+  # Run 2: Enabled
+  ENABLE_CLOUD_INIT=1 BASE_IMAGE="image-a" \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_1="$output"
+
+  [ "$id_0" != "$id_1" ]
+}
+
+@test "cache_build_id: GHCR path remains unchanged (only vcs-ref matters)" {
+  # For GHCR, we only use the vcs-ref.
+  # We verify that changing BASE_IMAGE or bib-config doesn't affect the GHCR build-id.
+  
+  # GHCR Build ID is just ghcr:<vcs-ref>
+  id_1=$(hbird_cache_build_id ghcr "acef96c")
+  
+  # Change other knobs
+  BASE_IMAGE="different-base"
+  VM_USER="different-user"
+  id_2=$(hbird_cache_build_id ghcr "acef96c")
+  
+  [ "$id_1" = "$id_2" ]
+}

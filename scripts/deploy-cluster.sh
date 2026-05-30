@@ -642,7 +642,16 @@ build_template() {
   if [[ "$IMAGE_SOURCE" == "ghcr" ]]; then
     build_id="$(hbird_cache_build_id ghcr "$(hbird_image_vcs_ref "$image_ref")")"
   else
-    build_id="$(hbird_cache_build_id local "$(hbird_containerfile_ref "$containerfile")")"
+    # Local build identity is a composite of the Containerfile content,
+    # the BASE_IMAGE, the rendered bib-config, and the cloud-init flag.
+    local composite_id
+    composite_id="$(printf '%s\n%s\n%s\n%s' \
+      "$(hbird_containerfile_ref "$containerfile")" \
+      "${BASE_IMAGE:-}" \
+      "$(render_bib_config)" \
+      "${ENABLE_CLOUD_INIT:-0}" \
+      | sha256sum | cut -c1-12)"
+    build_id="$(hbird_cache_build_id local "$composite_id")"
   fi
   force_this="${FORCE_REBUILD:-}"
   hbird_assess_qcow2_cache "$qcow" "$build_id" "$label" || rc=$?

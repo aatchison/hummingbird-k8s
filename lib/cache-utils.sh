@@ -68,6 +68,9 @@ hbird_image_vcs_ref() {
 # equal even when the bits are identical — #373 round-2 MED). An empty <id>
 # (unverifiable — e.g. a GHCR image with no revision label) yields EMPTY so it
 # is never recorded and never actionable.
+# For LOCAL source, the <id> should fold in the BASE_IMAGE and any
+# config-derived identities (e.g. a digest of render_bib_config output)
+# so that changes to the underlying OS or user/ssh config bust the cache.
 hbird_cache_build_id() {
   local source="$1" id="$2"
   [[ -n "$id" ]] || return 0
@@ -208,4 +211,18 @@ hbird_assess_qcow2_cache() {
   printf 'WARN: cached %s build-ref %s differs from expected %s; forcing rebuild. (#373)\n' \
     "$label" "$cached" "$expected" >&2
   return 10
+}
+
+# hbird_local_build_id_calc <containerfile>
+# Internal helper for testing: calculates the composite LOCAL build-id.
+hbird_local_build_id_calc() {
+  local cf="$1"
+  local composite_id
+  composite_id="$(printf '%s\n%s\n%s\n%s' \
+    "$(hbird_containerfile_ref "$cf")" \
+    "${BASE_IMAGE:-}" \
+    "$(render_bib_config)" \
+    "${ENABLE_CLOUD_INIT:-0}" \
+    | sha256sum | cut -c1-12)"
+  hbird_cache_build_id local "$composite_id"
 }
