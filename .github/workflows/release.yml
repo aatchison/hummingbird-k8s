@@ -18,7 +18,6 @@ name: Release hbird CLI
 on:
   push:
     tags: ['v*']
-    branches: ["ci/forgejo-harden-push"]  # temp: strip post-merge
   workflow_dispatch:
     inputs:
       version:

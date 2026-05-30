@@ -3,7 +3,6 @@ name: Build & publish — hummingbird-k8s
 on:
   push:
     tags: ['k8s/v*']
-    branches: ["ci/forgejo-harden-push"]  # temp: strip post-merge
   workflow_dispatch:
     inputs:
       version:

@@ -31,13 +31,11 @@
 # Anything unverifiable — empty ref on either side, or two refs from different
 # sources that aren't comparable — is "cannot tell" and resolves to "reuse
 # silently" in BOTH normal and STRICT_CACHE modes. This matters because the
-# DEFAULT path is `IMAGE_SOURCE=ghcr` and the published Containerfiles do not
-# stamp `org.opencontainers.image.revision` yet (release.yml passes a REVISION
-# build-arg the Containerfile drops). If "unverifiable" forced action, every
-# default deploy would do a full bib rebuild (or hard-fail under STRICT_CACHE)
-# even when nothing changed — defeating build_qcow2's skip-if-exists fast path.
-# Teaching the Containerfiles to stamp the label is an out-of-scope follow-up;
-# once it lands, the CONFIRMED-mismatch path starts firing for ghcr too.
+# DEFAULT path is `IMAGE_SOURCE=ghcr` and the published Containerfiles stamp
+# `org.opencontainers.image.revision` via the REVISION build-arg (release.yml,
+# build-k8s.yml, build-worker.yml all pass it; #385/#387). The CONFIRMED-mismatch
+# path therefore fires for Forgejo-registry images when the running commit differs
+# from the deployed image's revision label — STRICT_CACHE+ghcr is functional.
 
 # Guard against double-source (deploy-cluster.sh + a test both sourcing).
 [[ -n "${_HBIRD_CACHE_UTILS_SH:-}" ]] && return 0
