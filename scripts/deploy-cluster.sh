@@ -182,6 +182,31 @@ worker_user_data() {
   } > "$out_file"
 }
 
+# resolve_switch_to_ghcr: #374 guard against the second false-positive
+# boot-test mechanism (sibling to #373's qcow2 cache reuse). FORCE_REBUILD=1
+# signals the operator is testing a SPECIFIC freshly-built image (a local
+# build, or a forced GHCR re-pull). But when SWITCH_TO_GHCR=true the render
+# functions above emit a first-boot `bootc switch ghcr.io/...:$GHCR_TAG` on
+# both the CP (~L88) and the workers (~L170) — which would immediately replace
+# those just-built bits with whatever the registry currently serves, silently
+# defeating the test (this is exactly how PR #367's cycle-2 boot-test came up
+# green on the PRE-change Cilium). So when FORCE_REBUILD=1 AND
+# SWITCH_TO_GHCR=true, auto-disable the switch with a loud WARN — unless the
+# operator opts back in with FORCE_SWITCH=1 (the rare "rebuild, then
+# deliberately run the registry image" case). FORCE_SWITCH mirrors the exact
+# knob name spawn-workers.sh uses (#375) for silent-override-family
+# consistency. Mutates the global SWITCH_TO_GHCR; idempotent; a no-op unless
+# both flags are set. (#374.)
+resolve_switch_to_ghcr() {
+  [[ "${FORCE_REBUILD:-}" == "1" && "${SWITCH_TO_GHCR:-}" == "true" ]] || return 0
+  if [[ "${FORCE_SWITCH:-}" == "1" ]]; then
+    log "FORCE_SWITCH=1: keeping SWITCH_TO_GHCR=true despite FORCE_REBUILD=1 — the freshly-built image WILL be replaced by ghcr.io/...:${GHCR_TAG:-latest} at first boot (explicit opt-in)."
+    return 0
+  fi
+  log "WARN: FORCE_REBUILD=1 with SWITCH_TO_GHCR=true would replace your freshly-built qcow2 with ghcr.io/...:${GHCR_TAG:-latest} at first boot, silently defeating a local boot-test (#374). Auto-disabling the GHCR switch; set FORCE_SWITCH=1 to keep it."
+  SWITCH_TO_GHCR=false
+}
+
 # Source-only mode for bats: when HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1, return
 # from `source` here so the test can call render_cp_user_data / worker_user_data
 # without the script's root/libvirt orchestration kicking in. (#181 round-2,
@@ -311,7 +336,7 @@ trap cleanup_on_failure EXIT
 # here (printf -v on an array name would mangle it).
 # shellcheck disable=SC2034  # snapshot vars are read indirectly via printf -v
 HBIRD_CLI_OVERRIDE_KNOBS=(
-  IMAGE_SOURCE GHCR_ORG GHCR_TAG SWITCH_TO_GHCR AUTO_UPDATE_CP
+  IMAGE_SOURCE GHCR_ORG GHCR_TAG SWITCH_TO_GHCR FORCE_SWITCH AUTO_UPDATE_CP
   FORCE_REBUILD STRICT_CACHE ENABLE_CLOUD_INIT RUN_VERIFY
   BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER
   BOOTC_SWITCH_TO_GHCR KVM_HOST
@@ -437,6 +462,13 @@ esac
 case "$AUTO_UPDATE_CP" in true|false) ;; *) fail "AUTO_UPDATE_CP must be true or false (got '$AUTO_UPDATE_CP')" ;; esac
 case "$SWITCH_TO_GHCR" in true|false) ;; *) fail "SWITCH_TO_GHCR must be true or false (got '$SWITCH_TO_GHCR')" ;; esac
 case "$STRICT_CACHE" in 0|1) ;; *) fail "STRICT_CACHE must be 0 or 1 (got '$STRICT_CACHE')" ;; esac
+
+# #374 guard: FORCE_REBUILD=1 + SWITCH_TO_GHCR=true auto-disables the first-boot
+# GHCR switch (unless FORCE_SWITCH=1) so a freshly-built image isn't silently
+# replaced by the registry's. Runs BEFORE the render functions read
+# SWITCH_TO_GHCR, so both the CP and worker cloud-init inherit the resolved
+# value from a single decision + WARN.
+resolve_switch_to_ghcr
 
 # If IMAGE_SOURCE wasn't in the operator's config (pre-#231 was a
 # `:?` hard-fail; #231 made `ghcr` the default), surface the resolution
