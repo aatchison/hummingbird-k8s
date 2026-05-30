@@ -142,11 +142,12 @@ hbird_assess_ghcr_image() {
     *)
       # Cannot determine: no revision label on the image (the current default
       # — see header), or its commit is not in this checkout's git history.
+      if hbird_cache_strict_enabled; then
+        printf 'ERROR: cannot prove freshness under STRICT_CACHE=1; rebuild with FORCE_REBUILD=1.\n' >&2
+        return 3
+      fi
       # Unverifiable is NOT a confirmed mismatch, so it resolves to "reuse
-      # silently" in BOTH modes (#373 round-2 HIGH). Failing closed here would
-      # make STRICT_CACHE=1 + the default ghcr path fail on EVERY deploy until
-      # the Containerfiles stamp a revision label. Only a CONFIRMED drift
-      # (rc 1 above) is actionable.
+      # silently" in non-strict mode (#373 round-2 HIGH).
       return 0
       ;;
   esac
@@ -179,11 +180,24 @@ hbird_assess_qcow2_cache() {
   # Empty id on either side (unverifiable — e.g. the default ghcr path's
   # missing revision label, or a sidecar-less legacy qcow2) or a cross-source
   # comparison (operator switched IMAGE_SOURCE) is "cannot tell" -> reuse
-  # silently. This preserves skip-if-exists on the default path and avoids the
-  # cross-mode churn that a content-hash-vs-git-commit compare would cause.
-  # (#373 round-2 HIGH + MED.)
-  [[ -n "$cached_id" && -n "$exp_id" ]] || return 0
-  [[ "$cached_src" == "$exp_src" ]]     || return 0
+  # silently in non-strict mode. Under STRICT_CACHE=1, unverifiable MUST
+  # FAIL CLOSED (rc 3). This preserves skip-if-exists on the default path
+  # for non-strict deploys while ensuring CI / boot-tests can prove they
+  # are NOT using a stale template (#373 round-2 HIGH + MED.)
+  [[ -n "$cached_id" && -n "$exp_id" ]] || {
+    if hbird_cache_strict_enabled; then
+      printf 'ERROR: cannot prove freshness under STRICT_CACHE=1; rebuild with FORCE_REBUILD=1.\n' >&2
+      return 3
+    fi
+    return 0
+  }
+  [[ "$cached_src" == "$exp_src" ]]     || {
+    if hbird_cache_strict_enabled; then
+      printf 'ERROR: cannot prove freshness under STRICT_CACHE=1; rebuild with FORCE_REBUILD=1.\n' >&2
+      return 3
+    fi
+    return 0
+  }
   [[ "$cached_id" != "$exp_id" ]]       || return 0
 
   if hbird_cache_strict_enabled; then

@@ -177,14 +177,14 @@ _stub_image_ref() {  # $1 = revision the stubbed podman reports
   [ -z "$output" ]
 }
 
-@test "assess_ghcr_image: unverifiable (no label), STRICT_CACHE=1 -> rc 0 (reuse, only confirmed drift fails)" {
-  # #373 round-2: unverifiable is NOT a confirmed mismatch. STRICT_CACHE must
-  # NOT hard-fail the default ghcr path on every deploy just because today's
-  # images carry no revision label — only a CONFIRMED drift (rc 1) fails.
+@test "assess_ghcr_image: unverifiable (no label), STRICT_CACHE=1 -> rc 3 + ERROR (fail-closed)" {
+  # #373 round-2: unverifiable is NOT a confirmed mismatch. However, under
+  # STRICT_CACHE=1, we fail closed because we cannot prove freshness.
   _stub_image_ref ""
   STRICT_CACHE=1 run hbird_assess_ghcr_image ghcr.io/x:latest "CP image" containers/k8s/Containerfile
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"ERROR"* ]]
+  [[ "$output" == *"cannot prove freshness"* ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -247,33 +247,29 @@ _stub_image_ref() {  # $1 = revision the stubbed podman reports
   [ -z "$output" ]
 }
 
-@test "assess_qcow2_cache: empty expected, STRICT_CACHE=1 -> rc 0, NO hard-fail" {
-  qcow="${BATS_TEST_TMPDIR}/noexp2.qcow2"; printf qcow2data > "$qcow"
+@test "assess_qcow2_cache: empty expected (default ghcr, no label), STRICT_CACHE=1 -> rc 3 + ERROR (fail-closed)" {
+  qcow="${BATS_TEST_TMPDIR}/noexp3.qcow2"; printf qcow2data > "$qcow"
   hbird_cache_write_ref "$qcow" "local:oldref00"
   STRICT_CACHE=1 run hbird_assess_qcow2_cache "$qcow" "" "CP image"
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"ERROR"* ]]
+  [[ "$output" == *"cannot prove freshness"* ]]
 }
 
-@test "assess_qcow2_cache: missing sidecar (legacy qcow2) -> rc 0 (cannot confirm; reuse)" {
-  # No recorded build-ref -> cannot confirm staleness -> reuse silently, even
-  # under STRICT_CACHE. Preserves skip-if-exists for pre-feature templates.
-  qcow="${BATS_TEST_TMPDIR}/legacy.qcow2"; printf qcow2data > "$qcow"
-  run hbird_assess_qcow2_cache "$qcow" "local:newref99" "CP image"
-  [ "$status" -eq 0 ]
+@test "assess_qcow2_cache: missing sidecar (legacy qcow2), STRICT_CACHE=1 -> rc 3 + ERROR (fail-closed)" {
+  qcow="${BATS_TEST_TMPDIR}/legacy3.qcow2"; printf qcow2data > "$qcow"
+# No sidecar written
   STRICT_CACHE=1 run hbird_assess_qcow2_cache "$qcow" "local:newref99" "CP image"
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"ERROR"* ]]
+  [[ "$output" == *"cannot prove freshness"* ]]
 }
 
-@test "assess_qcow2_cache: cross-source (operator switched IMAGE_SOURCE) -> rc 0, NO churn" {
-  # local-baked template, now a ghcr deploy: content-hash vs git-commit are
-  # different identity spaces. Comparing them would always "mismatch" -> must
-  # NOT be treated as stale (#373 round-2 MED). Even under STRICT_CACHE.
-  qcow="${BATS_TEST_TMPDIR}/xmode.qcow2"; printf qcow2data > "$qcow"
+@test "assess_qcow2_cache: cross-source (operator switched IMAGE_SOURCE), STRICT_CACHE=1 -> rc 3 + ERROR (fail-closed)" {
+  qcow="${BATS_TEST_TMPDIR}/xmode3.qcow2"; printf qcow2data > "$qcow"
   hbird_cache_write_ref "$qcow" "local:abc123"
-  run hbird_assess_qcow2_cache "$qcow" "ghcr:acef96c" "CP image"
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
   STRICT_CACHE=1 run hbird_assess_qcow2_cache "$qcow" "ghcr:acef96c" "CP image"
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"ERROR"* ]]
+  [[ "$output" == *"cannot prove freshness"* ]]
 }
