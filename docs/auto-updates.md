@@ -8,6 +8,9 @@ stock upstream `bootc-fetch-apply-updates.timer` is **disabled** in the
 shipped preset (but still present on the image — operators can re-enable
 it per host if they want the legacy `:latest` behaviour).
 
+> See [boot-test-overrides.md](boot-test-overrides.md) for the deploy-time knobs that
+> control which image a node boots before this timer takes over.
+
 The `hummingbird-k8s-worker` flavor enables auto-updates by default. The
 `hummingbird-k8s` control-plane image ships with the timer **disabled by
 default** — opt in per host via `systemctl enable --now` (see below).
