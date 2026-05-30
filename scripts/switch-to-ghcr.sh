@@ -21,6 +21,13 @@
 #
 # Honors BOOTC_SWITCH_TO_GHCR=0 as an escape hatch (operator wants to keep
 # tracking localhost on purpose, e.g. for an offline lab).
+#
+# Single-VM mode also honors FORCE_REBUILD=1 (#375): a fresh local rebuild
+# means the operator is boot-testing local Containerfile changes, so flipping
+# that just-deployed VM to the GHCR-published image would mask exactly what
+# they are testing. In single-VM mode FORCE_REBUILD=1 skips the switch unless
+# FORCE_SWITCH=1 is also set, and warns loudly. (all-VMs mode is a deliberate
+# operator action — `make switch-to-ghcr` — and is NOT gated on FORCE_REBUILD.)
 
 set -euo pipefail
 
@@ -188,6 +195,19 @@ switch_one() {
 if [[ $# -ge 1 ]]; then
   vm_name="$1"
   ref="${2:-}"
+  # FORCE_REBUILD opt-out (#375). This is the post-deploy/post-spawn caller
+  # path (deploy-cluster.sh / spawn-workers.sh). When the operator rebuilt
+  # the image locally (FORCE_REBUILD=1), switching the freshly-installed VM
+  # to the GHCR-published image would track a possibly-stale remote and mask
+  # the local change being boot-tested. Skip unless FORCE_SWITCH=1 explicitly
+  # opts back in. Mirrors the HBIRD_REMOTE_STRICT explicit-mode pattern; the
+  # primary gate is in spawn-workers.sh, this is the canonical backstop so any
+  # single-VM caller is protected. Non-fatal: the deploy already succeeded.
+  if [[ "${FORCE_REBUILD:-}" = "1" && "${FORCE_SWITCH:-}" != "1" ]]; then
+    log "WARN: FORCE_REBUILD=1 — skipping switch of '${vm_name}' to GHCR so it keeps tracking its freshly-built install-time image (#375)."
+    log "WARN: set FORCE_SWITCH=1 to switch anyway, or unset FORCE_REBUILD for normal GHCR-tracking behavior."
+    exit 0
+  fi
   if [[ -z "$ref" ]]; then
     if flavor="$(flavor_for_vm "$vm_name")"; then
       ref="${GHCR_ORG}/${flavor}:${GHCR_TAG}"
