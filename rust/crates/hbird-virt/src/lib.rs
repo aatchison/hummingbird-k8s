@@ -567,6 +567,19 @@ impl Connection {
             .inspect_err(|err| tracing::debug!(error = ?err, "virt-install failed"))
     }
 
+    /// Execute an arbitrary shell command via this connection's transport.
+    ///
+    /// For a local transport ([`LocalClient`]): runs via `sh -c` on this
+    /// machine. For an SSH transport ([`Connection::new`]): runs on the
+    /// remote host configured in the [`QemuSshUri`].
+    ///
+    /// Used by deploy-cluster for `podman`/`make`/bib operations that share
+    /// the same transport as the libvirt verb calls — so the caller doesn't
+    /// need a second SSH client plumbed alongside the `Connection`.
+    pub fn exec_shell(&self, cmd: &str) -> Result<String> {
+        self.run(cmd)
+    }
+
     /// Run a remote command, wrapping transport / non-zero-exit failures
     /// into the crate's [`Error`] type.
     fn run(&self, command: &str) -> Result<String> {

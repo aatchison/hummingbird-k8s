@@ -43,9 +43,11 @@ use clap::{Parser, Subcommand};
 use tracing::info_span;
 use tracing_subscriber::EnvFilter;
 
+pub mod cache;
 mod commands;
 mod cp_kubectl;
 mod cp_resolve;
+mod virt_bridge;
 
 use commands::{
     deploy_cluster::DeployClusterArgs, destroy_cluster::DestroyClusterArgs,

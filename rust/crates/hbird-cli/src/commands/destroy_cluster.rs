@@ -33,16 +33,13 @@
 //! [#289]: https://github.com/aatchison/hummingbird-k8s/issues/289
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use clap::Args;
 use clap::builder::BoolishValueParser;
 
 use hbird_config::ClusterConfig;
-use hbird_ssh::{Client, SshOptions};
-use hbird_virt::ssh::{SshClient, SshError};
-use hbird_virt::{Connection, Error as VirtError, Instance, QemuSshUri};
+use hbird_virt::{Connection, Error as VirtError};
 
 // ---- Arguments (block #1: clap surface) ------------------------------------
 
@@ -302,59 +299,6 @@ fn run_dry_run(plan: &Plan) {
     log("DRY-RUN done.");
 }
 
-// ---- SshClient bridge ------------------------------------------------------
-
-/// Bridge that lets [`hbird_virt::Connection`] call out via
-/// [`hbird_ssh::Client`].
-///
-/// `hbird-virt` defines its own `SshClient` trait (so the crate stays
-/// dep-free of an SSH backend); `hbird-ssh::Client` provides the real
-/// OpenSSH-subprocess implementation. This struct is the seam.
-///
-/// `host` is captured at construction time and overrides the `host`
-/// argument passed to `SshClient::run` — when KVM_HOST is set, every
-/// call goes to that host regardless of the `qemu+ssh://` URI's
-/// embedded host. (The URI's host stays in the embedded
-/// `qemu+ssh://...` string for `virsh -c` though.)
-struct CliSshBridge {
-    inner: Client,
-}
-
-impl CliSshBridge {
-    fn new(options: SshOptions) -> Self {
-        Self {
-            inner: Client::new(options),
-        }
-    }
-}
-
-impl SshClient for CliSshBridge {
-    fn run(&self, _host: &str, command: &str) -> std::result::Result<String, SshError> {
-        // Use the captured options' host rather than the `host` arg.
-        // hbird-virt::Connection passes `self.uri.ssh_target()` here,
-        // but for destroy-cluster the operator-supplied `--kvm-host`
-        // (or the on-host empty case) is the authoritative target.
-        match self.inner.run(command) {
-            Ok(out) => Ok(out.stdout_lossy()),
-            Err(hbird_ssh::Error::NonZeroExit {
-                host,
-                status,
-                stderr,
-                ..
-            }) => Err(SshError::RemoteExit {
-                host,
-                command: command.to_string(),
-                exit_code: status.code(),
-                stderr,
-            }),
-            Err(e) => Err(SshError::Transport {
-                host: self.inner.options().host().to_string(),
-                message: e.to_string(),
-            }),
-        }
-    }
-}
-
 // ---- run entrypoint --------------------------------------------------------
 
 /// Dispatch entrypoint invoked by `main.rs`.
@@ -371,24 +315,7 @@ pub fn run(args: DestroyClusterArgs) -> Result<()> {
     // Build the Connection: SSH-tunnelled when kvm_host is set (operator
     // running from a remote workstation), local when it's absent/empty
     // (operator running hbird directly on the KVM host — S2a Option A).
-    let conn = if let Some(kvm_host) = plan.kvm_host.as_deref().filter(|s| !s.is_empty()) {
-        // Remote SSH path: tunnel virsh through qemu+ssh://<host>/system,
-        // mirroring the bash twin's `virsh -c qemu:///system` via ssh-wrap.
-        let ssh_options = SshOptions::new(kvm_host.to_string());
-        let uri = QemuSshUri {
-            user: None,
-            host: kvm_host.to_string(),
-            port: None,
-            instance: Instance::System,
-            query: None,
-        };
-        let bridge: Arc<dyn SshClient> = Arc::new(CliSshBridge::new(ssh_options));
-        Connection::new(uri, bridge)
-    } else {
-        // Local path (S2a): run virsh/cp/etc directly on this host via
-        // std::process — operator is on the KVM host, no SSH needed.
-        Connection::new_local()
-    };
+    let conn = crate::virt_bridge::build_connection(plan.kvm_host.as_deref());
 
     log(&format!("config: {}", plan.config_path.display()));
     log(&format!(
