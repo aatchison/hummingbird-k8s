@@ -1073,7 +1073,24 @@ _resolve_switch() {
   [[ "$output" == *"FORCE_SWITCH=1"* ]]   # the WARN tells the operator how to opt back in
 }
 
-@test "deploy-cluster: FORCE_REBUILD=1 + SWITCH_TO_GHCR=true + FORCE_SWITCH=1 -> kept, no auto-disable (#374)" {
+  @test "deploy-cluster: IMAGE_SOURCE=local + SWITCH_TO_GHCR=true -> auto-disabled + WARN (#9e)" {
+    run _resolve_switch 'IMAGE_SOURCE=local' 'SWITCH_TO_GHCR=true' 'GHCR_TAG=v9.9.9'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RESOLVED=false"* ]]
+    [[ "$output" == *"WARN"* ]]
+    [[ "$output" == *"IMAGE_SOURCE=local"* ]]
+    [[ "$output" == *"#374"* ]]
+  }
+
+  @test "deploy-cluster: IMAGE_SOURCE=local + SWITCH_TO_GHCR=true + FORCE_SWITCH=1 -> kept, no auto-disable (#9e)" {
+    run _resolve_switch 'IMAGE_SOURCE=local' 'SWITCH_TO_GHCR=true' 'FORCE_SWITCH=1'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RESOLVED=true"* ]]
+    [[ "$output" != *"Auto-disabling"* ]]
+    [[ "$output" == *"FORCE_SWITCH=1"* ]]
+  }
+
+  @test "deploy-cluster: FORCE_REBUILD=1 + SWITCH_TO_GHCR=true + FORCE_SWITCH=1 -> kept, no auto-disable (#374)" {
   run _resolve_switch 'FORCE_REBUILD=1' 'SWITCH_TO_GHCR=true' 'FORCE_SWITCH=1'
   [ "$status" -eq 0 ]
   [[ "$output" == *"RESOLVED=true"* ]]

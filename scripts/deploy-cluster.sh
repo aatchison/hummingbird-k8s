@@ -198,12 +198,19 @@ worker_user_data() {
 # consistency. Mutates the global SWITCH_TO_GHCR; idempotent; a no-op unless
 # both flags are set. (#374.)
 resolve_switch_to_ghcr() {
-  [[ "${FORCE_REBUILD:-}" == "1" && "${SWITCH_TO_GHCR:-}" == "true" ]] || return 0
+  [[ "${SWITCH_TO_GHCR:-}" == "true" ]] || return 0
+  [[ "${FORCE_REBUILD:-}" == "1" || "${IMAGE_SOURCE:-}" == "local" ]] || return 0
+
   if [[ "${FORCE_SWITCH:-}" == "1" ]]; then
-    log "FORCE_SWITCH=1: keeping SWITCH_TO_GHCR=true despite FORCE_REBUILD=1 — the freshly-built image WILL be replaced by ghcr.io/...:${GHCR_TAG:-latest} at first boot (explicit opt-in)."
+    log "FORCE_SWITCH=1: keeping SWITCH_TO_GHCR=true despite FORCE_REBUILD=1 or IMAGE_SOURCE=local — the freshly-built image WILL be replaced by ghcr.io/...:${GHCR_TAG:-latest} at first boot (explicit opt-in)."
     return 0
   fi
-  log "WARN: FORCE_REBUILD=1 with SWITCH_TO_GHCR=true would replace your freshly-built qcow2 with ghcr.io/...:${GHCR_TAG:-latest} at first boot, silently defeating a local boot-test (#374). Auto-disabling the GHCR switch; set FORCE_SWITCH=1 to keep it."
+
+  local reason="FORCE_REBUILD=1"
+  [[ "${IMAGE_SOURCE:-}" == "local" ]] && reason="IMAGE_SOURCE=local"
+  [[ "${FORCE_REBUILD:-}" == "1" && "${IMAGE_SOURCE:-}" == "local" ]] && reason="FORCE_REBUILD=1 and IMAGE_SOURCE=local"
+
+  log "WARN: ${reason} with SWITCH_TO_GHCR=true would replace your freshly-built qcow2 with ghcr.io/...:${GHCR_TAG:-latest} at first boot, silently defeating a local boot-test (#374). Auto-disabling the GHCR switch; set FORCE_SWITCH=1 to keep it."
   SWITCH_TO_GHCR=false
 }
 
