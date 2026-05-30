@@ -112,20 +112,35 @@ setup() {
     return 1
   }
 
-  # Extract the CLI-env precedence block for #377 tests. Spans from the
-  # `HBIRD_CLI_OVERRIDE_KNOBS=(` array open through the `# ---- end CLI-env
-  # precedence` end marker — i.e. the snapshot loop, the `source
-  # "$CONFIG_PATH"`, and the restore loop as a single contiguous unit, so the
-  # test exercises the real precedence code (not a paraphrase). Anchor on the
-  # unique substring `HBIRD_CLI_OVERRIDE_KNOBS=(` via index() and stop at the
-  # end-marker comment (matched by index() to avoid awk `{`/`}` quirks).
+  # Extract the CLI-env precedence block for #377 tests. After the #2 fix,
+  # the snapshot (HBIRD_CLI_OVERRIDE_KNOBS array + capture loop) lives at the
+  # TOP of the script (before any lib sources) while the source "$CONFIG_PATH"
+  # + restore loop stay further down. Extract both separately and concatenate
+  # so drivers can source a single snippet that exercises the full precedence
+  # chain as a unit (snapshot -> source CONFIG -> restore).
   awk '
     index($0, "HBIRD_CLI_OVERRIDE_KNOBS=(") { capture=1 }
     capture { print }
+    capture && index($0, "end CLI-env snapshot") { exit }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/cli-snapshot.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/cli-snapshot.snippet" ] || {
+    echo "FATAL: failed to extract CLI-env snapshot block from ${SCRIPT}" >&2
+    return 1
+  }
+  awk '
+    /^source "/ && /CONFIG_PATH/ { capture=1 }
+    capture { print }
     capture && index($0, "end CLI-env precedence") { exit }
-  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/cli-restore.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/cli-restore.snippet" ] || {
+    echo "FATAL: failed to extract CLI-env restore block from ${SCRIPT}" >&2
+    return 1
+  }
+  cat "${BATS_TEST_TMPDIR}/cli-snapshot.snippet" \
+      "${BATS_TEST_TMPDIR}/cli-restore.snippet" \
+      > "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
   [ -s "${BATS_TEST_TMPDIR}/cli-precedence.snippet" ] || {
-    echo "FATAL: failed to extract CLI-env precedence block from ${SCRIPT}" >&2
+    echo "FATAL: failed to assemble cli-precedence.snippet from ${SCRIPT}" >&2
     return 1
   }
 
@@ -925,6 +940,72 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"STRICT_CACHE=1"* ]]
   [[ "$output" == *"KVM_HOST=clibox"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# ENABLE_CLOUD_INIT config-value regression (#2 / #377 precapture fix)
+#
+# lib/build-common.sh runs `: "${ENABLE_CLOUD_INIT:=0}"` which defaults the
+# var to "0" if unset. Before the #2 fix, the snapshot loop ran AFTER that
+# lib source, so it captured "0" (the lib default) as a phantom CLI override.
+# The restore then clobbered a config's ENABLE_CLOUD_INIT=1 back to 0,
+# causing deploy to hard-fail. The fix moves the snapshot to the TOP of the
+# script, before any lib source.
+#
+# These tests exercise the precedence block (cli-precedence.snippet) with
+# ENABLE_CLOUD_INIT. The snippet now starts with the snapshot (capturing the
+# genuine parent-env state), then sources CONFIG, then restores. No lib is
+# sourced inside the snippet, so to prove the ordering fix is load-bearing we
+# rely on the contract: snapshot must not see any value not placed there by
+# the driver (= genuine CLI/parent-env state). Two cases:
+#
+#   a. Operator did NOT pass ENABLE_CLOUD_INIT on the CLI → config's "1" wins.
+#   b. Operator explicitly passed ENABLE_CLOUD_INIT=0 on the CLI → "0" wins
+#      (real CLI overrides config 1 — preserve true CLI precedence).
+# ---------------------------------------------------------------------------
+
+@test "deploy-cluster: config ENABLE_CLOUD_INIT=1 survives when CLI has no override (#2 regression)" {
+  local conf="${BATS_TEST_TMPDIR}/eci-config.conf"
+  printf 'ENABLE_CLOUD_INIT=1\n' > "$conf"
+  local driver="${BATS_TEST_TMPDIR}/driver-eci-nooverride.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+# ENABLE_CLOUD_INIT is NOT set (operator passed no CLI override).
+# In the OLD code build-common.sh would have run here and set it to 0,
+# causing the snapshot to capture 0 as a phantom CLI override. The fix
+# ensures the snapshot runs before any lib can default it, so the snapshot
+# sees "" (unset) and the restore skips it, letting config's 1 stand.
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'ENABLE_CLOUD_INIT=%s\n' "\$ENABLE_CLOUD_INIT"
+EOF
+  chmod +x "$driver"
+  run env -u ENABLE_CLOUD_INIT bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ENABLE_CLOUD_INIT=1"* ]]
+}
+
+@test "deploy-cluster: CLI ENABLE_CLOUD_INIT=0 still beats config ENABLE_CLOUD_INIT=1 (#2 regression)" {
+  local conf="${BATS_TEST_TMPDIR}/eci-config2.conf"
+  printf 'ENABLE_CLOUD_INIT=1\n' > "$conf"
+  local driver="${BATS_TEST_TMPDIR}/driver-eci-override.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+# Operator explicitly passed ENABLE_CLOUD_INIT=0 on the CLI — a genuine
+# override that must win over the config's 1.
+ENABLE_CLOUD_INIT=0
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'ENABLE_CLOUD_INIT=%s\n' "\$ENABLE_CLOUD_INIT"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ENABLE_CLOUD_INIT=0"* ]]
 }
 
 # ---------------------------------------------------------------------------

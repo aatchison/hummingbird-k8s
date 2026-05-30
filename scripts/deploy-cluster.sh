@@ -229,6 +229,27 @@ if [[ "${HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY:-0}" = 1 ]]; then
   return 0
 fi
 
+# ---- CLI-env snapshot (MUST be before any `source lib/*.sh`) (#377 fix, #2) --
+# lib/build-common.sh (and other libs sourced below) run `: "${KNOB:=default}"`,
+# which sets KNOB to the lib default when unset. The original #377 capture loop
+# ran AFTER those lib sources, so it snapped the lib default (e.g.
+# ENABLE_CLOUD_INIT=0 from build-common.sh:139) as a phantom CLI override; the
+# restore then clobbered the config's ENABLE_CLOUD_INIT=1 back to 0 and deploy
+# hard-failed. Fix: capture the genuine parent-env/CLI state HERE, before any lib
+# can default these knobs. The restore loop stays after `source "$CONFIG_PATH"`.
+# shellcheck disable=SC2034  # snapshot vars are read indirectly via printf -v
+HBIRD_CLI_OVERRIDE_KNOBS=(
+  IMAGE_SOURCE GHCR_ORG GHCR_TAG SWITCH_TO_GHCR FORCE_SWITCH AUTO_UPDATE_CP
+  FORCE_REBUILD STRICT_CACHE ENABLE_CLOUD_INIT RUN_VERIFY
+  BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER
+  BOOTC_SWITCH_TO_GHCR KVM_HOST
+  CP_MEMORY CP_VCPUS WORKER_MEMORY WORKER_VCPUS POOL_DIR
+)
+for _hbird_knob in "${HBIRD_CLI_OVERRIDE_KNOBS[@]}"; do
+  printf -v "_hbird_cli_${_hbird_knob}" '%s' "${!_hbird_knob:-}"
+done
+# ---- end CLI-env snapshot ---------------------------------------------------
+
 # ---- Remote KVM-host re-exec shim (C3, #232) -------------------------------
 # When KVM_HOST is set and we're NOT on the KVM host, re-exec this script
 # on the remote host via SSH. The client never needs sudo or libvirt —
@@ -329,9 +350,11 @@ trap cleanup_on_failure EXIT
 # silently clobbers whatever the operator passed on the CLI
 # (`make deploy-cluster IMAGE_SOURCE=local SWITCH_TO_GHCR=false`). The
 # `: "${VAR:=default}"` defaulting below cannot rescue this — by then the var
-# is already set to the config's value. So we snapshot the CLI values of every
-# operator-overridable knob HERE (before the source) and restore any that were
-# non-empty AFTER it. Net precedence: CLI > config > built-in default.
+# is already set to the config's value. HBIRD_CLI_OVERRIDE_KNOBS is declared
+# and the snapshot captured at the TOP of the script (before any lib sources)
+# so lib-defaulted values are never mistaken for genuine CLI overrides (#2).
+# The restore here wins a non-empty CLI value over the config. Net precedence:
+# CLI > config > built-in default.
 #
 # Scope of the list: every scalar operator knob this script reads AFTER the
 # source. A knob that is also forwarded across the C3 KVM-host re-exec must
@@ -348,17 +371,6 @@ trap cleanup_on_failure EXIT
 # to the remote host; that path is governed by ssh-wrap.sh, not this array.
 # WORKER_NAMES is an array, resolved by its own block below — do NOT add it
 # here (printf -v on an array name would mangle it).
-# shellcheck disable=SC2034  # snapshot vars are read indirectly via printf -v
-HBIRD_CLI_OVERRIDE_KNOBS=(
-  IMAGE_SOURCE GHCR_ORG GHCR_TAG SWITCH_TO_GHCR FORCE_SWITCH AUTO_UPDATE_CP
-  FORCE_REBUILD STRICT_CACHE ENABLE_CLOUD_INIT RUN_VERIFY
-  BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER
-  BOOTC_SWITCH_TO_GHCR KVM_HOST
-  CP_MEMORY CP_VCPUS WORKER_MEMORY WORKER_VCPUS POOL_DIR
-)
-for _hbird_knob in "${HBIRD_CLI_OVERRIDE_KNOBS[@]}"; do
-  printf -v "_hbird_cli_${_hbird_knob}" '%s' "${!_hbird_knob:-}"
-done
 
 # shellcheck disable=SC1090
 source "$CONFIG_PATH"
