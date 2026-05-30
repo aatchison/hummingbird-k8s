@@ -208,6 +208,8 @@ hbird_ssh_wrap_maybe_reexec "$0" "$@"
 source "${REPO_ROOT}/lib/build-common.sh"
 # shellcheck source=lib/cloud-init-seed.sh
 source "${SCRIPT_DIR}/lib/cloud-init-seed.sh"
+# shellcheck source=../lib/cache-utils.sh
+source "${REPO_ROOT}/lib/cache-utils.sh"
 
 setup_logging "[deploy-cluster]"
 
@@ -290,16 +292,29 @@ trap cleanup_on_failure EXIT
 # `: "${VAR:=default}"` defaulting below cannot rescue this — by then the var
 # is already set to the config's value. So we snapshot the CLI values of every
 # operator-overridable knob HERE (before the source) and restore any that were
-# non-empty AFTER it. Net precedence: CLI > config > built-in default. The
-# knob list mirrors the operator-overridable entries in
-# HBIRD_SSH_WRAP_ALLOWED_ENV (scripts/lib/ssh-wrap.sh) that this flow consumes;
-# add new operator knobs to BOTH places.
+# non-empty AFTER it. Net precedence: CLI > config > built-in default.
+#
+# Scope of the list: every scalar operator knob this script reads AFTER the
+# source. A knob that is also forwarded across the C3 KVM-host re-exec must
+# ALSO appear in HBIRD_SSH_WRAP_ALLOWED_ENV (scripts/lib/ssh-wrap.sh:200), or
+# the remote side never receives the CLI value and the restore below sees an
+# empty snapshot. Host-local-only knobs (CP_MEMORY, CP_VCPUS, WORKER_MEMORY,
+# WORKER_VCPUS, RUN_VERIFY, ...) are deliberately NOT in the allowlist — they
+# act on the machine that actually runs virt-install — so they live ONLY here.
+# When adding a knob, decide which category it is and update the right place(s).
+#
+# KVM_HOST is included because it is operator-overridable and consumed AFTER
+# the source (the RUN_VERIFY --kvm-host arg and the closing hint). The separate
+# re-exec shim above reads KVM_HOST BEFORE this block to decide whether to hop
+# to the remote host; that path is governed by ssh-wrap.sh, not this array.
+# WORKER_NAMES is an array, resolved by its own block below — do NOT add it
+# here (printf -v on an array name would mangle it).
 # shellcheck disable=SC2034  # snapshot vars are read indirectly via printf -v
 HBIRD_CLI_OVERRIDE_KNOBS=(
   IMAGE_SOURCE GHCR_ORG GHCR_TAG SWITCH_TO_GHCR AUTO_UPDATE_CP
-  FORCE_REBUILD ENABLE_CLOUD_INIT RUN_VERIFY
+  FORCE_REBUILD STRICT_CACHE ENABLE_CLOUD_INIT RUN_VERIFY
   BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER
-  BOOTC_SWITCH_TO_GHCR
+  BOOTC_SWITCH_TO_GHCR KVM_HOST
   CP_MEMORY CP_VCPUS WORKER_MEMORY WORKER_VCPUS POOL_DIR
 )
 for _hbird_knob in "${HBIRD_CLI_OVERRIDE_KNOBS[@]}"; do
@@ -352,6 +367,10 @@ _image_source_was_unset=0
 : "${WORKER_VCPUS:=2}"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
 : "${RUN_VERIFY:=false}"
+# STRICT_CACHE=1 turns the qcow2/image freshness checks below from
+# WARN+auto-rebuild into a hard-fail — the fail-closed posture a CI / boot-test
+# gate wants (mirrors HBIRD_REMOTE_STRICT). Default 0 (operator-friendly). (#373)
+: "${STRICT_CACHE:=0}"
 
 # POOL_DIR preflight for the non-root path (#305 round-2 review L3). Silent
 # fail-late-at-virt-install was a real UX problem pre-round-2: an operator
@@ -417,6 +436,7 @@ case "$IMAGE_SOURCE" in
 esac
 case "$AUTO_UPDATE_CP" in true|false) ;; *) fail "AUTO_UPDATE_CP must be true or false (got '$AUTO_UPDATE_CP')" ;; esac
 case "$SWITCH_TO_GHCR" in true|false) ;; *) fail "SWITCH_TO_GHCR must be true or false (got '$SWITCH_TO_GHCR')" ;; esac
+case "$STRICT_CACHE" in 0|1) ;; *) fail "STRICT_CACHE must be 0 or 1 (got '$STRICT_CACHE')" ;; esac
 
 # If IMAGE_SOURCE wasn't in the operator's config (pre-#231 was a
 # `:?` hard-fail; #231 made `ghcr` the default), surface the resolution
@@ -475,6 +495,21 @@ case "$IMAGE_SOURCE" in
     podman "${_PODMAN_OPTS[@]}" pull "$CP_IMAGE_REF"
     log "pulling ${WORKER_IMAGE_REF}"
     podman "${_PODMAN_OPTS[@]}" pull "$WORKER_IMAGE_REF"
+    # Freshness gate (#373): GHCR `:latest` lags HEAD. If the pulled image was
+    # built from a commit that predates the on-disk Containerfile, this deploy
+    # would silently boot-test the PUBLISHED bits, not the operator's change —
+    # the false-positive-green that surfaced in PR #367. Warn loudly; under
+    # STRICT_CACHE=1 (CI/boot-test) refuse outright. The gate acts ONLY on a
+    # CONFIRMED drift (image revision known AND the Containerfile changed
+    # since it); an unverifiable image — today's default, no revision label —
+    # reuses silently in both modes (#373 round-2). No local rebuild path here
+    # — the recovery is IMAGE_SOURCE=local FORCE_REBUILD=1 (issue #373 workaround).
+    _ghcr_stale=0
+    hbird_assess_ghcr_image "$CP_IMAGE_REF" "control-plane image" \
+      "${REPO_ROOT}/containers/k8s/Containerfile" || _ghcr_stale=1
+    hbird_assess_ghcr_image "$WORKER_IMAGE_REF" "worker image" \
+      "${REPO_ROOT}/containers/k8s-worker/Containerfile" || _ghcr_stale=1
+    (( _ghcr_stale )) && fail "STRICT_CACHE=1: refusing to deploy a GHCR image whose revision predates the on-disk Containerfile (see ERROR above). Rebuild from source with IMAGE_SOURCE=local FORCE_REBUILD=1."
     ;;
   local)
     CP_IMAGE_REF="localhost/hummingbird-k8s:latest"
@@ -514,11 +549,49 @@ cp "$BIB_CFG_CP" "$BIB_CFG_WORKER"
 CP_TEMPLATE_NAME="hummingbird-k8s-deploy"
 WORKER_TEMPLATE_NAME="hummingbird-k8s-worker-deploy"
 
-log "building CP qcow2 template"
-build_qcow2 "$CP_IMAGE_REF" "$CP_TEMPLATE_NAME" "$BIB_CFG_CP"
+# build_template: wrap build_qcow2 with the #373 qcow2-template cache check.
+# build_qcow2 has a skip-if-exists shortcut that would otherwise reuse a stale
+# template even when the source it was baked from has changed. We record the
+# build identity in a sidecar (lib/cache-utils.sh) and compare on the next run:
+#   * fresh            -> reuse (build_qcow2 skips as before)
+#   * stale/unknown    -> force a rebuild for THIS template only (FORCE_REBUILD
+#                         is scoped to the build_qcow2 call so the other flavor
+#                         is judged independently)
+#   * stale + STRICT_CACHE=1 -> hard-fail
+# The build identity is source-namespaced (`<source>:<id>`): the pulled
+# image's vcs-ref (ghcr) or the on-disk Containerfile content hash (local).
+# An unverifiable id (e.g. a GHCR image with no revision label) yields an empty
+# build_id, which hbird_assess_qcow2_cache treats as "cannot confirm -> reuse"
+# and hbird_cache_write_ref declines to record — so the default ghcr path keeps
+# build_qcow2's skip-if-exists fast path intact. (#373 round-2.)
+# $1=image-ref $2=template-name $3=bib-cfg $4=containerfile $5=label
+build_template() {
+  local image_ref="$1" name="$2" cfg="$3" containerfile="$4" label="$5"
+  local qcow="${POOL_DIR}/${name}.qcow2"
+  local build_id force_this rc=0
+  if [[ "$IMAGE_SOURCE" == "ghcr" ]]; then
+    build_id="$(hbird_cache_build_id ghcr "$(hbird_image_vcs_ref "$image_ref")")"
+  else
+    build_id="$(hbird_cache_build_id local "$(hbird_containerfile_ref "$containerfile")")"
+  fi
+  force_this="${FORCE_REBUILD:-}"
+  hbird_assess_qcow2_cache "$qcow" "$build_id" "$label" || rc=$?
+  case "$rc" in
+    3) fail "STRICT_CACHE=1: cached ${label} is stale (see ERROR above). Rebuild with FORCE_REBUILD=1, or unset STRICT_CACHE to auto-rebuild." ;;
+    10) force_this=1 ;;
+  esac
+  log "building ${label} (qcow2 template)"
+  FORCE_REBUILD="$force_this" build_qcow2 "$image_ref" "$name" "$cfg"
+  # Record what we just baked so the next deploy can detect drift. Best-effort:
+  # a POOL_DIR write failure must not abort an otherwise-successful build.
+  hbird_cache_write_ref "$qcow" "$build_id" \
+    || log "WARN: could not record cache build-ref sidecar for ${qcow} (cache freshness check will rebuild next run)"
+}
 
-log "building worker qcow2 template"
-build_qcow2 "$WORKER_IMAGE_REF" "$WORKER_TEMPLATE_NAME" "$BIB_CFG_WORKER"
+build_template "$CP_IMAGE_REF" "$CP_TEMPLATE_NAME" "$BIB_CFG_CP" \
+  "${REPO_ROOT}/containers/k8s/Containerfile" "CP image"
+build_template "$WORKER_IMAGE_REF" "$WORKER_TEMPLATE_NAME" "$BIB_CFG_WORKER" \
+  "${REPO_ROOT}/containers/k8s-worker/Containerfile" "worker image"
 
 # #310: BIB config tempfiles have served their purpose (build_qcow2
 # consumed them; they aren't read again). Drop them now so a successful

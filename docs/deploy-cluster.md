@@ -277,12 +277,47 @@ trip the skip — the guard uses `[[ -s "$qcow" ]]`, not `[[ -e ]]`.
    FORCE_REBUILD=1 sudo make deploy-cluster CONFIG=cluster.local.conf
    ```
 
-**Staleness caveat:** the skip does not validate that the on-disk
-qcow2 matches the local container image's digest. After pulling a
-new `ghcr.io/aatchison/hummingbird-k8s:<tag>`, the templates on disk
-are stale until you set `FORCE_REBUILD=1` and rebuild. A future
-candidate could compare the qcow2's recorded build digest against
-the current image — see #311 for the trade-off.
+**Staleness detection (#373):** the skip used to silently reuse a stale
+template — after pulling a new `ghcr.io/aatchison/hummingbird-k8s:<tag>`
+or changing a `containers/*/Containerfile`, the on-disk qcow2 could be
+out of date and the deploy would quietly boot the *old* bits (a
+false-positive "cluster came up OK" against pre-change code). Deploy now
+records the build identity alongside each template
+(`<template>.qcow2.build-ref`, written by `lib/cache-utils.sh`, namespaced
+by source as `local:<hash>` / `ghcr:<ref>`) and acts **only on a confirmed
+mismatch** before reusing:
+
+- **`IMAGE_SOURCE=local`** — the on-disk Containerfile content hash. If it
+  differs from the recorded ref, the template is rebuilt automatically
+  (`FORCE_REBUILD=1` is applied for that template only) with a `WARN`.
+- **`IMAGE_SOURCE=ghcr`** — the pulled image's
+  `org.opencontainers.image.revision` label. If the Containerfile changed
+  since that commit, you get a `WARN` that the deploy is testing the
+  *published* image, not your local change (there is no local rebuild
+  path for `ghcr` — switch to `IMAGE_SOURCE=local FORCE_REBUILD=1` to test
+  local edits).
+
+**Unverifiable is not stale.** If the build identity can't be established
+(today's published images carry no revision label; or a pre-feature
+template has no sidecar; or you switched `IMAGE_SOURCE` between deploys so
+the two identities aren't comparable), the check **reuses the template
+silently** — it never forces a rebuild and never fails. Only a *confirmed*
+same-source mismatch is acted on. This keeps `build_qcow2`'s skip-if-exists
+fast path intact on the default `ghcr` path.
+
+Set **`STRICT_CACHE=1`** to turn a confirmed-stale `WARN` into a hard
+failure — the fail-closed posture a CI / boot-test gate wants (mirrors
+`HBIRD_REMOTE_STRICT`). `STRICT_CACHE` does **not** fail on the
+unverifiable case above (that would break every default `ghcr` deploy until
+the images stamp a revision label); it fails only on a confirmed mismatch.
+`STRICT_CACHE` is operator-overridable and forwarded across the
+`KVM_HOST=` re-exec.
+
+> Note on tags: `GHCR_TAG=latest` (the default) tracks whatever the
+> publish pipeline last pushed; the running node's own drift is governed
+> separately by `bootc-semver-update.timer`, which resolves the highest
+> `vX.Y.Z` — not a literal `:latest` poll. The freshness check here is
+> strictly about the qcow2 template the deploy bakes, not node auto-update.
 
 Diagnostic when the operator is neither root nor in the `libvirt`
 group on the KVM host:
@@ -329,7 +364,7 @@ Current allowlist:
 | Group | Vars |
 | --- | --- |
 | Config + flags | `CONFIG`, `FLAGS` |
-| Image + auto-update | `IMAGE_SOURCE`, `GHCR_TAG`, `AUTO_UPDATE_CP`, `SWITCH_TO_GHCR`, `BOOTC_UPDATE_SCHEDULE`, `BOOTC_UPDATE_REPO_K8S`, `BOOTC_UPDATE_REPO_WORKER` |
+| Image + auto-update | `IMAGE_SOURCE`, `GHCR_TAG`, `AUTO_UPDATE_CP`, `SWITCH_TO_GHCR`, `BOOTC_UPDATE_SCHEDULE`, `BOOTC_UPDATE_REPO_K8S`, `BOOTC_UPDATE_REPO_WORKER`, `STRICT_CACHE` (fail-closed cache freshness, #373) |
 | Update-cluster flags | `DRY_RUN`, `SKIP_DRAIN`, `WORKERS_ONLY`, `NODE`, `START_FROM`, `PARALLEL` |
 | Timeouts | `READY_TIMEOUT`, `DRAIN_TIMEOUT`, `APISERVER_TIMEOUT`, `SSH_TIMEOUT`, `INTER_NODE_SLEEP`, `DAEMONSET_TIMEOUT` |
 | Topology | `CP_NAME`, `WORKER_NAMES`, `POOL_DIR` |
@@ -444,6 +479,7 @@ The full set is in `cluster.example.conf`; the essentials:
 | `WORKER_MEMORY` / `WORKER_VCPUS` | no | `4096` / `2` | Per-worker sizing. |
 | `POOL_DIR` | no | `/var/lib/libvirt/images` | Where qcow2s + seed ISOs land. |
 | `RUN_VERIFY` | no | `false` | Run `hbird verify app-deploy` (post-#353, was `scripts/verify-app-deploy.sh`) after Ready. |
+| `STRICT_CACHE` | no | `0` | `1` makes the qcow2/image freshness checks fail-closed instead of WARN+auto-rebuild — the CI / boot-test posture. See [Reusing pre-built qcow2 templates](#reusing-pre-built-qcow2-templates-311). |
 | `KVM_HOST` | no | unset | Recorded in the summary for downstream `hbird kubectl` use (post-#353, was `scripts/kubectl-k8s.sh`). |
 | `BOOTC_UPDATE_SCHEDULE` | no | unset (use image default) | Override the `bootc-semver-update.timer` `OnCalendar=` on every node. Any systemd `OnCalendar=` value. See [Customizing auto-update](#customizing-auto-update). |
 | `BOOTC_UPDATE_REPO_K8S` | no | unset (use image-baked default) | OCI ref without tag — overrides the CP's tracked semver-update repo (e.g. point at a fork). |

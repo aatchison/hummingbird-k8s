@@ -897,3 +897,32 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"IMAGE_SOURCE=ghcr"* ]]
 }
+
+@test "deploy-cluster: CLI STRICT_CACHE + KVM_HOST beat hard-assigning config (#373/#377)" {
+  # STRICT_CACHE is the new #373 knob; KVM_HOST is the operator-overridable
+  # host target consumed AFTER the source. Both must be in the capture array
+  # so a config hard-assign cannot clobber the operator's CLI value — this
+  # pins them against accidental removal from HBIRD_CLI_OVERRIDE_KNOBS.
+  local conf="${BATS_TEST_TMPDIR}/knobs.conf"
+  cat > "$conf" <<'CONF_EOF'
+STRICT_CACHE=0
+KVM_HOST=configbox
+CONF_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-knobs.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+STRICT_CACHE=1
+KVM_HOST=clibox
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'STRICT_CACHE=%s\n' "\$STRICT_CACHE"
+printf 'KVM_HOST=%s\n' "\$KVM_HOST"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"STRICT_CACHE=1"* ]]
+  [[ "$output" == *"KVM_HOST=clibox"* ]]
+}
