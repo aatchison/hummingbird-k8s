@@ -368,33 +368,27 @@ pub fn run(args: DestroyClusterArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Live mode requires a KVM host alias to SSH to. Empty == operator
-    // is on the KVM host directly; that's a configuration we can't yet
-    // honor in the Rust path because hbird-ssh::Client always shells
-    // out to `ssh`. Surface a clear diagnostic; bash twin handles this
-    // by simply not having a re-exec shim trigger.
-    let kvm_host = plan.kvm_host.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
-        anyhow!(
-            "live-mode destroy-cluster requires --kvm-host (or KVM_HOST env / config) to be set. \
-             Local libvirt access without SSH is not yet wired in the Rust path; \
-             on the KVM host itself, run `bash scripts/destroy-cluster.sh CONFIG` directly. \
-             Use --dry-run to preview the plan from the operator's workstation."
-        )
-    })?;
-
-    // Build the SSH options + QemuSshUri. We tunnel virsh through
-    // qemu+ssh://<host>/system to mirror the bash twin's
-    // `virsh -c qemu:///system` invoked via the ssh-wrap re-exec.
-    let ssh_options = SshOptions::new(kvm_host.to_string());
-    let uri = QemuSshUri {
-        user: None,
-        host: kvm_host.to_string(),
-        port: None,
-        instance: Instance::System,
-        query: None,
+    // Build the Connection: SSH-tunnelled when kvm_host is set (operator
+    // running from a remote workstation), local when it's absent/empty
+    // (operator running hbird directly on the KVM host — S2a Option A).
+    let conn = if let Some(kvm_host) = plan.kvm_host.as_deref().filter(|s| !s.is_empty()) {
+        // Remote SSH path: tunnel virsh through qemu+ssh://<host>/system,
+        // mirroring the bash twin's `virsh -c qemu:///system` via ssh-wrap.
+        let ssh_options = SshOptions::new(kvm_host.to_string());
+        let uri = QemuSshUri {
+            user: None,
+            host: kvm_host.to_string(),
+            port: None,
+            instance: Instance::System,
+            query: None,
+        };
+        let bridge: Arc<dyn SshClient> = Arc::new(CliSshBridge::new(ssh_options));
+        Connection::new(uri, bridge)
+    } else {
+        // Local path (S2a): run virsh/cp/etc directly on this host via
+        // std::process — operator is on the KVM host, no SSH needed.
+        Connection::new_local()
     };
-    let bridge: Arc<dyn SshClient> = Arc::new(CliSshBridge::new(ssh_options));
-    let conn = Connection::new(uri, bridge);
 
     log(&format!("config: {}", plan.config_path.display()));
     log(&format!(

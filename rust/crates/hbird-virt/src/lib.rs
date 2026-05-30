@@ -66,11 +66,13 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 pub mod error;
+mod local;
 pub mod poll;
 pub mod ssh;
 mod uri;
 
 pub use error::{Error, Result};
+pub use local::LocalClient;
 pub use ssh::{SshClient, SshError};
 pub use uri::{Instance, QemuSshUri};
 
@@ -146,6 +148,32 @@ impl Connection {
     #[must_use]
     pub fn new(uri: QemuSshUri, ssh: Arc<dyn SshClient>) -> Self {
         Self { uri, ssh }
+    }
+
+    /// Open a local connection targeting `qemu:///system` on this machine.
+    ///
+    /// Uses [`LocalClient`] to run `virsh`/`cp`/`virt-install` via
+    /// `sh -c` rather than SSH. This is the operator-on-KVM-host path
+    /// (Option A, #289 S2a): `kvm_host` absent or empty in the config.
+    #[must_use]
+    pub fn new_local() -> Self {
+        Self::new_local_with_client(Arc::new(LocalClient::new()))
+    }
+
+    /// Open a local-transport connection with an injected [`SshClient`].
+    ///
+    /// Like [`Self::new_local`] but accepts any `SshClient` implementation.
+    /// Primary use: unit tests that inject a stub to capture command strings
+    /// without running anything locally (mirrors the [`Self::new`] + stub
+    /// pattern used for the SSH path).
+    #[must_use]
+    pub fn new_local_with_client(client: Arc<dyn SshClient>) -> Self {
+        // A synthetic URI is needed for `remote_uri()` → `qemu:///system`.
+        // The `ssh_target()` ("localhost") is passed to the SshClient but
+        // LocalClient ignores it; stubs key only on the command string.
+        let uri = QemuSshUri::parse("qemu+ssh://localhost/system")
+            .expect("static local URI is always valid");
+        Self { uri, ssh: client }
     }
 
     /// The URI this connection targets. Useful for diagnostics.

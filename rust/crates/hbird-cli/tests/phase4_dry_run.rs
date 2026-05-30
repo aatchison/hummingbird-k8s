@@ -211,12 +211,13 @@ fn spawn_workers_live_mode_surfaces_335_diagnostic() {
     );
 }
 
-/// `destroy-cluster` live mode is implemented but requires `--kvm-host`
-/// to be set (the Rust path doesn't yet support on-host libvirt without
-/// SSH). Assert the diagnostic is clear and points at `--dry-run` /
-/// the bash twin as the workaround.
+/// `destroy-cluster` live mode without `--kvm-host` now uses the local
+/// libvirt transport (S2a). On any host where the test cluster doesn't
+/// exist (CI, workstations), virsh reports "domain not found" which the
+/// idempotent destroy path treats as already torn down — so the command
+/// exits 0. Assert the old "kvm-host required" gate is gone.
 #[test]
-fn destroy_cluster_live_mode_without_kvm_host_surfaces_clear_diagnostic() {
+fn destroy_cluster_live_mode_without_kvm_host_uses_local_transport() {
     let tmp = tempdir_for_test();
     let conf_path = tmp.path().join("cluster.local.conf");
     write_fixture_config(&conf_path);
@@ -228,18 +229,24 @@ fn destroy_cluster_live_mode_without_kvm_host_surfaces_clear_diagnostic() {
         .args(["destroy-cluster", "--config", "cluster.local.conf"])
         .output()
         .expect("spawn hbird");
-    assert!(
-        !out.status.success(),
-        "live-mode destroy-cluster without --kvm-host exited 0"
-    );
+
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // S2a removed the "not yet wired" gate — that message must never appear.
     assert!(
-        stderr.contains("--kvm-host") || stderr.contains("KVM_HOST"),
-        "destroy-cluster should mention --kvm-host in the diagnostic; got:\n{stderr}"
+        !stderr.contains("Local libvirt access without SSH is not yet wired"),
+        "S2a removed this limitation; got:\n{stderr}"
     );
+    // The old hard-fail required --kvm-host. That must be gone too.
     assert!(
-        stderr.contains("dry-run") || stderr.contains("destroy-cluster"),
-        "destroy-cluster should mention --dry-run or bash fallback; got:\n{stderr}"
+        !stderr.contains("requires --kvm-host"),
+        "S2a: no-kvm-host is valid via local transport; got:\n{stderr}"
+    );
+    // On CI the test cluster doesn't exist locally, so virsh says "domain
+    // not found" (VirshFailed) → treated as already torn down → exit 0.
+    // If virsh isn't installed at all, sh exits 127 → also VirshFailed → exit 0.
+    assert!(
+        out.status.success(),
+        "destroy-cluster without --kvm-host should succeed (idempotent: no cluster on CI). stderr:\n{stderr}"
     );
 }
 
