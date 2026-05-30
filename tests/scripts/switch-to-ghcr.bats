@@ -145,3 +145,45 @@ setup() {
   # Pin the exact boolean: only skips when FORCE_REBUILD=1 AND FORCE_SWITCH!=1.
   grep -Eq '\$\{FORCE_REBUILD:-\}" = "1" && "\$\{FORCE_SWITCH:-\}" != "1"' "$SCRIPT"
 }
+
+# ---------------------------------------------------------------------------
+# RUN path: FORCE_REBUILD=1 FORCE_SWITCH=1 must REACH the switch (#382 follow-up)
+# ---------------------------------------------------------------------------
+#
+# The #375 tests only pin the SKIP path. An over-firing guard (e.g. a stray
+# `||` / wrong comparison) that skips even when FORCE_SWITCH=1 would silently
+# pass them all — and would make the documented opt-back-in a no-op. This test
+# exercises the opposite branch: with FORCE_SWITCH=1 the guard must NOT fire,
+# so execution reaches switch_one. We stub virsh + ssh so switch_one runs to
+# completion without real libvirt/SSH (and without the 30×2s wait loops).
+
+@test "switch-to-ghcr: FORCE_REBUILD=1 FORCE_SWITCH=1 reaches switch_one, no skip WARN (#382 follow-up)" {
+  local stub="$BATS_TEST_TMPDIR/bin"
+  mkdir -p "$stub"
+  # virsh stub: only domifaddr is exercised here. Emit an RFC5737 TEST-NET-1
+  # (documentation-only, non-routable) lease so wait_for_ip returns on the
+  # first iteration with no sleep.
+  cat >"$stub/virsh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *domifaddr*) echo " vnet0  52:54:00:00:00:01  ipv4  192.0.2.10/24" ;;
+esac
+exit 0
+SH
+  # ssh stub: succeed instantly so wait_for_ssh / bootc switch don't block.
+  cat >"$stub/ssh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$stub/virsh" "$stub/ssh"
+
+  run env -u KVM_HOST -u BOOTC_SWITCH_TO_GHCR -u HBIRD_SWITCH_TO_GHCR_SOURCE_ONLY \
+      PATH="$stub:$PATH" FORCE_REBUILD=1 FORCE_SWITCH=1 \
+      bash "$SCRIPT" hummingbird-k8s-worker-1 \
+      ghcr.io/aatchison/hummingbird-k8s-worker:latest
+  [ "$status" -eq 0 ]
+  # Reached switch_one (its first log line) — the guard did NOT skip.
+  [[ "$output" == *"resolving IP"* ]]
+  # And explicitly did NOT take the FORCE_REBUILD skip path.
+  [[ "$output" != *"skipping switch"* ]]
+}
