@@ -3,182 +3,173 @@ name: Build & publish — hummingbird-k8s
 on:
   push:
     tags: ['k8s/v*']
+    branches: ["ci/forgejo-harden-push"]  # temp: strip post-merge
   workflow_dispatch:
     inputs:
       version:
-        description: 'Semver tag (vX.Y.Z)'
-        required: true
+        description: 'Semver tag (vX.Y.Z); ignored on real tag push'
+        required: false
+        default: 'v0.0.0-dryrun'
         type: string
+      dry_run:
+        description: 'Skip registry push + sign + scan. Build + login still validated.'
+        required: false
+        default: true
+        type: boolean
 
 # Serialize tag-driven publishes on the same ref. cancel-in-progress is
-# deliberately false: a real tag push that is mid-publish must finish
-# (sign, attest, etc.) — a second invocation should queue, not pre-empt.
+# deliberately false: a real tag push that is mid-flight must finish —
+# a second invocation should queue, not pre-empt.
 concurrency:
   group: build-k8s-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
-  security-events: write
+
+env:
+  IMAGE: forgejo.atchison.io/aatchison/hummingbird-k8s
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
           fetch-depth: 0
 
       - name: Refuse to publish if the tagged commit isn't on main
-        if: github.event_name == 'push'
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          git fetch --no-tags --depth=1 origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "Tag $GITHUB_REF points to $GITHUB_SHA, not reachable from origin/main." >&2
+          git fetch --no-tags --depth=1 forgejo main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" forgejo/main; then
+            echo "Tag $GITHUB_REF points to $GITHUB_SHA, not reachable from forgejo/main." >&2
             exit 1
           fi
 
-      - name: Resolve version
+      - name: Resolve version + mode
         id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            version="${{ inputs.version }}"
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+            dry_run="$INPUT_DRY_RUN"
+          elif [[ "$REF" == refs/tags/k8s/* ]]; then
+            version="${REF#refs/tags/k8s/}"
+            dry_run="false"
           else
-            version="${GITHUB_REF#refs/tags/k8s/}"
+            # Branch push: build + login validation only, no push
+            version="v0.0.0-dryrun"
+            dry_run="true"
           fi
           if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
             echo "Version $version is not vX.Y.Z[-pre]" >&2; exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "Resolved: version=$version dry_run=$dry_run" >&2
 
-      # Third-party actions pinned to commit SHAs (bump via Renovate/Dependabot).
-      - name: Log in to GHCR
-        uses: redhat-actions/podman-login@4934294ad0449894bcd1e9f191899d7292469603 # v1.7
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Resolve the canonical Containerfile path from the Makefile so the
-      # build-* workflows track repo layout changes via a single source.
-      - name: Resolve Containerfile path from Makefile
-        id: cf
-        run: echo "path=$(make -s print-containerfile-k8s)" >> "$GITHUB_OUTPUT"
-
-      # Multi-arch (amd64 + arm64) cross-builds require qemu-user-static so
-      # buildah can execute foreign-arch binaries during RUN steps. The
-      # GitHub-hosted ubuntu-latest runner ships binfmt_misc handlers but
-      # not the static interpreters; this action installs them.
-      - name: Build
-        id: build
-        uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
-        with:
-          image: hummingbird-k8s
-          tags: ${{ steps.v.outputs.version }} latest
-          containerfiles: ${{ steps.cf.outputs.path }}
-          context: .
-          # Multi-arch: emit a manifest index containing both linux/amd64
-          # and linux/arm64 child manifests. The Containerfile uses
-          # TARGETARCH to fetch the right cilium-cli tarball per arch.
-          # Closes #107.
-          platforms: linux/amd64
-          # Stamp the building commit SHA into org.opencontainers.image.revision
-          # (see the ARG/LABEL at the end of the Containerfile) so the #373/#384
-          # GHCR cache-freshness gate can detect a stale published image (#385).
-          build-args: |
-            REVISION=${{ github.sha }}
-          # Reuse layers from the previously published :latest when available.
-          # buildah tolerates a missing remote (first-time cache miss); no
-          # --pull-always so a registry hiccup doesn't break a real publish.
-          extra-args: |
-            --cache-from ghcr.io/${{ github.repository_owner }}/hummingbird-k8s
-
-      # Vulnerability scan the locally-built image before push. exit-code=0
-      # keeps this report-only for now (future PR can ratchet to fail-on-HIGH).
-      - name: Push to GHCR
-        id: push
-        uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2.8
-        with:
-          image: ${{ steps.build.outputs.image }}
-          tags: ${{ steps.build.outputs.tags }}
-          registry: ghcr.io/${{ github.repository_owner }}
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      # Resolve the pushed image digest once, share it with sign + attest.
-      # Falls back to `podman manifest inspect` if push-to-registry didn't
-      # emit one (older versions / single-tag pushes).
-      - name: Resolve pushed image digest
-        id: digest
+      - name: Log in to Forgejo container registry
+        if: steps.v.outputs.dry_run == 'false'
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s
-          PUSH_DIGEST: ${{ steps.push.outputs.digest }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          echo "$REGISTRY_PASSWORD" | docker login forgejo.atchison.io -u aatchison --password-stdin
+
+      - name: Build OCI image
+        env:
+          DOCKER_BUILDKIT: "1"
+          VERSION: ${{ steps.v.outputs.version }}
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --platform linux/amd64 \
+            --build-arg "REVISION=${REVISION}" \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:latest" \
+            --file containers/k8s/Containerfile \
+            .
+
+      - name: Push to Forgejo container registry
+        if: steps.v.outputs.dry_run == 'false'
+        env:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
-          digest="$PUSH_DIGEST"
-          if [ -z "$digest" ]; then
-            echo "push step did not emit a digest; falling back to podman manifest inspect" >&2
-            digest="$(podman manifest inspect --verbose "${IMAGE}:${VERSION}" \
-              | jq -r '.Digest // .digest')"
-          fi
+          set -euo pipefail
+          docker push "${IMAGE}:${VERSION}"
+
+      - name: Push :latest tag (tag-triggered publishes only)
+        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
+        run: docker push "${IMAGE}:latest"
+
+      - name: Resolve pushed image digest
+        id: digest
+        if: steps.v.outputs.dry_run == 'false'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${VERSION}" \
+            | cut -d@ -f2)
           if [ -z "$digest" ] || [ "$digest" = "null" ]; then
             echo "could not determine image digest" >&2; exit 1
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
-      # Signing is by digest with --recursive, which walks the multi-arch
-      # manifest index and signs both the index itself AND each per-arch
-      # child manifest. See the cosign sign step below.
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        if: steps.v.outputs.dry_run == 'false'
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s@${{ steps.digest.outputs.digest }}
+          image-ref: ${{ env.IMAGE }}@${{ steps.digest.outputs.digest }}
           severity: HIGH,CRITICAL
           exit-code: '0'
           format: sarif
           output: trivy-results.sarif
 
-      - name: Upload Trivy SARIF
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
-        if: always()
-        with:
-          sarif_file: trivy-results.sarif
-          category: trivy-hummingbird-k8s
+      # github/codeql-action/upload-sarif is a sub-path action not mirrored
+      # on Forgejo; it causes parse-time rejection even behind an if-guard.
+      # Omitted here. Re-add if deploying on GitHub Actions.
 
-      # Generate an SPDX SBOM of the locally-built image. Uploaded as a
-      # workflow artifact and later cosign-attested against the pushed digest.
       - name: Generate SBOM with syft
+        if: steps.v.outputs.dry_run == 'false'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s@${{ steps.digest.outputs.digest }}
+          image: ${{ env.IMAGE }}@${{ steps.digest.outputs.digest }}
           output-file: sbom-${{ steps.v.outputs.version }}.spdx.json
           format: spdx-json
 
       - name: Upload SBOM artifact
+        if: steps.v.outputs.dry_run == 'false'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-k8s-${{ steps.v.outputs.version }}
           path: sbom-${{ steps.v.outputs.version }}.spdx.json
 
+      - name: Install cosign
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
       - name: Sign image with cosign (keyless, OIDC)
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s
           DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
-          # --recursive walks the multi-arch manifest index and signs both
-          # the index itself and each referenced per-arch child manifest.
-          # cosign 2.x flag; v3.10.1 of cosign-installer pins cosign 2.6.1.
           cosign sign --yes --recursive "${IMAGE}@${DIGEST}"
 
-      # Attest the SBOM against the pushed digest so consumers can verify
-      # provenance via `cosign verify-attestation --type spdx`.
       - name: cosign attest SBOM
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/hummingbird-k8s
           DIGEST: ${{ steps.digest.outputs.digest }}
           VERSION: ${{ steps.v.outputs.version }}
           COSIGN_EXPERIMENTAL: 'true'
@@ -186,3 +177,7 @@ jobs:
           cosign attest --yes --type spdxjson \
             --predicate "sbom-${VERSION}.spdx.json" \
             "${IMAGE}@${DIGEST}"
+
+      - name: docker logout
+        if: always()
+        run: docker logout forgejo.atchison.io
