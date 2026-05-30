@@ -11,13 +11,16 @@
 #                 qemu:///system and switch each one. Skip VMs that already
 #                 track ghcr.
 #
-#   * "single VM" — for use by `scripts/deploy-cluster.sh` and
-#                 `scripts/spawn-workers.sh` immediately after a fresh
-#                 deploy. Invoked as:
+#   * "single VM" — for use by `scripts/spawn-workers.sh` immediately after
+#                 a fresh worker spawn. Invoked as:
 #                     scripts/switch-to-ghcr.sh <vm-name> <ghcr-ref>
 #                 No discovery / iteration; switches just that one VM.
 #                 Errors are non-fatal (the caller's deploy succeeded; the
 #                 switch is a follow-on).
+#                 NOTE: deploy-cluster.sh does NOT call this script — it flips
+#                 the CP to GHCR via a cloud-init first-boot `bootc switch`
+#                 runcmd (gated by SWITCH_TO_GHCR), a separate mechanism whose
+#                 FORCE_REBUILD gating is tracked independently (#374).
 #
 # Honors BOOTC_SWITCH_TO_GHCR=0 as an escape hatch (operator wants to keep
 # tracking localhost on purpose, e.g. for an offline lab).
@@ -58,15 +61,16 @@ fi
 #
 # This script's all-VMs mode (no positional args) iterates every running
 # hummingbird-* libvirt domain via `virsh -c qemu:///system`, so it must
-# run on the KVM host. The single-VM mode (called by deploy-cluster.sh /
-# spawn-workers.sh) ALSO needs local libvirt — those callers themselves
-# C3-wrap, so when this script is invoked from inside one of them on the
-# KVM host the shim is a no-op (HBIRD_REMOTE_REEXEC=1 sentinel set).
+# run on the KVM host. The single-VM mode (called by spawn-workers.sh) ALSO
+# needs local libvirt — that caller itself C3-wraps, so when this script is
+# invoked from inside it on the KVM host the shim is a no-op
+# (HBIRD_REMOTE_REEXEC=1 sentinel set).
 #
 # Env-var passthrough: EXPLICIT ALLOWLIST in lib/ssh-wrap.sh. The vars
-# this script honors (BOOTC_SWITCH_TO_GHCR, GHCR_ORG, GHCR_TAG) all need
-# to be added to HBIRD_SSH_WRAP_ALLOWED_ENV there if operators expect
-# workstation-set values to reach the remote side. (GHCR_TAG already is.)
+# this script honors (BOOTC_SWITCH_TO_GHCR, GHCR_ORG, GHCR_TAG, and the
+# FORCE_REBUILD/FORCE_SWITCH opt-out pair from #375) all need to be in
+# HBIRD_SSH_WRAP_ALLOWED_ENV there if operators expect workstation-set
+# values to reach the remote side. (All of the above are now allowlisted.)
 #
 # shellcheck source=lib/ssh-wrap.sh
 source "${SCRIPT_DIR}/lib/ssh-wrap.sh"
@@ -189,15 +193,16 @@ switch_one() {
 }
 
 # --- single-VM mode ---------------------------------------------------------
-# Invoked by scripts/deploy-cluster.sh / scripts/spawn-workers.sh immediately
-# after a fresh deploy. Two positional args: the VM name and the exact GHCR
-# ref to switch to.
+# Invoked by scripts/spawn-workers.sh immediately after a fresh worker spawn.
+# Two positional args: the VM name and the exact GHCR ref to switch to.
+# (deploy-cluster.sh does NOT reach here — it switches the CP via a cloud-init
+# bootc-switch runcmd, a separate path; see the header and #374.)
 if [[ $# -ge 1 ]]; then
   vm_name="$1"
   ref="${2:-}"
-  # FORCE_REBUILD opt-out (#375). This is the post-deploy/post-spawn caller
-  # path (deploy-cluster.sh / spawn-workers.sh). When the operator rebuilt
-  # the image locally (FORCE_REBUILD=1), switching the freshly-installed VM
+  # FORCE_REBUILD opt-out (#375). This is the post-spawn caller path
+  # (spawn-workers.sh). When the operator rebuilt the image locally
+  # (FORCE_REBUILD=1), switching the freshly-installed VM
   # to the GHCR-published image would track a possibly-stale remote and mask
   # the local change being boot-tested. Skip unless FORCE_SWITCH=1 explicitly
   # opts back in. Mirrors the HBIRD_REMOTE_STRICT explicit-mode pattern; the
