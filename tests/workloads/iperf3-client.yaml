@@ -16,6 +16,10 @@ spec:
         app: iperf3-client
         test-workload: net
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       affinity:
         nodeAffinity:
           # Force cross-node traffic by preferring hbird-w2.
@@ -38,6 +42,12 @@ spec:
       containers:
         - name: iperf3
           image: docker.io/networkstatic/iperf3:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsUser: 65534
           command:
             - sh
             - -c

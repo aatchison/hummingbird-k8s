@@ -16,9 +16,19 @@ spec:
         app: stress-ng
         test-workload: cpu
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: stress-ng
           image: quay.io/srcc/stress-ng:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsUser: 65534
           args:
             - --cpu
             - "1"
