@@ -1201,3 +1201,67 @@ _warn_drift() {
   [[ "$output" != *"WARN"* ]]
   [[ "$output" == *"DONE"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# lib-defaulted knobs CLI-env precedence (#8)
+# ---------------------------------------------------------------------------
+#
+# BASE_IMAGE, BIB, ENABLE_ROOT_SSH, VM_USER, VM_USER_GROUPS are lib-defaulted
+# by build-common.sh and read after `source CONFIG` in build_qcow2 /
+# render_bib_config. They were missing from HBIRD_CLI_OVERRIDE_KNOBS, so a
+# config file that hard-assigns them silently clobbered a CLI override — the
+# same silent-override class that #2/#377 fixed for other knobs.
+#
+# These tests mirror the #377 pattern: drive the real cli-precedence.snippet
+# (which now includes BASE_IMAGE, BIB, ENABLE_ROOT_SSH, VM_USER,
+# VM_USER_GROUPS) to pin CLI > config > default semantics for the newly added
+# knobs.
+
+@test "deploy-cluster: CLI BASE_IMAGE/VM_USER beat hard-assigning config (#8)" {
+  local conf="${BATS_TEST_TMPDIR}/clobber8.conf"
+  cat > "$conf" <<'CONF_EOF'
+BASE_IMAGE=quay.io/fedora/fedora-bootc:41
+VM_USER=config-user
+CONF_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-precedence8.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+BASE_IMAGE=quay.io/centos-bootc/centos-bootc:stream9
+VM_USER=cli-user
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'BASE_IMAGE=%s\n' "\$BASE_IMAGE"
+printf 'VM_USER=%s\n' "\$VM_USER"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BASE_IMAGE=quay.io/centos-bootc/centos-bootc:stream9"* ]]
+  [[ "$output" == *"VM_USER=cli-user"* ]]
+}
+
+@test "deploy-cluster: config BASE_IMAGE/VM_USER honored when no CLI override (#8)" {
+  local conf="${BATS_TEST_TMPDIR}/configonly8.conf"
+  cat > "$conf" <<'CONF_EOF'
+BASE_IMAGE=quay.io/fedora/fedora-bootc:41
+VM_USER=config-user
+CONF_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-configonly8.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+# No CLI override — config value must win.
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'BASE_IMAGE=%s\n' "\$BASE_IMAGE"
+printf 'VM_USER=%s\n' "\$VM_USER"
+EOF
+  chmod +x "$driver"
+  run env -u BASE_IMAGE -u VM_USER bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BASE_IMAGE=quay.io/fedora/fedora-bootc:41"* ]]
+  [[ "$output" == *"VM_USER=config-user"* ]]
+}
