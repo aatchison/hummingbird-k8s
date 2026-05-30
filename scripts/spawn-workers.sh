@@ -293,8 +293,24 @@ virsh -c qemu:///system pool-refresh mass2 >/dev/null || true
 # actually flow. See #138. Best-effort per worker: if one fails (e.g. GHCR
 # ref hasn't been published yet for this flavor) we continue with the rest.
 # Set BOOTC_SWITCH_TO_GHCR=0 to skip.
-for i in $(seq 1 "$COUNT"); do
-  NAME="hummingbird-k8s-worker-${i}"
-  bash scripts/switch-to-ghcr.sh "$NAME" ghcr.io/aatchison/hummingbird-k8s-worker:latest || \
-    echo "WARN: bootc switch failed for $NAME; VM still tracks localhost:latest" >&2
-done
+#
+# FORCE_REBUILD opt-out (#375): when the operator set FORCE_REBUILD=1 they
+# rebuilt the worker image from local Containerfile changes (defeating
+# build_qcow2's skip-if-exists cache — see lib/build-common.sh). Flipping the
+# freshly-spawned worker to the GHCR-published `:latest` would immediately
+# track a STALE remote image and silently mask exactly the local change the
+# operator is boot-testing — a false-positive boot test. So skip the
+# post-spawn switch in that case unless FORCE_SWITCH=1 explicitly opts back
+# in, and WARN loudly. Mirrors the HBIRD_REMOTE_STRICT explicit-mode pattern
+# (#371/#365): the safe default warns; the operator re-enables deliberately.
+if [[ "${FORCE_REBUILD:-}" = "1" && "${FORCE_SWITCH:-}" != "1" ]]; then
+  echo "${0##*/}: WARN: FORCE_REBUILD=1 — skipping post-spawn switch-to-ghcr so the freshly-built worker keeps tracking localhost/hummingbird-k8s-worker:latest (the image you just built)." >&2
+  echo "${0##*/}: WARN: this avoids a false-positive boot test where the worker would flip to a possibly-stale GHCR image and mask your local change (#375)." >&2
+  echo "${0##*/}: WARN: set FORCE_SWITCH=1 (alongside FORCE_REBUILD=1) to switch anyway, or unset FORCE_REBUILD for the normal GHCR-tracking behavior." >&2
+else
+  for i in $(seq 1 "$COUNT"); do
+    NAME="hummingbird-k8s-worker-${i}"
+    bash scripts/switch-to-ghcr.sh "$NAME" ghcr.io/aatchison/hummingbird-k8s-worker:latest || \
+      echo "WARN: bootc switch failed for $NAME; VM still tracks localhost:latest" >&2
+  done
+fi
