@@ -40,14 +40,19 @@
 //!
 //! Mutating libvirt operations: as of [#289] Phase 4,
 //! [`Connection::destroy_domain`] and [`Connection::undefine_domain`]
-//! are exposed for the destroy-cluster live path; additional verbs
-//! (`start`, `define`, etc.) land when consumer crates need them.
+//! are exposed for the destroy-cluster live path. As of [#289] Stage 1,
+//! [`Connection::start_domain`], [`Connection::virsh_pool_refresh`],
+//! [`Connection::virt_install`], and [`Connection::remote_cp_reflink`]
+//! are added for the deploy-cluster/spawn-workers live paths (S2/S3).
 //! Auxiliary remote-shell helpers ([`Connection::remote_rm_f`],
 //! [`Connection::remote_rm_rf`], [`Connection::remote_path_exists`])
 //! are exposed here too — they target the same SSH session the
 //! libvirt verbs run over, so callers don't need a second
 //! `SshClient` plumb to clean qcow2 + seed ISO artifacts that
 //! `virsh` itself can't reach.
+//!
+//! A shared retry/poll helper lives in [`crate::poll`] for use by
+//! CP-IP and cluster-ready polls in S2/S3.
 //!
 //! [#279]: https://github.com/aatchison/hummingbird-k8s/issues/279
 //! [#284]: https://github.com/aatchison/hummingbird-k8s/issues/284
@@ -61,6 +66,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 pub mod error;
+pub mod poll;
 pub mod ssh;
 mod uri;
 
@@ -404,6 +410,133 @@ impl Connection {
                 Err(err)
             }
         }
+    }
+
+    /// Start a defined (but shut-off) domain (`virsh start`).
+    ///
+    /// Bash twin: `scripts/spawn-workers.sh::247` —
+    /// `virsh -c qemu:///system start "$NAME" 2>/dev/null || true`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] when `virsh` exits non-zero (e.g. domain
+    ///   not defined or already running).
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
+    pub fn start_domain(&self, domain: &str) -> Result<()> {
+        let cmd = format!(
+            "virsh -c {} start {}",
+            self.uri.remote_uri(),
+            shell_quote(domain),
+        );
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "virsh start failed"))
+    }
+
+    /// Refresh a libvirt storage pool (`virsh pool-refresh`).
+    ///
+    /// Bash twin: `scripts/spawn-workers.sh::288` —
+    /// `virsh -c qemu:///system pool-refresh mass2 >/dev/null || true`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] when `virsh` exits non-zero.
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, pool))]
+    pub fn virsh_pool_refresh(&self, pool: &str) -> Result<()> {
+        let cmd = format!(
+            "virsh -c {} pool-refresh {}",
+            self.uri.remote_uri(),
+            shell_quote(pool),
+        );
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "virsh pool-refresh failed"))
+    }
+
+    /// Copy a file on the remote KVM host using `cp --reflink=auto`.
+    ///
+    /// Bash twin: `scripts/deploy-cluster.sh::691` and
+    /// `scripts/spawn-workers.sh::251` —
+    /// `cp --reflink=auto "$TEMPLATE" "$QCOW"`.
+    ///
+    /// `--reflink=auto` produces a copy-on-write clone on btrfs/xfs
+    /// (zero-cost until the first write), falling back to a full copy on
+    /// filesystems that don't support reflinking.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] (overloaded) when `cp` exits non-zero.
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, src, dst))]
+    pub fn remote_cp_reflink(&self, src: &str, dst: &str) -> Result<()> {
+        let cmd = format!(
+            "cp --reflink=auto {} {}",
+            shell_quote(src),
+            shell_quote(dst),
+        );
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "cp --reflink=auto failed"))
+    }
+
+    /// Install a new VM via `virt-install --import --noautoconsole`.
+    ///
+    /// Mirrors the bash twin's invocation shape exactly (flags, order)
+    /// so the generated remote command is diff-friendly against the bash
+    /// scripts.
+    ///
+    /// Bash twins:
+    /// - CP variant (with cdrom): `scripts/deploy-cluster.sh::700-710`.
+    /// - Worker variant (no cdrom): `scripts/spawn-workers.sh::276-284`.
+    ///
+    /// # Arguments
+    ///
+    /// - `name` — VM name (must not contain shell metacharacters; see
+    ///   [`shell_quote`] for the quoting applied).
+    /// - `memory_mib` — RAM in MiB (`--memory`).
+    /// - `vcpus` — virtual CPUs (`--vcpus`).
+    /// - `disk_path` — absolute path to the qcow2 disk image on the KVM
+    ///   host. Passed as `--disk <path>,format=qcow2,bus=virtio`.
+    /// - `cdrom` — optional path to a cloud-init seed ISO on the KVM
+    ///   host. When present, appended as
+    ///   `--disk path=<cdrom>,device=cdrom,readonly=on`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] when `virt-install` exits non-zero.
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, name, memory_mib, vcpus))]
+    pub fn virt_install(
+        &self,
+        name: &str,
+        memory_mib: u64,
+        vcpus: u32,
+        disk_path: &str,
+        cdrom: Option<&str>,
+    ) -> Result<()> {
+        let mut cmd = format!(
+            "virt-install --connect {} --name {} --memory {} --vcpus {} --disk {},format=qcow2,bus=virtio",
+            self.uri.remote_uri(),
+            shell_quote(name),
+            memory_mib,
+            vcpus,
+            shell_quote(disk_path),
+        );
+        if let Some(cdrom_path) = cdrom {
+            cmd.push_str(&format!(
+                " --disk path={},device=cdrom,readonly=on",
+                shell_quote(cdrom_path),
+            ));
+        }
+        cmd.push_str(
+            " --import --os-variant fedora-unknown --network network=default,model=virtio \
+             --graphics vnc,listen=127.0.0.1 --noautoconsole",
+        );
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "virt-install failed"))
     }
 
     /// Run a remote command, wrapping transport / non-zero-exit failures

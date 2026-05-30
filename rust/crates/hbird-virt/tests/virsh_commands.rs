@@ -505,3 +505,178 @@ fn remote_path_exists_propagates_transport_error() {
         "expected transport error chain preserved. err: {err}"
     );
 }
+
+// =============================================================================
+// #289 Stage 1 — virt_install, start_domain, virsh_pool_refresh,
+// remote_cp_reflink (ws-c-ci). Command-string assertions; no live calls.
+// =============================================================================
+
+#[test]
+fn start_domain_emits_virsh_start() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system start hbird-cp1",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.start_domain("hbird-cp1").expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, "virsh -c qemu:///system start hbird-cp1");
+}
+
+#[test]
+fn start_domain_quotes_hostile_name() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system start 'evil; rm -rf /'",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.start_domain("evil; rm -rf /").expect("ok");
+    let calls = stub.calls();
+    assert!(
+        calls[0].1.contains("'evil; rm -rf /'"),
+        "hostile name must be single-quoted: {:?}",
+        calls[0].1
+    );
+}
+
+#[test]
+fn virsh_pool_refresh_emits_pool_refresh() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system pool-refresh mass2",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.virsh_pool_refresh("mass2").expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, "virsh -c qemu:///system pool-refresh mass2");
+}
+
+#[test]
+fn remote_cp_reflink_emits_cp_reflink_auto() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "cp --reflink=auto '/mnt/mass2/vms/template.qcow2' '/mnt/mass2/vms/hbird-cp1.qcow2'",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.remote_cp_reflink(
+        "/mnt/mass2/vms/template.qcow2",
+        "/mnt/mass2/vms/hbird-cp1.qcow2",
+    )
+    .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].1,
+        "cp --reflink=auto '/mnt/mass2/vms/template.qcow2' '/mnt/mass2/vms/hbird-cp1.qcow2'"
+    );
+}
+
+// ---- virt_install: CP variant (with cdrom) ----------------------------------
+
+#[test]
+fn virt_install_with_cdrom_mirrors_deploy_cluster_bash() {
+    // Bash twin: scripts/deploy-cluster.sh:700-710
+    // virt-install --connect qemu:///system \
+    //   --name "$CP_NAME" --memory "$CP_MEMORY" --vcpus "$CP_VCPUS" \
+    //   --disk "$CP_QCOW",format=qcow2,bus=virtio \
+    //   --disk path="$CP_SEED",device=cdrom,readonly=on \
+    //   --import --os-variant fedora-unknown \
+    //   --network network=default,model=virtio \
+    //   --graphics vnc,listen=127.0.0.1 --noautoconsole
+    let stub = Arc::new(StubSshClient::new());
+    let expected_cmd = concat!(
+        "virt-install --connect qemu:///system",
+        " --name hbird-cp1",
+        " --memory 4096 --vcpus 4",
+        " --disk '/mnt/mass2/vms/hbird-cp1.qcow2',format=qcow2,bus=virtio",
+        " --disk path='/mnt/mass2/vms/hbird-cp1-seed.iso',device=cdrom,readonly=on",
+        " --import",
+        " --os-variant fedora-unknown",
+        " --network network=default,model=virtio",
+        " --graphics vnc,listen=127.0.0.1",
+        " --noautoconsole",
+    );
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.virt_install(
+        "hbird-cp1",
+        4096,
+        4,
+        "/mnt/mass2/vms/hbird-cp1.qcow2",
+        Some("/mnt/mass2/vms/hbird-cp1-seed.iso"),
+    )
+    .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, expected_cmd);
+}
+
+// ---- virt_install: worker variant (no cdrom) --------------------------------
+
+#[test]
+fn virt_install_without_cdrom_mirrors_spawn_workers_bash() {
+    // Bash twin: scripts/spawn-workers.sh:276-284
+    // virt-install --connect qemu:///system \
+    //   --name "$NAME" --memory "$WORKER_MEMORY" --vcpus "$WORKER_VCPUS" \
+    //   --disk "$QCOW",format=qcow2,bus=virtio \
+    //   --import --os-variant fedora-unknown \
+    //   --network network=default,model=virtio \
+    //   --graphics vnc,listen=127.0.0.1 --noautoconsole
+    let stub = Arc::new(StubSshClient::new());
+    let expected_cmd = concat!(
+        "virt-install --connect qemu:///system",
+        " --name hbird-w1",
+        " --memory 2048 --vcpus 2",
+        " --disk '/mnt/mass2/vms/hbird-w1.qcow2',format=qcow2,bus=virtio",
+        " --import",
+        " --os-variant fedora-unknown",
+        " --network network=default,model=virtio",
+        " --graphics vnc,listen=127.0.0.1",
+        " --noautoconsole",
+    );
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.virt_install("hbird-w1", 2048, 2, "/mnt/mass2/vms/hbird-w1.qcow2", None)
+        .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, expected_cmd);
+}
+
+#[test]
+fn virt_install_quotes_hostile_name() {
+    let stub = Arc::new(StubSshClient::new());
+    // Only assert the name portion is single-quoted; the rest of the
+    // command is covered by the happy-path tests above.
+    let expected_cmd = concat!(
+        "virt-install --connect qemu:///system",
+        " --name 'evil; rm -rf /'",
+        " --memory 1024 --vcpus 1",
+        " --disk '/mnt/mass2/vms/t.qcow2',format=qcow2,bus=virtio",
+        " --import",
+        " --os-variant fedora-unknown",
+        " --network network=default,model=virtio",
+        " --graphics vnc,listen=127.0.0.1",
+        " --noautoconsole",
+    );
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.virt_install("evil; rm -rf /", 1024, 1, "/mnt/mass2/vms/t.qcow2", None)
+        .expect("ok");
+    let calls = stub.calls();
+    assert!(
+        calls[0].1.contains("'evil; rm -rf /'"),
+        "hostile name must be single-quoted: {:?}",
+        calls[0].1
+    );
+}
