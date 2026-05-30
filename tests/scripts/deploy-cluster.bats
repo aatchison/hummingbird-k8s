@@ -112,6 +112,23 @@ setup() {
     return 1
   }
 
+  # Extract the CLI-env precedence block for #377 tests. Spans from the
+  # `HBIRD_CLI_OVERRIDE_KNOBS=(` array open through the `# ---- end CLI-env
+  # precedence` end marker — i.e. the snapshot loop, the `source
+  # "$CONFIG_PATH"`, and the restore loop as a single contiguous unit, so the
+  # test exercises the real precedence code (not a paraphrase). Anchor on the
+  # unique substring `HBIRD_CLI_OVERRIDE_KNOBS=(` via index() and stop at the
+  # end-marker comment (matched by index() to avoid awk `{`/`}` quirks).
+  awk '
+    index($0, "HBIRD_CLI_OVERRIDE_KNOBS=(") { capture=1 }
+    capture { print }
+    capture && index($0, "end CLI-env precedence") { exit }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/cli-precedence.snippet" ] || {
+    echo "FATAL: failed to extract CLI-env precedence block from ${SCRIPT}" >&2
+    return 1
+  }
+
   cat > "$HARNESS" <<'HARNESS_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -780,4 +797,103 @@ EOF
   # AND must point at the POOL_DIR group-write prerequisite — that's the
   # second half of the no-sudo story and easy to miss without a hint.
   [[ "$output" == *"POOL_DIR"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# CLI-env precedence over config sourcing — Pattern A (#377)
+# ---------------------------------------------------------------------------
+#
+# `source "$CONFIG_PATH"` performs unconditional `VAR=...` assignment, so a
+# config file that hard-assigns an operator-overridable knob silently clobbers
+# whatever the operator passed on the CLI (the KEYSTONE bug of the
+# silent-override family). deploy-cluster.sh snapshots the CLI values before
+# the source and restores any non-empty ones after, so CLI > config > default.
+#
+# We exercise the real precedence block by extracting it (see setup's
+# cli-precedence.snippet) and driving it with a config file that hard-assigns
+# the same knobs the "CLI" pre-set — same lockstep-extract approach as the
+# WORKER_NAMES / IMAGE_SOURCE / pubkey blocks above.
+
+@test "deploy-cluster: CLI IMAGE_SOURCE/SWITCH_TO_GHCR beat hard-assigning config (#377)" {
+  local conf="${BATS_TEST_TMPDIR}/clobber.conf"
+  cat > "$conf" <<'CONF_EOF'
+# Mirrors a real cluster.local.conf that hard-assigns the knobs.
+IMAGE_SOURCE=ghcr
+SWITCH_TO_GHCR=true
+FORCE_REBUILD=0
+CONF_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-precedence.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+# These stand in for operator CLI env (make ... IMAGE_SOURCE=local ...),
+# which reach the script via HBIRD_SSH_WRAP_ALLOWED_ENV.
+IMAGE_SOURCE=local
+SWITCH_TO_GHCR=false
+FORCE_REBUILD=1
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'IMAGE_SOURCE=%s\n' "\$IMAGE_SOURCE"
+printf 'SWITCH_TO_GHCR=%s\n' "\$SWITCH_TO_GHCR"
+printf 'FORCE_REBUILD=%s\n' "\$FORCE_REBUILD"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  # CLI values must survive the source — this is the bug #377 fixes.
+  [[ "$output" == *"IMAGE_SOURCE=local"* ]]
+  [[ "$output" == *"SWITCH_TO_GHCR=false"* ]]
+  [[ "$output" == *"FORCE_REBUILD=1"* ]]
+}
+
+@test "deploy-cluster: config value honored when operator passes no CLI override (#377)" {
+  # The capture+restore must NOT break the config-only flow: when the operator
+  # sets nothing on the CLI, the config's hard assignment is what takes effect.
+  local conf="${BATS_TEST_TMPDIR}/configonly.conf"
+  cat > "$conf" <<'CONF_EOF'
+IMAGE_SOURCE=ghcr
+SWITCH_TO_GHCR=true
+CONF_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-configonly.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+# No CLI override pre-set (run via \`env -u\` below) — config wins.
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'IMAGE_SOURCE=%s\n' "\$IMAGE_SOURCE"
+printf 'SWITCH_TO_GHCR=%s\n' "\$SWITCH_TO_GHCR"
+EOF
+  chmod +x "$driver"
+  run env -u IMAGE_SOURCE -u SWITCH_TO_GHCR bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"IMAGE_SOURCE=ghcr"* ]]
+  [[ "$output" == *"SWITCH_TO_GHCR=true"* ]]
+}
+
+@test "deploy-cluster: empty CLI override does not clobber config value (#377)" {
+  # A set-but-empty CLI var (e.g. \`IMAGE_SOURCE=\` exported into the env) is
+  # treated as "no override" — the snapshot's `-n` guard skips restore, so the
+  # config's value stands. This pins the empty-vs-unset semantics so a future
+  # refactor that restores empties (clobbering config with "") breaks loudly.
+  local conf="${BATS_TEST_TMPDIR}/emptycli.conf"
+  cat > "$conf" <<'CONF_EOF'
+IMAGE_SOURCE=ghcr
+CONF_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-emptycli.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+IMAGE_SOURCE=""
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'IMAGE_SOURCE=%s\n' "\$IMAGE_SOURCE"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"IMAGE_SOURCE=ghcr"* ]]
 }

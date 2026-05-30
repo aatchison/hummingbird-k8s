@@ -282,8 +282,42 @@ trap cleanup_on_failure EXIT
 
 # ---- Source config + validate ----------------------------------------------
 
+# CLI-env precedence (Pattern A, #377). `source "$CONFIG_PATH"` performs
+# unconditional `VAR=...` assignment, so a config file that hard-assigns an
+# operator-overridable knob (e.g. `IMAGE_SOURCE=ghcr`, `SWITCH_TO_GHCR=true`)
+# silently clobbers whatever the operator passed on the CLI
+# (`make deploy-cluster IMAGE_SOURCE=local SWITCH_TO_GHCR=false`). The
+# `: "${VAR:=default}"` defaulting below cannot rescue this — by then the var
+# is already set to the config's value. So we snapshot the CLI values of every
+# operator-overridable knob HERE (before the source) and restore any that were
+# non-empty AFTER it. Net precedence: CLI > config > built-in default. The
+# knob list mirrors the operator-overridable entries in
+# HBIRD_SSH_WRAP_ALLOWED_ENV (scripts/lib/ssh-wrap.sh) that this flow consumes;
+# add new operator knobs to BOTH places.
+# shellcheck disable=SC2034  # snapshot vars are read indirectly via printf -v
+HBIRD_CLI_OVERRIDE_KNOBS=(
+  IMAGE_SOURCE GHCR_ORG GHCR_TAG SWITCH_TO_GHCR AUTO_UPDATE_CP
+  FORCE_REBUILD ENABLE_CLOUD_INIT RUN_VERIFY
+  BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER
+  BOOTC_SWITCH_TO_GHCR
+  CP_MEMORY CP_VCPUS WORKER_MEMORY WORKER_VCPUS POOL_DIR
+)
+for _hbird_knob in "${HBIRD_CLI_OVERRIDE_KNOBS[@]}"; do
+  printf -v "_hbird_cli_${_hbird_knob}" '%s' "${!_hbird_knob:-}"
+done
+
 # shellcheck disable=SC1090
 source "$CONFIG_PATH"
+
+# Restore operator CLI overrides — a non-empty CLI value wins over any hard
+# assignment the config just made. An empty/unset CLI value leaves the config
+# (or downstream default) in place. (#377)
+for _hbird_knob in "${HBIRD_CLI_OVERRIDE_KNOBS[@]}"; do
+  _hbird_snap="_hbird_cli_${_hbird_knob}"
+  [[ -n "${!_hbird_snap:-}" ]] && printf -v "$_hbird_knob" '%s' "${!_hbird_snap}"
+done
+unset _hbird_knob _hbird_snap
+# ---- end CLI-env precedence (#377) ------------------------------------------
 
 # Required scalars.
 : "${CP_NAME:?CP_NAME is required in $CONFIG_PATH}"
