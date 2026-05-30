@@ -132,6 +132,18 @@ RUN systemctl preset crio.service kubelet.service worker-init.service \
       bootc-fetch-apply-updates.timer health-check-rollback.timer \
       bootc-semver-update.timer || true
 
+# org.opencontainers.image.revision stamps the building commit SHA so the
+# #373/#384 GHCR cache-freshness gate (lib/cache-utils.sh hbird_image_vcs_ref)
+# can detect a published image that predates the on-disk Containerfile (#385).
+# Declared here, at the very end of the build, so the per-commit REVISION value
+# only invalidates this trailing metadata layer — the expensive package/RUN
+# layers above stay cache-eligible against --cache-from in build-worker.yml.
+# Defaults empty so local `make build-worker` (scripts/build-worker.sh) still
+# builds without a REVISION arg; the local cache path keys off the Containerfile
+# hash, not this label, so an empty value there is correct.
+ARG REVISION=""
+
 LABEL containers.bootc=1
 LABEL org.opencontainers.image.source=https://github.com/aatchison/hummingbird-k8s
 LABEL org.opencontainers.image.description="Fedora Hummingbird bootc worker that auto-joins the hummingbird-k8s cluster"
+LABEL org.opencontainers.image.revision="${REVISION}"
