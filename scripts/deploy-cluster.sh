@@ -207,6 +207,20 @@ resolve_switch_to_ghcr() {
   SWITCH_TO_GHCR=false
 }
 
+# warn_bootc_update_drift: #376's deferred deploy-time WARN, folded in here per
+# bt-374's decided-scope (#380 documented the drift but left the deploy-cluster.sh
+# WARN to wave 2 to avoid colliding with #377). BOOTC_UPDATE_SCHEDULE arms
+# bootc-semver-update.timer on the deployed nodes, which periodically advances
+# them to the highest published vX.Y.Z GHCR tag (semver-aware — NOT a literal
+# :latest poll). Across PRs that means a cluster silently drifts off the image
+# it was deployed with: fine for a long-lived lab, a footgun for a reproducible
+# boot-test. Surface it once at deploy time. See docs/auto-updates.md (#376) and
+# the override family #373/#374/#375/#377. No-op unless the schedule is set.
+warn_bootc_update_drift() {
+  [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]] || return 0
+  log "WARN: BOOTC_UPDATE_SCHEDULE=${BOOTC_UPDATE_SCHEDULE} arms bootc-semver-update.timer — this cluster will advance to the highest published vX.Y.Z GHCR tag over time, drifting off the image it was deployed with (silent multi-PR mismatch). Leave BOOTC_UPDATE_SCHEDULE unset for a reproducible boot-test. See docs/auto-updates.md (#376)."
+}
+
 # Source-only mode for bats: when HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1, return
 # from `source` here so the test can call render_cp_user_data / worker_user_data
 # without the script's root/libvirt orchestration kicking in. (#181 round-2,
@@ -469,6 +483,10 @@ case "$STRICT_CACHE" in 0|1) ;; *) fail "STRICT_CACHE must be 0 or 1 (got '$STRI
 # SWITCH_TO_GHCR, so both the CP and worker cloud-init inherit the resolved
 # value from a single decision + WARN.
 resolve_switch_to_ghcr
+
+# #376 (folded in per bt-374 scope): warn once if BOOTC_UPDATE_SCHEDULE will
+# drift this cluster off its deployed image over time.
+warn_bootc_update_drift
 
 # If IMAGE_SOURCE wasn't in the operator's config (pre-#231 was a
 # `:?` hard-fail; #231 made `ghcr` the default), surface the resolution

@@ -1080,3 +1080,43 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"FORCE_SWITCH=1"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# BOOTC_UPDATE_SCHEDULE long-term-drift WARN — warn_bootc_update_drift
+# (#376 deferred WARN, folded into #374 per bt-374 decided-scope)
+# ---------------------------------------------------------------------------
+
+# Helper: source source-only with a log() shim, set BOOTC_UPDATE_SCHEDULE from
+# $1, run warn_bootc_update_drift, surfacing its log output.
+_warn_drift() {
+  local driver="${BATS_TEST_TMPDIR}/warn-drift.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'export HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*" >&2; }\n'
+    printf 'source %q\n' "$SCRIPT"
+    printf 'BOOTC_UPDATE_SCHEDULE=%q\n' "$1"
+    printf 'warn_bootc_update_drift\n'
+    printf 'printf "DONE\\n"\n'
+  } > "$driver"
+  bash "$driver"
+}
+
+@test "deploy-cluster: BOOTC_UPDATE_SCHEDULE set -> drift WARN (semver wording, not :latest) (#376)" {
+  run _warn_drift "*-*-* 04:00:00"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN"* ]]
+  [[ "$output" == *"BOOTC_UPDATE_SCHEDULE"* ]]
+  [[ "$output" == *"bootc-semver-update.timer"* ]]
+  [[ "$output" == *"vX.Y.Z"* ]]
+  # Must use semver-timer language, NOT imply a literal :latest poll.
+  [[ "$output" != *":latest"* ]]
+  [[ "$output" == *"DONE"* ]]
+}
+
+@test "deploy-cluster: BOOTC_UPDATE_SCHEDULE unset -> no drift WARN (#376)" {
+  run _warn_drift ""
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARN"* ]]
+  [[ "$output" == *"DONE"* ]]
+}
