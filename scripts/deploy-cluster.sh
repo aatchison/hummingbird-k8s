@@ -499,14 +499,17 @@ case "$IMAGE_SOURCE" in
     # built from a commit that predates the on-disk Containerfile, this deploy
     # would silently boot-test the PUBLISHED bits, not the operator's change —
     # the false-positive-green that surfaced in PR #367. Warn loudly; under
-    # STRICT_CACHE=1 (CI/boot-test) refuse outright. No local rebuild path here
+    # STRICT_CACHE=1 (CI/boot-test) refuse outright. The gate acts ONLY on a
+    # CONFIRMED drift (image revision known AND the Containerfile changed
+    # since it); an unverifiable image — today's default, no revision label —
+    # reuses silently in both modes (#373 round-2). No local rebuild path here
     # — the recovery is IMAGE_SOURCE=local FORCE_REBUILD=1 (issue #373 workaround).
     _ghcr_stale=0
     hbird_assess_ghcr_image "$CP_IMAGE_REF" "control-plane image" \
       "${REPO_ROOT}/containers/k8s/Containerfile" || _ghcr_stale=1
     hbird_assess_ghcr_image "$WORKER_IMAGE_REF" "worker image" \
       "${REPO_ROOT}/containers/k8s-worker/Containerfile" || _ghcr_stale=1
-    (( _ghcr_stale )) && fail "STRICT_CACHE=1: refusing to deploy a stale/unverifiable GHCR image (see ERROR above). Rebuild from source with IMAGE_SOURCE=local FORCE_REBUILD=1."
+    (( _ghcr_stale )) && fail "STRICT_CACHE=1: refusing to deploy a GHCR image whose revision predates the on-disk Containerfile (see ERROR above). Rebuild from source with IMAGE_SOURCE=local FORCE_REBUILD=1."
     ;;
   local)
     CP_IMAGE_REF="localhost/hummingbird-k8s:latest"
