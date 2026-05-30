@@ -926,3 +926,197 @@ EOF
   [[ "$output" == *"STRICT_CACHE=1"* ]]
   [[ "$output" == *"KVM_HOST=clibox"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# FORCE_REBUILD + SWITCH_TO_GHCR guard — resolve_switch_to_ghcr (#374)
+# ---------------------------------------------------------------------------
+#
+# When the operator builds/tests a specific image (FORCE_REBUILD=1), a
+# first-boot `bootc switch ghcr.io/...` would silently replace those bits with
+# the registry's — the second false-positive boot-test mechanism (sibling to
+# #373). resolve_switch_to_ghcr auto-disables SWITCH_TO_GHCR in that case
+# (loud WARN) unless FORCE_SWITCH=1 opts back in. We exercise the real function
+# in source-only mode (it's defined above the source-only guard, like the
+# render functions) with a log() shim.
+
+# Helper: source the script source-only with a log() shim, apply the given
+# `VAR=VAL` knob assignments, run resolve_switch_to_ghcr, and print the result.
+_resolve_switch() {
+  local driver="${BATS_TEST_TMPDIR}/resolve-driver.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'export HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*" >&2; }\n'
+    printf 'source %q\n' "$SCRIPT"
+    local kv
+    for kv in "$@"; do printf '%s\n' "$kv"; done
+    printf 'resolve_switch_to_ghcr\n'
+    printf 'printf "RESOLVED=%%s\\n" "$SWITCH_TO_GHCR"\n'
+  } > "$driver"
+  bash "$driver"
+}
+
+@test "deploy-cluster: FORCE_REBUILD=1 + SWITCH_TO_GHCR=true -> auto-disabled + WARN (#374)" {
+  run _resolve_switch 'FORCE_REBUILD=1' 'SWITCH_TO_GHCR=true' 'GHCR_TAG=v9.9.9'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"RESOLVED=false"* ]]
+  [[ "$output" == *"WARN"* ]]
+  [[ "$output" == *"#374"* ]]
+  [[ "$output" == *"FORCE_SWITCH=1"* ]]   # the WARN tells the operator how to opt back in
+}
+
+@test "deploy-cluster: FORCE_REBUILD=1 + SWITCH_TO_GHCR=true + FORCE_SWITCH=1 -> kept, no auto-disable (#374)" {
+  run _resolve_switch 'FORCE_REBUILD=1' 'SWITCH_TO_GHCR=true' 'FORCE_SWITCH=1'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"RESOLVED=true"* ]]
+  # Opt-in path logs an explicit notice, NOT the auto-disable WARN.
+  [[ "$output" != *"Auto-disabling"* ]]
+  [[ "$output" == *"FORCE_SWITCH=1"* ]]
+}
+
+@test "deploy-cluster: FORCE_REBUILD=1 + SWITCH_TO_GHCR=false -> no-op, no WARN (#374)" {
+  run _resolve_switch 'FORCE_REBUILD=1' 'SWITCH_TO_GHCR=false'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"RESOLVED=false"* ]]
+  [[ "$output" != *"WARN"* ]]
+}
+
+@test "deploy-cluster: SWITCH_TO_GHCR=true without FORCE_REBUILD -> unchanged, no WARN (#374)" {
+  # The golden ghcr path (FORCE_REBUILD unset) must NOT be touched by the guard.
+  run _resolve_switch 'SWITCH_TO_GHCR=true'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"RESOLVED=true"* ]]
+  [[ "$output" != *"WARN"* ]]
+}
+
+@test "deploy-cluster: #374 guard -> CP cloud-init OMITS bootc switch; FORCE_SWITCH=1 keeps it" {
+  # End-to-end: guard mutates SWITCH_TO_GHCR, then render_cp_user_data (which
+  # reads it) must drop the `bootc switch` runcmd. Proves the guard->render wire.
+  local driver="${BATS_TEST_TMPDIR}/driver-374-cp.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1
+log() { printf 'LOG: %s\n' "\$*" >&2; }
+export CP_NAME=hbird-cp1
+export SSH_PUBKEY_CONTENT="ssh-ed25519 AAAA-test key@host"
+export GHCR_TAG=v9.9.9
+export AUTO_UPDATE_CP=true
+export BOOTC_UPDATE_SCHEDULE=""
+export BOOTC_UPDATE_REPO_K8S=""
+FORCE_REBUILD=1
+SWITCH_TO_GHCR=true
+FORCE_SWITCH="\${FORCE_SWITCH:-}"
+# shellcheck disable=SC1090
+source "${SCRIPT}"
+resolve_switch_to_ghcr
+render_cp_user_data
+EOF
+  chmod +x "$driver"
+
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  # Guard fired -> the GHCR switch line for the CP image must be absent.
+  [[ "$output" != *"bootc, switch, ghcr.io/aatchison/hummingbird-k8s:v9.9.9"* ]]
+
+  # Opt back in -> the switch line returns.
+  FORCE_SWITCH=1 run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"bootc, switch, ghcr.io/aatchison/hummingbird-k8s:v9.9.9"* ]]
+}
+
+@test "deploy-cluster: #374 guard -> worker cloud-init OMITS bootc switch; FORCE_SWITCH=1 keeps it" {
+  local driver="${BATS_TEST_TMPDIR}/driver-374-worker.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1
+log() { printf 'LOG: %s\n' "\$*" >&2; }
+export SSH_PUBKEY_CONTENT="ssh-ed25519 AAAA-test key@host"
+export JOIN_CMD="kubeadm join PLACEHOLDER --token redacted"
+export GHCR_TAG=v9.9.9
+export BOOTC_UPDATE_SCHEDULE=""
+export BOOTC_UPDATE_REPO_WORKER=""
+FORCE_REBUILD=1
+SWITCH_TO_GHCR=true
+FORCE_SWITCH="\${FORCE_SWITCH:-}"
+# shellcheck disable=SC1090
+source "${SCRIPT}"
+resolve_switch_to_ghcr
+out="\$(mktemp)"
+worker_user_data hbird-w1 "\$out"
+cat "\$out"
+EOF
+  chmod +x "$driver"
+
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"bootc, switch, ghcr.io/aatchison/hummingbird-k8s-worker:v9.9.9"* ]]
+
+  FORCE_SWITCH=1 run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"bootc, switch, ghcr.io/aatchison/hummingbird-k8s-worker:v9.9.9"* ]]
+}
+
+@test "deploy-cluster: CLI FORCE_SWITCH beats hard-assigning config (#374)" {
+  # FORCE_SWITCH must be in HBIRD_CLI_OVERRIDE_KNOBS so a config hard-assign
+  # cannot clobber the operator's explicit opt-in/out.
+  local conf="${BATS_TEST_TMPDIR}/fs.conf"
+  cat > "$conf" <<'CONF_EOF'
+FORCE_SWITCH=0
+CONF_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-fs.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+FORCE_SWITCH=1
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'FORCE_SWITCH=%s\n' "\$FORCE_SWITCH"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"FORCE_SWITCH=1"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# BOOTC_UPDATE_SCHEDULE long-term-drift WARN — warn_bootc_update_drift
+# (#376 deferred WARN, folded into #374 per bt-374 decided-scope)
+# ---------------------------------------------------------------------------
+
+# Helper: source source-only with a log() shim, set BOOTC_UPDATE_SCHEDULE from
+# $1, run warn_bootc_update_drift, surfacing its log output.
+_warn_drift() {
+  local driver="${BATS_TEST_TMPDIR}/warn-drift.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'export HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY=1\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*" >&2; }\n'
+    printf 'source %q\n' "$SCRIPT"
+    printf 'BOOTC_UPDATE_SCHEDULE=%q\n' "$1"
+    printf 'warn_bootc_update_drift\n'
+    printf 'printf "DONE\\n"\n'
+  } > "$driver"
+  bash "$driver"
+}
+
+@test "deploy-cluster: BOOTC_UPDATE_SCHEDULE set -> drift WARN (semver wording, not :latest) (#376)" {
+  run _warn_drift "*-*-* 04:00:00"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN"* ]]
+  [[ "$output" == *"BOOTC_UPDATE_SCHEDULE"* ]]
+  [[ "$output" == *"bootc-semver-update.timer"* ]]
+  [[ "$output" == *"vX.Y.Z"* ]]
+  # Must use semver-timer language, NOT imply a literal :latest poll.
+  [[ "$output" != *":latest"* ]]
+  [[ "$output" == *"DONE"* ]]
+}
+
+@test "deploy-cluster: BOOTC_UPDATE_SCHEDULE unset -> no drift WARN (#376)" {
+  run _warn_drift ""
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"WARN"* ]]
+  [[ "$output" == *"DONE"* ]]
+}
