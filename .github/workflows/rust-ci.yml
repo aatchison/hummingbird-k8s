@@ -7,6 +7,19 @@
 # deliberately scoped narrow so a bash-only PR doesn't pay for a Rust
 # toolchain spin-up.
 #
+# Forgejo-hardening note (bt-ci-harden-rust): the original workflow used
+# three GitHub-only actions that are not mirrored on the Forgejo runner:
+#   - dtolnay/rust-toolchain   (fmt/clippy/build/test/deny/pre-commit)
+#   - Swatinem/rust-cache      (clippy/build/test/pre-commit)
+#   - taiki-e/install-action   (cargo-deny in deny; cargo-nextest in test)
+# These are replaced with the docker-build-context-tarball pattern proven
+# by pr-validate.yml: `docker build -t ci-rust-<job> -f - . <<'DOCKERFILE'
+# FROM rust:1.96 ... DOCKERFILE`. actions/checkout, docker/*, and
+# actions/setup-python are mirrored and unchanged. cargo-nextest is
+# replaced by plain `cargo test`; cargo-deny is installed via
+# `cargo install --locked cargo-deny` in the deny image layer.
+# Docker layer caching on the self-hosted runner keeps repeat runs fast.
+#
 # Implementation choice: most jobs run on a flat ubuntu-latest runner with
 # rustup + the same cargo-* tools the devcontainer installs. The
 # devcontainer-smoke job builds the actual `.devcontainer/Containerfile`
@@ -49,7 +62,10 @@ on:
       - "scripts/verify-rust-lints-inheritance.sh"
       - "tests/scripts/verify-rust-lints-inheritance.bats"
   push:
-    branches: [main]
+    # TEMP: ci/forgejo-harden-rust added so the hardening branch gets a
+    # real run before merge. Strip this branch from the list post-merge
+    # (only main should remain, matching the original intent).
+    branches: [main, ci/forgejo-harden-rust]
     paths:
       - "rust/**"
       - ".devcontainer/**"
@@ -77,98 +93,114 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
-      - name: Install Rust toolchain (channel + components from rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
-        with:
-          components: rustfmt
       - name: Check formatting (cargo fmt --check)
-        working-directory: rust
-        # On failure also dump the diff so the operator can apply it
-        # locally with `cargo fmt --all`. (PR #314 round-2 review Lens 3
-        # HIGH: --check exits non-zero with file list but no diff.)
+        # Build a temp image with the repo baked in (no bind mounts — same
+        # docker-build-context-tarball pattern as pr-validate.yml).
+        # rust:1.96 pinned (rust:stable not resolvable on this Docker daemon;
+        # 1.96 = current stable from rust-toolchain.toml channel = "stable").
         run: |
-          if ! cargo fmt --all -- --check; then
-            echo "::group::Diff that would apply"
-            cargo fmt --all -- --check --files-with-diff || true
-            cargo fmt --all -- --emit=diff || true
-            echo "::endgroup::"
-            echo "::error::cargo fmt would change files — run \`cargo fmt --all\` locally to fix."
-            exit 1
-          fi
+          docker build -t ci-rust-fmt -f - . <<'DOCKERFILE'
+          FROM rust:1.96
+          COPY . /repo
+          WORKDIR /repo/rust
+          DOCKERFILE
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            ci-rust-fmt \
+            bash -c '
+              if ! cargo fmt --all -- --check; then
+                echo "::group::Diff that would apply"
+                cargo fmt --all -- --emit=diff || true
+                echo "::endgroup::"
+                echo "::error::cargo fmt would change files — run \`cargo fmt --all\` locally to fix."
+                exit 1
+              fi
+            '
 
   clippy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
-        with:
-          components: clippy
-      - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-        with:
-          workspaces: rust
       - name: Reject clippy warnings (-D warnings)
-        working-directory: rust
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: |
+          docker build -t ci-rust-clippy -f - . <<'DOCKERFILE'
+          FROM rust:1.96
+          COPY . /repo
+          WORKDIR /repo/rust
+          DOCKERFILE
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_INCREMENTAL=0 \
+            -e RUSTFLAGS="-D warnings" \
+            ci-rust-clippy \
+            cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
-      - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-        with:
-          workspaces: rust
       - name: Workspace build (all targets)
-        working-directory: rust
-        run: cargo build --workspace --all-targets
+        run: |
+          docker build -t ci-rust-build -f - . <<'DOCKERFILE'
+          FROM rust:1.96
+          COPY . /repo
+          WORKDIR /repo/rust
+          DOCKERFILE
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_INCREMENTAL=0 \
+            -e RUSTFLAGS="-D warnings" \
+            ci-rust-build \
+            cargo build --workspace --all-targets
 
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
-      - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-        with:
-          workspaces: rust
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@8f531eaecd1898bc3da7d104ad91bee98d1b97bd # v2.79.9
-        with:
-          tool: cargo-nextest
-      - name: Workspace test run (nextest, --no-fail-fast)
-        working-directory: rust
-        # --no-fail-fast so a single CI run surfaces all failing tests at
-        # once, not just the first. (PR #314 round-2 review Lens 3 LOW.)
-        run: cargo nextest run --workspace --no-fail-fast
+      - name: Workspace test run (--no-fail-fast)
+        # cargo-nextest replaced by plain `cargo test` — same tests, same
+        # --no-fail-fast semantics, no taiki-e/install-action dependency.
+        run: |
+          docker build -t ci-rust-test -f - . <<'DOCKERFILE'
+          FROM rust:1.96
+          COPY . /repo
+          WORKDIR /repo/rust
+          DOCKERFILE
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_INCREMENTAL=0 \
+            ci-rust-test \
+            cargo test --workspace --no-fail-fast
 
   deny:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Generous timeout: first cold run compiles cargo-deny from crates.io
+    # (~5-10 min); Docker layer caching on the self-hosted runner makes
+    # repeat runs fast (<1 min once the layer is cached).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@8f531eaecd1898bc3da7d104ad91bee98d1b97bd # v2.79.9
-        with:
-          tool: cargo-deny
       - name: Supply-chain audit (advisories / bans / licenses / sources)
-        working-directory: rust
-        # `--show-stats` is a check-subcommand flag, not a top-level
-        # cargo-deny flag — putting it before `check` exits non-zero
-        # with a usage error.
-        run: cargo deny check --show-stats
+        # cargo-deny installed via `cargo install --locked` in a dedicated
+        # image layer BEFORE the repo COPY so the compiled binary is cached
+        # independently of source changes.
+        run: |
+          docker build -t ci-rust-deny -f - . <<'DOCKERFILE'
+          FROM rust:1.96
+          RUN cargo install --locked cargo-deny
+          COPY . /repo
+          WORKDIR /repo/rust
+          DOCKERFILE
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            ci-rust-deny \
+            cargo deny check --show-stats
 
   lint-inheritance:
     # Lens 6 MEDIUM finding from PR #313 round-2 review: every crate must
@@ -179,6 +211,7 @@ jobs:
     # side (cargo intentionally requires opt-in per crate); CI is the
     # backstop. Helper script lives at scripts/verify-rust-lints-inheritance.sh
     # and has bats coverage at tests/scripts/verify-rust-lints-inheritance.bats.
+    # No Rust toolchain needed — pure bash. No unmirrored actions.
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
@@ -190,8 +223,13 @@ jobs:
     # Runs the project's pre-commit hooks against the full tree. Catches
     # both hook drift (rules changed but a stale snapshot got committed)
     # and the case where someone bypassed pre-commit with --no-verify.
+    #
+    # The hooks use `language: system` and shell out to `cargo fmt` and
+    # `cargo clippy`. We bake both Rust (rust:stable) and pre-commit
+    # (python3-pip + pip install) into a single Docker image so cargo is
+    # on PATH when the hooks execute inside the container.
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
@@ -200,28 +238,35 @@ jobs:
           # changed-only mode, anything using `git diff`) sees the full
           # tree. PR #314 round-2 review Lens 3 MEDIUM.
           fetch-depth: 0
-      - name: Install Rust toolchain (hooks shell out to cargo fmt + clippy)
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
-        with:
-          components: rustfmt, clippy
-      - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-        with:
-          workspaces: rust
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.0.0
-        with:
-          python-version: "3.x"
-      - name: Install pre-commit
-        run: pip install pre-commit
       - name: Run all pre-commit hooks
-        run: pre-commit run --all-files --show-diff-on-failure
+        run: |
+          docker build -t ci-rust-precommit -f - . <<'DOCKERFILE'
+          FROM rust:1.96
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                python3-pip git \
+              && pip3 install pre-commit --break-system-packages \
+              && git config --global --add safe.directory /repo \
+              && rm -rf /var/lib/apt/lists/*
+          COPY . /repo
+          WORKDIR /repo
+          DOCKERFILE
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_INCREMENTAL=0 \
+            -e RUSTFLAGS="-D warnings" \
+            ci-rust-precommit \
+            pre-commit run --all-files --show-diff-on-failure
 
   devcontainer-smoke:
+    # GitHub-only: Forgejo DinD cannot build the devcontainer image (#18). Runs on GitHub, skips on Forgejo.
+    if: ${{ github.server_url == 'https://github.com' }}
     # Dev/CI parity gate: build the actual .devcontainer/Containerfile and
     # confirm the toolchain it ships matches what the flat jobs above
     # consumed. Slow (~5-10 min cold; ~1-2 min with cache) so it runs once
-    # per PR, not per fmt/clippy job. If this fails while flat jobs pass,
+    # per PR, not per fmt/clippy/test job. If this fails while flat jobs pass,
     # the devcontainer has drifted from what CI/dev was supposed to share.
+    # Uses docker/setup-buildx-action + docker/build-push-action which are
+    # mirrored on the Forgejo runner (unchanged from original).
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -238,8 +283,6 @@ jobs:
           push: false
           load: true
           tags: hummingbird-k8s-devcontainer:ci
-          cache-from: type=gha,scope=devcontainer
-          cache-to: type=gha,scope=devcontainer,mode=max
       - name: Confirm toolchain + cargo tools present in the image
         env:
           WORKSPACE: ${{ github.workspace }}
