@@ -842,16 +842,33 @@ if [[ "$RUN_VERIFY" = "true" ]]; then
   # would re-resolve via virsh-domifaddr — slower + relies on KVM_HOST
   # being a usable SSH alias from this host). Explicit flags also make
   # the intent grep-able in the deploy log.
+  #
+  # #9 item (a): when STRICT_CACHE=1 both missing-hbird and verifier
+  # non-zero are fatal — the strict gate must be able to fail the deploy.
+  # The non-strict (default) path is unchanged (informational).
+  # ---- begin run-verify-block ---
   if command -v hbird >/dev/null 2>&1; then
     log "running hbird verify app-deploy"
+    _verify_rc=0
     hbird verify app-deploy \
       --config "$CONFIG_PATH" \
       --cp-ip "$CP_IP" \
-      --kvm-host "${KVM_HOST:-}" \
-      || log "hbird verify app-deploy exited non-zero (cluster is up; verifier failure is informational)"
+      --kvm-host "${KVM_HOST:-}" || _verify_rc=$?
+    if (( _verify_rc != 0 )); then
+      if [[ "${STRICT_CACHE:-0}" == "1" ]]; then
+        fail "hbird verify app-deploy exited non-zero (rc=${_verify_rc}) — deploy fails under STRICT_CACHE=1"
+      else
+        log "hbird verify app-deploy exited non-zero (cluster is up; verifier failure is informational)"
+      fi
+    fi
   else
-    log "RUN_VERIFY=true but \`hbird\` CLI not found on PATH; skipping (install per docs/rust-cli.md)"
+    if [[ "${STRICT_CACHE:-0}" == "1" ]]; then
+      fail "RUN_VERIFY=true but \`hbird\` CLI not found on PATH (required under STRICT_CACHE=1; install per docs/rust-cli.md)"
+    else
+      log "RUN_VERIFY=true but \`hbird\` CLI not found on PATH; skipping (install per docs/rust-cli.md)"
+    fi
   fi
+  # ---- end run-verify-block ---
 fi
 
 # ---- Summary ----------------------------------------------------------------

@@ -144,6 +144,19 @@ setup() {
     return 1
   }
 
+  # Extract the run-verify block for #9 item (a) tests. The block spans from
+  # "# ---- begin run-verify-block ---" through "# ---- end run-verify-block ---"
+  # (exclusive of the marker lines). Tests source it with mock log/fail/hbird.
+  awk '
+    /# ---- begin run-verify-block ---/ { capture=1; next }
+    capture && /# ---- end run-verify-block ---/ { exit }
+    capture { print }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/run-verify.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/run-verify.snippet" ] || {
+    echo "FATAL: failed to extract run-verify-block from ${SCRIPT}" >&2
+    return 1
+  }
+
   # Extract the cluster-ready poll block for #9 tests. The block spans from
   # "# ---- begin cluster-ready-poll ---" through "# ---- end cluster-ready-poll ---"
   # (exclusive of the marker lines). Tests source it with a mock cp_ssh() so
@@ -1346,4 +1359,85 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" == *"BASE_IMAGE=quay.io/fedora/fedora-bootc:41"* ]]
   [[ "$output" == *"VM_USER=config-user"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# RUN_VERIFY fail-closed under STRICT_CACHE (#9 item a)
+# ---------------------------------------------------------------------------
+#
+# Today both failure paths in the RUN_VERIFY block are non-fatal: verifier
+# non-zero -> log informational; missing hbird -> log and skip. Under
+# STRICT_CACHE=1 (the explicit strict boot-test gate) both must be fatal so
+# the gate cannot false-green on app-verification failure.
+#
+# Tests source the real run-verify snippet (see setup) with mock log/fail and
+# a stubbed hbird binary so no real cluster is needed.
+
+@test "deploy-cluster: RUN_VERIFY=true + STRICT_CACHE=1 + verifier non-zero -> deploy fails (#9)" {
+  # Stub hbird to always exit 1 (verifier failure).
+  local bindir="${BATS_TEST_TMPDIR}/bin-strict-fail"
+  mkdir -p "$bindir"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "${bindir}/hbird"
+  chmod +x "${bindir}/hbird"
+  local driver="${BATS_TEST_TMPDIR}/driver-rv-strict-fail.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+    printf 'PATH=%q:${PATH}\n' "$bindir"
+    printf 'STRICT_CACHE=1\n'
+    printf 'CONFIG_PATH=/dev/null\nCP_IP=127.0.0.1\nKVM_HOST=\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/run-verify.snippet"
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FAIL:"* ]]
+  [[ "$output" == *"STRICT_CACHE=1"* ]]
+}
+
+@test "deploy-cluster: RUN_VERIFY=true + STRICT_CACHE=1 + hbird missing -> deploy fails (#9)" {
+  # No hbird on PATH — use an empty bin dir so command -v hbird fails.
+  local emptydir="${BATS_TEST_TMPDIR}/bin-empty"
+  mkdir -p "$emptydir"
+  local driver="${BATS_TEST_TMPDIR}/driver-rv-strict-missing.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+    printf 'PATH=%q\n' "$emptydir"
+    printf 'STRICT_CACHE=1\n'
+    printf 'CONFIG_PATH=/dev/null\nCP_IP=127.0.0.1\nKVM_HOST=\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/run-verify.snippet"
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FAIL:"* ]]
+  [[ "$output" == *"STRICT_CACHE=1"* ]]
+}
+
+@test "deploy-cluster: RUN_VERIFY=true + STRICT_CACHE unset + verifier non-zero -> informational, deploy succeeds (#9)" {
+  # Stub hbird to exit 1; without STRICT_CACHE=1 this must remain non-fatal.
+  local bindir="${BATS_TEST_TMPDIR}/bin-nonstrict"
+  mkdir -p "$bindir"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "${bindir}/hbird"
+  chmod +x "${bindir}/hbird"
+  local driver="${BATS_TEST_TMPDIR}/driver-rv-nonstrict.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+    printf 'PATH=%q:${PATH}\n' "$bindir"
+    printf '# STRICT_CACHE deliberately unset — non-strict path\n'
+    printf 'CONFIG_PATH=/dev/null\nCP_IP=127.0.0.1\nKVM_HOST=\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/run-verify.snippet"
+    printf 'echo "deploy-ok"\n'
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"informational"* ]]
+  [[ "$output" == *"deploy-ok"* ]]
+  [[ "$output" != *"FAIL:"* ]]
 }
