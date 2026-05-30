@@ -283,11 +283,12 @@ or changing a `containers/*/Containerfile`, the on-disk qcow2 could be
 out of date and the deploy would quietly boot the *old* bits (a
 false-positive "cluster came up OK" against pre-change code). Deploy now
 records the build identity alongside each template
-(`<template>.qcow2.build-ref`, written by `lib/cache-utils.sh`) and
-compares it before reusing:
+(`<template>.qcow2.build-ref`, written by `lib/cache-utils.sh`, namespaced
+by source as `local:<hash>` / `ghcr:<ref>`) and acts **only on a confirmed
+mismatch** before reusing:
 
 - **`IMAGE_SOURCE=local`** — the on-disk Containerfile content hash. If it
-  drifts from the recorded ref, the template is rebuilt automatically
+  differs from the recorded ref, the template is rebuilt automatically
   (`FORCE_REBUILD=1` is applied for that template only) with a `WARN`.
 - **`IMAGE_SOURCE=ghcr`** — the pulled image's
   `org.opencontainers.image.revision` label. If the Containerfile changed
@@ -296,12 +297,21 @@ compares it before reusing:
   path for `ghcr` — switch to `IMAGE_SOURCE=local FORCE_REBUILD=1` to test
   local edits).
 
-Set **`STRICT_CACHE=1`** to turn every such `WARN` into a hard failure —
-the fail-closed posture a CI / boot-test gate wants (mirrors
-`HBIRD_REMOTE_STRICT`). When the image carries no revision label and the
-freshness can't be verified, `STRICT_CACHE=1` fails closed rather than
-proceeding. `STRICT_CACHE` is operator-overridable and forwarded across
-the `KVM_HOST=` re-exec.
+**Unverifiable is not stale.** If the build identity can't be established
+(today's published images carry no revision label; or a pre-feature
+template has no sidecar; or you switched `IMAGE_SOURCE` between deploys so
+the two identities aren't comparable), the check **reuses the template
+silently** — it never forces a rebuild and never fails. Only a *confirmed*
+same-source mismatch is acted on. This keeps `build_qcow2`'s skip-if-exists
+fast path intact on the default `ghcr` path.
+
+Set **`STRICT_CACHE=1`** to turn a confirmed-stale `WARN` into a hard
+failure — the fail-closed posture a CI / boot-test gate wants (mirrors
+`HBIRD_REMOTE_STRICT`). `STRICT_CACHE` does **not** fail on the
+unverifiable case above (that would break every default `ghcr` deploy until
+the images stamp a revision label); it fails only on a confirmed mismatch.
+`STRICT_CACHE` is operator-overridable and forwarded across the
+`KVM_HOST=` re-exec.
 
 > Note on tags: `GHCR_TAG=latest` (the default) tracks whatever the
 > publish pipeline last pushed; the running node's own drift is governed

@@ -555,17 +555,21 @@ WORKER_TEMPLATE_NAME="hummingbird-k8s-worker-deploy"
 #                         is scoped to the build_qcow2 call so the other flavor
 #                         is judged independently)
 #   * stale + STRICT_CACHE=1 -> hard-fail
-# The build identity is the pulled image's vcs-ref (ghcr) or the on-disk
-# Containerfile content hash (local) — whatever uniquely pins "what these bits
-# are". $1=image-ref $2=template-name $3=bib-cfg $4=containerfile $5=label
+# The build identity is source-namespaced (`<source>:<id>`): the pulled
+# image's vcs-ref (ghcr) or the on-disk Containerfile content hash (local).
+# An unverifiable id (e.g. a GHCR image with no revision label) yields an empty
+# build_id, which hbird_assess_qcow2_cache treats as "cannot confirm -> reuse"
+# and hbird_cache_write_ref declines to record — so the default ghcr path keeps
+# build_qcow2's skip-if-exists fast path intact. (#373 round-2.)
+# $1=image-ref $2=template-name $3=bib-cfg $4=containerfile $5=label
 build_template() {
   local image_ref="$1" name="$2" cfg="$3" containerfile="$4" label="$5"
   local qcow="${POOL_DIR}/${name}.qcow2"
   local build_id force_this rc=0
   if [[ "$IMAGE_SOURCE" == "ghcr" ]]; then
-    build_id="$(hbird_image_vcs_ref "$image_ref")"
+    build_id="$(hbird_cache_build_id ghcr "$(hbird_image_vcs_ref "$image_ref")")"
   else
-    build_id="$(hbird_containerfile_ref "$containerfile")"
+    build_id="$(hbird_cache_build_id local "$(hbird_containerfile_ref "$containerfile")")"
   fi
   force_this="${FORCE_REBUILD:-}"
   hbird_assess_qcow2_cache "$qcow" "$build_id" "$label" || rc=$?

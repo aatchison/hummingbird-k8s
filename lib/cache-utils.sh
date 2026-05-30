@@ -26,13 +26,18 @@
 # so tests/lib/cache-utils.bats exercises them without root, podman, or a
 # real cluster.
 #
-# NOTE: the GHCR image revision check reads the OCI label
-# `org.opencontainers.image.revision`. The published Containerfiles do not
-# emit that label yet (release.yml passes a REVISION build-arg that the
-# Containerfile currently drops on the floor) — so on today's images the
-# GHCR check degrades to "cannot verify" (WARN, or fail under STRICT_CACHE).
-# That is the correct fail-closed posture for a boot-test gate. Teaching the
-# Containerfiles to stamp the label is a separate, out-of-scope follow-up.
+# Core principle (#373 round-2): ACT ONLY ON A CONFIRMED MISMATCH. Both refs
+# must be present (non-empty) AND differ before we WARN/rebuild/hard-fail.
+# Anything unverifiable — empty ref on either side, or two refs from different
+# sources that aren't comparable — is "cannot tell" and resolves to "reuse
+# silently" in BOTH normal and STRICT_CACHE modes. This matters because the
+# DEFAULT path is `IMAGE_SOURCE=ghcr` and the published Containerfiles do not
+# stamp `org.opencontainers.image.revision` yet (release.yml passes a REVISION
+# build-arg the Containerfile drops). If "unverifiable" forced action, every
+# default deploy would do a full bib rebuild (or hard-fail under STRICT_CACHE)
+# even when nothing changed — defeating build_qcow2's skip-if-exists fast path.
+# Teaching the Containerfiles to stamp the label is an out-of-scope follow-up;
+# once it lands, the CONFIRMED-mismatch path starts firing for ghcr too.
 
 # Guard against double-source (deploy-cluster.sh + a test both sourcing).
 [[ -n "${_HBIRD_CACHE_UTILS_SH:-}" ]] && return 0
@@ -56,6 +61,19 @@ hbird_image_vcs_ref() {
   podman image inspect \
     --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
     "$1" 2>/dev/null || true
+}
+
+# hbird_cache_build_id <source> <id>: a source-namespaced build identity for
+# the sidecar, e.g. `local:9f2c…` or `ghcr:acef96c`. Namespacing keeps the two
+# identity spaces apart so switching IMAGE_SOURCE between deploys does not read
+# as a stale-template "mismatch" (a content-hash and a git-commit are never
+# equal even when the bits are identical — #373 round-2 MED). An empty <id>
+# (unverifiable — e.g. a GHCR image with no revision label) yields EMPTY so it
+# is never recorded and never actionable.
+hbird_cache_build_id() {
+  local source="$1" id="$2"
+  [[ -n "$id" ]] || return 0
+  printf '%s:%s\n' "$source" "$id"
 }
 
 # hbird_cache_sidecar_path <qcow>: path of the sidecar that records the
@@ -124,17 +142,13 @@ hbird_assess_ghcr_image() {
       return 0
       ;;
     *)
-      # Cannot determine: no revision label on the image, or its commit is not
-      # in this checkout's git history. A boot-test gate (STRICT_CACHE=1) must
-      # fail closed — an unverifiable image is exactly the false-positive #373
-      # is about. But the DEFAULT deploy path is ghcr+latest and the published
-      # images do not stamp a revision label yet, so nagging on every routine
-      # interactive deploy would be pure noise — stay silent there.
-      if hbird_cache_strict_enabled; then
-        printf 'ERROR: cannot verify pulled %s against on-disk %s (vcs-ref %s not in local git history) — STRICT_CACHE=1 refuses an unverifiable boot-test. Rebuild from source: IMAGE_SOURCE=local FORCE_REBUILD=1.\n' \
-          "$label" "$*" "${ref:-<none>}" >&2
-        return 3
-      fi
+      # Cannot determine: no revision label on the image (the current default
+      # — see header), or its commit is not in this checkout's git history.
+      # Unverifiable is NOT a confirmed mismatch, so it resolves to "reuse
+      # silently" in BOTH modes (#373 round-2 HIGH). Failing closed here would
+      # make STRICT_CACHE=1 + the default ghcr path fail on EVERY deploy until
+      # the Containerfiles stamp a revision label. Only a CONFIRMED drift
+      # (rc 1 above) is actionable.
       return 0
       ;;
   esac
@@ -142,25 +156,44 @@ hbird_assess_ghcr_image() {
 
 # hbird_assess_qcow2_cache <qcow> <expected-build-id> <label>
 # For the build_qcow2 skip-if-exists template cache: is the cached qcow2
-# stale relative to the identity we are about to build from?
-#   rc 0  = fresh, reuse
-#   rc 10 = stale/unverifiable -> auto-rebuild (caller sets FORCE_REBUILD=1)
-#   rc 3  = stale/unverifiable under STRICT_CACHE=1 (caller MUST abort)
+# CONFIRMED stale relative to the identity we are about to build from?
+# <expected-build-id> and the recorded sidecar are source-namespaced
+# (`<source>:<id>`, see hbird_cache_build_id).
+#   rc 0  = reuse — fresh, OR unverifiable/cross-source (cannot confirm stale)
+#   rc 10 = CONFIRMED stale -> auto-rebuild (caller sets FORCE_REBUILD=1)
+#   rc 3  = CONFIRMED stale under STRICT_CACHE=1 (caller MUST abort)
 hbird_assess_qcow2_cache() {
   local qcow="$1" expected="$2" label="$3"
   # Nothing cached yet — build_qcow2 will create it; no staleness possible.
   [[ -s "$qcow" ]] || return 0
   local cached
   cached="$(hbird_cache_read_ref "$qcow")"
-  if [[ -n "$cached" && -n "$expected" && "$cached" == "$expected" ]]; then
-    return 0
-  fi
+
+  # Split each ref into <source> and <id> (split on the FIRST colon). A ref
+  # with no colon (a legacy pre-namespacing sidecar) parses to id==src==whole,
+  # so its source won't match a namespaced expected — and it falls through to
+  # "cannot confirm -> reuse", which is the safe outcome.
+  local exp_src exp_id cached_src cached_id
+  exp_src="${expected%%:*}";   exp_id="${expected#*:}"
+  cached_src="${cached%%:*}";  cached_id="${cached#*:}"
+
+  # Act ONLY on a CONFIRMED mismatch: both ids present, SAME source, differing.
+  # Empty id on either side (unverifiable — e.g. the default ghcr path's
+  # missing revision label, or a sidecar-less legacy qcow2) or a cross-source
+  # comparison (operator switched IMAGE_SOURCE) is "cannot tell" -> reuse
+  # silently. This preserves skip-if-exists on the default path and avoids the
+  # cross-mode churn that a content-hash-vs-git-commit compare would cause.
+  # (#373 round-2 HIGH + MED.)
+  [[ -n "$cached_id" && -n "$exp_id" ]] || return 0
+  [[ "$cached_src" == "$exp_src" ]]     || return 0
+  [[ "$cached_id" != "$exp_id" ]]       || return 0
+
   if hbird_cache_strict_enabled; then
     printf 'ERROR: cached %s (%s) build-ref %s != expected %s — STRICT_CACHE=1 refuses to reuse it. Set FORCE_REBUILD=1 to rebuild.\n' \
-      "$label" "$qcow" "${cached:-<none>}" "${expected:-<unknown>}" >&2
+      "$label" "$qcow" "$cached" "$expected" >&2
     return 3
   fi
   printf 'WARN: cached %s build-ref %s differs from expected %s; forcing rebuild. (#373)\n' \
-    "$label" "${cached:-<none>}" "${expected:-<unknown>}" >&2
+    "$label" "$cached" "$expected" >&2
   return 10
 }
