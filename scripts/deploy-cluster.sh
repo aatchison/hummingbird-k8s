@@ -801,23 +801,31 @@ done
 (( WAIT_RC == 0 )) || fail "one or more worker virt-installs failed (rc=${WAIT_RC})"
 
 # ---- Wait for full cluster Ready --------------------------------------------
-
-EXPECTED_NODES=$(( 1 + ${#WORKER_NAMES[@]} ))
-log "polling cluster until ${EXPECTED_NODES} nodes are Ready"
+# Asserts each expected node by NAME rather than an aggregate count — a stray
+# or duplicate node cannot satisfy the count while a named worker join failed.
+# ---- begin cluster-ready-poll ---
+_CLUSTER_POLL_NODES=("$CP_NAME" "${WORKER_NAMES[@]}")
+log "polling cluster until all ${#_CLUSTER_POLL_NODES[@]} named nodes Ready: ${_CLUSTER_POLL_NODES[*]}"
 CLUSTER_READY=0
 for attempt in $(seq 1 "$CP_READY_RETRIES"); do
-  ready_count="$(cp_ssh "kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers 2>/dev/null | awk '\$2==\"Ready\"' | wc -l" 2>/dev/null || echo 0)"
-  ready_count="${ready_count//[^0-9]/}"
-  : "${ready_count:=0}"
-  if (( ready_count >= EXPECTED_NODES )); then
+  _all_ready=1
+  for _node in "${_CLUSTER_POLL_NODES[@]}"; do
+    _node_ok="$(cp_ssh "kubectl --kubeconfig=/etc/kubernetes/admin.conf get node '${_node}' --no-headers 2>/dev/null | awk '\$2==\"Ready\"{print \"yes\"}'" 2>/dev/null || true)"
+    if [[ "${_node_ok//[[:space:]]/}" != "yes" ]]; then
+      _all_ready=0
+      log "node '${_node}' not Ready (attempt ${attempt}/${CP_READY_RETRIES})"
+      break
+    fi
+  done
+  if (( _all_ready == 1 )); then
     CLUSTER_READY=1
-    log "cluster Ready: ${ready_count}/${EXPECTED_NODES} nodes (after ${attempt} attempt(s))"
+    log "cluster Ready: all ${#_CLUSTER_POLL_NODES[@]} named nodes Ready (attempt ${attempt}/${CP_READY_RETRIES})"
     break
   fi
-  log "cluster not Ready: ${ready_count}/${EXPECTED_NODES} (attempt ${attempt}/${CP_READY_RETRIES})"
   sleep "$CP_READY_SLEEP"
 done
-(( CLUSTER_READY == 1 )) || fail "cluster never reached ${EXPECTED_NODES} Ready nodes — inspect 'ssh root@${CP_IP} kubectl get nodes' and per-worker 'journalctl -u worker-init.service'"
+# ---- end cluster-ready-poll ---
+(( CLUSTER_READY == 1 )) || fail "cluster never reached Ready for all named nodes (${_CLUSTER_POLL_NODES[*]}) — inspect 'ssh root@${CP_IP} kubectl get nodes' and per-worker 'journalctl -u worker-init.service'"
 
 # ---- Optional verification --------------------------------------------------
 

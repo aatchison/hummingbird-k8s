@@ -144,6 +144,20 @@ setup() {
     return 1
   }
 
+  # Extract the cluster-ready poll block for #9 tests. The block spans from
+  # "# ---- begin cluster-ready-poll ---" through "# ---- end cluster-ready-poll ---"
+  # (exclusive of the marker lines). Tests source it with a mock cp_ssh() so
+  # the per-node check can be driven without a real cluster.
+  awk '
+    /# ---- begin cluster-ready-poll ---/ { capture=1; next }
+    capture && /# ---- end cluster-ready-poll ---/ { exit }
+    capture { print }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/ready-poll.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/ready-poll.snippet" ] || {
+    echo "FATAL: failed to extract cluster-ready-poll block from ${SCRIPT}" >&2
+    return 1
+  }
+
   cat > "$HARNESS" <<'HARNESS_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1200,6 +1214,74 @@ _warn_drift() {
   [ "$status" -eq 0 ]
   [[ "$output" != *"WARN"* ]]
   [[ "$output" == *"DONE"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Per-node-by-name cluster Ready poll (#9 item d)
+# ---------------------------------------------------------------------------
+#
+# The old aggregate `ready_count >= EXPECTED_NODES` check can be satisfied
+# by a stray or duplicate node while a named worker's kubeadm join silently
+# failed. The fix iterates CP_NAME + WORKER_NAMES[@] and asserts each node
+# individually via `kubectl get node <name>`.
+#
+# Tests source the real ready-poll snippet (see setup) with a mock cp_ssh()
+# so the per-name semantics can be driven without a real cluster.
+
+@test "deploy-cluster: per-node Ready poll — all named nodes Ready -> CLUSTER_READY=1 (#9)" {
+  cat > "${BATS_TEST_TMPDIR}/cp-ssh-all-ready.sh" <<'MOCK_EOF'
+# All nodes return "yes" — every named node is Ready.
+cp_ssh() { echo "yes"; }
+MOCK_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-ready-all.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/cp-ssh-all-ready.sh"
+    printf 'CP_NAME=hbird-cp\n'
+    printf 'WORKER_NAMES=(hbird-w1)\n'
+    printf 'CP_READY_RETRIES=1\nCP_READY_SLEEP=0\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/ready-poll.snippet"
+    printf 'printf "CLUSTER_READY=%%d\\n" "$CLUSTER_READY"\n'
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CLUSTER_READY=1"* ]]
+  [[ "$output" == *"all 2 named nodes Ready"* ]]
+}
+
+@test "deploy-cluster: per-node Ready poll — named worker NotReady, stray node ignored -> CLUSTER_READY=0 (#9)" {
+  # CP is Ready; named worker hbird-w1 is not (simulates a failed kubeadm
+  # join). A hypothetical stray node would have satisfied the old aggregate
+  # count (>=2). The per-name check must still report CLUSTER_READY=0.
+  cat > "${BATS_TEST_TMPDIR}/cp-ssh-stray.sh" <<'MOCK_EOF'
+cp_ssh() {
+  local cmd="$1"
+  # Only the CP 'hbird-cp' responds Ready; 'hbird-w1' returns nothing.
+  if printf '%s' "$cmd" | grep -qF "'hbird-cp'"; then
+    echo "yes"
+  fi
+}
+MOCK_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-ready-stray.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/cp-ssh-stray.sh"
+    printf 'CP_NAME=hbird-cp\n'
+    printf 'WORKER_NAMES=(hbird-w1)\n'
+    printf 'CP_READY_RETRIES=1\nCP_READY_SLEEP=0\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/ready-poll.snippet"
+    printf 'printf "CLUSTER_READY=%%d\\n" "$CLUSTER_READY"\n'
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CLUSTER_READY=0"* ]]
+  [[ "$output" == *"not Ready"* ]]
 }
 
 # ---------------------------------------------------------------------------
