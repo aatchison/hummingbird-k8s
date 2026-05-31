@@ -22,7 +22,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: stress-ng
-          image: quay.io/srcc/stress-ng:latest
+          image: docker.io/ubuntu/stress-ng:latest
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
