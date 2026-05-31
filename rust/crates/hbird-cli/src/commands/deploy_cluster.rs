@@ -1036,7 +1036,7 @@ pub fn run(args: DeployClusterArgs) -> Result<()> {
 // ---- S2c helpers -----------------------------------------------------------
 
 /// Strip `.pub` from pubkey path to get privkey path.
-fn derive_privkey_path(pubkey_file: &str) -> String {
+pub(crate) fn derive_privkey_path(pubkey_file: &str) -> String {
     pubkey_file
         .strip_suffix(".pub")
         .unwrap_or(pubkey_file)
@@ -1045,7 +1045,7 @@ fn derive_privkey_path(pubkey_file: &str) -> String {
 
 /// Build `ssh -i <privkey> -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 /// root@<ip> <remote_cmd>` command string.
-fn cp_ssh_cmd(privkey_path: &str, cp_ip: &str, remote_cmd: &str) -> String {
+pub(crate) fn cp_ssh_cmd(privkey_path: &str, cp_ip: &str, remote_cmd: &str) -> String {
     format!(
         "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{} {}",
         sh_quote(privkey_path),

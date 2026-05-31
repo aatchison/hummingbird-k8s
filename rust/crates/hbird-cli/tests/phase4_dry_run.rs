@@ -197,23 +197,35 @@ fn deploy_cluster_live_mode_fails_at_infra_or_boot_stub() {
     let _ = stderr; // accepted either failure mode
 }
 
-/// Live mode for spawn-workers bails the same way.
+/// Live mode for spawn-workers (S3): stubs replaced with real implementations.
+/// On CI without a live cluster the command fails at CP IP resolution (domifaddr),
+/// which is the correct live behavior — no longer the old #335 stub.
 #[test]
-fn spawn_workers_live_mode_surfaces_335_diagnostic() {
+fn spawn_workers_live_mode_fails_at_infra() {
     let tmp = tempdir_for_test();
     let conf_path = tmp.path().join("cluster.local.conf");
     write_fixture_config(&conf_path);
 
     let out = Command::new(hbird_bin())
         .current_dir(tmp.path())
-        .args(["spawn-workers", "--config", "cluster.local.conf"])
+        .args([
+            "spawn-workers",
+            "--config",
+            "cluster.local.conf",
+            "--cp-ssh-retries",
+            "1",
+        ])
         .output()
         .expect("spawn hbird");
-    assert!(!out.status.success());
+
+    // Must fail — no live cluster on CI.
+    assert!(!out.status.success(), "live-mode spawn-workers exited 0");
+
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Must NOT contain the old pre-S3 stub message.
     assert!(
-        stderr.contains("#335"),
-        "live-mode spawn-workers should reference #335; got:\n{stderr}"
+        !stderr.contains("not yet implemented"),
+        "S3 replaced the live-mode stubs; got:\n{stderr}"
     );
 }
 
