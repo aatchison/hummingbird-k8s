@@ -148,7 +148,11 @@ pub struct DeployClusterArgs {
     pub strict_cache: bool,
 
     /// Repo root for `make image-*` targets (used when `IMAGE_SOURCE=local`).
-    /// Maps to `REPO_ROOT` env. Defaults to the directory of `--config`.
+    /// Maps to `REPO_ROOT` env. Defaults to the repo root resolved from cwd
+    /// (`git rev-parse --show-toplevel`, or walk-up to `Makefile+containers/`).
+    /// The config file's location is NOT used as the default — configs often
+    /// live outside the repo (e.g. `~/cluster.local.conf`). Override with
+    /// this flag or `REPO_ROOT=<path>` when running outside the repo tree.
     #[arg(long, env = "REPO_ROOT")]
     pub repo_root: Option<PathBuf>,
 
@@ -223,13 +227,11 @@ struct Plan {
 impl Plan {
     fn from_args(args: &DeployClusterArgs, config: ClusterConfig) -> Result<Self> {
         let worker_names = config.resolved_worker_names();
-        // Repo root: explicit flag > sibling of config file > cwd.
-        let repo_root = args.repo_root.clone().unwrap_or_else(|| {
-            args.config
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
+        // Repo root: explicit --repo-root/REPO_ROOT flag wins; otherwise
+        // derive from cwd (not the config file's directory — configs often
+        // live outside the repo, e.g. ~/cluster.local.conf → that would set
+        // repo_root=HOME and break `make -C HOME image-*`). Fixed by #33.
+        let repo_root = args.repo_root.clone().unwrap_or_else(find_repo_root);
         Ok(Self {
             config_path: args.config.clone(),
             cp_name: config.cp_name,
@@ -1168,6 +1170,59 @@ fn cloud_init_seed_cmd(hostname: &str, ud_tmp: &str, out_iso: &str) -> String {
 
 // ---- helpers ---------------------------------------------------------------
 
+/// Derive the repo root from the current working directory.
+///
+/// Resolution order (the config file's path is intentionally NOT consulted —
+/// it often lives outside the repo, which was the bug in #33):
+///
+/// 1. `git rev-parse --show-toplevel` in cwd — fast path when already inside
+///    the repo checkout.
+/// 2. Walk up from cwd looking for a directory that contains both `Makefile`
+///    and a `containers/` subdirectory (the two hummingbird-k8s root markers).
+/// 3. `"."` as a last resort — caller will get a clear `make` error rather
+///    than a misleading path-resolution failure.
+fn path_has_repo_markers(p: &std::path::Path) -> bool {
+    p.join("Makefile").exists() && p.join("containers").is_dir()
+}
+
+pub(crate) fn find_repo_root() -> PathBuf {
+    // Try git first — fastest and most authoritative.
+    // Guard: only accept the git-returned toplevel if it actually has the
+    // repo markers (Makefile + containers/). Running hbird from a different
+    // or nested git repo would otherwise return the wrong toplevel.
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            let path = s.trim();
+            if !path.is_empty() {
+                let p = PathBuf::from(path);
+                if path_has_repo_markers(&p) {
+                    return p;
+                }
+            }
+        }
+    }
+
+    // Walk up from cwd looking for Makefile + containers/ (repo root markers).
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut dir: &std::path::Path = &cwd;
+        loop {
+            if path_has_repo_markers(dir) {
+                return dir.to_path_buf();
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent,
+                None => break,
+            }
+        }
+    }
+
+    PathBuf::from(".")
+}
+
 /// Construct the "not yet implemented in the Rust live path" error
 /// used by every helper that needs a real bib / virt-install /
 /// SSH round-trip. The error wording explicitly points at the follow-up
@@ -1328,23 +1383,25 @@ pub(crate) fn git_diff_cmd(
 
 /// Generate a bib TOML configuration with `core` and `root` users.
 ///
-/// Mirrors `lib/build-common.sh::render_bib_config`. The generated TOML
-/// contains two `[[customizations.user]]` stanzas:
+/// Emits two `[[customizations.user]]` stanzas, each with only the `key`
+/// field set to `pubkey_contents`. Password, groups, and env-knobs
+/// (VM_USER, ENABLE_ROOT_SSH) are not emitted — filed as a parity
+/// follow-up.
 ///
-/// - `core` — the default Fedora/CentOS bootc user; SSH pubkey injected.
-/// - `root` — direct root login; same pubkey.
+/// Uses the `key` field (BIB's `UserCustomization.Key` — a single
+/// authorized-key string). The earlier `ssh_authorized_keys = [...]` array
+/// form caused BIB to reject the config with "unknown keys found"; `key`
+/// is the correct field. Matches the bash twin's `_render_user_block`
+/// which emits `key = """<pubkey>"""`. Fixed by S4-bug #33b.
 ///
-/// The `ssh_pubkey_file` contents are embedded verbatim in `ssh_authorized_keys`.
+/// `pubkey_contents` must not contain `"""` — true for all standard SSH
+/// public key material.
 pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
+    // Triple-quoted TOML string (`"""..."""`) matches the bash twin's
+    // `printf 'key = """%s"""\n'` output and tolerates embedded double-quotes
+    // in unusual key material.
     format!(
-        r#"[[customizations.user]]
-name = "core"
-ssh_authorized_keys = ["{pubkey_contents}"]
-
-[[customizations.user]]
-name = "root"
-ssh_authorized_keys = ["{pubkey_contents}"]
-"#
+        "[[customizations.user]]\nname = \"core\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n\n[[customizations.user]]\nname = \"root\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n"
     )
 }
 
@@ -1544,6 +1601,13 @@ mod tests {
         assert!(toml.contains("[[customizations.user]]"), "toml: {toml}");
         assert!(toml.contains("name = \"core\""), "toml: {toml}");
         assert!(toml.contains("name = \"root\""), "toml: {toml}");
+        // Must use `key` (BIB schema field), NOT `ssh_authorized_keys`
+        // (which BIB rejects as "unknown key" — S4 bug #33b).
+        assert!(toml.contains("key = "), "must use 'key' field: {toml}");
+        assert!(
+            !toml.contains("ssh_authorized_keys"),
+            "must NOT use ssh_authorized_keys (BIB rejects it): {toml}"
+        );
     }
 
     #[test]
@@ -1560,6 +1624,54 @@ mod tests {
             2,
             "key must appear for both users"
         );
+    }
+
+    /// BIB config must parse as valid TOML and carry the correct `key` field
+    /// per user entry. Before the fix, `ssh_authorized_keys` (an unknown BIB
+    /// field) was used, causing BIB to reject the config with
+    /// "unknown keys found: [customizations.user.ssh_authorized_keys
+    ///  customizations.user.ssh_authorized_keys]". (S4 bug #33b.)
+    #[test]
+    fn render_bib_config_parses_as_valid_toml_with_key_per_user() {
+        let pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI testuser@testhost";
+        let rendered = render_bib_config(pubkey);
+
+        // Must parse as valid TOML without errors.
+        let val: toml::Value =
+            toml::from_str(&rendered).expect("render_bib_config must produce valid TOML");
+
+        // Must have a customizations.user array with exactly two entries.
+        let users = val
+            .get("customizations")
+            .and_then(|c| c.get("user"))
+            .and_then(|u| u.as_array())
+            .expect("customizations.user must be a TOML array");
+        assert_eq!(
+            users.len(),
+            2,
+            "must have exactly 2 user entries (core + root)"
+        );
+
+        // Each entry must have `key` (BIB's authorized-key field) and must NOT
+        // have `ssh_authorized_keys` (the field BIB rejects as unknown).
+        for user in users {
+            let name = user
+                .get("name")
+                .and_then(|n| n.as_str())
+                .expect("user entry must have a name");
+            let key_val = user
+                .get("key")
+                .and_then(|k| k.as_str())
+                .unwrap_or_else(|| panic!("user '{name}' must have a 'key' field"));
+            assert!(
+                key_val.contains(pubkey),
+                "user '{name}' key must contain the pubkey"
+            );
+            assert!(
+                user.get("ssh_authorized_keys").is_none(),
+                "user '{name}' must NOT have ssh_authorized_keys (BIB rejects it as unknown)"
+            );
+        }
     }
 
     // ---- S2c helper tests --------------------------------------------------
@@ -1755,5 +1867,91 @@ mod tests {
         assert!(cmd.contains("hbird-cp1"), "must embed hostname: {cmd}");
         assert!(cmd.contains("meta-data"), "must create meta-data: {cmd}");
         assert!(cmd.contains("user-data"), "must copy user-data: {cmd}");
+    }
+
+    // ---- find_repo_root (#33 regression tests) --------------------------------
+
+    /// `find_repo_root` must find the hummingbird-k8s repo root regardless of
+    /// where the config file lives. When tests run (cwd is inside the repo),
+    /// the repo root must contain both `Makefile` and `containers/`.
+    ///
+    /// This is the core bug from #33: the old default was `config.parent()`,
+    /// so `~/cluster.local.conf` → repo_root=`~` → `make -C ~` failed.
+    #[test]
+    fn find_repo_root_resolves_to_dir_with_makefile_and_containers() {
+        let root = find_repo_root();
+        assert!(
+            root.join("Makefile").exists(),
+            "repo root must contain Makefile; find_repo_root returned: {root:?}"
+        );
+        assert!(
+            root.join("containers").is_dir(),
+            "repo root must contain containers/; find_repo_root returned: {root:?}"
+        );
+    }
+
+    /// When `--repo-root` is absent, the Plan must use the repo root derived
+    /// from cwd, NOT the config file's parent directory.
+    #[test]
+    fn plan_repo_root_defaults_to_cwd_derived_root_not_config_dir() {
+        // Config lives in /tmp — definitely not the repo root.
+        let tmp_conf = std::env::temp_dir().join("cluster-test-33.conf");
+        let args = DeployClusterArgs {
+            config: tmp_conf.clone(),
+            repo_root: None,
+            ..default_args()
+        };
+        let plan = Plan::from_args(&args, cfg(None)).expect("plan");
+        // The resolved repo_root must NOT be /tmp (the config's parent).
+        let config_parent = tmp_conf
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        assert_ne!(
+            plan.repo_root, config_parent,
+            "#33: repo_root must not default to the config file's parent directory"
+        );
+        // It must look like a valid repo root (contains Makefile + containers/).
+        assert!(
+            plan.repo_root.join("Makefile").exists(),
+            "plan.repo_root must be the actual repo root; got: {:?}",
+            plan.repo_root
+        );
+    }
+
+    /// The git fast-path in `find_repo_root` must validate markers before
+    /// accepting the returned toplevel. A path without `Makefile` +
+    /// `containers/` must be rejected so that a different/nested git repo
+    /// does not produce a wrong root; the walk-up then finds the real one.
+    ///
+    /// Tests the `path_has_repo_markers` guard directly — the end-to-end
+    /// "git returns wrong root → walk-up corrects it" scenario requires
+    /// changing process cwd and is covered by the integration gate.
+    #[test]
+    fn find_repo_root_git_fast_path_requires_markers() {
+        // A directory without the markers must be rejected by the guard.
+        let tmp = std::env::temp_dir();
+        assert!(
+            !path_has_repo_markers(&tmp),
+            "/tmp must not have repo markers — test precondition failed"
+        );
+        // A real hummingbird-k8s root must pass the guard.
+        let real_root = find_repo_root();
+        assert!(
+            path_has_repo_markers(&real_root),
+            "find_repo_root must return a path with Makefile+containers/; got {real_root:?}"
+        );
+    }
+
+    /// An explicit `--repo-root` override always wins over the cwd-derived default.
+    #[test]
+    fn plan_repo_root_explicit_override_wins() {
+        let args = DeployClusterArgs {
+            config: PathBuf::from("/tmp/cluster.conf"),
+            repo_root: Some(PathBuf::from("/explicit/path")),
+            ..default_args()
+        };
+        let plan = Plan::from_args(&args, cfg(None)).expect("plan");
+        assert_eq!(plan.repo_root, PathBuf::from("/explicit/path"));
     }
 }
