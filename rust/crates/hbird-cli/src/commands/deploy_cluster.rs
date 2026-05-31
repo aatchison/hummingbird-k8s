@@ -231,7 +231,15 @@ impl Plan {
         // derive from cwd (not the config file's directory — configs often
         // live outside the repo, e.g. ~/cluster.local.conf → that would set
         // repo_root=HOME and break `make -C HOME image-*`). Fixed by #33.
-        let repo_root = args.repo_root.clone().unwrap_or_else(find_repo_root);
+        let repo_root = if let Some(ref root) = args.repo_root {
+            root.clone()
+        } else if config.image_source == "local" {
+            find_repo_root()
+        } else {
+            // For registry pulls, repo_root is not used for image acquisition,
+            // but we provide a sane default (cwd) to avoid failing the plan.
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        };
         Ok(Self {
             config_path: args.config.clone(),
             cp_name: config.cp_name,
@@ -1901,7 +1909,10 @@ mod tests {
             repo_root: None,
             ..default_args()
         };
-        let plan = Plan::from_args(&args, cfg(None)).expect("plan");
+        // To test the "defaults to cwd-derived root" path, we must set IMAGE_SOURCE=local.
+        let mut config = cfg(None);
+        config.image_source = "local".to_string();
+        let plan = Plan::from_args(&args, config).expect("plan");
         // The resolved repo_root must NOT be /tmp (the config's parent).
         let config_parent = tmp_conf
             .parent()
