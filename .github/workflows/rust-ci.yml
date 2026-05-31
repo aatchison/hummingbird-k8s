@@ -156,7 +156,7 @@ jobs:
             -e CARGO_INCREMENTAL=0 \
             -e RUSTFLAGS="-D warnings" \
             ci-rust-build \
-            cargo build --workspace --all-targets
+            cargo build --workspace --all-targets --locked
 
   test:
     runs-on: ubuntu-latest
@@ -176,7 +176,7 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
             ci-rust-test \
-            cargo test --workspace --no-fail-fast
+            cargo test --workspace --no-fail-fast --locked
 
   deny:
     runs-on: ubuntu-latest
