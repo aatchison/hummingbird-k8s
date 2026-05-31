@@ -79,11 +79,16 @@ jobs:
           echo "Resolved: version=$version dry_run=$dry_run" >&2
 
       - name: Log in to Forgejo container registry
-        if: steps.v.outputs.dry_run == 'false'
-        env:
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-        run: |
-          echo "$REGISTRY_PASSWORD" | docker login forgejo.atchison.io -u aatchison --password-stdin
+        if: steps.v.outputs.dry_run == 'false' && github.server_url != 'https://github.com'
+        uses: redhat-actions/podman-login@4934294ad0449894bcd1e9f191899d7292469603 # v1.7
+        with:
+          registry: forgejo.atchison.io
+          username: aatchison
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Log in to GHCR
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Build OCI image
         env:
@@ -101,16 +106,24 @@ jobs:
             .
 
       - name: Push to Forgejo container registry
-        if: steps.v.outputs.dry_run == 'false'
+        if: steps.v.outputs.dry_run == 'false' && github.server_url != 'https://github.com'
+        uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2.8
+        with:
+          image: ${{ env.IMAGE }}
+          tags: ${{ steps.v.outputs.version }},latest
+
+      - name: Push to GHCR
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         env:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
           set -euo pipefail
-          docker push "${IMAGE}:${VERSION}"
-
-      - name: Push :latest tag (tag-triggered publishes only)
-        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
-        run: docker push "${IMAGE}:latest"
+          # Note: IMAGE env is forgejo.atchison.io..., we need ghcr.io for GHCR push
+          GH_IMAGE="ghcr.io/${{ github.repository }}/hummingbird-k8s"
+          docker tag "${IMAGE}:${VERSION}" "${GH_IMAGE}:${VERSION}"
+          docker tag "${IMAGE}:latest" "${GH_IMAGE}:latest"
+          docker push "${GH_IMAGE}:${VERSION}"
+          docker push "${GH_IMAGE}:latest"
 
       - name: Resolve pushed image digest
         id: digest
@@ -119,7 +132,12 @@ jobs:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
           set -euo pipefail
-          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${VERSION}" \
+          # Use the registry matching the server
+          TARGET_IMAGE="${IMAGE}:${VERSION}"
+          if [ "${{ github.server_url }}" = "https://github.com" ]; then
+            TARGET_IMAGE="ghcr.io/${{ github.repository }}/hummingbird-k8s:${VERSION}"
+          fi
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$TARGET_IMAGE" \
             | cut -d@ -f2)
           if [ -z "$digest" ] || [ "$digest" = "null" ]; then
             echo "could not determine image digest" >&2; exit 1
@@ -127,7 +145,7 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Trivy vulnerability scan
-        if: steps.v.outputs.dry_run == 'false'
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}@${{ steps.digest.outputs.digest }}
@@ -136,12 +154,8 @@ jobs:
           format: sarif
           output: trivy-results.sarif
 
-      # github/codeql-action/upload-sarif is a sub-path action not mirrored
-      # on Forgejo; it causes parse-time rejection even behind an if-guard.
-      # Omitted here. Re-add if deploying on GitHub Actions.
-
       - name: Generate SBOM with syft
-        if: steps.v.outputs.dry_run == 'false'
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ${{ env.IMAGE }}@${{ steps.digest.outputs.digest }}
@@ -149,7 +163,7 @@ jobs:
           format: spdx-json
 
       - name: Upload SBOM artifact
-        if: steps.v.outputs.dry_run == 'false'
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-k8s-${{ steps.v.outputs.version }}
@@ -179,4 +193,6 @@ jobs:
 
       - name: docker logout
         if: always()
-        run: docker logout forgejo.atchison.io
+        run: |
+          docker logout forgejo.atchison.io || true
+          docker logout ghcr.io || true
