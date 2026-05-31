@@ -316,3 +316,48 @@ jobs:
               cargo check --workspace --all-targets
               echo "::endgroup::"
             '
+
+  devcontainer-smoke-forgejo:
+    # Forgejo-native variant of devcontainer-smoke (#18): uses docker:dind service
+    # + plain `docker build` instead of buildx (which is DinD-hostile on Forgejo runners).
+    if: ${{ github.server_url != 'https://github.com' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      docker:
+        image: docker:dind
+        options: --privileged
+    env:
+      DOCKER_HOST: tcp://localhost:2375
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+      - name: Wait for Docker daemon
+        run: until docker info; do sleep 2; done
+      - name: Build devcontainer image (plain docker build, no buildx)
+        run: |
+          docker build \
+            --file .devcontainer/Containerfile \
+            --tag hummingbird-k8s-devcontainer:ci \
+            .
+      - name: Confirm toolchain + cargo tools present in the image
+        env:
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${WORKSPACE}:/workspaces/hummingbird-k8s:ro" \
+            -w /workspaces/hummingbird-k8s/rust \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            hummingbird-k8s-devcontainer:ci \
+            bash -c '
+              set -euo pipefail
+              echo "::group::Toolchain"
+              rustc --version
+              cargo --version
+              cargo fmt --version
+              cargo clippy --version
+              echo "::endgroup::"
+              echo "::group::Cargo tools"
+              cargo deny --version
+              echo "::endgroup::"
+            '
