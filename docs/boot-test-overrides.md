@@ -116,3 +116,9 @@ Notes:
 
 - [deploy-cluster.md](deploy-cluster.md) — full config surface + the `FORCE_SWITCH` note
 - [auto-updates.md](auto-updates.md) — semver-update timer, `BOOTC_SWITCH_TO_GHCR` escape hatch
+
+## #9 boot-test hardening (merged)
+
+- `STRICT_CACHE=1` now FAILS CLOSED on UNVERIFIABLE cache freshness (empty/missing/cross-source ref) — returns an error + rebuild hint, instead of silently reusing. (Non-strict still reuses.)
+- `SWITCH_TO_GHCR` auto-disables when `IMAGE_SOURCE=local` (a local boot-test image is no longer silently replaced by the GHCR image at first boot); set `FORCE_SWITCH=1` to override.
+- The LOCAL qcow2 build-id now folds `BASE_IMAGE` + the rendered bib-config (SSH pubkeys / VM_USER / ENABLE_CLOUD_INIT) — changing any of those now busts the qcow2 cache (previously only Containerfile text did).
