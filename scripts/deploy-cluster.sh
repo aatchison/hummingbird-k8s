@@ -546,6 +546,17 @@ fi
 
 log "config OK: CP=${CP_NAME}, workers=(${WORKER_NAMES[*]}), source=${IMAGE_SOURCE}, tag=${GHCR_TAG}"
 
+# ---- begin podman-preflight-block ---
+if [[ "$IMAGE_SOURCE" == "local" ]]; then
+  log "pre-flight: checking for rootful podman (required for bootc-image-builder)"
+  if [[ $EUID -eq 0 ]]; then
+    podman info >/dev/null 2>&1
+  else
+    sudo podman info >/dev/null 2>&1
+  fi || fail "rootful podman is unavailable. bootc-image-builder requires rootful podman to build qcow2 templates. Try: sudo dnf install -y podman (or check your rootful podman setup)."
+fi
+# ---- end podman-preflight-block ---
+
 # ---- Image acquisition ------------------------------------------------------
 
 CP_IMAGE_REF=""

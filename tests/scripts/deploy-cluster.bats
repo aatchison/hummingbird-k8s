@@ -157,6 +157,17 @@ setup() {
     return 1
   }
 
+  # Extract the podman-preflight block for #4 tests.
+  awk '
+    /# ---- begin podman-preflight-block ---/ { capture=1; next }
+    capture && /# ---- end podman-preflight-block ---/ { exit }
+    capture { print }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/podman-preflight.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/podman-preflight.snippet" ] || {
+    echo "FATAL: failed to extract podman-preflight-block from ${SCRIPT}" >&2
+    return 1
+  }
+
   # Extract the cluster-ready poll block for #9 tests. The block spans from
   # "# ---- begin cluster-ready-poll ---" through "# ---- end cluster-ready-poll ---"
   # (exclusive of the marker lines). Tests source it with a mock cp_ssh() so
@@ -1378,17 +1389,62 @@ EOF
   [[ "$output" == *"VM_USER=config-user"* ]]
 }
 
-# ---------------------------------------------------------------------------
-# RUN_VERIFY fail-closed under STRICT_CACHE (#9 item a)
-# ---------------------------------------------------------------------------
-#
-# Today both failure paths in the RUN_VERIFY block are non-fatal: verifier
-# non-zero -> log informational; missing hbird -> log and skip. Under
-# STRICT_CACHE=1 (the explicit strict boot-test gate) both must be fatal so
-# the gate cannot false-green on app-verification failure.
-#
-# Tests source the real run-verify snippet (see setup) with mock log/fail and
-# a stubbed hbird binary so no real cluster is needed.
+  # Helper: source the pre-flight snippet with a mock podman, and print the result.
+  _preflight_podman() {
+    local podman_rc="$1"
+    local driver="${BATS_TEST_TMPDIR}/driver-preflight.sh"
+    {
+      printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+      printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+      printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+      # Mock podman: always exits with the given rc.
+      printf 'podman() { return %d; }\n' "$podman_rc"
+      # Mock sudo: just calls the inner command.
+      printf 'sudo() { "$@"; }\n'
+      printf 'IMAGE_SOURCE=local\n'
+      printf '# shellcheck disable=[]\n'
+      printf 'source %q\n' "${BATS_TEST_TMPDIR}/podman-preflight.snippet"
+    } > "$driver"
+    chmod +x "$driver"
+    bash "$driver"
+  }
+
+  # ---------------------------------------------------------------------------
+  # rootful podman pre-flight check (#4)
+  # ---------------------------------------------------------------------------
+
+  @test "deploy-cluster: IMAGE_SOURCE=local + rootful podman OK -> passes pre-flight" {
+    run _preflight_podman 0
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"LOG: pre-flight: checking for rootful podman"* ]]
+  }
+
+  @test "deploy-cluster: IMAGE_SOURCE=local + rootful podman FAIL -> bails with hint (#4)" {
+    run _preflight_podman 1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"FAIL: rootful podman is unavailable"* ]]
+    [[ "$output" == *"sudo dnf install -y podman"* ]]
+  }
+
+  @test "deploy-cluster: IMAGE_SOURCE=ghcr -> skips podman pre-flight" {
+    local driver="${BATS_TEST_TMPDIR}/driver-skip-preflight.sh"
+    {
+      printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+      printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+      printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+      # Mock podman: always fail.
+      printf 'podman() { return 1; }\n'
+      printf 'sudo() { "$@"; }\n'
+      printf 'IMAGE_SOURCE=ghcr\n'
+      printf '# shellcheck disable=[]\n'
+      printf 'source %q\n' "${BATS_TEST_TMPDIR}/podman-preflight.snippet"
+    } > "$driver"
+    chmod +x "$driver"
+    run bash "$driver"
+    [ "$status" -eq 0 ]
+    # Must NOT have attempted the podman check.
+    [[ "$output" != *"LOG: pre-flight: checking for rootful podman"* ]]
+  }
 
 @test "deploy-cluster: RUN_VERIFY=true + STRICT_CACHE=1 + verifier non-zero -> deploy fails (#9)" {
   # Stub hbird to always exit 1 (verifier failure).
