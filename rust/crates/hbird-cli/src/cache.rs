@@ -37,14 +37,19 @@ pub enum CacheAssessResult {
 /// Decide whether to reuse a cached qcow2 template.
 ///
 /// Only acts on a **confirmed mismatch**: both IDs non-empty, same source
-/// prefix (split on `:`), and different value. Any uncertainty → [`Reuse`].
+/// prefix (split on `:`), and different value.
+///
+/// Under `STRICT_CACHE=1` (`strict=true`), **unverifiable** freshness (either
+/// ID missing or empty) also returns [`StrictFail`] rather than [`Reuse`].
+/// This mirrors the bash twin `lib/cache-utils.sh::hbird_assess_ghcr_image`
+/// (`rc 3` for unverifiable under `STRICT_CACHE=1`, merged PR #25 `fbe2082`).
 ///
 /// # Arguments
 ///
 /// - `cached_ref` — the build ID stored in the `.build-ref` sidecar file.
 /// - `expected_ref` — the build ID computed from the current image/source.
-/// - `strict` — if `true`, confirmed stale returns [`StrictFail`] instead of
-///   [`Rebuild`].
+/// - `strict` — if `true`, confirmed stale AND unverifiable both return
+///   [`StrictFail`].
 ///
 /// [`Reuse`]: CacheAssessResult::Reuse
 pub fn assess_qcow2_cache(
@@ -52,11 +57,18 @@ pub fn assess_qcow2_cache(
     expected_ref: Option<&str>,
     strict: bool,
 ) -> CacheAssessResult {
+    // #9c parity: under STRICT_CACHE=1, unverifiable (missing/empty IDs) → StrictFail.
     let (Some(cached), Some(expected)) = (cached_ref, expected_ref) else {
+        if strict {
+            return CacheAssessResult::StrictFail;
+        }
         // One or both IDs missing — cannot confirm stale.
         return CacheAssessResult::Reuse;
     };
     if cached.is_empty() || expected.is_empty() {
+        if strict {
+            return CacheAssessResult::StrictFail;
+        }
         return CacheAssessResult::Reuse;
     }
     // Extract source prefix (everything before the first `:`).
@@ -199,26 +211,52 @@ mod tests {
     }
 
     #[test]
-    fn assess_qcow2_cache_reuses_when_either_empty() {
-        // cached empty
+    fn assess_qcow2_cache_reuses_when_either_empty_non_strict() {
+        // Non-strict: unverifiable IDs → Reuse (cannot confirm stale).
+        // cached empty, strict=false
+        assert_eq!(
+            assess_qcow2_cache(Some(""), Some("ghcr:abc123"), false),
+            CacheAssessResult::Reuse
+        );
+        // expected empty, strict=false
+        assert_eq!(
+            assess_qcow2_cache(Some("ghcr:abc123"), Some(""), false),
+            CacheAssessResult::Reuse
+        );
+        // both None, strict=false
+        assert_eq!(
+            assess_qcow2_cache(None, None, false),
+            CacheAssessResult::Reuse
+        );
+        // one None, strict=false
+        assert_eq!(
+            assess_qcow2_cache(None, Some("ghcr:abc123"), false),
+            CacheAssessResult::Reuse
+        );
+    }
+
+    // #9c parity: under STRICT_CACHE=1, unverifiable freshness → StrictFail.
+    #[test]
+    fn assess_qcow2_cache_strict_fails_on_unverifiable() {
+        // cached empty, strict=true → StrictFail
         assert_eq!(
             assess_qcow2_cache(Some(""), Some("ghcr:abc123"), true),
-            CacheAssessResult::Reuse
+            CacheAssessResult::StrictFail
         );
-        // expected empty
+        // expected empty, strict=true → StrictFail
         assert_eq!(
             assess_qcow2_cache(Some("ghcr:abc123"), Some(""), true),
-            CacheAssessResult::Reuse
+            CacheAssessResult::StrictFail
         );
-        // both None
+        // both None, strict=true → StrictFail
         assert_eq!(
             assess_qcow2_cache(None, None, true),
-            CacheAssessResult::Reuse
+            CacheAssessResult::StrictFail
         );
-        // one None
+        // one None, strict=true → StrictFail
         assert_eq!(
             assess_qcow2_cache(None, Some("ghcr:abc123"), true),
-            CacheAssessResult::Reuse
+            CacheAssessResult::StrictFail
         );
     }
 

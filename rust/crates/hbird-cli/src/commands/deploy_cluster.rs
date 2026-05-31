@@ -14,9 +14,8 @@
 //! `tests/update_cluster/fixtures/dry_run_deploy_*.txt` pin the output.
 //!
 //! S2b lands the live-execution path for image acquisition and bib qcow2
-//! build. The boot half (cp_seed, virt_install, cp_ready, join_token,
-//! worker_spawn, cluster_ready, verify) remains stubbed with
-//! `live_mode_not_implemented` pointing at [#335].
+//! build. S2c completes the boot half (cp_seed, virt_install, cp_ready,
+//! join_token, worker_spawn, cluster_ready, verify).
 //!
 //! # Block traceability
 //!
@@ -152,6 +151,18 @@ pub struct DeployClusterArgs {
     /// Maps to `REPO_ROOT` env. Defaults to the directory of `--config`.
     #[arg(long, env = "REPO_ROOT")]
     pub repo_root: Option<PathBuf>,
+
+    /// CP-Ready poll retry count. Env: CP_READY_RETRIES. Default: 60.
+    #[arg(long, env = "CP_READY_RETRIES", default_value = "60")]
+    pub cp_ready_retries: u32,
+
+    /// Sleep seconds between CP-Ready poll attempts. Env: CP_READY_SLEEP. Default: 10.
+    #[arg(long, env = "CP_READY_SLEEP", default_value = "10")]
+    pub cp_ready_sleep_secs: u64,
+
+    /// kubeadm join-token TTL. Env: TOKEN_TTL. Default: "2h".
+    #[arg(long, env = "TOKEN_TTL", default_value = "2h")]
+    pub token_ttl: String,
 }
 
 // ---- Logger ----------------------------------------------------------------
@@ -186,7 +197,9 @@ struct Plan {
     ssh_pubkey_file: String,
     /// `KVM_HOST` SSH alias (`None` = local libvirt).
     kvm_host: Option<String>,
-    /// Consumed by live-execution slice (#335).
+    /// When `true`, remote commands skip `sudo` (operator is in the `libvirt`
+    /// group and the pool dir is group-writable). Consumed by live-execution
+    /// helpers; not yet plumbed through every command string in S2c.
     #[allow(dead_code)]
     no_sudo: bool,
     dry_run: bool,
@@ -198,6 +211,13 @@ struct Plan {
     force_rebuild: bool,
     strict_cache: bool,
     repo_root: PathBuf,
+    // S2c fields
+    bootc_update_schedule: Option<String>,
+    bootc_update_repo_k8s: Option<String>,
+    bootc_update_repo_worker: Option<String>,
+    cp_ready_retries: u32,
+    cp_ready_sleep_secs: u64,
+    token_ttl: String,
 }
 
 impl Plan {
@@ -236,6 +256,12 @@ impl Plan {
             force_rebuild: args.force_rebuild,
             strict_cache: args.strict_cache,
             repo_root,
+            bootc_update_schedule: config.bootc_update_schedule,
+            bootc_update_repo_k8s: config.bootc_update_repo_k8s,
+            bootc_update_repo_worker: config.bootc_update_repo_worker,
+            cp_ready_retries: args.cp_ready_retries,
+            cp_ready_sleep_secs: args.cp_ready_sleep_secs,
+            token_ttl: args.token_ttl.clone(),
         })
     }
 
@@ -501,7 +527,7 @@ fn compute_expected_build_id(plan: &Plan, image_ref: &str, conn: &Connection) ->
 // ---- Block #6+7: CP cloud-init seed + virt-install --------------------------
 
 /// Plan the CP cloud-init user-data + seed ISO step. Mirrors lines 465-478.
-fn plan_cp_seed(plan: &Plan) -> Result<String> {
+fn plan_cp_seed(plan: &Plan, conn: &Connection, pubkey_contents: &str) -> Result<String> {
     let cp_seed = format!("{}/{}-seed.iso", plan.pool_dir, plan.cp_name);
     if plan.dry_run {
         log(&format!(
@@ -511,14 +537,39 @@ fn plan_cp_seed(plan: &Plan) -> Result<String> {
         log(&format!("DRY-RUN would build CP cloud-init seed {cp_seed}"));
         return Ok(cp_seed);
     }
-    Err(live_mode_not_implemented(
-        "plan_cp_seed",
-        "render_cp_user_data + build_cloud_init_seed",
-    ))
+
+    let user_data = render_cp_user_data(
+        &plan.cp_name,
+        pubkey_contents,
+        plan.switch_to_ghcr,
+        &plan.ghcr_tag,
+        plan.auto_update_cp,
+        plan.bootc_update_schedule.as_deref(),
+        plan.bootc_update_repo_k8s.as_deref(),
+    );
+
+    let ud_tmp = format!("/tmp/hbird-cp-ud-{}.yaml", std::process::id());
+    let write_cmd = format!(
+        "cat > '{}' << 'HBIRD_CI_EOF'\n{}\nHBIRD_CI_EOF",
+        ud_tmp, user_data
+    );
+    conn.exec_shell(&write_cmd)
+        .map_err(|e| anyhow!("could not write CP user-data to {ud_tmp}: {e}"))?;
+
+    let seed_cmd = cloud_init_seed_cmd(&plan.cp_name, &ud_tmp, &cp_seed);
+    conn.exec_shell(&seed_cmd)
+        .map_err(|e| anyhow!("cloud-init seed build for CP failed: {e}"))?;
+
+    Ok(cp_seed)
 }
 
 /// Plan the CP virt-install step. Mirrors lines 480-508.
-fn plan_cp_virt_install(plan: &Plan, cp_template: &str, cp_seed: &str) -> Result<String> {
+fn plan_cp_virt_install(
+    plan: &Plan,
+    conn: &Connection,
+    cp_template: &str,
+    cp_seed: &str,
+) -> Result<String> {
     let cp_qcow = format!("{}/{}.qcow2", plan.pool_dir, plan.cp_name);
     if plan.dry_run {
         log(&format!(
@@ -534,16 +585,44 @@ fn plan_cp_virt_install(plan: &Plan, cp_template: &str, cp_seed: &str) -> Result
         ));
         return Ok(cp_qcow);
     }
-    Err(live_mode_not_implemented(
-        "plan_cp_virt_install",
-        "virsh dominfo + cp --reflink=auto + virt-install --import",
-    ))
+
+    // Guard: fail if CP VM already defined.
+    match conn.dominfo(&plan.cp_name) {
+        Ok(_) => {
+            return Err(anyhow!(
+                "CP VM '{}' is already defined — refusing to overwrite",
+                plan.cp_name
+            ));
+        }
+        Err(hbird_virt::Error::VirshFailed { .. }) => {} // not defined, proceed
+        Err(e) => return Err(anyhow!("dominfo probe for CP failed: {e}")),
+    }
+
+    log(&format!("cloning CP qcow2 -> {cp_qcow}"));
+    conn.remote_cp_reflink(cp_template, &cp_qcow)
+        .map_err(|e| anyhow!("reflink clone {cp_template} -> {cp_qcow} failed: {e}"))?;
+
+    log(&format!(
+        "virt-install {} (memory={} vcpus={})",
+        plan.cp_name, plan.cp_memory, plan.cp_vcpus
+    ));
+    conn.virt_install(
+        &plan.cp_name,
+        plan.cp_memory as u64,
+        plan.cp_vcpus,
+        &cp_qcow,
+        Some(cp_seed),
+    )
+    .map_err(|e| anyhow!("virt-install {} failed: {e}", plan.cp_name))?;
+
+    Ok(cp_qcow)
 }
 
 // ---- Block #8+9: CP Ready + kubeadm token ----------------------------------
 
 /// Plan the CP IP discovery + Ready poll. Mirrors lines 510-539.
-fn plan_cp_ready(plan: &Plan) -> Result<String> {
+/// Returns the CP IP address string.
+fn plan_cp_ready(plan: &Plan, conn: &Connection, privkey_path: &str) -> Result<String> {
     if plan.dry_run {
         log(&format!(
             "DRY-RUN would resolve CP IP via 'virsh domifaddr {}' (timeout ~5min)",
@@ -552,30 +631,118 @@ fn plan_cp_ready(plan: &Plan) -> Result<String> {
         log("DRY-RUN would poll 'kubectl get nodes' on CP until Ready (timeout ~600s)");
         return Ok("<resolved-at-runtime>".to_string());
     }
-    Err(live_mode_not_implemented(
-        "plan_cp_ready",
-        "virsh domifaddr + ssh root@CP_IP kubectl get nodes (poll)",
-    ))
+
+    // Poll domifaddr until CP gets an IP.
+    log("waiting for CP IP to appear via DHCP...");
+    let cp_ip_cell = std::cell::Cell::new(None::<std::net::Ipv4Addr>);
+    let found =
+        hbird_virt::poll::retry(
+            plan.cp_ready_retries,
+            plan.cp_ready_sleep_secs,
+            || match conn.domifaddr(&plan.cp_name) {
+                Ok(Some(ip)) => {
+                    cp_ip_cell.set(Some(ip));
+                    Ok(true)
+                }
+                Ok(None) => Ok(false),
+                Err(e) => {
+                    tracing::debug!("domifaddr probe: {e}");
+                    Ok(false)
+                }
+            },
+        )
+        .map_err(|e: anyhow::Error| e)?;
+
+    if !found {
+        return Err(anyhow!(
+            "could not resolve CP IP after ~{}min",
+            plan.cp_ready_retries * plan.cp_ready_sleep_secs as u32 / 60
+        ));
+    }
+    let cp_ip = cp_ip_cell.get().unwrap();
+    log(&format!("CP IP: {cp_ip}"));
+
+    // Poll kubectl Ready via SSH.
+    let kubectl_ready_cmd = cp_ssh_cmd(
+        privkey_path,
+        &cp_ip.to_string(),
+        "kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers 2>/dev/null \
+         | awk '$2==\"Ready\"' | grep -q .",
+    );
+
+    log(&format!(
+        "polling kubectl until CP Ready (max ~{}s)",
+        plan.cp_ready_retries * plan.cp_ready_sleep_secs as u32
+    ));
+    let cp_ready =
+        hbird_virt::poll::retry(
+            plan.cp_ready_retries,
+            plan.cp_ready_sleep_secs,
+            || match conn.exec_shell(&kubectl_ready_cmd) {
+                Ok(_) => Ok(true),
+                Err(_) => Ok(false),
+            },
+        )
+        .map_err(|e: anyhow::Error| e)?;
+
+    if !cp_ready {
+        return Err(anyhow!("CP never reached Ready"));
+    }
+    log("CP Ready");
+    Ok(cp_ip.to_string())
 }
 
 /// Plan the kubeadm join-token mint. Mirrors lines 541-545.
-fn plan_join_token(plan: &Plan, cp_ip: &str) -> Result<()> {
+/// Returns the full `kubeadm join ...` command string.
+fn plan_join_token(
+    plan: &Plan,
+    conn: &Connection,
+    cp_ip: &str,
+    privkey_path: &str,
+) -> Result<String> {
     if plan.dry_run {
         log(&format!(
             "DRY-RUN would mint 2h-TTL kubeadm join token via 'ssh root@{cp_ip} kubeadm token create --print-join-command'"
         ));
-        return Ok(());
+        return Ok("<join-cmd-at-runtime>".to_string());
     }
-    Err(live_mode_not_implemented(
-        "plan_join_token",
-        "ssh root@CP_IP kubeadm token create --print-join-command",
-    ))
+
+    log(&format!(
+        "minting {}-TTL kubeadm join token from CP",
+        plan.token_ttl
+    ));
+    let kubeadm_cmd = format!(
+        "kubeadm token create --ttl {} --print-join-command",
+        plan.token_ttl
+    );
+    let ssh_cmd = cp_ssh_cmd(privkey_path, cp_ip, &kubeadm_cmd);
+    let join_cmd = conn
+        .exec_shell(&ssh_cmd)
+        .map_err(|e| anyhow!("kubeadm token create failed: {e}"))?;
+    let join_cmd = join_cmd.trim().to_string();
+
+    if !join_cmd.starts_with("kubeadm join") {
+        return Err(anyhow!(
+            "expected 'kubeadm join ...' from CP, got: {:?}",
+            join_cmd
+        ));
+    }
+    Ok(join_cmd)
 }
 
 // ---- Block #10: per-worker seed + spawn ------------------------------------
 
 /// Plan the per-worker seed + virt-install step. Mirrors lines 547-597.
-fn plan_worker_spawn(plan: &Plan, worker_template: &str) -> Result<()> {
+fn plan_worker_spawn(
+    plan: &Plan,
+    conn: &Connection,
+    worker_template: &str,
+    join_cmd: &str,
+    cp_ip: &str,
+    privkey_path: &str,
+    pubkey_contents: &str,
+) -> Result<()> {
+    let _ = (cp_ip, privkey_path); // used in future cluster-ready polling; declared for signature parity
     if plan.worker_names.is_empty() {
         if plan.dry_run {
             log("DRY-RUN WORKER_NAMES=() — CP-only deploy, no workers to spawn");
@@ -606,34 +773,126 @@ fn plan_worker_spawn(plan: &Plan, worker_template: &str) -> Result<()> {
         ));
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "plan_worker_spawn",
-        "parallel virt-install loop with worker_user_data + seed ISO",
-    ))
+
+    for w in &plan.worker_names {
+        // Guard: fail if worker VM already defined.
+        match conn.dominfo(w) {
+            Ok(_) => {
+                return Err(anyhow!(
+                    "worker VM '{w}' already defined — refusing to overwrite"
+                ));
+            }
+            Err(hbird_virt::Error::VirshFailed { .. }) => {}
+            Err(e) => return Err(anyhow!("dominfo probe for worker {w}: {e}")),
+        }
+
+        let w_qcow = format!("{}/{w}.qcow2", plan.pool_dir);
+        let w_seed = format!("{}/{w}-seed.iso", plan.pool_dir);
+        let ud_tmp = format!("/tmp/hbird-w-ud-{}-{w}.yaml", std::process::id());
+
+        let user_data = render_worker_user_data(
+            w,
+            pubkey_contents,
+            join_cmd,
+            plan.switch_to_ghcr,
+            &plan.ghcr_tag,
+            plan.bootc_update_schedule.as_deref(),
+            plan.bootc_update_repo_worker.as_deref(),
+        );
+
+        let write_cmd = format!(
+            "cat > '{}' << 'HBIRD_CI_EOF'\n{}\nHBIRD_CI_EOF",
+            ud_tmp, user_data
+        );
+        conn.exec_shell(&write_cmd)
+            .map_err(|e| anyhow!("could not write worker user-data to {ud_tmp}: {e}"))?;
+
+        let seed_cmd = cloud_init_seed_cmd(w, &ud_tmp, &w_seed);
+        conn.exec_shell(&seed_cmd)
+            .map_err(|e| anyhow!("cloud-init seed build for {w} failed: {e}"))?;
+
+        log(&format!("cloning worker qcow2 -> {w_qcow}"));
+        conn.remote_cp_reflink(worker_template, &w_qcow)
+            .map_err(|e| anyhow!("reflink clone {worker_template} -> {w_qcow} failed: {e}"))?;
+
+        log(&format!(
+            "virt-install {w} (memory={} vcpus={}) [bg]",
+            plan.worker_memory, plan.worker_vcpus
+        ));
+        conn.virt_install(
+            w,
+            plan.worker_memory as u64,
+            plan.worker_vcpus,
+            &w_qcow,
+            Some(&w_seed),
+        )
+        .map_err(|e| anyhow!("virt-install {w} failed: {e}"))?;
+    }
+
+    Ok(())
 }
 
 // ---- Block #11+12: cluster Ready + optional verify --------------------------
 
 /// Plan the full-cluster Ready poll. Mirrors lines 599-616.
-fn plan_cluster_ready(plan: &Plan) -> Result<()> {
-    let expected = 1 + plan.worker_names.len();
+fn plan_cluster_ready(
+    plan: &Plan,
+    conn: &Connection,
+    cp_ip: &str,
+    privkey_path: &str,
+) -> Result<()> {
+    let expected_nodes: Vec<String> = std::iter::once(plan.cp_name.clone())
+        .chain(plan.worker_names.iter().cloned())
+        .collect();
+    let expected = expected_nodes.len();
+
     if plan.dry_run {
         log(&format!(
             "DRY-RUN would poll cluster until {expected} nodes Ready (timeout ~600s)"
         ));
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "plan_cluster_ready",
-        "ssh root@CP_IP kubectl get nodes (count Ready nodes)",
-    ))
+
+    for node_name in &expected_nodes {
+        log(&format!(
+            "polling '{node_name}' Ready (max ~{}s)",
+            plan.cp_ready_retries * plan.cp_ready_sleep_secs as u32
+        ));
+        let check_cmd = cp_ssh_cmd(
+            privkey_path,
+            cp_ip,
+            &format!(
+                "kubectl --kubeconfig=/etc/kubernetes/admin.conf get node '{}' \
+                 --no-headers 2>/dev/null | awk '$2==\"Ready\"{{print \"yes\"}}'",
+                node_name
+            ),
+        );
+
+        let ready = hbird_virt::poll::retry(
+            plan.cp_ready_retries,
+            plan.cp_ready_sleep_secs,
+            || match conn.exec_shell(&check_cmd) {
+                Ok(out) if out.trim().contains("yes") => Ok(true),
+                Ok(_) => Ok(false),
+                Err(_) => Ok(false),
+            },
+        )
+        .map_err(|e: anyhow::Error| e)?;
+
+        if !ready {
+            return Err(anyhow!("node '{}' never reached Ready", node_name));
+        }
+    }
+
+    log(&format!("cluster Ready: all {expected} named nodes Ready"));
+    Ok(())
 }
 
 /// Plan the optional verify step. Mirrors lines 618-627. After the
 /// v0.1.0 cutover (#353) the bash twin's verify call is now
 /// `hbird verify app-deploy` (the Rust twin replaced
 /// `scripts/verify-app-deploy.sh`).
-fn plan_verify(plan: &Plan) -> Result<()> {
+fn plan_verify(plan: &Plan, cp_ip: &str) -> Result<()> {
     if !plan.run_verify {
         return Ok(());
     }
@@ -643,10 +902,46 @@ fn plan_verify(plan: &Plan) -> Result<()> {
         );
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "plan_verify",
-        "hbird verify app-deploy",
-    ))
+
+    let mut cmd = std::process::Command::new("hbird");
+    cmd.args([
+        "verify",
+        "app-deploy",
+        "--config",
+        plan.config_path.to_str().unwrap_or(""),
+        "--cp-ip",
+        cp_ip,
+    ]);
+    if let Some(ref kvm_host) = plan.kvm_host {
+        if !kvm_host.is_empty() {
+            cmd.args(["--kvm-host", kvm_host]);
+        }
+    }
+
+    let status = cmd.status();
+
+    match status {
+        Err(e) if plan.strict_cache => {
+            return Err(anyhow!(
+                "hbird verify app-deploy not found on PATH (required under STRICT_CACHE=1): {e}"
+            ));
+        }
+        Err(_) => {
+            log("hbird verify app-deploy not found on PATH; skipping");
+        }
+        Ok(s) if !s.success() => {
+            if plan.strict_cache {
+                return Err(anyhow!(
+                    "hbird verify app-deploy exited non-zero — deploy fails under STRICT_CACHE=1"
+                ));
+            }
+            log(
+                "hbird verify app-deploy exited non-zero (cluster is up; verifier failure is informational)",
+            );
+        }
+        Ok(_) => {}
+    }
+    Ok(())
 }
 
 // ---- Block #13: summary footer ---------------------------------------------
@@ -707,18 +1002,168 @@ pub fn run(args: DeployClusterArgs) -> Result<()> {
     // Build connection once; shared by image acquisition and bib.
     let conn = crate::virt_bridge::build_connection(plan.kvm_host.as_deref());
 
+    // Read the SSH pubkey contents from the KVM host (needed for cloud-init).
+    let pubkey_contents = if plan.dry_run {
+        String::new()
+    } else {
+        conn.exec_shell(&format!("cat -- {}", sh_quote(&plan.ssh_pubkey_file)))
+            .map_err(|e| anyhow!("cannot read SSH_PUBKEY_FILE {}: {e}", plan.ssh_pubkey_file))?
+    };
+    let privkey_path = derive_privkey_path(&plan.ssh_pubkey_file);
+
     let (cp_ref, worker_ref) = plan_image_acquisition(&plan, &conn)?;
     let (cp_template, worker_template) = plan_build_qcow2(&plan, &cp_ref, &worker_ref, &conn)?;
-    let cp_seed = plan_cp_seed(&plan)?;
-    let _cp_qcow = plan_cp_virt_install(&plan, &cp_template, &cp_seed)?;
-    let cp_ip = plan_cp_ready(&plan)?;
-    plan_join_token(&plan, &cp_ip)?;
-    plan_worker_spawn(&plan, &worker_template)?;
-    plan_cluster_ready(&plan)?;
-    plan_verify(&plan)?;
+    let cp_seed = plan_cp_seed(&plan, &conn, &pubkey_contents)?;
+    let _cp_qcow = plan_cp_virt_install(&plan, &conn, &cp_template, &cp_seed)?;
+    let cp_ip = plan_cp_ready(&plan, &conn, &privkey_path)?;
+    let join_cmd = plan_join_token(&plan, &conn, &cp_ip, &privkey_path)?;
+    plan_worker_spawn(
+        &plan,
+        &conn,
+        &worker_template,
+        &join_cmd,
+        &cp_ip,
+        &privkey_path,
+        &pubkey_contents,
+    )?;
+    plan_cluster_ready(&plan, &conn, &cp_ip, &privkey_path)?;
+    plan_verify(&plan, &cp_ip)?;
     plan_summary(&plan, &cp_ip);
 
     Ok(())
+}
+
+// ---- S2c helpers -----------------------------------------------------------
+
+/// Strip `.pub` from pubkey path to get privkey path.
+fn derive_privkey_path(pubkey_file: &str) -> String {
+    pubkey_file
+        .strip_suffix(".pub")
+        .unwrap_or(pubkey_file)
+        .to_string()
+}
+
+/// Build `ssh -i <privkey> -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+/// root@<ip> <remote_cmd>` command string.
+fn cp_ssh_cmd(privkey_path: &str, cp_ip: &str, remote_cmd: &str) -> String {
+    format!(
+        "ssh -i {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{} {}",
+        sh_quote(privkey_path),
+        cp_ip,
+        sh_quote(remote_cmd),
+    )
+}
+
+/// Render CP cloud-config YAML (bash twin: `render_cp_user_data`).
+///
+/// Pure function — takes all inputs, returns YAML string.
+pub(crate) fn render_cp_user_data(
+    cp_name: &str,
+    pubkey_contents: &str,
+    switch_to_ghcr: bool,
+    ghcr_tag: &str,
+    auto_update_cp: bool,
+    bootc_update_schedule: Option<&str>,
+    bootc_update_repo_k8s: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("#cloud-config\n");
+    out.push_str(&format!("hostname: {cp_name}\n"));
+    out.push_str("disable_root: false\n");
+    out.push_str("users:\n");
+    out.push_str("  - name: root\n");
+    out.push_str("    ssh_authorized_keys:\n");
+    out.push_str(&format!("      - {pubkey_contents}\n"));
+    // TODO: emit write_files block for bootc_update_schedule / bootc_update_repo_k8s
+    // when either is set. Omitted in S2c to keep scope focused — implement in follow-up.
+    let _ = (bootc_update_schedule, bootc_update_repo_k8s);
+    out.push_str("runcmd:\n");
+    if switch_to_ghcr {
+        out.push_str(&format!(
+            "  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s:{ghcr_tag} ]\n"
+        ));
+    }
+    if auto_update_cp {
+        out.push_str("  - [ systemctl, enable, --now, bootc-semver-update.timer ]\n");
+        out.push_str("  - [ systemctl, disable, --now, bootc-fetch-apply-updates.timer ]\n");
+    } else {
+        out.push_str("  - [ systemctl, disable, --now, bootc-semver-update.timer ]\n");
+    }
+    out
+}
+
+/// Render worker cloud-config YAML (bash twin: `worker_user_data`).
+pub(crate) fn render_worker_user_data(
+    worker_name: &str,
+    pubkey_contents: &str,
+    join_cmd: &str,
+    switch_to_ghcr: bool,
+    ghcr_tag: &str,
+    bootc_update_schedule: Option<&str>,
+    bootc_update_repo_worker: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("#cloud-config\n");
+    out.push_str(&format!("hostname: {worker_name}\n"));
+    out.push_str("disable_root: false\n");
+    out.push_str("users:\n");
+    out.push_str("  - name: root\n");
+    out.push_str("    ssh_authorized_keys:\n");
+    out.push_str(&format!("      - {pubkey_contents}\n"));
+    out.push_str("write_files:\n");
+    out.push_str("  - path: /etc/hummingbird/worker-join.env\n");
+    out.push_str("    owner: root:root\n");
+    out.push_str("    permissions: '0600'\n");
+    out.push_str("    content: |\n");
+    out.push_str(&format!("      {join_cmd}\n"));
+    // TODO: emit write_files entries for bootc_update_schedule / bootc_update_repo_worker
+    // when either is set. Omitted in S2c to keep scope focused — implement in follow-up.
+    let _ = (bootc_update_repo_worker,);
+    if switch_to_ghcr || bootc_update_schedule.is_some() {
+        out.push_str("runcmd:\n");
+        if switch_to_ghcr {
+            out.push_str(&format!(
+                "  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s-worker:{ghcr_tag} ]\n"
+            ));
+        }
+        if bootc_update_schedule.is_some() {
+            out.push_str("  - [ systemctl, daemon-reload ]\n");
+            out.push_str("  - [ systemctl, restart, bootc-semver-update.timer ]\n");
+        }
+    }
+    out
+}
+
+/// Build the shell script that writes a user-data YAML tmpfile and runs
+/// cloud-localds / genisoimage / mkisofs to produce a seed ISO.
+///
+/// Mirrors `scripts/lib/cloud-init-seed.sh`.
+///
+/// `ud_tmp` is the path to the already-written user-data YAML on the remote.
+fn cloud_init_seed_cmd(hostname: &str, ud_tmp: &str, out_iso: &str) -> String {
+    let hostname_q = sh_quote(hostname);
+    let ud_q = sh_quote(ud_tmp);
+    let iso_q = sh_quote(out_iso);
+    format!(
+        "set -euo pipefail; \
+         _tmp=$(mktemp -d -t hbird-ci-XXXXXX); \
+         cp {ud_q} \"$_tmp/user-data\"; \
+         printf 'instance-id: hbird-%s-%s\\nlocal-hostname: %s\\n' \
+           \"$(date +%s)\" \"$$\" {hostname_q} > \"$_tmp/meta-data\"; \
+         if command -v cloud-localds >/dev/null 2>&1; then \
+           cloud-localds {iso_q} \"$_tmp/user-data\" \"$_tmp/meta-data\"; \
+         elif command -v genisoimage >/dev/null 2>&1; then \
+           genisoimage -output {iso_q} -volid cidata -joliet -rock \
+             \"$_tmp/user-data\" \"$_tmp/meta-data\" >/dev/null 2>&1; \
+         elif command -v mkisofs >/dev/null 2>&1; then \
+           mkisofs -output {iso_q} -volid cidata -joliet -rock \
+             \"$_tmp/user-data\" \"$_tmp/meta-data\" >/dev/null 2>&1; \
+         else \
+           echo 'build_cloud_init_seed: need cloud-localds / genisoimage / mkisofs' >&2; exit 1; \
+         fi; \
+         rm -rf -- \"$_tmp\"; \
+         rm -f -- {ud_q}"
+    )
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -732,7 +1177,11 @@ pub fn run(args: DeployClusterArgs) -> Result<()> {
 /// deploy + spawn — not [#289], which this PR closes with the
 /// dry-run parity surface.
 ///
+/// Retained for backwards-compatibility with the existing test that validates
+/// the error wording; no longer invoked by any production path after S2c.
+///
 /// [#335]: https://github.com/aatchison/hummingbird-k8s/issues/335
+#[cfg(test)]
 fn live_mode_not_implemented(helper: &str, equivalent: &str) -> anyhow::Error {
     anyhow!(
         "live-mode deploy-cluster: `{helper}` requires a remote libvirt / bib / SSH round-trip \
@@ -957,6 +1406,9 @@ mod tests {
             force_rebuild: false,
             strict_cache: false,
             repo_root: None,
+            cp_ready_retries: 60,
+            cp_ready_sleep_secs: 10,
+            token_ttl: "2h".to_string(),
         }
     }
 
@@ -1108,5 +1560,200 @@ mod tests {
             2,
             "key must appear for both users"
         );
+    }
+
+    // ---- S2c helper tests --------------------------------------------------
+
+    #[test]
+    fn derive_privkey_path_strips_pub_suffix() {
+        assert_eq!(
+            derive_privkey_path("/home/user/.ssh/id_ed25519.pub"),
+            "/home/user/.ssh/id_ed25519"
+        );
+        // Without .pub suffix: returned unchanged.
+        assert_eq!(
+            derive_privkey_path("/home/user/.ssh/id_ed25519"),
+            "/home/user/.ssh/id_ed25519"
+        );
+        // Empty string.
+        assert_eq!(derive_privkey_path(""), "");
+    }
+
+    #[test]
+    fn cp_ssh_cmd_shape() {
+        let cmd = cp_ssh_cmd(
+            "/home/user/.ssh/id_ed25519",
+            "192.168.122.42",
+            "kubectl get nodes",
+        );
+        assert!(cmd.contains("ssh"), "must invoke ssh: {cmd}");
+        assert!(cmd.contains("-i"), "must have identity flag: {cmd}");
+        assert!(cmd.contains("id_ed25519"), "must contain privkey: {cmd}");
+        assert!(
+            cmd.contains("StrictHostKeyChecking=no"),
+            "must disable strict host checking: {cmd}"
+        );
+        assert!(
+            cmd.contains("root@192.168.122.42"),
+            "must target root@ip: {cmd}"
+        );
+        assert!(
+            cmd.contains("kubectl get nodes"),
+            "must embed remote cmd: {cmd}"
+        );
+    }
+
+    #[test]
+    fn render_cp_user_data_hostname_and_root_user() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "ssh-ed25519 AAAA test-key",
+            false,
+            "v0.1.0",
+            false,
+            None,
+            None,
+        );
+        assert!(
+            yaml.starts_with("#cloud-config\n"),
+            "must start with cloud-config: {yaml}"
+        );
+        assert!(
+            yaml.contains("hostname: hbird-cp1\n"),
+            "must set hostname: {yaml}"
+        );
+        assert!(
+            yaml.contains("disable_root: false\n"),
+            "must allow root: {yaml}"
+        );
+        assert!(
+            yaml.contains("name: root\n"),
+            "must configure root user: {yaml}"
+        );
+        assert!(
+            yaml.contains("ssh-ed25519 AAAA test-key"),
+            "must embed pubkey: {yaml}"
+        );
+    }
+
+    #[test]
+    fn render_cp_user_data_switch_to_ghcr_emits_runcmd() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "ssh-ed25519 AAAA test",
+            true,
+            "v0.42.0",
+            false,
+            None,
+            None,
+        );
+        assert!(yaml.contains("runcmd:\n"), "must have runcmd: {yaml}");
+        assert!(
+            yaml.contains("ghcr.io/aatchison/hummingbird-k8s:v0.42.0"),
+            "must have bootc switch runcmd: {yaml}"
+        );
+    }
+
+    #[test]
+    fn render_cp_user_data_auto_update_cp_false_disables_timer() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "ssh-ed25519 AAAA test",
+            false,
+            "v0.1.0",
+            false,
+            None,
+            None,
+        );
+        assert!(
+            yaml.contains("systemctl, disable, --now, bootc-semver-update.timer"),
+            "auto_update_cp=false must disable timer: {yaml}"
+        );
+        assert!(
+            !yaml.contains("systemctl, enable"),
+            "auto_update_cp=false must NOT enable timer: {yaml}"
+        );
+    }
+
+    #[test]
+    fn render_cp_user_data_auto_update_cp_true_enables_timer() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "ssh-ed25519 AAAA test",
+            false,
+            "v0.1.0",
+            true,
+            None,
+            None,
+        );
+        assert!(
+            yaml.contains("systemctl, enable, --now, bootc-semver-update.timer"),
+            "auto_update_cp=true must enable timer: {yaml}"
+        );
+        assert!(
+            yaml.contains("systemctl, disable, --now, bootc-fetch-apply-updates.timer"),
+            "auto_update_cp=true must disable legacy timer: {yaml}"
+        );
+    }
+
+    #[test]
+    fn render_worker_user_data_contains_join_cmd() {
+        let join_cmd = "kubeadm join 192.168.122.10:6443 --token abc.def --discovery-token-ca-cert-hash sha256:deadbeef";
+        let yaml = render_worker_user_data(
+            "hbird-w1",
+            "ssh-ed25519 AAAA test",
+            join_cmd,
+            false,
+            "v0.1.0",
+            None,
+            None,
+        );
+        assert!(yaml.contains(join_cmd), "must embed join command: {yaml}");
+        assert!(
+            yaml.contains("/etc/hummingbird/worker-join.env"),
+            "must set join env path: {yaml}"
+        );
+        assert!(
+            yaml.contains("permissions: '0600'"),
+            "must set 0600 permissions: {yaml}"
+        );
+    }
+
+    #[test]
+    fn render_worker_user_data_hostname_matches() {
+        let yaml = render_worker_user_data(
+            "hbird-w2",
+            "ssh-ed25519 AAAA test",
+            "kubeadm join ...",
+            false,
+            "v0.1.0",
+            None,
+            None,
+        );
+        assert!(
+            yaml.contains("hostname: hbird-w2\n"),
+            "hostname must match: {yaml}"
+        );
+    }
+
+    #[test]
+    fn cloud_init_seed_cmd_uses_cloud_localds() {
+        let cmd = cloud_init_seed_cmd("hbird-cp1", "/tmp/ud.yaml", "/mnt/pool/hbird-cp1-seed.iso");
+        assert!(
+            cmd.contains("cloud-localds"),
+            "must try cloud-localds first: {cmd}"
+        );
+        assert!(
+            cmd.contains("genisoimage"),
+            "must fall back to genisoimage: {cmd}"
+        );
+        assert!(cmd.contains("mkisofs"), "must fall back to mkisofs: {cmd}");
+        assert!(
+            cmd.contains("/mnt/pool/hbird-cp1-seed.iso"),
+            "must embed iso path: {cmd}"
+        );
+        assert!(cmd.contains("hbird-cp1"), "must embed hostname: {cmd}");
+        assert!(cmd.contains("meta-data"), "must create meta-data: {cmd}");
+        assert!(cmd.contains("user-data"), "must copy user-data: {cmd}");
     }
 }
