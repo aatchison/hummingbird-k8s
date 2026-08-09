@@ -158,27 +158,41 @@ _fedora_release_arg() {
 }
 
 @test "containerfiles: build-time base-era assertion is present in both flavors" {
+  # Match the executable RUN comparison, not comments that merely mention
+  # `rpm -E %fedora` (the FROM/ARG comment blocks do).
   for f in "$CP_CONTAINERFILE" "$WORKER_CONTAINERFILE"; do
-    grep -q 'rpm -E %fedora' "$f" || {
-      echo "$f: missing the rpm -E %fedora era assertion — it is the loud-failure fence for base/repo era drift (#397)"
+    grep -Fq 'RUN if [ "$(rpm -E %fedora)" != "${FEDORA_RELEASE}" ]' "$f" || {
+      echo "$f: missing the executable rpm -E %fedora era assertion (RUN if ... != FEDORA_RELEASE) — it is the loud-failure fence for base/repo era drift (#397)"
       return 1
     }
   done
 }
 
 @test "containerfiles: every Fedora repo stanza carries the pkgs.k8s.io-shielding exclude" {
-  # Each repo-writing printf line holds two stanzas (release + updates); the
-  # exclude must appear once per metalink in that same line so neither stanza
-  # can silently drop it.
+  # Each repo-writing printf line holds two stanzas (release + updates).
+  # Validate PER STANZA — split each line on the literal `[fedora-` section
+  # headers and require the exclude inside every segment — so one stanza
+  # can't silently drop it while another carries two. Also require the repo
+  # drops to exist at all (an empty grep must fail, not vacuously pass).
   for f in "$CP_CONTAINERFILE" "$WORKER_CONTAINERFILE"; do
+    lines_found=0
     while IFS= read -r line; do
-      metalinks="$(printf '%s' "$line" | grep -o 'metalink=https://mirrors.fedoraproject.org/metalink' | wc -l)"
-      excludes="$(printf '%s' "$line" | grep -o 'exclude=cri-o,cri-tools\*,containernetworking-plugins' | wc -l)"
-      [ "$metalinks" -eq "$excludes" ] || {
-        echo "$f: a Fedora repo printf has $metalinks metalink stanza(s) but $excludes exclude line(s)"
-        echo "line: $line"
-        return 1
-      }
+      lines_found=$((lines_found + 1))
+      awk -v fname="$f" '
+        {
+          n = split($0, seg, /\[fedora-/)
+          if (n < 2) { print fname ": no [fedora- stanza header on a metalink line"; exit 1 }
+          for (i = 2; i <= n; i++) {
+            if (seg[i] !~ /exclude=cri-o,cri-tools\*,containernetworking-plugins/) {
+              print fname ": Fedora stanza #" (i - 1) " is missing the exclude list"
+              exit 1
+            }
+          }
+        }' <<< "$line" || return 1
     done < <(grep 'metalink=https://mirrors.fedoraproject.org/metalink' "$f")
+    [ "$lines_found" -ge 2 ] || {
+      echo "$f: expected >=2 Fedora repo printf lines (cloud-init temp + permanent), found $lines_found"
+      return 1
+    }
   done
 }

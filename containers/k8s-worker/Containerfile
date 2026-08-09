@@ -8,7 +8,7 @@ FROM quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0
 # FEDORA_RELEASE pins the Fedora compose era of the build-time package repos.
 # Must match the CP image's value AND the base image's era — asserted at
 # build time; see containers/k8s/Containerfile for the full rationale
-# (#397, #399: F43 EOL 2026-12-09).
+# (#397; #399: F43 EOL early December 2026 per the current Fedora schedule).
 ARG FEDORA_RELEASE=43
 
 # K8S_VERSION pins the major.minor only (e.g. v1.31). pkgs.k8s.io URLs are

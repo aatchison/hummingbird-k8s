@@ -12,7 +12,8 @@ FROM quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0
 # bump that crosses eras cannot merge with stale repo pins (#397). Bump it in
 # tandem with the base digest and the vendored
 # containers/shared/gpg/RPM-GPG-KEY-fedora-<NN>-primary key.
-# F43 goes EOL 2026-12-09 — the pin must move before then (#399).
+# F43 goes EOL early December 2026 (2026-12-02 on the current Fedora
+# schedule) — the pin must move before then (#399).
 ARG FEDORA_RELEASE=43
 
 # K8S_VERSION pins the major.minor only (e.g. v1.31). pkgs.k8s.io URLs are
