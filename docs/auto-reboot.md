@@ -26,7 +26,7 @@ a sentinel and coordinates via a cluster-wide lock), see the note at the end.
 
 One host-side timer on the KVM host (`geary`):
 
-```
+```text
 nightly timer ── ExecCondition ─▶ hbird-staged-check.sh
                                      │ exit 1 (nothing staged) ─▶ service skips, ~2s, no churn
                                      │ exit 0 (something staged) ─▶
@@ -36,8 +36,13 @@ nightly timer ── ExecCondition ─▶ hbird-staged-check.sh
 - The **gate** (`scripts/hbird-staged-check.sh`) resolves each node's IP from
   libvirt and probes `bootc status`. It exits `0` only if at least one node has
   a staged image, so quiet nights are three quick SSH probes rather than a
-  pointless drain/uncordon cycle across the cluster. A non-zero `ExecCondition`
-  makes systemd skip the unit cleanly — it is not a failure.
+  pointless drain/uncordon cycle across the cluster. Its exit codes are:
+  `0` = a node has a staged image (run the roll); `1` = full scan, nothing
+  staged; `2` = config unreadable; `3` = scan incomplete (a node could not be
+  probed — we do **not** roll on a partial scan). systemd treats any
+  `ExecCondition` exit in the range `1`–`254` as a clean **skip**, not a
+  failure (only `255` or a signal marks the unit failed), and this gate never
+  returns `255` — so a failed probe safely skips the roll.
 - The **roll** is plain `hbird update-cluster`. On a night where nothing is
   staged the gate skips it entirely; even if forced, `bootc upgrade --apply` is
   itself a no-op when there is no staged image.
@@ -59,9 +64,20 @@ session is open.
 
 ## Prerequisites
 
-- The `hbird` CLI installed for the operator, e.g. at `~/.local/bin/hbird`
-  (build with `cargo build --release --bin hbird` under `rust/`, or install a
-  release binary per [`docs/rust-cli.md`](rust-cli.md)).
+- The `hbird` CLI installed at **`~/.local/bin/hbird`** — the exact path the
+  unit's `ExecStart` uses. Either build it or use a release binary, then place
+  it there:
+
+  ```bash
+  # from a source build:
+  install -Dm0755 rust/target/release/hbird ~/.local/bin/hbird
+  # ...or a release binary (see docs/rust-cli.md for the verified download):
+  install -Dm0755 ./hbird ~/.local/bin/hbird
+  hbird --version
+  ```
+
+  Keep it under `~/.local/bin` (not `/usr/local/bin`): as a **user** service it
+  runs in your login domain, so a home-dir binary is fine and needs no sudo.
 - The operator is in the `libvirt` group (so `virsh -c qemu:///system` and the
   cluster lifecycle tools work without sudo).
 - Passwordless SSH as `root@<node>` to every node (the same key the deploy uses).
@@ -93,8 +109,10 @@ ExecCondition=%h/hummingbird-k8s/scripts/hbird-staged-check.sh %h/hummingbird-k8
 # but `hbird update-cluster` requires the --config flag.
 ExecStart=%h/.local/bin/hbird update-cluster --config %h/hummingbird-k8s/cluster.local.conf
 
-# A full CP + workers roll (drain + reboot + rejoin each) fits comfortably.
-TimeoutStartSec=1800
+# A full CP + workers roll is drain + reboot + rejoin per node. update-cluster's
+# default per-node drain is 5m, so worst-case a multi-worker roll can approach or
+# exceed 30m; 3600s leaves headroom so systemd never SIGTERMs mid-uncordon.
+TimeoutStartSec=3600
 Nice=10
 
 [Install]
@@ -148,7 +166,7 @@ journalctl --user -u hbird-update.service -n 20 --no-pager
 
 Expected on a quiet run:
 
-```
+```text
 hbird-staged-check: no staged bootc updates on any node -> skipping roll
 hbird-update.service: Skipped due to 'exec-condition'.
 ```
@@ -182,6 +200,12 @@ hbird update-cluster --config ~/hummingbird-k8s/cluster.local.conf --dry-run
 - **No auto-reboot chaining.** `update-cluster` stages nothing new — it only
   applies what the per-node timer already staged. The two layers are
   independent: staging (in-image timer) and applying (this timer).
+- **SSH host-key trust.** The gate probes `root@<node>` unattended. It assumes
+  the node host keys are already trusted (the deploy populates the operator's
+  `known_hosts`); `StrictHostKeyChecking=accept-new` is only a TOFU fallback for
+  a freshly re-leased DHCP address. If you want strict verification, pre-populate
+  `known_hosts` (or a managed `UserKnownHostsFile`) and drop `accept-new`. When a
+  key can't be verified the probe fails, which yields a skip (exit 3), not a roll.
 
 ## Alternative: in-cluster reboot daemon
 
