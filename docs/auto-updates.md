@@ -11,6 +11,11 @@ it per host if they want the legacy `:latest` behaviour).
 > See [boot-test-overrides.md](boot-test-overrides.md) for the deploy-time knobs that
 > control which image a node boots before this timer takes over.
 
+> This timer **stages** the new image (`bootc switch` + `bootc upgrade`) but does
+> **not** reboot into it. To apply staged images automatically on a schedule —
+> coordinated across the CP and workers — see
+> [auto-reboot.md](auto-reboot.md).
+
 The `hummingbird-k8s-worker` flavor enables auto-updates by default. The
 `hummingbird-k8s` control-plane image ships with the timer **disabled by
 default** — opt in per host via `systemctl enable --now` (see below).
