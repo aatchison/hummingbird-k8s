@@ -221,16 +221,19 @@ expect `worker-init.sh` to do it for you.
 - **Build dependency.** Hummingbird's curated repo ships
   `cloud-init` itself but not all of its deps (xfsprogs, python3
   modules, dhcpcd, nc). The conditional build block adds a
-  one-shot Fedora Rawhide repo just for the cloud-init install,
-  then removes the repo file before the layer commits — the
-  resulting image does not carry a dangling Rawhide
-  configuration. This works uniformly across k8s and k8s-worker
-  (both already have a permanent Rawhide repo for
-  iptables/socat/etc, but the cloud-init block stays
-  self-contained so it's resilient to reordering). The Fedora
-  GPG keyring is imported and the repo runs with `gpgcheck=1`,
-  so cloud-init's RPM dependencies are signature-verified at
-  install time (#70).
+  one-shot Fedora 43 release repo just for the cloud-init
+  install, then removes the repo file before the layer commits —
+  the resulting image does not carry a dangling extra repo
+  configuration. The Fedora repo is pinned to the base image's
+  release era (Fedora 43, not Rawhide) so cloud-init's `nc`
+  dependency resolves against the base's FIPS-pinned openssl
+  3.5.6-hum1 instead of dragging in Rawhide's openssl-4 (#397).
+  This works uniformly across k8s and k8s-worker (both already
+  have a permanent Fedora 43 repo for iptables/socat/etc, but
+  the cloud-init block stays self-contained so it's resilient
+  to reordering). The Fedora GPG keyring is imported and the
+  repo runs with `gpgcheck=1`, so cloud-init's RPM dependencies
+  are signature-verified at install time (#70).
 
 ## Disabling at runtime on an enabled image
 

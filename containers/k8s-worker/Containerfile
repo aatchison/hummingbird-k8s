@@ -27,7 +27,7 @@ ARG ENABLE_CLOUD_INIT=1
 COPY containers/shared/ssh/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
 
 # Import Fedora's GPG keyring (release-aligned public-key bundle from
-# fedoraproject.org) so every dnf install from the Rawhide repo below — and
+# fedoraproject.org) so every dnf install from the Fedora repo below — and
 # from the optional cloud-init repo — is signature-verified at install time
 # (#70). Same posture as the CP image; see containers/k8s/Containerfile for
 # the rationale + the gpg re-armor explanation.
@@ -46,21 +46,27 @@ RUN curl -fsSL --retry 3 --retry-delay 2 -o /tmp/fedora.gpg \
 # set, so the default image is byte-identical to pre-cloud-init.
 #
 # cloud-init pulls deps (xfsprogs, python3 modules, dhcpcd, nc) that aren't
-# in Hummingbird's curated repo, so the conditional drops in Fedora Rawhide
-# as a one-shot secondary source (Hummingbird is Rawhide-based) and removes
-# the repo file before the layer commits. The worker's main RUN below adds
-# its own permanent Rawhide repo for iptables/socat/etc; this
+# in Hummingbird's curated repo, so the conditional drops in the Fedora 43
+# release + updates composes as a one-shot secondary source and removes the
+# repo file before the layer commits. The pinned bootc-os base is Fedora
+# 43-era (fc43 packages preinstalled), so F43 is the compose whose ABI
+# matches the base's FIPS-pinned openssl 3.5.6-hum1 — Rawhide moved to
+# openssl-4 and became unresolvable against that pin (#397). exclude=cri-o
+# keeps the pkgs.k8s.io K8S_VERSION-locked cri-o winning over Fedora's.
+# NOTE: bump repo=fedora-43/updates-released-f43 in tandem with any future
+# base-digest bump to a newer Fedora era. The worker's main RUN below adds
+# its own permanent Fedora repo for iptables/socat/etc; this
 # self-contained drop-in keeps the cloud-init block independent of step
 # ordering. gpgcheck=1 against the Fedora keyring imported above (#70).
 COPY containers/shared/cloud-init/10-cloud-init.preset /usr/lib/systemd/system-preset/10-cloud-init.preset
 COPY containers/shared/cloud-init/98-hummingbird-users.cfg /etc/cloud/cloud.cfg.d/98-hummingbird-users.cfg
 COPY containers/shared/cloud-init/99-hummingbird-datasource.cfg /etc/cloud/cloud.cfg.d/99-hummingbird-datasource.cfg
 RUN if [ "${ENABLE_CLOUD_INIT}" = "1" ]; then \
-      printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\n' \
-        > /etc/yum.repos.d/fedora-rawhide-cloudinit.repo \
+      printf '[fedora-43]\nname=Fedora 43\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-43&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\nexclude=cri-o\n\n[fedora-43-updates]\nname=Fedora 43 Updates\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=updates-released-f43&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\nexclude=cri-o\n' \
+        > /etc/yum.repos.d/fedora-43-cloudinit.repo \
       && dnf install -y cloud-init cloud-utils-growpart \
       && dnf clean all \
-      && rm -f /etc/yum.repos.d/fedora-rawhide-cloudinit.repo \
+      && rm -f /etc/yum.repos.d/fedora-43-cloudinit.repo \
       && systemctl preset cloud-init-local.service \
            cloud-init-main.service cloud-init-network.service \
            cloud-config.service cloud-final.service ; \
@@ -69,10 +75,13 @@ RUN if [ "${ENABLE_CLOUD_INIT}" = "1" ]; then \
             /etc/cloud/cloud.cfg.d/99-hummingbird-datasource.cfg ; \
     fi
 
-# Same secondary Fedora Rawhide source as the CP image (Hummingbird's curated
-# set lacks iptables/socat/etc). gpgcheck=1 against the Fedora keyring (#70).
-RUN printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\n' \
-      > /etc/yum.repos.d/fedora-rawhide.repo
+# Same secondary Fedora 43 release + updates source as the CP image
+# (Hummingbird's curated set lacks iptables/socat/etc). Pinned to the base's
+# F43 era so openssl stays on the FIPS-pinned 3.5.6-hum1 family (#397);
+# exclude=cri-o keeps the pkgs.k8s.io cri-o pin winning. Bump in tandem with
+# any base-digest bump. gpgcheck=1 against the Fedora keyring (#70).
+RUN printf '[fedora-43]\nname=Fedora 43\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-43&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\nexclude=cri-o\n\n[fedora-43-updates]\nname=Fedora 43 Updates\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=updates-released-f43&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\nexclude=cri-o\n' \
+      > /etc/yum.repos.d/fedora-43.repo
 
 RUN printf '[kubernetes]\nname=Kubernetes\nbaseurl=https://pkgs.k8s.io/core:/stable:/%s/rpm/\nenabled=1\ngpgcheck=1\ngpgkey=https://pkgs.k8s.io/core:/stable:/%s/rpm/repodata/repomd.xml.key\n' "$K8S_VERSION" "$K8S_VERSION" \
       > /etc/yum.repos.d/kubernetes.repo \
