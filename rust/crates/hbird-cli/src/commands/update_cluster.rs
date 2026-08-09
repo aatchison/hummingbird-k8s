@@ -85,7 +85,7 @@ use hbird_config::ClusterConfig;
 #[derive(Debug, Args)]
 pub struct UpdateClusterArgs {
     /// Path to `cluster.local.conf`.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "CONFIG")]
     pub config: PathBuf,
 
     /// SSH alias of the KVM host. Overrides `KVM_HOST` env / config.

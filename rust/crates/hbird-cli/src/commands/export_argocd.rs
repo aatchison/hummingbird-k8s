@@ -50,7 +50,7 @@ use crate::cp_kubectl::{CpTarget, cp_ssh_capture};
 #[derive(Debug, Args)]
 pub struct ExportArgocdArgs {
     /// Path to `cluster.local.conf`.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "CONFIG")]
     pub config: PathBuf,
 
     /// Output path. Bash-twin default: `argocd-kubeconfig.yaml`.
