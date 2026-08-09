@@ -114,7 +114,7 @@ Tracked under #298 (umbrella) / #304 (Renovate-config implementation).
 
 ## Install style: upstream kubeadm (`containers/k8s/Containerfile`)
 
-- Adds Fedora Rawhide as a secondary repo (Hummingbird's curated set lacks `iptables-nft`, `socat`, `conntrack-tools`, `ethtool`). The Fedora GPG keyring bundle is imported at build time and the repo is configured with `gpgcheck=1`, so Rawhide RPMs are signature-verified during install (#70).
+- Adds Fedora 43 release + updates as a secondary repo (Hummingbird's curated set lacks `iptables-nft`, `socat`, `conntrack-tools`, `ethtool`), with `exclude=cri-o` so the pkgs.k8s.io cri-o repo stays authoritative. Originally Rawhide, re-pinned to the F43 compose after Rawhide's openssl-4 era broke resolution against the base's FIPS-pinned openssl (#397). The Fedora GPG keyring bundle is imported at build time and the repo is configured with `gpgcheck=1`, so its RPMs are signature-verified during install (#70).
 - Adds `pkgs.k8s.io` RPM repos for `core` (kubelet/kubeadm/kubectl) and `addons:cri-o`.
 - Pre-creates `/usr/libexec/kubernetes/kubelet-plugins/volume/exec` so kube-controller-manager doesn't fail on read-only `/usr`.
 - Drops `/etc/modules-load.d/k8s.conf` + sysctls.
