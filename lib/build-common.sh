@@ -98,7 +98,11 @@
 #   BASE_IMAGE        — Upstream bootc-os base. Pinned by digest (OCI index,
 #                       multi-arch) for reproducibility. Override only when
 #                       deliberately bumping the base; keep it in lockstep with
-#                       the `FROM` lines in containers/*/Containerfile.
+#                       the `FROM` lines in containers/*/Containerfile — AND
+#                       with their `ARG FEDORA_RELEASE` era pin + vendored GPG
+#                       key when the new base crosses a Fedora release (a
+#                       build-time assertion fails loudly on mismatch;
+#                       #397, #399).
 #   BIB               — bootc-image-builder image.
 #                       Default: quay.io/centos-bootc/bootc-image-builder:latest
 #   ENABLE_CLOUD_INIT — "1" to opt into cloud-init in the built image (see

@@ -24,6 +24,14 @@
 #      conditional/optional block again (the pre-#257 placement inside
 #      the bootc-semver-update layer worked but was unobvious; this fence
 #      keeps jq pinned to the primary package layer).
+#   2. Fedora era pinning (#397/#399): the build-time Fedora repos are pinned
+#      to the base image's release era via `ARG FEDORA_RELEASE`. These fences
+#      assert (a) no Rawhide metalink sneaks back in, (b) both flavors agree
+#      on one era, (c) the era matches a vendored GPG key, (d) the build-time
+#      base-era assertion is present, and (e) every Fedora repo stanza keeps
+#      the exclude list that shields the pkgs.k8s.io version locks
+#      (cri-o, cri-tools — incl. Fedora's versioned names like cri-tools1.35,
+#      hence the glob — and kubernetes-cni via containernetworking-plugins).
 #
 # Run via:
 #   bats tests/containers/containerfile-deps.bats
@@ -106,5 +114,71 @@ _extract_primary_dnf_install() {
       echo "containers/k8s-worker/Containerfile: $tool missing"
       return 1
     }
+  done
+}
+
+# ---- Fedora era pin fences (#397/#399) ----------------------------------
+
+# Extract the value of `ARG FEDORA_RELEASE=` from a Containerfile.
+_fedora_release_arg() {
+  sed -n 's/^ARG FEDORA_RELEASE=\([0-9][0-9]*\)$/\1/p' "$1" | head -1
+}
+
+@test "containerfiles: no Rawhide metalink (the #397 regression)" {
+  for f in "$CP_CONTAINERFILE" "$WORKER_CONTAINERFILE"; do
+    if grep -q 'metalink=[^ ]*repo=rawhide' "$f"; then
+      echo "$f: found a Rawhide metalink — Fedora repos must stay pinned to the base's release era (#397)"
+      return 1
+    fi
+  done
+}
+
+@test "containerfiles: CP and worker agree on one ARG FEDORA_RELEASE" {
+  cp_era="$(_fedora_release_arg "$CP_CONTAINERFILE")"
+  worker_era="$(_fedora_release_arg "$WORKER_CONTAINERFILE")"
+  [ -n "$cp_era" ] || { echo "containers/k8s/Containerfile: ARG FEDORA_RELEASE missing"; return 1; }
+  [ -n "$worker_era" ] || { echo "containers/k8s-worker/Containerfile: ARG FEDORA_RELEASE missing"; return 1; }
+  [ "$cp_era" = "$worker_era" ] || {
+    echo "FEDORA_RELEASE era skew: CP=$cp_era worker=$worker_era — bump both flavors together"
+    return 1
+  }
+}
+
+@test "containerfiles: vendored GPG key exists for the pinned era" {
+  era="$(_fedora_release_arg "$CP_CONTAINERFILE")"
+  key="$REPO_ROOT/containers/shared/gpg/RPM-GPG-KEY-fedora-${era}-primary"
+  [ -f "$key" ] || {
+    echo "missing $key — vendor the era's key when bumping FEDORA_RELEASE (#399)"
+    return 1
+  }
+  head -1 "$key" | grep -q 'BEGIN PGP PUBLIC KEY BLOCK' || {
+    echo "$key is not an ASCII-armored PGP key"
+    return 1
+  }
+}
+
+@test "containerfiles: build-time base-era assertion is present in both flavors" {
+  for f in "$CP_CONTAINERFILE" "$WORKER_CONTAINERFILE"; do
+    grep -q 'rpm -E %fedora' "$f" || {
+      echo "$f: missing the rpm -E %fedora era assertion — it is the loud-failure fence for base/repo era drift (#397)"
+      return 1
+    }
+  done
+}
+
+@test "containerfiles: every Fedora repo stanza carries the pkgs.k8s.io-shielding exclude" {
+  # Each repo-writing printf line holds two stanzas (release + updates); the
+  # exclude must appear once per metalink in that same line so neither stanza
+  # can silently drop it.
+  for f in "$CP_CONTAINERFILE" "$WORKER_CONTAINERFILE"; do
+    while IFS= read -r line; do
+      metalinks="$(printf '%s' "$line" | grep -o 'metalink=https://mirrors.fedoraproject.org/metalink' | wc -l)"
+      excludes="$(printf '%s' "$line" | grep -o 'exclude=cri-o,cri-tools\*,containernetworking-plugins' | wc -l)"
+      [ "$metalinks" -eq "$excludes" ] || {
+        echo "$f: a Fedora repo printf has $metalinks metalink stanza(s) but $excludes exclude line(s)"
+        echo "line: $line"
+        return 1
+      }
+    done < <(grep 'metalink=https://mirrors.fedoraproject.org/metalink' "$f")
   done
 }

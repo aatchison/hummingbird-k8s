@@ -233,7 +233,8 @@ expect `worker-init.sh` to do it for you.
   have a permanent Fedora 43 release+updates repo for
   iptables/socat/etc, but
   the cloud-init block stays self-contained so it's resilient
-  to reordering). The Fedora GPG keyring is imported and the
+  to reordering). The era's Fedora signing key is vendored in-repo
+  (`containers/shared/gpg/`, imported at build time) and the
   repo runs with `gpgcheck=1`, so cloud-init's RPM dependencies
   are signature-verified at install time (#70).
 
