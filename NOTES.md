@@ -107,14 +107,15 @@ Three files carry the same digest in lockstep:
 Renovate watches all three via a `customManagers` regex rule in `.github/renovate.json` and opens a **single grouped PR** (`bootc-os-base` group) when the upstream `:latest` digest moves. The grouped PR is **never auto-merged** — `pr-validate.yml` only runs `podman build`, which can't catch a base-image drift that breaks first boot (systemd unit rename, kernel module drop, RPM removal). Operator workflow on each bump PR:
 
 1. Read the upstream changelog via `org.opencontainers.image.revision` label diff at `gitlab.com/redhat/hummingbird/containers/-/compare/<old-revision>...<new-revision>` (find each side's revision with `skopeo inspect docker://quay.io/hummingbird-community/bootc-os@<digest> | jq -r '.Labels[\"org.opencontainers.image.revision\"]'`).
-2. Boot-test by hand on a KVM host before merge (until the #32-class self-hosted boot test lands).
-3. Merge; the next image release will roll the new base layer to the fleet via `bootc-semver-update.timer`.
+2. Check the new base's **Fedora era**: `docker run --rm quay.io/hummingbird-community/bootc-os@<new-digest> rpm -E %fedora`. If it differs from the current `ARG FEDORA_RELEASE` in the Containerfiles, change that ARG in both flavors **in the same PR**, vendor the new era's GPG key as `containers/shared/gpg/RPM-GPG-KEY-fedora-<NN>-primary`, and re-run the resolve probes from #398. A build-time assertion fails `containerfile-build` loudly on era mismatch, so a bump PR that skips this step cannot merge green (#397, #399).
+3. Boot-test by hand on a KVM host before merge (until the #32-class self-hosted boot test lands).
+4. Merge; the next image release will roll the new base layer to the fleet via `bootc-semver-update.timer`.
 
 Tracked under #298 (umbrella) / #304 (Renovate-config implementation).
 
 ## Install style: upstream kubeadm (`containers/k8s/Containerfile`)
 
-- Adds Fedora Rawhide as a secondary repo (Hummingbird's curated set lacks `iptables-nft`, `socat`, `conntrack-tools`, `ethtool`). The Fedora GPG keyring bundle is imported at build time and the repo is configured with `gpgcheck=1`, so Rawhide RPMs are signature-verified during install (#70).
+- Adds Fedora release + updates (era = `ARG FEDORA_RELEASE`, asserted against the base at build time) as a secondary repo (Hummingbird's curated set lacks `iptables-nft`, `socat`, `conntrack-tools`, `ethtool`), with `exclude=cri-o,cri-tools*,containernetworking-plugins` so the pkgs.k8s.io version-locked cri-o/cri-tools/kubernetes-cni stay authoritative. Originally Rawhide, re-pinned to the F43 compose after Rawhide's openssl-4 era broke resolution against the base's FIPS-pinned openssl (#397; F43 EOL tracking: #399). The era's Fedora signing key is vendored at `containers/shared/gpg/` and the repo is configured with `gpgcheck=1`, so its RPMs are signature-verified during install (#70).
 - Adds `pkgs.k8s.io` RPM repos for `core` (kubelet/kubeadm/kubectl) and `addons:cri-o`.
 - Pre-creates `/usr/libexec/kubernetes/kubelet-plugins/volume/exec` so kube-controller-manager doesn't fail on read-only `/usr`.
 - Drops `/etc/modules-load.d/k8s.conf` + sysctls.

@@ -1,6 +1,20 @@
 # Pinned by digest (OCI index, multi-arch) for reproducibility. Bump deliberately;
 # see PR description for the procedure (`skopeo inspect docker://...:latest`).
+# The base's Fedora era is coupled to FEDORA_RELEASE below — bump both (plus
+# the vendored GPG key) together; a build-time assertion fails loudly on
+# mismatch (#397, #399).
 FROM quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0f22286fb41c9e00b4f3c9a862696e3bfb84
+
+# FEDORA_RELEASE pins the Fedora compose era of the build-time package repos
+# (release + updates metalinks below). It MUST match the Fedora era of the
+# digest-pinned base image above: the first RUN asserts `rpm -E %fedora`
+# equals this and fails the build loudly on drift, so a Renovate base-digest
+# bump that crosses eras cannot merge with stale repo pins (#397). Bump it in
+# tandem with the base digest and the vendored
+# containers/shared/gpg/RPM-GPG-KEY-fedora-<NN>-primary key.
+# F43 goes EOL early December 2026 (2026-12-02 on the current Fedora
+# schedule) — the pin must move before then (#399).
+ARG FEDORA_RELEASE=43
 
 # K8S_VERSION pins the major.minor only (e.g. v1.31). pkgs.k8s.io URLs are
 # major.minor-scoped, so dnf installs the latest 1.31.x patch at build time.
@@ -26,24 +40,26 @@ ARG ENABLE_CLOUD_INIT=1
 # package-install layer cache below.
 COPY containers/shared/ssh/99-no-passwords.conf /etc/ssh/sshd_config.d/99-no-passwords.conf
 
-# Import Fedora's GPG keyring (release-aligned public-key bundle from
-# fedoraproject.org) so every dnf install from the Rawhide repo below — and
-# from the optional cloud-init repo — is signature-verified at install time
-# (#70). The bundle ships keys for the current and adjacent Fedora releases
-# (currently F42-F45); dnf picks the right one by the package's signing-key
-# fingerprint at install time. Pinning the bundle URL avoids the previous
-# "gpgcheck=0 to skip bootstrap" posture that left Rawhide RPMs unverified.
+# Fedora signing key, vendored in-repo (containers/shared/gpg/; fetched from
+# the fedora-repos dist-git and fingerprint-checked against the bundle at
+# https://fedoraproject.org/fedora.gpg) so every dnf install from the Fedora
+# repos below — and from the optional cloud-init repo — is signature-verified
+# at install time (#70). Vendoring pins the trust anchor to the
+# FEDORA_RELEASE era: the rolling fedoraproject.org/fedora.gpg bundle used
+# previously drops keys for EOL releases, which would have broken F43-pinned
+# rebuilds after F43 EOL (#399). The key file is already ASCII-armored, so
+# rpm --import takes it directly.
 #
-# The upstream bundle is binary-OpenPGP, but rpm --import only accepts
-# ASCII-armored keys, so we re-armor via gpg before importing.
-RUN curl -fsSL --retry 3 --retry-delay 2 -o /tmp/fedora.gpg \
-      https://fedoraproject.org/fedora.gpg \
- && GNUPGHOME=$(mktemp -d) \
- && gpg --homedir "$GNUPGHOME" --import /tmp/fedora.gpg \
- && gpg --homedir "$GNUPGHOME" --armor --export \
-      > /etc/pki/rpm-gpg/RPM-GPG-KEY-fedora \
- && rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-fedora \
- && rm -rf "$GNUPGHOME" /tmp/fedora.gpg
+# The same RUN asserts the base image's Fedora era matches FEDORA_RELEASE —
+# this is the loud-failure fence that forces base-digest bumps and the repo
+# pins below to move in tandem (#397).
+COPY containers/shared/gpg/RPM-GPG-KEY-fedora-${FEDORA_RELEASE}-primary /etc/pki/rpm-gpg/
+RUN if [ "$(rpm -E %fedora)" != "${FEDORA_RELEASE}" ]; then \
+      echo "ERROR: base image is Fedora $(rpm -E %fedora) but FEDORA_RELEASE=${FEDORA_RELEASE}." ; \
+      echo "Bump ARG FEDORA_RELEASE, the vendored GPG key, and the base digest in tandem (#397, #399)." ; \
+      exit 1 ; \
+    fi \
+ && rpm --import "/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-${FEDORA_RELEASE}-primary"
 
 # Optional cloud-init package + units. The shared datasource config + preset
 # are COPY'd unconditionally (they're tiny and inert without the package),
@@ -51,21 +67,30 @@ RUN curl -fsSL --retry 3 --retry-delay 2 -o /tmp/fedora.gpg \
 # set, so the default image is byte-identical to pre-cloud-init.
 #
 # cloud-init pulls deps (xfsprogs, python3 modules, dhcpcd, nc) that aren't
-# in Hummingbird's curated repo, so the conditional drops in Fedora Rawhide
-# as a one-shot secondary source (Hummingbird is Rawhide-based) and removes
-# the repo file before the layer commits. The k8s flavor's main RUN below
-# adds its own permanent Rawhide repo for iptables/socat/etc; this
-# self-contained drop-in keeps the cloud-init block independent of step
-# ordering. gpgcheck=1 against the Fedora keyring imported above (#70).
+# in Hummingbird's curated repo, so the conditional drops in the Fedora
+# ${FEDORA_RELEASE} release + updates composes as a one-shot secondary source
+# and removes the repo file before the layer commits. The compose era comes
+# from FEDORA_RELEASE (asserted against the base at build time above), whose
+# ABI matches the base's FIPS-pinned openssl 3.5.6-hum1 — Rawhide moved to
+# openssl-4 and became unresolvable against that pin (#397).
+# exclude=cri-o,cri-tools*,containernetworking-plugins keeps the pkgs.k8s.io
+# version-locked equivalents (cri-o, cri-tools, kubernetes-cni) winning the
+# provider contest: Fedora ships newer cri-o and versioned-name cri-tools
+# (e.g. cri-tools1.35 — hence the glob), and containernetworking-plugins
+# provides kubernetes-cni. The k8s flavor's main RUN below adds its own
+# permanent Fedora repo for iptables/socat/etc; this self-contained drop-in
+# keeps the cloud-init block independent of step ordering. gpgcheck=1
+# against the vendored Fedora key imported above (#70).
 COPY containers/shared/cloud-init/10-cloud-init.preset /usr/lib/systemd/system-preset/10-cloud-init.preset
 COPY containers/shared/cloud-init/98-hummingbird-users.cfg /etc/cloud/cloud.cfg.d/98-hummingbird-users.cfg
 COPY containers/shared/cloud-init/99-hummingbird-datasource.cfg /etc/cloud/cloud.cfg.d/99-hummingbird-datasource.cfg
 RUN if [ "${ENABLE_CLOUD_INIT}" = "1" ]; then \
-      printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\n' \
-        > /etc/yum.repos.d/fedora-rawhide-cloudinit.repo \
+      printf '[fedora-%s]\nname=Fedora %s\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-%s&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-%s-primary\nskip_if_unavailable=False\nexclude=cri-o,cri-tools*,containernetworking-plugins\n\n[fedora-%s-updates]\nname=Fedora %s Updates\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=updates-released-f%s&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-%s-primary\nskip_if_unavailable=False\nexclude=cri-o,cri-tools*,containernetworking-plugins\n' \
+        "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" \
+        > "/etc/yum.repos.d/fedora-${FEDORA_RELEASE}-cloudinit.repo" \
       && dnf install -y cloud-init cloud-utils-growpart \
       && dnf clean all \
-      && rm -f /etc/yum.repos.d/fedora-rawhide-cloudinit.repo \
+      && rm -f "/etc/yum.repos.d/fedora-${FEDORA_RELEASE}-cloudinit.repo" \
       && systemctl preset cloud-init-local.service \
            cloud-init-main.service cloud-init-network.service \
            cloud-config.service cloud-final.service ; \
@@ -75,11 +100,20 @@ RUN if [ "${ENABLE_CLOUD_INIT}" = "1" ]; then \
     fi
 
 # Hummingbird's curated repo doesn't carry the standard k8s deps (iptables, socat,
-# conntrack-tools, ethtool). Add Fedora Rawhide as a secondary source — Hummingbird
-# is Rawhide-based so versions are compatible. gpgcheck=1 against the Fedora
-# keyring imported above (#70).
-RUN printf '[fedora-rawhide]\nname=Fedora Rawhide\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=rawhide&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora\nskip_if_unavailable=False\n' \
-      > /etc/yum.repos.d/fedora-rawhide.repo
+# conntrack-tools, ethtool). Add the Fedora ${FEDORA_RELEASE} release + updates
+# composes as a secondary source. The compose era comes from FEDORA_RELEASE
+# (asserted against the base at build time above), which stays ABI-compatible
+# with the base's FIPS-pinned openssl 3.5.6-hum1 (Rawhide moved to openssl-4
+# and became unresolvable, #397).
+# exclude=cri-o,cri-tools*,containernetworking-plugins keeps the pkgs.k8s.io
+# version-locked equivalents (cri-o, cri-tools, kubernetes-cni) winning the
+# provider contest: Fedora ships newer cri-o and versioned-name cri-tools
+# (e.g. cri-tools1.35 — hence the glob), and containernetworking-plugins
+# provides kubernetes-cni. gpgcheck=1 against the vendored Fedora key
+# imported above (#70).
+RUN printf '[fedora-%s]\nname=Fedora %s\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=fedora-%s&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-%s-primary\nskip_if_unavailable=False\nexclude=cri-o,cri-tools*,containernetworking-plugins\n\n[fedora-%s-updates]\nname=Fedora %s Updates\nmetalink=https://mirrors.fedoraproject.org/metalink?repo=updates-released-f%s&arch=$basearch\nenabled=1\ngpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-%s-primary\nskip_if_unavailable=False\nexclude=cri-o,cri-tools*,containernetworking-plugins\n' \
+      "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" "$FEDORA_RELEASE" \
+      > "/etc/yum.repos.d/fedora-${FEDORA_RELEASE}.repo"
 
 # Upstream Kubernetes + CRI-O RPM repos (version-aligned)
 RUN printf '[kubernetes]\nname=Kubernetes\nbaseurl=https://pkgs.k8s.io/core:/stable:/%s/rpm/\nenabled=1\ngpgcheck=1\ngpgkey=https://pkgs.k8s.io/core:/stable:/%s/rpm/repodata/repomd.xml.key\n' "$K8S_VERSION" "$K8S_VERSION" \
