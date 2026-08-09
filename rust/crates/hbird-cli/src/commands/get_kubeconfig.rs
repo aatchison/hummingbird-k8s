@@ -25,7 +25,7 @@ use crate::commands::export_argocd::{ExportOptions, export_kubeconfig};
 pub struct GetKubeconfigArgs {
     /// Path to `cluster.local.conf`. Required (the bash twin sources it
     /// to read `CP_NAME`).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", env = "CONFIG")]
     pub config: PathBuf,
 
     /// Output path for the kubeconfig. Bash-twin default:
