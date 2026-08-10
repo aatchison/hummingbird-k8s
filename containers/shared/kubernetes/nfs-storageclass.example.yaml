@@ -1,0 +1,41 @@
+# EXAMPLE StorageClass for csi-driver-nfs — NOT applied automatically.
+#
+# `server` and `share` are site-specific, so k8s-init.sh deliberately does not
+# apply this: a StorageClass pointing at the wrong export would bind PVCs to a
+# volume that silently fails to mount. Copy it, fill in your NAS, apply it.
+#
+#   sed -e 's/NFS_SERVER_HERE/10.0.0.20/' -e 's#NFS_SHARE_HERE#/export/k8s#' \
+#     nfs-storageclass.example.yaml | kubectl apply -f -
+#
+# Marking it default (uncomment the annotation) makes a PVC with no
+# storageClassName land here. Only one StorageClass in the cluster may be
+# default.
+#
+# See docs/nfs-storage.md.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-csi
+  # annotations:
+  #   storageclass.kubernetes.io/is-default-class: "true"
+provisioner: nfs.csi.k8s.io
+parameters:
+  server: NFS_SERVER_HERE
+  share: NFS_SHARE_HERE
+  # subDir: ${pvc.metadata.namespace}/${pvc.metadata.name}   # per-PVC subdirectory
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+mountOptions:
+  # nfsvers=4.1 avoids NFSv3, which would need rpc.statd for locking. The
+  # plugin image ships statd, but pinning the version keeps the negotiation
+  # predictable.
+  - nfsvers=4.1
+  # `hard` is the default and is deliberate: a `soft` mount returns EIO on
+  # server hiccups and silently corrupts writes. The trade-off is that an
+  # unreachable server blocks I/O — see the "hung mounts vs the nightly reboot
+  # roll" note in docs/nfs-storage.md.
+  - hard
+  - timeo=600
+  - retrans=2
+  - noresvport

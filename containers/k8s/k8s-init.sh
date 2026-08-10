@@ -210,10 +210,16 @@ KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
   --wait \
   --wait-duration 5m
 
-echo "applying baseline cluster posture (metrics-server, quotas, SA token restriction)..."
+echo "applying baseline cluster posture (metrics-server, quotas, SA token restriction, NFS CSI)..."
 KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /etc/kubernetes/metrics-server.yaml
 KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /etc/kubernetes/default-ns-quota.yaml
 KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /etc/kubernetes/restrict-sa-token-mount.yaml
+
+# csi-driver-nfs. Inert until a StorageClass names a server + share (the shipped
+# nfs-storageclass.example.yaml is NOT applied — see docs/nfs-storage.md), so
+# installing it unconditionally costs one small controller Deployment plus a
+# node DaemonSet and commits the cluster to nothing.
+KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f /etc/kubernetes/csi-driver-nfs.yaml
 
 # Best-effort wait for metrics-server to become Ready. Don't fail the whole
 # init if it's slow — the deployment is applied and will reconcile.
