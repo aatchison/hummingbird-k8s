@@ -120,7 +120,8 @@ Tracked under #298 (umbrella) / #304 (Renovate-config implementation).
 - Pre-creates `/usr/libexec/kubernetes/kubelet-plugins/volume/exec` so kube-controller-manager doesn't fail on read-only `/usr`.
 - Drops `/etc/modules-load.d/k8s.conf` + sysctls.
 - `k8s-init.service` runs once at first boot: `kubeadm init` (with `--apiserver-cert-extra-sans` for tunneled access), installs Cilium via `cilium-cli` (see [`docs/cilium-migration.md`](docs/cilium-migration.md)), untaints the control-plane node, makes admin.conf world-readable, then touches `/var/lib/k8s-init.done` so it doesn't re-run.
-- Final cluster: 1 node, ~9 pods (etcd, apiserver, controller-manager, scheduler, kube-proxy, 2x coredns, cilium agent, cilium-operator).
+- Applies **csi-driver-nfs** (upstream v4.13.4, vendored verbatim) so PVCs can be satisfied from an NFS export. Deliberately **no `nfs-utils` on the node image**: the CSI node plugin ships its own `mount.nfs` and mounts in its own namespace, propagating to kubelet via `mountPropagation: Bidirectional` — so the host gains no NFS packages, no `rpcbind`, and no setuid binary. The StorageClass is site-specific and is *not* applied; see [`docs/nfs-storage.md`](docs/nfs-storage.md).
+- Final cluster: 1 node, ~9 pods (etcd, apiserver, controller-manager, scheduler, kube-proxy, 2x coredns, cilium agent, cilium-operator) plus the NFS CSI controller + node DaemonSet.
 - Roughly matches Red Hat's "Build Your K8s Ready Distro With BootC" talk pattern — Praveen Kumar describes installing the Kubernetes RPMs straight into a fedora-bootc image.
 
 ## Reference: Praveen Kumar's public bootc demos
