@@ -13,11 +13,12 @@ ssh root@<node> "bootc status --json | jq -r .status.staged.image.image.image"
 
 A non-null value means "new image fetched, waiting for a reboot".
 
-This doc wires up the missing **trigger**: a scheduled, coordinated
-`hbird update-cluster` that applies whatever is staged, one node at a time,
-with drain/uncordon and the bootID reboot-gate. It reuses the tool documented
-in [`docs/update-cluster.md`](update-cluster.md) — nothing new orchestrates the
-roll; the timer just runs it on a schedule.
+This doc wires up the missing **trigger**: a nightly systemd timer that applies
+whatever is staged, one node at a time, with drain/uncordon and a bootID reboot
+gate. It runs `scripts/hbird-rolling-apply.sh` rather than
+`hbird update-cluster` — the latter's live path is unimplemented as of v0.0.1
+(see [Why not `hbird update-cluster`?](#why-not-hbird-update-cluster)), so the
+executor is a stopgap until upstream #322 lands.
 
 For a fully in-cluster alternative (a reboot daemon such as `kured` that watches
 a sentinel and coordinates via a cluster-wide lock), see the note at the end.
@@ -30,7 +31,7 @@ One host-side timer on the KVM host (`geary`):
 nightly timer ── ExecCondition ─▶ hbird-staged-check.sh
                                      │ exit 1 (nothing staged) ─▶ service skips, ~2s, no churn
                                      │ exit 0 (something staged) ─▶
-                 ExecStart ────────▶ hbird update-cluster  (CP ▶ w1 ▶ w2, drain/apply/uncordon)
+                 ExecStart ────────▶ hbird-rolling-apply.sh  (CP ▶ w1 ▶ w2, drain/apply/uncordon)
 ```
 
 - The **gate** (`scripts/hbird-staged-check.sh`) resolves each node's IP from
@@ -43,9 +44,41 @@ nightly timer ── ExecCondition ─▶ hbird-staged-check.sh
   `ExecCondition` exit in the range `1`–`254` as a clean **skip**, not a
   failure (only `255` or a signal marks the unit failed), and this gate never
   returns `255` — so a failed probe safely skips the roll.
-- The **roll** is plain `hbird update-cluster`. On a night where nothing is
-  staged the gate skips it entirely; even if forced, `bootc upgrade --apply` is
-  itself a no-op when there is no staged image.
+- The **roll** (`scripts/hbird-rolling-apply.sh`) walks the CP first (no drain —
+  single-CP topology has nowhere to evict to), then each worker serially:
+  cordon → drain → `systemctl reboot` → **bootID-change wait** → Ready-wait →
+  uncordon. A node with nothing staged is skipped untouched, so the roll is
+  per-node idempotent. Reboot detection compares
+  `/proc/sys/kernel/random/boot_id` before and after: a fast-returning SSH on
+  the still-up pre-reboot host cannot false-success. Any node that fails to
+  come back (no bootID change, or not Ready in time) aborts the roll rather
+  than proceeding to the next node — a broken image takes down one node, not
+  the cluster.
+
+### Why not `hbird update-cluster`?
+
+[`docs/update-cluster.md`](update-cluster.md) describes `hbird update-cluster`
+as the coordinated roll, and it is the right long-term home for this logic —
+but as of `hbird` v0.0.1 its **live path is unimplemented**. A live invocation
+aborts with:
+
+```text
+`timer_stop` requires a remote SSH/kubectl round-trip that is not yet
+implemented in the Rust path. ... Until the live-execution slice lands
+(tracked by #322), run with `--dry-run` to preview the plan
+```
+
+`--dry-run` succeeds and prints a complete, plausible plan (`succeeded (3)`),
+which makes this easy to miss when validating an unattended timer — the dry-run
+exercises none of the SSH/kubectl surface. Two things fail before that point,
+too: live mode does not resolve node IPs from libvirt (it requires `CP_IP` /
+`WORKER_IPS` in the config), and the error's own suggested fallback is
+circular — `make update-cluster` just calls `hbird update-cluster`, and the
+bash twin `scripts/update-cluster.sh` was removed in the v0.1.0 cutover.
+
+So this doc drives the shell executor instead. When #322 lands, point
+`ExecStart` back at `hbird update-cluster --config …` and delete the script —
+the surrounding gate, unit, and linger setup are unchanged.
 
 ### Run it as a *user* service, not a system service
 
@@ -64,20 +97,11 @@ session is open.
 
 ## Prerequisites
 
-- The `hbird` CLI installed at **`~/.local/bin/hbird`** — the exact path the
-  unit's `ExecStart` uses. Either build it or use a release binary, then place
-  it there:
-
-  ```bash
-  # from a source build:
-  install -Dm0755 rust/target/release/hbird ~/.local/bin/hbird
-  # ...or a release binary (see docs/rust-cli.md for the verified download):
-  install -Dm0755 ./hbird ~/.local/bin/hbird
-  hbird --version
-  ```
-
-  Keep it under `~/.local/bin` (not `/usr/local/bin`): as a **user** service it
-  runs in your login domain, so a home-dir binary is fine and needs no sudo.
+- `jq` on the KVM host, and `jq` + `bootc` on the nodes (both are already in the
+  node images). No `hbird` binary is required by the timer itself — the gate and
+  the executor are plain shell. (`hbird` is still worth having for
+  `--dry-run` previews and the rest of the lifecycle; see
+  [`docs/rust-cli.md`](rust-cli.md).)
 - The operator is in the `libvirt` group (so `virsh -c qemu:///system` and the
   cluster lifecycle tools work without sudo).
 - Passwordless SSH as `root@<node>` to every node (the same key the deploy uses).
@@ -104,13 +128,12 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Gate: only roll if a node has a STAGED image; otherwise skip cleanly (exit 1).
 ExecCondition=%h/hummingbird-k8s/scripts/hbird-staged-check.sh %h/hummingbird-k8s/cluster.local.conf
 
-# Call hbird directly with --config. NOTE: `make update-cluster CONFIG=...` does
-# not work with the current CLI — the Makefile only exports CONFIG in the env,
-# but `hbird update-cluster` requires the --config flag.
-ExecStart=%h/.local/bin/hbird update-cluster --config %h/hummingbird-k8s/cluster.local.conf
+# Live executor. NOT `hbird update-cluster`: its live path is unimplemented
+# (see "Why not hbird update-cluster?" below) — it aborts at timer_stop.
+ExecStart=%h/hummingbird-k8s/scripts/hbird-rolling-apply.sh %h/hummingbird-k8s/cluster.local.conf
 
-# A full CP + workers roll is drain + reboot + rejoin per node. update-cluster's
-# default per-node drain is 5m, so worst-case a multi-worker roll can approach or
+# A full CP + workers roll is drain + reboot + rejoin per node. The per-node
+# drain timeout is 5m, so worst-case a multi-worker roll can approach or
 # exceed 30m; 3600s leaves headroom so systemd never SIGTERMs mid-uncordon.
 TimeoutStartSec=3600
 Nice=10
@@ -175,21 +198,32 @@ That is success: the gate **ran** and decided to skip. Contrast with a
 `Permission denied` at the exec step, which means the unit was installed as a
 system service and hit the SELinux block described above.
 
-To dry-run the underlying roll itself (plan only, changes nothing):
+To exercise the executor for real, stage something on exactly one node and run
+the service by hand — it should roll that node only and skip the others:
 
 ```bash
-hbird update-cluster --config ~/hummingbird-k8s/cluster.local.conf --dry-run
+ssh root@<one-worker> bootc switch ghcr.io/aatchison/hummingbird-k8s-worker:<older-tag>
+systemctl --user start hbird-update.service
+journalctl --user -u hbird-update.service -f     # expect "[apply] <node>: ..." lines
 ```
+
+`hbird update-cluster --config … --dry-run` still prints a useful plan preview,
+but note it validates none of the live SSH/kubectl path (see
+[Why not `hbird update-cluster`?](#why-not-hbird-update-cluster) above), so a
+green dry-run is not evidence the unattended roll works.
 
 ## Tuning
 
 - **Cadence** — `OnCalendar=*-*-* 03:30:00` is nightly. Weekly
   (`OnCalendar=Sun *-*-* 03:30:00`) reboots less often but lets nodes drift
   further behind the published image.
-- **Always roll** — drop the `ExecCondition` line to run `update-cluster` every
-  night regardless. It is still safe (bootc no-update detection skips the actual
-  reboot), but each run drains every worker first, so you trade a little nightly
-  pod churn for not depending on the gate.
+- **Always roll** — dropping the `ExecCondition` is safe but pointless here: the
+  executor re-checks `staged` per node and skips untouched nodes anyway, so the
+  gate is a cheap short-circuit rather than the only guard.
+- **Timeouts** — `REBOOT_TIMEOUT` (default 600s) bounds the bootID-change wait
+  and `READY_TIMEOUT` (600s) the post-reboot Ready wait; both are env overrides
+  on the executor. Raise them for slow storage, and raise the unit's
+  `TimeoutStartSec` alongside.
 
 ## Caveats
 
@@ -197,9 +231,15 @@ hbird update-cluster --config ~/hummingbird-k8s/cluster.local.conf --dry-run
   update, applying it reboots the CP and the Kubernetes API is unavailable for
   ~1–2 minutes. This is inherent to a single-CP topology; only an HA control
   plane removes it.
-- **No auto-reboot chaining.** `update-cluster` stages nothing new — it only
+- **No auto-reboot chaining.** The executor stages nothing new — it only
   applies what the per-node timer already staged. The two layers are
   independent: staging (in-image timer) and applying (this timer).
+- **The in-image semver timer is not paused during the roll.** `update-cluster`
+  stops `bootc-semver-update.timer` on each node first (that is the step whose
+  absence #322 tracks); this executor does not. In practice the race is benign:
+  the semver timer only ever *stages*, and a stage landing mid-roll is picked up
+  on the next night. If you want strict serialization, stop the timers by hand
+  around a manual roll.
 - **SSH host-key trust.** The gate probes `root@<node>` unattended. It assumes
   the node host keys are already trusted (the deploy populates the operator's
   `known_hosts`); `StrictHostKeyChecking=accept-new` is only a TOFU fallback for
