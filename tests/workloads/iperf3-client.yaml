@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iperf3-client
+  labels:
+    app: iperf3-client
+    test-workload: net
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iperf3-client
+  template:
+    metadata:
+      labels:
+        app: iperf3-client
+        test-workload: net
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          # Force cross-node traffic by preferring hbird-w2.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["hbird-w2"]
+        # Avoid co-locating with the server.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: iperf3-server
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: iperf3
+          image: docker.io/networkstatic/iperf3:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsUser: 65534
+          command:
+            - sh
+            - -c
+            - |
+              # Wait for the server Service to resolve, then loop iperf forever.
+              until nc -z iperf3-server 5201 2>/dev/null; do
+                echo "[client] waiting for iperf3-server:5201..."
+                sleep 3
+              done
+              echo "[client] server reachable; starting iperf3 loop"
+              while true; do
+                iperf3 -c iperf3-server -p 5201 -t 30 -i 5 || true
+                sleep 10
+              done
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"

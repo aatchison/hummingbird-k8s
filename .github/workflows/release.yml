@@ -38,10 +38,8 @@ concurrency:
   group: release-hbird-${{ github.ref }}
   cancel-in-progress: false
 
-# Round-2 lens L1 MED: workflow-global permissions are a defense-in-depth
-# smell. Default to read-only here; the release job below opts into the
-# write scopes it actually needs. Any future job added to this workflow
-# inherits read-only by default and has to opt in explicitly.
+# Default to read-only; the release job below opts into the write scopes it
+# actually needs.
 permissions:
   contents: read
 
@@ -49,32 +47,29 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUSTFLAGS: "-D warnings -C target-feature=+crt-static"
-  IMAGE: ghcr.io/${{ github.repository_owner }}/hbird
+  IMAGE: forgejo.atchison.io/aatchison/hbird
 
 jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Round-2 lens L1 MED: job-scoped permissions so the write scopes
-    # are isolated to this job (not inherited by any future jobs added
-    # to this workflow).
     permissions:
-      contents: write       # gh release create + asset upload
-      packages: write       # ghcr push
-      id-token: write       # cosign keyless OIDC
+      contents: write       # release create + asset upload
+      packages: write       # registry push
+      id-token: write       # cosign keyless OIDC (GitHub only)
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
           fetch-depth: 0
 
-      # Same ancestry gate as build-worker.yml — refuse to publish a tag
-      # that doesn't sit on main. Skipped on workflow_dispatch.
+      # Refuse to publish a tag that doesn't sit on main. Skipped on
+      # workflow_dispatch and branch pushes.
       - name: Refuse to publish if the tagged commit isn't on main
-        if: github.event_name == 'push'
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          git fetch --no-tags --depth=1 origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "Tag $GITHUB_REF points to $GITHUB_SHA, not reachable from origin/main." >&2
+          git fetch --no-tags --depth=1 forgejo main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" forgejo/main; then
+            echo "Tag $GITHUB_REF points to $GITHUB_SHA, not reachable from forgejo/main." >&2
             exit 1
           fi
 
@@ -90,9 +85,13 @@ jobs:
           if [ "$EVENT" = "workflow_dispatch" ]; then
             version="$INPUT_VERSION"
             dry_run="$INPUT_DRY_RUN"
-          else
+          elif [[ "$REF" == refs/tags/* ]]; then
             version="${REF#refs/tags/}"
             dry_run="false"
+          else
+            # Branch push: build + image-build validation only, no publish
+            version="v0.0.0-dryrun"
+            dry_run="true"
           fi
           if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
             echo "Version '$version' is not vX.Y.Z[-pre]" >&2
@@ -102,16 +101,24 @@ jobs:
           echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
           echo "Resolved: version=$version dry_run=$dry_run" >&2
 
-      - name: Install Rust toolchain (with musl target)
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-26
-        with:
-          targets: x86_64-unknown-linux-musl
+      - name: Install Rust toolchain (stable + musl target)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- --default-toolchain stable \
+              --target x86_64-unknown-linux-musl \
+              -y --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Cache cargo registry + build artifacts
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - name: Cache Cargo registry + build artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
-          workspaces: rust
-          key: release-musl
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: release-musl-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            release-musl-
 
       - name: Install musl-tools (linker + headers for musl target)
         run: |
@@ -134,14 +141,6 @@ jobs:
           set -euo pipefail
           bin="target/x86_64-unknown-linux-musl/release/hbird"
           file "$bin"
-          # Discovered by v0.0.1 dry-run (2026-05-27): the prior shape
-          # `grep -qv 'not a dynamic executable'` was inverted-logic
-          # buggy — it returned true (i.e. "dynamic") any time ldd's
-          # output didn't literally contain that phrase, including the
-          # `statically linked` case (the desired outcome on static-pie
-          # musl builds). Replaced with a positive check that PASSES
-          # when ldd output contains either of the two known-good
-          # markers and FAILS otherwise.
           ldd_out=$(ldd "$bin" 2>&1 || true)
           echo "$ldd_out"
           if [[ "$ldd_out" != *"statically linked"* ]] \
@@ -167,40 +166,13 @@ jobs:
           echo "binary=dist/hbird-${VERSION}-x86_64-unknown-linux-musl" >> "$GITHUB_OUTPUT"
           echo "checksums=dist/hbird-${VERSION}-SHA256SUMS" >> "$GITHUB_OUTPUT"
 
+      # Cosign keyless signing requires GitHub's OIDC provider; skip on Forgejo.
       - name: Install cosign
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # Cosign keyless OIDC: Fulcio mints a short-lived cert from the GHA
-      # OIDC token; Rekor logs the signature for public transparency.
-      # Caught by v0.0.1 dry-run round-2: cosign deprecated
-      # `--tlog-upload=false` (now requires a custom --signing-config to
-      # disable Rekor). PR #348's original "always run cosign-sign in
-      # dry-run" intent was to exercise the OIDC plumbing end-to-end.
-      # But the Rekor-leak concern (L1 MED on #348) means the only safe
-      # options are (a) custom signing-config (added complexity, fragile
-      # vs upstream changes) or (b) skip cosign entirely in dry-run.
-      #
-      # Chose (b): skip cosign-sign + cosign-verify in dry-run. The
-      # first real tag push validates the OIDC plumbing as a one-time
-      # cost; dry-run exercises every other step (build, static-link
-      # verify, OCI image build, label assembly, version parsing,
-      # tag-ref gate, artifact staging, dry-run summary). Trade-off
-      # accepted: dry-run no longer validates the cosign step itself,
-      # but it no longer leaves permanent Rekor records either.
-      # Caught by v0.0.1 REAL release (run 26540413369): cosign now
-      # defaults to --new-bundle-format which deprecates
-      # --output-signature + --output-certificate (both ignored) AND
-      # requires --bundle <path>. Without it cosign tries to create a
-      # bundle at "" and errors with "create bundle file: open : no
-      # such file or directory". PR #351 had warned this would surface
-      # on the first real run; here it is.
-      #
-      # Migrate to --bundle for both sign-blob and verify-blob. The
-      # bundle is a JSON file containing signature + cert + Rekor entry
-      # all in one — operators verify with `cosign verify-blob --bundle
-      # <path>` (verify command also handles the new format).
       - name: Cosign sign binary (keyless OIDC)
-        if: steps.v.outputs.dry_run == 'false'
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         env:
           VERSION: ${{ steps.v.outputs.version }}
           BINARY: ${{ steps.stage.outputs.binary }}
@@ -211,11 +183,8 @@ jobs:
             "$BINARY"
           ls -la dist/
 
-      # Verify what we just signed BEFORE publishing. Depends on
-      # cosign-sign's bundle output; skipped in dry-run (cosign-sign is
-      # also skipped).
       - name: Verify cosign signature locally before publish
-        if: steps.v.outputs.dry_run == 'false'
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         env:
           VERSION: ${{ steps.v.outputs.version }}
           BINARY: ${{ steps.stage.outputs.binary }}
@@ -230,13 +199,12 @@ jobs:
 
       # ---- OCI image build + push ----------------------------------------
 
-      - name: Log in to GHCR
-        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
-        uses: redhat-actions/podman-login@4934294ad0449894bcd1e9f191899d7292469603 # v1.7
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Forgejo container registry
+        if: steps.v.outputs.dry_run == 'false'
+        env:
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          echo "$REGISTRY_PASSWORD" | docker login forgejo.atchison.io -u aatchison --password-stdin
 
       # Stage the OCI build context as a tiny directory containing just
       # the binary + Containerfile. Keeps the build context small (~5MB)
@@ -253,42 +221,45 @@ jobs:
           chmod +x octx/hbird
           echo "context=octx" >> "$GITHUB_OUTPUT"
 
-      - name: Build OCI image (buildah)
-        id: build
-        uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
-        with:
-          image: hbird
-          tags: ${{ steps.v.outputs.version }} latest
-          containerfiles: ${{ steps.octx.outputs.context }}/Containerfile
-          context: ${{ steps.octx.outputs.context }}
-          platforms: linux/amd64
-          build-args: |
-            VERSION=${{ steps.v.outputs.version }}
-            REVISION=${{ github.sha }}
+      - name: Build OCI image
+        env:
+          DOCKER_BUILDKIT: "1"
+          VERSION: ${{ steps.v.outputs.version }}
+          REVISION: ${{ github.sha }}
+          CTX: ${{ steps.octx.outputs.context }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --platform linux/amd64 \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "REVISION=${REVISION}" \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:latest" \
+            --file "${CTX}/Containerfile" \
+            "${CTX}"
 
-      - name: Push to GHCR
+      - name: Push to Forgejo container registry
         id: push
+        if: steps.v.outputs.dry_run == 'false'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${VERSION}"
+
+      - name: Push :latest tag (tag-triggered publishes only)
         if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
-        uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2.8
-        with:
-          image: ${{ steps.build.outputs.image }}
-          tags: ${{ steps.build.outputs.tags }}
-          registry: ghcr.io/${{ github.repository_owner }}
+        run: docker push "${IMAGE}:latest"
 
       - name: Resolve pushed image digest
         id: digest
-        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
+        if: steps.v.outputs.dry_run == 'false'
         env:
-          IMAGE_REF: ${{ env.IMAGE }}
           VERSION: ${{ steps.v.outputs.version }}
-          PUSH_DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
-          digest="$PUSH_DIGEST"
-          if [ -z "$digest" ]; then
-            digest="$(podman manifest inspect --verbose "${IMAGE_REF}:${VERSION}" \
-              | jq -r '.Digest // .digest')"
-          fi
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${VERSION}" \
+            | cut -d@ -f2)
           if [ -z "$digest" ] || [ "$digest" = "null" ]; then
             echo "could not determine image digest" >&2
             exit 1
@@ -296,17 +267,17 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Cosign sign image (keyless OIDC)
-        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         env:
-          IMAGE_REF: ${{ env.IMAGE }}
           DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
-          cosign sign --yes "${IMAGE_REF}@${DIGEST}"
+          cosign sign --yes "${IMAGE}@${DIGEST}"
 
-      # ---- GitHub Release upload ----------------------------------------
+      # ---- Release upload ------------------------------------------------
 
+      # Upload binary + checksums + signature to GitHub Release (GitHub only).
       - name: Upload binary + checksums + signature to GitHub Release
-        if: steps.v.outputs.dry_run == 'false' && startsWith(github.ref, 'refs/tags/')
+        if: steps.v.outputs.dry_run == 'false' && github.server_url == 'https://github.com'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.v.outputs.version }}
@@ -334,10 +305,7 @@ jobs:
             echo "## Install (OCI image)"
             echo
             echo '```sh'
-            echo "podman pull ghcr.io/${OWNER}/hbird:${VERSION}"
-            echo "cosign verify ghcr.io/${OWNER}/hbird:${VERSION} \\"
-            echo "  --certificate-identity-regexp \"^https://github.com/${REPO}/.github/workflows/release.yml@\" \\"
-            echo "  --certificate-oidc-issuer \"https://token.actions.githubusercontent.com\""
+            echo "podman pull forgejo.atchison.io/${OWNER}/hbird:${VERSION}"
             echo '```'
           } > "$notes_file"
           gh release create "$VERSION" \
@@ -346,6 +314,33 @@ jobs:
             "dist/hbird-${VERSION}-x86_64-unknown-linux-musl" \
             "dist/hbird-${VERSION}-x86_64-unknown-linux-musl.cosign.bundle" \
             "dist/hbird-${VERSION}-SHA256SUMS"
+
+      # Create Forgejo release via API (Forgejo only).
+      - name: Create Forgejo release
+        if: steps.v.outputs.dry_run == 'false' && github.server_url != 'https://github.com'
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          body="\`hbird\` ${VERSION} — hummingbird-k8s operator CLI.\n\n## Install (OCI image)\n\`\`\`sh\npodman pull forgejo.atchison.io/${OWNER}/hbird:${VERSION}\n\`\`\`"
+          release_id=$(curl -sSf -X POST \
+            -H "Authorization: token ${FORGEJO_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${SERVER}/api/v1/repos/${REPO}/releases" \
+            -d "{\"tag_name\":\"${VERSION}\",\"name\":\"hbird ${VERSION}\",\"body\":\"${body}\"}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          for f in "dist/hbird-${VERSION}-x86_64-unknown-linux-musl" \
+                   "dist/hbird-${VERSION}-SHA256SUMS"; do
+            curl -sSf -X POST \
+              -H "Authorization: token ${FORGEJO_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              "${SERVER}/api/v1/repos/${REPO}/releases/${release_id}/assets?name=$(basename "$f")" \
+              --data-binary "@$f"
+          done
 
       - name: Dry-run summary
         if: steps.v.outputs.dry_run == 'true'
@@ -359,14 +354,18 @@ jobs:
             echo ""
             echo "Steps exercised:"
             echo "- static musl binary build + ldd-static verification"
-            echo "- cosign sign-blob (keyless OIDC) + local verify-blob"
-            echo "- OCI image build via buildah"
+            echo "- OCI image build (docker build, no push)"
             echo ""
             echo "Steps SKIPPED (dry-run):"
-            echo "- GHCR push"
-            echo "- cosign sign image"
-            echo "- gh release create"
+            echo "- cosign sign-blob (GitHub only — requires GitHub OIDC)"
+            echo "- Forgejo/GitHub registry push"
+            echo "- cosign sign image (GitHub only)"
+            echo "- release create"
             echo ""
             echo "Artifacts staged in \`dist/\`:"
             ls -la dist/
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: docker logout
+        if: always()
+        run: docker logout forgejo.atchison.io

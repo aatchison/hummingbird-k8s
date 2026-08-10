@@ -31,13 +31,11 @@
 # Anything unverifiable — empty ref on either side, or two refs from different
 # sources that aren't comparable — is "cannot tell" and resolves to "reuse
 # silently" in BOTH normal and STRICT_CACHE modes. This matters because the
-# DEFAULT path is `IMAGE_SOURCE=ghcr` and the published Containerfiles do not
-# stamp `org.opencontainers.image.revision` yet (release.yml passes a REVISION
-# build-arg the Containerfile drops). If "unverifiable" forced action, every
-# default deploy would do a full bib rebuild (or hard-fail under STRICT_CACHE)
-# even when nothing changed — defeating build_qcow2's skip-if-exists fast path.
-# Teaching the Containerfiles to stamp the label is an out-of-scope follow-up;
-# once it lands, the CONFIRMED-mismatch path starts firing for ghcr too.
+# DEFAULT path is `IMAGE_SOURCE=ghcr` and the published Containerfiles stamp
+# `org.opencontainers.image.revision` via the REVISION build-arg (release.yml,
+# build-k8s.yml, build-worker.yml all pass it; #385/#387). The CONFIRMED-mismatch
+# path therefore fires for Forgejo-registry images when the running commit differs
+# from the deployed image's revision label — STRICT_CACHE+ghcr is functional.
 
 # Guard against double-source (deploy-cluster.sh + a test both sourcing).
 [[ -n "${_HBIRD_CACHE_UTILS_SH:-}" ]] && return 0
@@ -70,6 +68,9 @@ hbird_image_vcs_ref() {
 # equal even when the bits are identical — #373 round-2 MED). An empty <id>
 # (unverifiable — e.g. a GHCR image with no revision label) yields EMPTY so it
 # is never recorded and never actionable.
+# For LOCAL source, the <id> should fold in the BASE_IMAGE and any
+# config-derived identities (e.g. a digest of render_bib_config output)
+# so that changes to the underlying OS or user/ssh config bust the cache.
 hbird_cache_build_id() {
   local source="$1" id="$2"
   [[ -n "$id" ]] || return 0
@@ -144,11 +145,12 @@ hbird_assess_ghcr_image() {
     *)
       # Cannot determine: no revision label on the image (the current default
       # — see header), or its commit is not in this checkout's git history.
+      if hbird_cache_strict_enabled; then
+        printf 'ERROR: cannot prove freshness under STRICT_CACHE=1; rebuild with FORCE_REBUILD=1.\n' >&2
+        return 3
+      fi
       # Unverifiable is NOT a confirmed mismatch, so it resolves to "reuse
-      # silently" in BOTH modes (#373 round-2 HIGH). Failing closed here would
-      # make STRICT_CACHE=1 + the default ghcr path fail on EVERY deploy until
-      # the Containerfiles stamp a revision label. Only a CONFIRMED drift
-      # (rc 1 above) is actionable.
+      # silently" in non-strict mode (#373 round-2 HIGH).
       return 0
       ;;
   esac
@@ -181,11 +183,24 @@ hbird_assess_qcow2_cache() {
   # Empty id on either side (unverifiable — e.g. the default ghcr path's
   # missing revision label, or a sidecar-less legacy qcow2) or a cross-source
   # comparison (operator switched IMAGE_SOURCE) is "cannot tell" -> reuse
-  # silently. This preserves skip-if-exists on the default path and avoids the
-  # cross-mode churn that a content-hash-vs-git-commit compare would cause.
-  # (#373 round-2 HIGH + MED.)
-  [[ -n "$cached_id" && -n "$exp_id" ]] || return 0
-  [[ "$cached_src" == "$exp_src" ]]     || return 0
+  # silently in non-strict mode. Under STRICT_CACHE=1, unverifiable MUST
+  # FAIL CLOSED (rc 3). This preserves skip-if-exists on the default path
+  # for non-strict deploys while ensuring CI / boot-tests can prove they
+  # are NOT using a stale template (#373 round-2 HIGH + MED.)
+  [[ -n "$cached_id" && -n "$exp_id" ]] || {
+    if hbird_cache_strict_enabled; then
+      printf 'ERROR: cannot prove freshness under STRICT_CACHE=1; rebuild with FORCE_REBUILD=1.\n' >&2
+      return 3
+    fi
+    return 0
+  }
+  [[ "$cached_src" == "$exp_src" ]]     || {
+    if hbird_cache_strict_enabled; then
+      printf 'ERROR: cannot prove freshness under STRICT_CACHE=1; rebuild with FORCE_REBUILD=1.\n' >&2
+      return 3
+    fi
+    return 0
+  }
   [[ "$cached_id" != "$exp_id" ]]       || return 0
 
   if hbird_cache_strict_enabled; then
@@ -196,4 +211,18 @@ hbird_assess_qcow2_cache() {
   printf 'WARN: cached %s build-ref %s differs from expected %s; forcing rebuild. (#373)\n' \
     "$label" "$cached" "$expected" >&2
   return 10
+}
+
+# hbird_local_build_id_calc <containerfile>
+# Internal helper for testing: calculates the composite LOCAL build-id.
+hbird_local_build_id_calc() {
+  local cf="$1"
+  local composite_id
+  composite_id="$(printf '%s\n%s\n%s\n%s' \
+    "$(hbird_containerfile_ref "$cf")" \
+    "${BASE_IMAGE:-}" \
+    "$(render_bib_config)" \
+    "${ENABLE_CLOUD_INIT:-0}" \
+    | sha256sum | cut -c1-12)"
+  hbird_cache_build_id local "$composite_id"
 }

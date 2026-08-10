@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iperf3-server
+  labels:
+    app: iperf3-server
+    test-workload: net
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iperf3-server
+  template:
+    metadata:
+      labels:
+        app: iperf3-server
+        test-workload: net
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        nodeAffinity:
+          # Prefer hbird-w1; if absent, schedule anywhere a worker is available.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["hbird-w1"]
+      containers:
+        - name: iperf3
+          image: docker.io/networkstatic/iperf3:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsUser: 65534
+          args: ["-s", "-i", "5"]
+          ports:
+            - containerPort: 5201
+              name: iperf
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iperf3-server
+  labels:
+    app: iperf3-server
+spec:
+  selector:
+    app: iperf3-server
+  ports:
+    - name: iperf
+      port: 5201
+      targetPort: iperf
+      protocol: TCP
+  type: ClusterIP

@@ -198,12 +198,19 @@ worker_user_data() {
 # consistency. Mutates the global SWITCH_TO_GHCR; idempotent; a no-op unless
 # both flags are set. (#374.)
 resolve_switch_to_ghcr() {
-  [[ "${FORCE_REBUILD:-}" == "1" && "${SWITCH_TO_GHCR:-}" == "true" ]] || return 0
+  [[ "${SWITCH_TO_GHCR:-}" == "true" ]] || return 0
+  [[ "${FORCE_REBUILD:-}" == "1" || "${IMAGE_SOURCE:-}" == "local" ]] || return 0
+
   if [[ "${FORCE_SWITCH:-}" == "1" ]]; then
-    log "FORCE_SWITCH=1: keeping SWITCH_TO_GHCR=true despite FORCE_REBUILD=1 — the freshly-built image WILL be replaced by ghcr.io/...:${GHCR_TAG:-latest} at first boot (explicit opt-in)."
+    log "FORCE_SWITCH=1: keeping SWITCH_TO_GHCR=true despite FORCE_REBUILD=1 or IMAGE_SOURCE=local — the freshly-built image WILL be replaced by ghcr.io/...:${GHCR_TAG:-latest} at first boot (explicit opt-in)."
     return 0
   fi
-  log "WARN: FORCE_REBUILD=1 with SWITCH_TO_GHCR=true would replace your freshly-built qcow2 with ghcr.io/...:${GHCR_TAG:-latest} at first boot, silently defeating a local boot-test (#374). Auto-disabling the GHCR switch; set FORCE_SWITCH=1 to keep it."
+
+  local reason="FORCE_REBUILD=1"
+  [[ "${IMAGE_SOURCE:-}" == "local" ]] && reason="IMAGE_SOURCE=local"
+  [[ "${FORCE_REBUILD:-}" == "1" && "${IMAGE_SOURCE:-}" == "local" ]] && reason="FORCE_REBUILD=1 and IMAGE_SOURCE=local"
+
+  log "WARN: ${reason} with SWITCH_TO_GHCR=true would replace your freshly-built qcow2 with ghcr.io/...:${GHCR_TAG:-latest} at first boot, silently defeating a local boot-test (#374). Auto-disabling the GHCR switch; set FORCE_SWITCH=1 to keep it."
   SWITCH_TO_GHCR=false
 }
 
@@ -228,6 +235,28 @@ warn_bootc_update_drift() {
 if [[ "${HBIRD_DEPLOY_CLUSTER_SOURCE_ONLY:-0}" = 1 ]]; then
   return 0
 fi
+
+# ---- CLI-env snapshot (MUST be before any `source lib/*.sh`) (#377 fix, #2) --
+# lib/build-common.sh (and other libs sourced below) run `: "${KNOB:=default}"`,
+# which sets KNOB to the lib default when unset. The original #377 capture loop
+# ran AFTER those lib sources, so it snapped the lib default (e.g.
+# ENABLE_CLOUD_INIT=0 from build-common.sh:139) as a phantom CLI override; the
+# restore then clobbered the config's ENABLE_CLOUD_INIT=1 back to 0 and deploy
+# hard-failed. Fix: capture the genuine parent-env/CLI state HERE, before any lib
+# can default these knobs. The restore loop stays after `source "$CONFIG_PATH"`.
+# shellcheck disable=SC2034  # snapshot vars are read indirectly via printf -v
+HBIRD_CLI_OVERRIDE_KNOBS=(
+  IMAGE_SOURCE GHCR_ORG GHCR_TAG SWITCH_TO_GHCR FORCE_SWITCH AUTO_UPDATE_CP
+  FORCE_REBUILD STRICT_CACHE ENABLE_CLOUD_INIT RUN_VERIFY
+  BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER
+  BOOTC_SWITCH_TO_GHCR KVM_HOST
+  CP_MEMORY CP_VCPUS WORKER_MEMORY WORKER_VCPUS POOL_DIR
+  BASE_IMAGE BIB ENABLE_ROOT_SSH VM_USER VM_USER_GROUPS
+)
+for _hbird_knob in "${HBIRD_CLI_OVERRIDE_KNOBS[@]}"; do
+  printf -v "_hbird_cli_${_hbird_knob}" '%s' "${!_hbird_knob:-}"
+done
+# ---- end CLI-env snapshot ---------------------------------------------------
 
 # ---- Remote KVM-host re-exec shim (C3, #232) -------------------------------
 # When KVM_HOST is set and we're NOT on the KVM host, re-exec this script
@@ -329,9 +358,11 @@ trap cleanup_on_failure EXIT
 # silently clobbers whatever the operator passed on the CLI
 # (`make deploy-cluster IMAGE_SOURCE=local SWITCH_TO_GHCR=false`). The
 # `: "${VAR:=default}"` defaulting below cannot rescue this — by then the var
-# is already set to the config's value. So we snapshot the CLI values of every
-# operator-overridable knob HERE (before the source) and restore any that were
-# non-empty AFTER it. Net precedence: CLI > config > built-in default.
+# is already set to the config's value. HBIRD_CLI_OVERRIDE_KNOBS is declared
+# and the snapshot captured at the TOP of the script (before any lib sources)
+# so lib-defaulted values are never mistaken for genuine CLI overrides (#2).
+# The restore here wins a non-empty CLI value over the config. Net precedence:
+# CLI > config > built-in default.
 #
 # Scope of the list: every scalar operator knob this script reads AFTER the
 # source. A knob that is also forwarded across the C3 KVM-host re-exec must
@@ -348,17 +379,6 @@ trap cleanup_on_failure EXIT
 # to the remote host; that path is governed by ssh-wrap.sh, not this array.
 # WORKER_NAMES is an array, resolved by its own block below — do NOT add it
 # here (printf -v on an array name would mangle it).
-# shellcheck disable=SC2034  # snapshot vars are read indirectly via printf -v
-HBIRD_CLI_OVERRIDE_KNOBS=(
-  IMAGE_SOURCE GHCR_ORG GHCR_TAG SWITCH_TO_GHCR FORCE_SWITCH AUTO_UPDATE_CP
-  FORCE_REBUILD STRICT_CACHE ENABLE_CLOUD_INIT RUN_VERIFY
-  BOOTC_UPDATE_SCHEDULE BOOTC_UPDATE_REPO_K8S BOOTC_UPDATE_REPO_WORKER
-  BOOTC_SWITCH_TO_GHCR KVM_HOST
-  CP_MEMORY CP_VCPUS WORKER_MEMORY WORKER_VCPUS POOL_DIR
-)
-for _hbird_knob in "${HBIRD_CLI_OVERRIDE_KNOBS[@]}"; do
-  printf -v "_hbird_cli_${_hbird_knob}" '%s' "${!_hbird_knob:-}"
-done
 
 # shellcheck disable=SC1090
 source "$CONFIG_PATH"
@@ -526,6 +546,17 @@ fi
 
 log "config OK: CP=${CP_NAME}, workers=(${WORKER_NAMES[*]}), source=${IMAGE_SOURCE}, tag=${GHCR_TAG}"
 
+# ---- begin podman-preflight-block ---
+if [[ "$IMAGE_SOURCE" == "local" ]]; then
+  log "pre-flight: checking for rootful podman (required for bootc-image-builder)"
+  if [[ $EUID -eq 0 ]]; then
+    podman info >/dev/null 2>&1
+  else
+    sudo podman info >/dev/null 2>&1
+  fi || fail "rootful podman is unavailable. bootc-image-builder requires rootful podman to build qcow2 templates. Try: sudo dnf install -y podman (or check your rootful podman setup)."
+fi
+# ---- end podman-preflight-block ---
+
 # ---- Image acquisition ------------------------------------------------------
 
 CP_IMAGE_REF=""
@@ -622,7 +653,16 @@ build_template() {
   if [[ "$IMAGE_SOURCE" == "ghcr" ]]; then
     build_id="$(hbird_cache_build_id ghcr "$(hbird_image_vcs_ref "$image_ref")")"
   else
-    build_id="$(hbird_cache_build_id local "$(hbird_containerfile_ref "$containerfile")")"
+    # Local build identity is a composite of the Containerfile content,
+    # the BASE_IMAGE, the rendered bib-config, and the cloud-init flag.
+    local composite_id
+    composite_id="$(printf '%s\n%s\n%s\n%s' \
+      "$(hbird_containerfile_ref "$containerfile")" \
+      "${BASE_IMAGE:-}" \
+      "$(render_bib_config)" \
+      "${ENABLE_CLOUD_INIT:-0}" \
+      | sha256sum | cut -c1-12)"
+    build_id="$(hbird_cache_build_id local "$composite_id")"
   fi
   force_this="${FORCE_REBUILD:-}"
   hbird_assess_qcow2_cache "$qcow" "$build_id" "$label" || rc=$?
@@ -788,23 +828,31 @@ done
 (( WAIT_RC == 0 )) || fail "one or more worker virt-installs failed (rc=${WAIT_RC})"
 
 # ---- Wait for full cluster Ready --------------------------------------------
-
-EXPECTED_NODES=$(( 1 + ${#WORKER_NAMES[@]} ))
-log "polling cluster until ${EXPECTED_NODES} nodes are Ready"
+# Asserts each expected node by NAME rather than an aggregate count — a stray
+# or duplicate node cannot satisfy the count while a named worker join failed.
+# ---- begin cluster-ready-poll ---
+_CLUSTER_POLL_NODES=("$CP_NAME" "${WORKER_NAMES[@]}")
+log "polling cluster until all ${#_CLUSTER_POLL_NODES[@]} named nodes Ready: ${_CLUSTER_POLL_NODES[*]}"
 CLUSTER_READY=0
 for attempt in $(seq 1 "$CP_READY_RETRIES"); do
-  ready_count="$(cp_ssh "kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes --no-headers 2>/dev/null | awk '\$2==\"Ready\"' | wc -l" 2>/dev/null || echo 0)"
-  ready_count="${ready_count//[^0-9]/}"
-  : "${ready_count:=0}"
-  if (( ready_count >= EXPECTED_NODES )); then
+  _all_ready=1
+  for _node in "${_CLUSTER_POLL_NODES[@]}"; do
+    _node_ok="$(cp_ssh "kubectl --kubeconfig=/etc/kubernetes/admin.conf get node '${_node}' --no-headers 2>/dev/null | awk '\$2==\"Ready\"{print \"yes\"}'" 2>/dev/null || true)"
+    if [[ "${_node_ok//[[:space:]]/}" != "yes" ]]; then
+      _all_ready=0
+      log "node '${_node}' not Ready (attempt ${attempt}/${CP_READY_RETRIES})"
+      break
+    fi
+  done
+  if (( _all_ready == 1 )); then
     CLUSTER_READY=1
-    log "cluster Ready: ${ready_count}/${EXPECTED_NODES} nodes (after ${attempt} attempt(s))"
+    log "cluster Ready: all ${#_CLUSTER_POLL_NODES[@]} named nodes Ready (attempt ${attempt}/${CP_READY_RETRIES})"
     break
   fi
-  log "cluster not Ready: ${ready_count}/${EXPECTED_NODES} (attempt ${attempt}/${CP_READY_RETRIES})"
   sleep "$CP_READY_SLEEP"
 done
-(( CLUSTER_READY == 1 )) || fail "cluster never reached ${EXPECTED_NODES} Ready nodes — inspect 'ssh root@${CP_IP} kubectl get nodes' and per-worker 'journalctl -u worker-init.service'"
+# ---- end cluster-ready-poll ---
+(( CLUSTER_READY == 1 )) || fail "cluster never reached Ready for all named nodes (${_CLUSTER_POLL_NODES[*]}) — inspect 'ssh root@${CP_IP} kubectl get nodes' and per-worker 'journalctl -u worker-init.service'"
 
 # ---- Optional verification --------------------------------------------------
 
@@ -821,16 +869,33 @@ if [[ "$RUN_VERIFY" = "true" ]]; then
   # would re-resolve via virsh-domifaddr — slower + relies on KVM_HOST
   # being a usable SSH alias from this host). Explicit flags also make
   # the intent grep-able in the deploy log.
+  #
+  # #9 item (a): when STRICT_CACHE=1 both missing-hbird and verifier
+  # non-zero are fatal — the strict gate must be able to fail the deploy.
+  # The non-strict (default) path is unchanged (informational).
+  # ---- begin run-verify-block ---
   if command -v hbird >/dev/null 2>&1; then
     log "running hbird verify app-deploy"
+    _verify_rc=0
     hbird verify app-deploy \
       --config "$CONFIG_PATH" \
       --cp-ip "$CP_IP" \
-      --kvm-host "${KVM_HOST:-}" \
-      || log "hbird verify app-deploy exited non-zero (cluster is up; verifier failure is informational)"
+      --kvm-host "${KVM_HOST:-}" || _verify_rc=$?
+    if (( _verify_rc != 0 )); then
+      if [[ "${STRICT_CACHE:-0}" == "1" ]]; then
+        fail "hbird verify app-deploy exited non-zero (rc=${_verify_rc}) — deploy fails under STRICT_CACHE=1"
+      else
+        log "hbird verify app-deploy exited non-zero (cluster is up; verifier failure is informational)"
+      fi
+    fi
   else
-    log "RUN_VERIFY=true but \`hbird\` CLI not found on PATH; skipping (install per docs/rust-cli.md)"
+    if [[ "${STRICT_CACHE:-0}" == "1" ]]; then
+      fail "RUN_VERIFY=true but \`hbird\` CLI not found on PATH (required under STRICT_CACHE=1; install per docs/rust-cli.md)"
+    else
+      log "RUN_VERIFY=true but \`hbird\` CLI not found on PATH; skipping (install per docs/rust-cli.md)"
+    fi
   fi
+  # ---- end run-verify-block ---
 fi
 
 # ---- Summary ----------------------------------------------------------------
