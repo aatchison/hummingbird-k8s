@@ -40,7 +40,11 @@ cpk() {
 }
 
 node_ready() {
-    cpk "get node $1 --no-headers" 2>/dev/null | awk '{print $2}' | grep -qx "Ready"
+    # STATUS is a comma-joined condition list, and the node is still cordoned
+    # at this point in the roll — so it reads "Ready,SchedulingDisabled", not
+    # "Ready". Match Ready as a whole element, never the entire field.
+    cpk "get node $1 --no-headers" 2>/dev/null \
+        | awk '{print $2}' | grep -qE '(^|,)Ready(,|$)'
 }
 
 apply_node() {
@@ -86,6 +90,7 @@ apply_node() {
     done
     if [ -z "$new_id" ]; then
         echo "[apply] $node: no bootID change within ${REBOOT_TIMEOUT}s — aborting roll" >&2
+        [ "$is_cp" = "0" ] && echo "[apply] $node: LEFT CORDONED for inspection" >&2
         return 1
     fi
 
@@ -93,6 +98,7 @@ apply_node() {
     until node_ready "$node"; do
         if [ "$SECONDS" -ge "$deadline" ]; then
             echo "[apply] $node: not Ready within ${READY_TIMEOUT}s after reboot — aborting roll" >&2
+            [ "$is_cp" = "0" ] && echo "[apply] $node: LEFT CORDONED for inspection (kubectl uncordon $node when healthy)" >&2
             return 1
         fi
         sleep 10
