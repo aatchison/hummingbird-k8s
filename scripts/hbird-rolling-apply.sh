@@ -21,7 +21,12 @@ CONF="${1:?usage: hbird-rolling-apply.sh <cluster.conf>}"
 # shellcheck disable=SC1090
 source "$CONF"   # provides CP_NAME, WORKER_NAMES=(...)
 
-SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8)
+# Host-key policy for the unattended root logins. Default `accept-new` keeps
+# routine operation working when a node returns on a fresh DHCP lease, at the
+# cost of trust-on-first-use for that new address. Set SSH_STRICT=yes (with a
+# pre-populated known_hosts) to require verified keys and fail closed instead.
+SSH_STRICT="${SSH_STRICT:-accept-new}"
+SSH_OPTS=(-o BatchMode=yes -o "StrictHostKeyChecking=${SSH_STRICT}" -o ConnectTimeout=8)
 REBOOT_TIMEOUT="${REBOOT_TIMEOUT:-600}"
 READY_TIMEOUT="${READY_TIMEOUT:-600}"
 
@@ -47,12 +52,32 @@ node_ready() {
         | awk '{print $2}' | grep -qE '(^|,)Ready(,|$)'
 }
 
-apply_node() {
-    local node="$1" ip="$2" is_cp="$3" staged boot_id new_id deadline
+node_kubelet_boot_id() {
+    # The boot ID the KUBELET registered, i.e. what the apiserver believes.
+    # A changed /proc boot ID only proves SSH reached a rebooted OS; the node
+    # object can still carry the pre-reboot Ready condition until the node
+    # controller ages it out. Gating on this instead makes "Ready" mean "the
+    # post-reboot kubelet said so".
+    cpk "get node $1 -o jsonpath='{.status.nodeInfo.bootID}'" 2>/dev/null | tr -d "'"
+}
 
-    staged="$(timeout 25 ssh "${SSH_OPTS[@]}" "root@${ip}" \
+node_booted_image() {
+    timeout 25 ssh "${SSH_OPTS[@]}" "root@${1}" \
+        "bootc status --json | jq -r '.status.booted.image.image.image // empty'" 2>/dev/null
+}
+
+apply_node() {
+    local node="$1" ip="$2" is_cp="$3" staged boot_id new_id booted_after deadline
+
+    # Distinguish "probe worked, nothing staged" from "probe failed". Folding
+    # an unreachable node into the former would silently skip it and let the
+    # roll report success over a node nobody checked.
+    if ! staged="$(timeout 25 ssh "${SSH_OPTS[@]}" "root@${ip}" \
         "bootc status --json | jq -r '.status.staged.image.image.image // empty'" \
-        2>/dev/null || true)"
+        2>/dev/null)"; then
+        echo "[apply] $node ($ip): staged-image probe FAILED (unreachable?) — aborting roll" >&2
+        return 1
+    fi
     if [ -z "$staged" ]; then
         echo "[apply] $node: nothing staged — skipping"
         return 0
@@ -94,21 +119,33 @@ apply_node() {
         return 1
     fi
 
+    # Require BOTH that the kubelet re-registered with the post-reboot boot ID
+    # and that the node is Ready — otherwise a stale pre-reboot Ready condition
+    # (or a kubelet that never came back) can look like success.
     deadline=$((SECONDS + READY_TIMEOUT))
-    until node_ready "$node"; do
+    until [ "$(node_kubelet_boot_id "$node")" = "$new_id" ] && node_ready "$node"; do
         if [ "$SECONDS" -ge "$deadline" ]; then
-            echo "[apply] $node: not Ready within ${READY_TIMEOUT}s after reboot — aborting roll" >&2
+            echo "[apply] $node: kubelet did not re-register Ready with the new boot ID within ${READY_TIMEOUT}s — aborting roll" >&2
             [ "$is_cp" = "0" ] && echo "[apply] $node: LEFT CORDONED for inspection (kubectl uncordon $node when healthy)" >&2
             return 1
         fi
         sleep 10
     done
 
+    # Confirm the staged image is the one now running. bootc rolls back to the
+    # previous deployment if the new one fails to boot, so "it came back Ready"
+    # is not evidence the update took.
+    booted_after="$(node_booted_image "$ip")"
+    if [ "$booted_after" != "$staged" ]; then
+        echo "[apply] $node: expected to boot '$staged' but is running '${booted_after:-<unknown>}' (rollback?) — aborting roll" >&2
+        [ "$is_cp" = "0" ] && echo "[apply] $node: LEFT CORDONED for inspection" >&2
+        return 1
+    fi
+
     if [ "$is_cp" = "0" ]; then
         cpk "uncordon $node"
     fi
-    echo "[apply] $node: now booted $(timeout 25 ssh "${SSH_OPTS[@]}" "root@${ip}" \
-        "bootc status --json | jq -r .status.booted.image.image.image" 2>/dev/null)"
+    echo "[apply] $node: now booted $booted_after"
 }
 
 # k8s node names equal libvirt domain names in hbird deployments.
