@@ -112,20 +112,73 @@ setup() {
     return 1
   }
 
-  # Extract the CLI-env precedence block for #377 tests. Spans from the
-  # `HBIRD_CLI_OVERRIDE_KNOBS=(` array open through the `# ---- end CLI-env
-  # precedence` end marker — i.e. the snapshot loop, the `source
-  # "$CONFIG_PATH"`, and the restore loop as a single contiguous unit, so the
-  # test exercises the real precedence code (not a paraphrase). Anchor on the
-  # unique substring `HBIRD_CLI_OVERRIDE_KNOBS=(` via index() and stop at the
-  # end-marker comment (matched by index() to avoid awk `{`/`}` quirks).
+  # Extract the CLI-env precedence block for #377 tests. After the #2 fix,
+  # the snapshot (HBIRD_CLI_OVERRIDE_KNOBS array + capture loop) lives at the
+  # TOP of the script (before any lib sources) while the source "$CONFIG_PATH"
+  # + restore loop stay further down. Extract both separately and concatenate
+  # so drivers can source a single snippet that exercises the full precedence
+  # chain as a unit (snapshot -> source CONFIG -> restore).
   awk '
     index($0, "HBIRD_CLI_OVERRIDE_KNOBS=(") { capture=1 }
     capture { print }
+    capture && index($0, "end CLI-env snapshot") { exit }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/cli-snapshot.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/cli-snapshot.snippet" ] || {
+    echo "FATAL: failed to extract CLI-env snapshot block from ${SCRIPT}" >&2
+    return 1
+  }
+  awk '
+    /^source "/ && /CONFIG_PATH/ { capture=1 }
+    capture { print }
     capture && index($0, "end CLI-env precedence") { exit }
-  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/cli-restore.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/cli-restore.snippet" ] || {
+    echo "FATAL: failed to extract CLI-env restore block from ${SCRIPT}" >&2
+    return 1
+  }
+  cat "${BATS_TEST_TMPDIR}/cli-snapshot.snippet" \
+      "${BATS_TEST_TMPDIR}/cli-restore.snippet" \
+      > "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
   [ -s "${BATS_TEST_TMPDIR}/cli-precedence.snippet" ] || {
-    echo "FATAL: failed to extract CLI-env precedence block from ${SCRIPT}" >&2
+    echo "FATAL: failed to assemble cli-precedence.snippet from ${SCRIPT}" >&2
+    return 1
+  }
+
+  # Extract the run-verify block for #9 item (a) tests. The block spans from
+  # "# ---- begin run-verify-block ---" through "# ---- end run-verify-block ---"
+  # (exclusive of the marker lines). Tests source it with mock log/fail/hbird.
+  awk '
+    /# ---- begin run-verify-block ---/ { capture=1; next }
+    capture && /# ---- end run-verify-block ---/ { exit }
+    capture { print }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/run-verify.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/run-verify.snippet" ] || {
+    echo "FATAL: failed to extract run-verify-block from ${SCRIPT}" >&2
+    return 1
+  }
+
+  # Extract the podman-preflight block for #4 tests.
+  awk '
+    /# ---- begin podman-preflight-block ---/ { capture=1; next }
+    capture && /# ---- end podman-preflight-block ---/ { exit }
+    capture { print }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/podman-preflight.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/podman-preflight.snippet" ] || {
+    echo "FATAL: failed to extract podman-preflight-block from ${SCRIPT}" >&2
+    return 1
+  }
+
+  # Extract the cluster-ready poll block for #9 tests. The block spans from
+  # "# ---- begin cluster-ready-poll ---" through "# ---- end cluster-ready-poll ---"
+  # (exclusive of the marker lines). Tests source it with a mock cp_ssh() so
+  # the per-node check can be driven without a real cluster.
+  awk '
+    /# ---- begin cluster-ready-poll ---/ { capture=1; next }
+    capture && /# ---- end cluster-ready-poll ---/ { exit }
+    capture { print }
+  ' "$SCRIPT" > "${BATS_TEST_TMPDIR}/ready-poll.snippet"
+  [ -s "${BATS_TEST_TMPDIR}/ready-poll.snippet" ] || {
+    echo "FATAL: failed to extract cluster-ready-poll block from ${SCRIPT}" >&2
     return 1
   }
 
@@ -928,6 +981,72 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# ENABLE_CLOUD_INIT config-value regression (#2 / #377 precapture fix)
+#
+# lib/build-common.sh runs `: "${ENABLE_CLOUD_INIT:=0}"` which defaults the
+# var to "0" if unset. Before the #2 fix, the snapshot loop ran AFTER that
+# lib source, so it captured "0" (the lib default) as a phantom CLI override.
+# The restore then clobbered a config's ENABLE_CLOUD_INIT=1 back to 0,
+# causing deploy to hard-fail. The fix moves the snapshot to the TOP of the
+# script, before any lib source.
+#
+# These tests exercise the precedence block (cli-precedence.snippet) with
+# ENABLE_CLOUD_INIT. The snippet now starts with the snapshot (capturing the
+# genuine parent-env state), then sources CONFIG, then restores. No lib is
+# sourced inside the snippet, so to prove the ordering fix is load-bearing we
+# rely on the contract: snapshot must not see any value not placed there by
+# the driver (= genuine CLI/parent-env state). Two cases:
+#
+#   a. Operator did NOT pass ENABLE_CLOUD_INIT on the CLI → config's "1" wins.
+#   b. Operator explicitly passed ENABLE_CLOUD_INIT=0 on the CLI → "0" wins
+#      (real CLI overrides config 1 — preserve true CLI precedence).
+# ---------------------------------------------------------------------------
+
+@test "deploy-cluster: config ENABLE_CLOUD_INIT=1 survives when CLI has no override (#2 regression)" {
+  local conf="${BATS_TEST_TMPDIR}/eci-config.conf"
+  printf 'ENABLE_CLOUD_INIT=1\n' > "$conf"
+  local driver="${BATS_TEST_TMPDIR}/driver-eci-nooverride.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+# ENABLE_CLOUD_INIT is NOT set (operator passed no CLI override).
+# In the OLD code build-common.sh would have run here and set it to 0,
+# causing the snapshot to capture 0 as a phantom CLI override. The fix
+# ensures the snapshot runs before any lib can default it, so the snapshot
+# sees "" (unset) and the restore skips it, letting config's 1 stand.
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'ENABLE_CLOUD_INIT=%s\n' "\$ENABLE_CLOUD_INIT"
+EOF
+  chmod +x "$driver"
+  run env -u ENABLE_CLOUD_INIT bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ENABLE_CLOUD_INIT=1"* ]]
+}
+
+@test "deploy-cluster: CLI ENABLE_CLOUD_INIT=0 still beats config ENABLE_CLOUD_INIT=1 (#2 regression)" {
+  local conf="${BATS_TEST_TMPDIR}/eci-config2.conf"
+  printf 'ENABLE_CLOUD_INIT=1\n' > "$conf"
+  local driver="${BATS_TEST_TMPDIR}/driver-eci-override.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+# Operator explicitly passed ENABLE_CLOUD_INIT=0 on the CLI — a genuine
+# override that must win over the config's 1.
+ENABLE_CLOUD_INIT=0
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'ENABLE_CLOUD_INIT=%s\n' "\$ENABLE_CLOUD_INIT"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ENABLE_CLOUD_INIT=0"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # FORCE_REBUILD + SWITCH_TO_GHCR guard — resolve_switch_to_ghcr (#374)
 # ---------------------------------------------------------------------------
 #
@@ -965,7 +1084,24 @@ _resolve_switch() {
   [[ "$output" == *"FORCE_SWITCH=1"* ]]   # the WARN tells the operator how to opt back in
 }
 
-@test "deploy-cluster: FORCE_REBUILD=1 + SWITCH_TO_GHCR=true + FORCE_SWITCH=1 -> kept, no auto-disable (#374)" {
+  @test "deploy-cluster: IMAGE_SOURCE=local + SWITCH_TO_GHCR=true -> auto-disabled + WARN (#9e)" {
+    run _resolve_switch 'IMAGE_SOURCE=local' 'SWITCH_TO_GHCR=true' 'GHCR_TAG=v9.9.9'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RESOLVED=false"* ]]
+    [[ "$output" == *"WARN"* ]]
+    [[ "$output" == *"IMAGE_SOURCE=local"* ]]
+    [[ "$output" == *"#374"* ]]
+  }
+
+  @test "deploy-cluster: IMAGE_SOURCE=local + SWITCH_TO_GHCR=true + FORCE_SWITCH=1 -> kept, no auto-disable (#9e)" {
+    run _resolve_switch 'IMAGE_SOURCE=local' 'SWITCH_TO_GHCR=true' 'FORCE_SWITCH=1'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RESOLVED=true"* ]]
+    [[ "$output" != *"Auto-disabling"* ]]
+    [[ "$output" == *"FORCE_SWITCH=1"* ]]
+  }
+
+  @test "deploy-cluster: FORCE_REBUILD=1 + SWITCH_TO_GHCR=true + FORCE_SWITCH=1 -> kept, no auto-disable (#374)" {
   run _resolve_switch 'FORCE_REBUILD=1' 'SWITCH_TO_GHCR=true' 'FORCE_SWITCH=1'
   [ "$status" -eq 0 ]
   [[ "$output" == *"RESOLVED=true"* ]]
@@ -1119,4 +1255,262 @@ _warn_drift() {
   [ "$status" -eq 0 ]
   [[ "$output" != *"WARN"* ]]
   [[ "$output" == *"DONE"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Per-node-by-name cluster Ready poll (#9 item d)
+# ---------------------------------------------------------------------------
+#
+# The old aggregate `ready_count >= EXPECTED_NODES` check can be satisfied
+# by a stray or duplicate node while a named worker's kubeadm join silently
+# failed. The fix iterates CP_NAME + WORKER_NAMES[@] and asserts each node
+# individually via `kubectl get node <name>`.
+#
+# Tests source the real ready-poll snippet (see setup) with a mock cp_ssh()
+# so the per-name semantics can be driven without a real cluster.
+
+@test "deploy-cluster: per-node Ready poll — all named nodes Ready -> CLUSTER_READY=1 (#9)" {
+  cat > "${BATS_TEST_TMPDIR}/cp-ssh-all-ready.sh" <<'MOCK_EOF'
+# All nodes return "yes" — every named node is Ready.
+cp_ssh() { echo "yes"; }
+MOCK_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-ready-all.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/cp-ssh-all-ready.sh"
+    printf 'CP_NAME=hbird-cp\n'
+    printf 'WORKER_NAMES=(hbird-w1)\n'
+    printf 'CP_READY_RETRIES=1\nCP_READY_SLEEP=0\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/ready-poll.snippet"
+    printf 'printf "CLUSTER_READY=%%d\\n" "$CLUSTER_READY"\n'
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CLUSTER_READY=1"* ]]
+  [[ "$output" == *"all 2 named nodes Ready"* ]]
+}
+
+@test "deploy-cluster: per-node Ready poll — named worker NotReady, stray node ignored -> CLUSTER_READY=0 (#9)" {
+  # CP is Ready; named worker hbird-w1 is not (simulates a failed kubeadm
+  # join). A hypothetical stray node would have satisfied the old aggregate
+  # count (>=2). The per-name check must still report CLUSTER_READY=0.
+  cat > "${BATS_TEST_TMPDIR}/cp-ssh-stray.sh" <<'MOCK_EOF'
+cp_ssh() {
+  local cmd="$1"
+  # Only the CP 'hbird-cp' responds Ready; 'hbird-w1' returns nothing.
+  if printf '%s' "$cmd" | grep -qF "'hbird-cp'"; then
+    echo "yes"
+  fi
+}
+MOCK_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-ready-stray.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/cp-ssh-stray.sh"
+    printf 'CP_NAME=hbird-cp\n'
+    printf 'WORKER_NAMES=(hbird-w1)\n'
+    printf 'CP_READY_RETRIES=1\nCP_READY_SLEEP=0\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/ready-poll.snippet"
+    printf 'printf "CLUSTER_READY=%%d\\n" "$CLUSTER_READY"\n'
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CLUSTER_READY=0"* ]]
+  [[ "$output" == *"not Ready"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# lib-defaulted knobs CLI-env precedence (#8)
+# ---------------------------------------------------------------------------
+#
+# BASE_IMAGE, BIB, ENABLE_ROOT_SSH, VM_USER, VM_USER_GROUPS are lib-defaulted
+# by build-common.sh and read after `source CONFIG` in build_qcow2 /
+# render_bib_config. They were missing from HBIRD_CLI_OVERRIDE_KNOBS, so a
+# config file that hard-assigns them silently clobbered a CLI override — the
+# same silent-override class that #2/#377 fixed for other knobs.
+#
+# These tests mirror the #377 pattern: drive the real cli-precedence.snippet
+# (which now includes BASE_IMAGE, BIB, ENABLE_ROOT_SSH, VM_USER,
+# VM_USER_GROUPS) to pin CLI > config > default semantics for the newly added
+# knobs.
+
+@test "deploy-cluster: CLI BASE_IMAGE/VM_USER beat hard-assigning config (#8)" {
+  local conf="${BATS_TEST_TMPDIR}/clobber8.conf"
+  cat > "$conf" <<'CONF_EOF'
+BASE_IMAGE=quay.io/fedora/fedora-bootc:41
+VM_USER=config-user
+CONF_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-precedence8.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+BASE_IMAGE=quay.io/centos-bootc/centos-bootc:stream9
+VM_USER=cli-user
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'BASE_IMAGE=%s\n' "\$BASE_IMAGE"
+printf 'VM_USER=%s\n' "\$VM_USER"
+EOF
+  chmod +x "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BASE_IMAGE=quay.io/centos-bootc/centos-bootc:stream9"* ]]
+  [[ "$output" == *"VM_USER=cli-user"* ]]
+}
+
+@test "deploy-cluster: config BASE_IMAGE/VM_USER honored when no CLI override (#8)" {
+  local conf="${BATS_TEST_TMPDIR}/configonly8.conf"
+  cat > "$conf" <<'CONF_EOF'
+BASE_IMAGE=quay.io/fedora/fedora-bootc:41
+VM_USER=config-user
+CONF_EOF
+  local driver="${BATS_TEST_TMPDIR}/driver-configonly8.sh"
+  cat > "$driver" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CONFIG_PATH="${conf}"
+# No CLI override — config value must win.
+# shellcheck disable=SC1091
+source "${BATS_TEST_TMPDIR}/cli-precedence.snippet"
+printf 'BASE_IMAGE=%s\n' "\$BASE_IMAGE"
+printf 'VM_USER=%s\n' "\$VM_USER"
+EOF
+  chmod +x "$driver"
+  run env -u BASE_IMAGE -u VM_USER bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BASE_IMAGE=quay.io/fedora/fedora-bootc:41"* ]]
+  [[ "$output" == *"VM_USER=config-user"* ]]
+}
+
+  # Helper: source the pre-flight snippet with a mock podman, and print the result.
+  _preflight_podman() {
+    local podman_rc="$1"
+    local driver="${BATS_TEST_TMPDIR}/driver-preflight.sh"
+    {
+      printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+      printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+      printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+      # Mock podman: always exits with the given rc.
+      printf 'podman() { return %d; }\n' "$podman_rc"
+      # Mock sudo: just calls the inner command.
+      printf 'sudo() { "$@"; }\n'
+      printf 'IMAGE_SOURCE=local\n'
+      printf '# shellcheck disable=[]\n'
+      printf 'source %q\n' "${BATS_TEST_TMPDIR}/podman-preflight.snippet"
+    } > "$driver"
+    chmod +x "$driver"
+    bash "$driver"
+  }
+
+  # ---------------------------------------------------------------------------
+  # rootful podman pre-flight check (#4)
+  # ---------------------------------------------------------------------------
+
+  @test "deploy-cluster: IMAGE_SOURCE=local + rootful podman OK -> passes pre-flight" {
+    run _preflight_podman 0
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"LOG: pre-flight: checking for rootful podman"* ]]
+  }
+
+  @test "deploy-cluster: IMAGE_SOURCE=local + rootful podman FAIL -> bails with hint (#4)" {
+    run _preflight_podman 1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"FAIL: rootful podman is unavailable"* ]]
+    [[ "$output" == *"sudo dnf install -y podman"* ]]
+  }
+
+  @test "deploy-cluster: IMAGE_SOURCE=ghcr -> skips podman pre-flight" {
+    local driver="${BATS_TEST_TMPDIR}/driver-skip-preflight.sh"
+    {
+      printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+      printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+      printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+      # Mock podman: always fail.
+      printf 'podman() { return 1; }\n'
+      printf 'sudo() { "$@"; }\n'
+      printf 'IMAGE_SOURCE=ghcr\n'
+      printf '# shellcheck disable=[]\n'
+      printf 'source %q\n' "${BATS_TEST_TMPDIR}/podman-preflight.snippet"
+    } > "$driver"
+    chmod +x "$driver"
+    run bash "$driver"
+    [ "$status" -eq 0 ]
+    # Must NOT have attempted the podman check.
+    [[ "$output" != *"LOG: pre-flight: checking for rootful podman"* ]]
+  }
+
+@test "deploy-cluster: RUN_VERIFY=true + STRICT_CACHE=1 + verifier non-zero -> deploy fails (#9)" {
+  # Stub hbird to always exit 1 (verifier failure).
+  local bindir="${BATS_TEST_TMPDIR}/bin-strict-fail"
+  mkdir -p "$bindir"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "${bindir}/hbird"
+  chmod +x "${bindir}/hbird"
+  local driver="${BATS_TEST_TMPDIR}/driver-rv-strict-fail.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+    printf 'PATH=%q:${PATH}\n' "$bindir"
+    printf 'STRICT_CACHE=1\n'
+    printf 'CONFIG_PATH=/dev/null\nCP_IP=127.0.0.1\nKVM_HOST=\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/run-verify.snippet"
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FAIL:"* ]]
+  [[ "$output" == *"STRICT_CACHE=1"* ]]
+}
+
+@test "deploy-cluster: RUN_VERIFY=true + STRICT_CACHE=1 + hbird missing -> deploy fails (#9)" {
+  # No hbird on PATH — use an empty bin dir so command -v hbird fails.
+  local emptydir="${BATS_TEST_TMPDIR}/bin-empty"
+  mkdir -p "$emptydir"
+  local driver="${BATS_TEST_TMPDIR}/driver-rv-strict-missing.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+    printf 'PATH=%q\n' "$emptydir"
+    printf 'STRICT_CACHE=1\n'
+    printf 'CONFIG_PATH=/dev/null\nCP_IP=127.0.0.1\nKVM_HOST=\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/run-verify.snippet"
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FAIL:"* ]]
+  [[ "$output" == *"STRICT_CACHE=1"* ]]
+}
+
+@test "deploy-cluster: RUN_VERIFY=true + STRICT_CACHE unset + verifier non-zero -> informational, deploy succeeds (#9)" {
+  # Stub hbird to exit 1; without STRICT_CACHE=1 this must remain non-fatal.
+  local bindir="${BATS_TEST_TMPDIR}/bin-nonstrict"
+  mkdir -p "$bindir"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "${bindir}/hbird"
+  chmod +x "${bindir}/hbird"
+  local driver="${BATS_TEST_TMPDIR}/driver-rv-nonstrict.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'log() { printf "LOG: %%s\\n" "$*"; }\n'
+    printf 'fail() { printf "FAIL: %%s\\n" "$*" >&2; exit 1; }\n'
+    printf 'PATH=%q:${PATH}\n' "$bindir"
+    printf '# STRICT_CACHE deliberately unset — non-strict path\n'
+    printf 'CONFIG_PATH=/dev/null\nCP_IP=127.0.0.1\nKVM_HOST=\n'
+    printf '# shellcheck disable=SC1091\n'
+    printf 'source %q\n' "${BATS_TEST_TMPDIR}/run-verify.snippet"
+    printf 'echo "deploy-ok"\n'
+  } > "$driver"
+  run bash "$driver"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"informational"* ]]
+  [[ "$output" == *"deploy-ok"* ]]
+  [[ "$output" != *"FAIL:"* ]]
 }

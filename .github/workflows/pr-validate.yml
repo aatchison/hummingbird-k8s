@@ -17,14 +17,18 @@ jobs:
       - name: Run shellcheck (errors fail; warnings printed)
         run: |
           shopt -s nullglob
-          # All shell lives under scripts/, lib/, and the in-image init
-          # scripts under containers/<flavor>/. Pick them up by glob so
-          # adding a new flavor automatically gets coverage.
           files=( scripts/*.sh lib/*.sh containers/*/*.sh )
           [ ${#files[@]} -eq 0 ] && { echo "No shell scripts found."; exit 0; }
-          # Show all findings for visibility, then fail only on errors.
-          shellcheck --severity=warning "${files[@]}" || true
-          shellcheck --severity=error   "${files[@]}"
+          # Build a temp image with the repo baked in (no bind mounts — DinD
+          # runner; docker build context-tarball is the proven working pattern).
+          docker build -t ci-shellcheck -f - . <<'DOCKERFILE'
+          FROM koalaman/shellcheck-alpine@sha256:c82fe42504fbc9fc68f15d36638e5ee2324ebb8b94e96a3c4e395bf361c49183
+          COPY . /repo
+          WORKDIR /repo
+          ENTRYPOINT ["shellcheck"]
+          DOCKERFILE
+          docker run --rm ci-shellcheck --severity=warning "${files[@]}" || true
+          docker run --rm ci-shellcheck --severity=error   "${files[@]}"
 
   hadolint:
     runs-on: ubuntu-latest
@@ -47,38 +51,44 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Run actionlint (workflow YAML only, no embedded-script linting)
-        uses: raven-actions/actionlint@v2
-        with:
-          shellcheck: false
-          pyflakes: false
+        run: |
+          ACTIONLINT_VERSION=1.7.7
+          ACTIONLINT_SHA256=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+          curl -sSfLo actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -shellcheck '' -pyflakes ''
 
   unit-tests-lib:
     # bats-core unit tests for lib/build-common.sh helpers (issue #106).
-    # Runs in a pinned bats container so the runner doesn't need bats installed.
-    # Mirrors `make test-lib` for local/CI parity.
+    # Bakes repo into bats/bats image via docker build (no bind mounts needed).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: bats unit tests for lib/
         run: |
-          podman run --rm -v "${{ github.workspace }}:/repo:Z" -w /repo \
-            docker.io/bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300 \
-            tests/lib/
+          docker build -t ci-bats-lib -f - . <<'DOCKERFILE'
+          FROM bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300
+          COPY . /repo
+          WORKDIR /repo
+          DOCKERFILE
+          docker run --rm ci-bats-lib tests/lib/
 
   unit-tests-scripts:
     # bats-core unit tests for the remaining scripts/ shell scripts
-    # post-v0.1.0 cutover (#353; scripts/update-cluster.sh +
-    # scripts/export-argocd.sh + scripts/verify-*.sh + scripts/kubectl-k8s.sh
-    # were removed, their Rust twins are canonical). Issue #189 origin.
-    # Same pinned bats container as unit-tests-lib.
+    # post-v0.1.0 cutover (#353). Same docker build pattern as unit-tests-lib.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: bats unit tests for scripts/
         run: |
-          podman run --rm -v "${{ github.workspace }}:/repo:Z" -w /repo \
-            docker.io/bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300 \
-            tests/scripts/
+          docker build -t ci-bats-scripts -f - . <<'DOCKERFILE'
+          FROM bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300
+          COPY . /repo
+          WORKDIR /repo
+          DOCKERFILE
+          docker run --rm ci-bats-scripts tests/scripts/
 
   render-bib-config-snapshot:
     runs-on: ubuntu-latest
@@ -107,18 +117,21 @@ jobs:
 
   makefile-tests:
     # Static integration tests for the top-level Makefile (issue #110).
-    # Pure `make -n` dry-runs — no libvirt / podman / sudo required, so
-    # this catches recipe-wiring regressions in seconds without the full
-    # containerfile-build matrix below.
+    # Pure `make -n` dry-runs. Build bats/bats image with `make` added via
+    # apk (Alpine mirrors reachable from docker build context; same as how
+    # containerfile-build downloads packages during docker build).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install bats
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bats
       - name: Run bats Makefile tests
-        run: bats tests/makefile.bats
+        run: |
+          docker build -t ci-bats-make -f - . <<'DOCKERFILE'
+          FROM bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300
+          RUN apk add --quiet make
+          COPY . /repo
+          WORKDIR /repo
+          DOCKERFILE
+          docker run --rm ci-bats-make tests/makefile.bats
 
   containerfile-build:
     runs-on: ubuntu-latest
@@ -150,14 +163,11 @@ jobs:
           echo "path=$path"   >> "$GITHUB_OUTPUT"
 
       - name: Build OCI image (no push) — ${{ matrix.flavor }}
-        uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
-        with:
-          image: ${{ steps.cf.outputs.image }}
-          tags: pr-${{ github.event.pull_request.number || github.run_id }}
-          containerfiles: ${{ steps.cf.outputs.path }}
-          context: .
-          # Warm the layer cache from the previously published :latest when
-          # available. Tolerates a missing remote (first-time cache miss);
-          # no --pull-always so a PR build is robust to transient GHCR issues.
-          extra-args: |
-            --cache-from ghcr.io/${{ github.repository_owner }}/${{ steps.cf.outputs.image }}
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --tag "${{ steps.cf.outputs.image }}:pr-${{ github.event.pull_request.number || github.run_id }}" \
+            --file "${{ steps.cf.outputs.path }}" \
+            .

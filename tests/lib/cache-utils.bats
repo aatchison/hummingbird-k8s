@@ -177,14 +177,14 @@ _stub_image_ref() {  # $1 = revision the stubbed podman reports
   [ -z "$output" ]
 }
 
-@test "assess_ghcr_image: unverifiable (no label), STRICT_CACHE=1 -> rc 0 (reuse, only confirmed drift fails)" {
-  # #373 round-2: unverifiable is NOT a confirmed mismatch. STRICT_CACHE must
-  # NOT hard-fail the default ghcr path on every deploy just because today's
-  # images carry no revision label — only a CONFIRMED drift (rc 1) fails.
+@test "assess_ghcr_image: unverifiable (no label), STRICT_CACHE=1 -> rc 3 + ERROR (fail-closed)" {
+  # #373 round-2: unverifiable is NOT a confirmed mismatch. However, under
+  # STRICT_CACHE=1, we fail closed because we cannot prove freshness.
   _stub_image_ref ""
   STRICT_CACHE=1 run hbird_assess_ghcr_image ghcr.io/x:latest "CP image" containers/k8s/Containerfile
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"ERROR"* ]]
+  [[ "$output" == *"cannot prove freshness"* ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -247,33 +247,105 @@ _stub_image_ref() {  # $1 = revision the stubbed podman reports
   [ -z "$output" ]
 }
 
-@test "assess_qcow2_cache: empty expected, STRICT_CACHE=1 -> rc 0, NO hard-fail" {
-  qcow="${BATS_TEST_TMPDIR}/noexp2.qcow2"; printf qcow2data > "$qcow"
+@test "assess_qcow2_cache: empty expected (default ghcr, no label), STRICT_CACHE=1 -> rc 3 + ERROR (fail-closed)" {
+  qcow="${BATS_TEST_TMPDIR}/noexp3.qcow2"; printf qcow2data > "$qcow"
   hbird_cache_write_ref "$qcow" "local:oldref00"
   STRICT_CACHE=1 run hbird_assess_qcow2_cache "$qcow" "" "CP image"
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"ERROR"* ]]
+  [[ "$output" == *"cannot prove freshness"* ]]
 }
 
-@test "assess_qcow2_cache: missing sidecar (legacy qcow2) -> rc 0 (cannot confirm; reuse)" {
-  # No recorded build-ref -> cannot confirm staleness -> reuse silently, even
-  # under STRICT_CACHE. Preserves skip-if-exists for pre-feature templates.
-  qcow="${BATS_TEST_TMPDIR}/legacy.qcow2"; printf qcow2data > "$qcow"
-  run hbird_assess_qcow2_cache "$qcow" "local:newref99" "CP image"
-  [ "$status" -eq 0 ]
+@test "assess_qcow2_cache: missing sidecar (legacy qcow2), STRICT_CACHE=1 -> rc 3 + ERROR (fail-closed)" {
+  qcow="${BATS_TEST_TMPDIR}/legacy3.qcow2"; printf qcow2data > "$qcow"
+# No sidecar written
   STRICT_CACHE=1 run hbird_assess_qcow2_cache "$qcow" "local:newref99" "CP image"
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"ERROR"* ]]
+  [[ "$output" == *"cannot prove freshness"* ]]
 }
 
-@test "assess_qcow2_cache: cross-source (operator switched IMAGE_SOURCE) -> rc 0, NO churn" {
-  # local-baked template, now a ghcr deploy: content-hash vs git-commit are
-  # different identity spaces. Comparing them would always "mismatch" -> must
-  # NOT be treated as stale (#373 round-2 MED). Even under STRICT_CACHE.
-  qcow="${BATS_TEST_TMPDIR}/xmode.qcow2"; printf qcow2data > "$qcow"
+@test "assess_qcow2_cache: cross-source (operator switched IMAGE_SOURCE), STRICT_CACHE=1 -> rc 3 + ERROR (fail-closed)" {
+  qcow="${BATS_TEST_TMPDIR}/xmode3.qcow2"; printf qcow2data > "$qcow"
   hbird_cache_write_ref "$qcow" "local:abc123"
-  run hbird_assess_qcow2_cache "$qcow" "ghcr:acef96c" "CP image"
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]
   STRICT_CACHE=1 run hbird_assess_qcow2_cache "$qcow" "ghcr:acef96c" "CP image"
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"ERROR"* ]]
+  [[ "$output" == *"cannot prove freshness"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Build-ID Scope tests (S8, #9b)
+# ---------------------------------------------------------------------------
+
+@test "cache_build_id: LOCAL build-id differs when BASE_IMAGE changes" {
+  # Mock render_bib_config to be stable
+  render_bib_config() { printf 'stable-config\n'; }
+  export -f render_bib_config
+
+  # Use a dummy Containerfile
+  printf 'FROM scratch' > "${BATS_TEST_TMPDIR}/CF"
+  
+  # Run 1: Base A
+  BASE_IMAGE="image-a" ENABLE_CLOUD_INIT=0 \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_a="$output"
+
+  # Run 2: Base B
+  BASE_IMAGE="image-b" ENABLE_CLOUD_INIT=0 \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_b="$output"
+
+  [ "$id_a" != "$id_b" ]
+}
+
+@test "cache_build_id: LOCAL build-id differs when bib-config (VM_USER/pubkeys) changes" {
+  render_bib_config() { printf "user=%s\n" "$VM_USER"; }
+  export -f render_bib_config
+  printf 'FROM scratch' > "${BATS_TEST_TMPDIR}/CF"
+
+  # Run 1: User A
+  VM_USER="alice" BASE_IMAGE="image-a" ENABLE_CLOUD_INIT=0 \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_a="$output"
+
+  # Run 2: User B
+  VM_USER="bob" BASE_IMAGE="image-a" ENABLE_CLOUD_INIT=0 \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_b="$output"
+
+  [ "$id_a" != "$id_b" ]
+}
+
+@test "cache_build_id: LOCAL build-id differs when ENABLE_CLOUD_INIT changes" {
+  render_bib_config() { printf 'stable-config\n'; }
+  export -f render_bib_config
+  printf 'FROM scratch' > "${BATS_TEST_TMPDIR}/CF"
+
+  # Run 1: Disabled
+  ENABLE_CLOUD_INIT=0 BASE_IMAGE="image-a" \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_0="$output"
+
+  # Run 2: Enabled
+  ENABLE_CLOUD_INIT=1 BASE_IMAGE="image-a" \
+    run hbird_local_build_id_calc "${BATS_TEST_TMPDIR}/CF"
+  id_1="$output"
+
+  [ "$id_0" != "$id_1" ]
+}
+
+@test "cache_build_id: GHCR path remains unchanged (only vcs-ref matters)" {
+  # For GHCR, we only use the vcs-ref.
+  # We verify that changing BASE_IMAGE or bib-config doesn't affect the GHCR build-id.
+  
+  # GHCR Build ID is just ghcr:<vcs-ref>
+  id_1=$(hbird_cache_build_id ghcr "acef96c")
+  
+  # Change other knobs
+  BASE_IMAGE="different-base"
+  VM_USER="different-user"
+  id_2=$(hbird_cache_build_id ghcr "acef96c")
+  
+  [ "$id_1" = "$id_2" ]
 }

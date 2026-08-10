@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dd-io-loop
+  labels:
+    app: dd-io-loop
+    test-workload: io
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dd-io-loop
+  template:
+    metadata:
+      labels:
+        app: dd-io-loop
+        test-workload: io
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dd-io-loop
+          image: docker.io/library/busybox:1.36
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsUser: 65534
+          command:
+            - sh
+            - -c
+            - |
+              # Continuous dd I/O loop to /scratch (emptyDir).
+              # Loops 100MiB writes then truncates and repeats.
+              while true; do
+                dd if=/dev/zero of=/scratch/out bs=1M count=100 oflag=direct 2>/dev/null || true
+                sync
+                : > /scratch/out
+              done
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "100m"
+              memory: "256Mi"
+      volumes:
+        - name: scratch
+          emptyDir:
+            sizeLimit: 256Mi
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: dd-io-loop

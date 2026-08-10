@@ -311,7 +311,7 @@ failure — the fail-closed posture a CI / boot-test gate wants (mirrors
 unverifiable case above (that would break every default `ghcr` deploy until
 the images stamp a revision label); it fails only on a confirmed mismatch.
 `STRICT_CACHE` is operator-overridable and forwarded across the
-`KVM_HOST=` re-exec.
+`KVM_HOST=` re-exec. See [boot-test-overrides.md](boot-test-overrides.md) for detailed #9 hardening behavior.
 
 > Note on tags: `GHCR_TAG=latest` (the default) tracks whatever the
 > publish pipeline last pushed; the running node's own drift is governed
@@ -614,6 +614,8 @@ covered in [`docs/auto-updates.md`](auto-updates.md).
 
 When `SWITCH_TO_GHCR=true` (default), every VM gets a first-boot
 `bootc switch ghcr.io/aatchison/hummingbird-<flavor>:$GHCR_TAG` runcmd.
+See [boot-test-overrides.md](boot-test-overrides.md) for how this interacts
+with `IMAGE_SOURCE=local` during boot-tests.
 Combined with `AUTO_UPDATE_CP=true` (CP) and the worker image's default
 auto-update timer, this means:
 

@@ -107,5 +107,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Integration tests (`tests/cli_smoke.rs`) parse the command tree without
 # running it — no extra deps beyond clap's built-in test surface needed.
 
+# TOML parsing for bib-config structural tests (S4-bug #33b): verify that
+# render_bib_config produces TOML BIB will actually accept (correct field
+# names, parseable structure) rather than just string-matching the output.
+toml = "0.8"
+
 [lints]
 workspace = true
