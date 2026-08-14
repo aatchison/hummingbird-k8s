@@ -201,6 +201,43 @@ worker_user_data() {
   } > "$out_file"
 }
 
+# render_net2_network_config — emit a cloud-init network-config (v2) YAML
+# to stdout for a dual-NIC VM.
+# Inputs:
+#   $1 — MAC of the second NIC (as passed to virt-install --network mac=)
+#   $2 — static address for the second NIC in CIDR form (e.g. 10.0.0.241/24)
+#
+# Why network-config and not a write_files NM keyfile: this file is rendered
+# by cloud-init-local BEFORE NetworkManager starts. A keyfile delivered via
+# write_files (cloud-config stage) loses the race — NM auto-defaults the new
+# NIC with DHCP first, and if that network's DHCP hands out a gateway the
+# node grows a second default route and its identity (apiserver
+# advertise-address, kubelet node IP) can move. The static stanza below has
+# NO gateway and disables RA, so the second NIC can never carry a default
+# route: internal traffic and node identity stay on the primary NIC.
+#
+# The primary NIC is matched by name (enp1s0 — deterministic on the q35
+# machine type these VMs use: first pcie-root-port, slot 1). It must be
+# declared here because providing ANY network-config disables cloud-init's
+# fallback DHCP config; omitting it would leave the primary NIC dead.
+render_net2_network_config() {
+  local mac="$1" ip="$2"
+  printf 'version: 2\n'
+  printf 'ethernets:\n'
+  printf '  primary:\n'
+  printf '    match:\n'
+  printf '      name: enp1s0\n'
+  printf '    dhcp4: true\n'
+  printf '  net2:\n'
+  printf '    match:\n'
+  printf '      macaddress: "%s"\n' "$mac"
+  printf '    dhcp4: false\n'
+  printf '    dhcp6: false\n'
+  printf '    accept-ra: false\n'
+  printf '    addresses:\n'
+  printf '      - "%s"\n' "$ip"
+}
+
 # resolve_switch_to_ghcr: #374 guard against the second false-positive
 # boot-test mechanism (sibling to #373's qcow2 cache reuse). FORCE_REBUILD=1
 # signals the operator is testing a SPECIFIC freshly-built image (a local
@@ -563,7 +600,40 @@ if [[ -n "${HBIRD_OPERATOR_PUBKEY_FILE:-}" && -r "$HBIRD_OPERATOR_PUBKEY_FILE" ]
   fi
 fi
 
-log "config OK: CP=${CP_NAME}, workers=(${WORKER_NAMES[*]}), source=${IMAGE_SOURCE}, tag=${GHCR_TAG}"
+# ---- begin extra-network-validation ---
+# Optional second NIC (EXTRA_NETWORK): validate the whole knob family up
+# front so a partial config fails here, not as a half-provisioned VM.
+# See cluster.example.conf for the schema and the host-side prerequisite
+# (the named libvirt network must exist — VF pool, bridge, whatever).
+_mac_re='^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'
+_cidr_re='^[0-9.]+/[0-9]+$'
+if [[ -n "${EXTRA_NETWORK:-}" ]]; then
+  [[ "${EXTRA_NET_CP_MAC:-}" =~ $_mac_re ]] \
+    || fail "EXTRA_NETWORK is set but EXTRA_NET_CP_MAC is missing/malformed (need aa:bb:cc:dd:ee:ff): '${EXTRA_NET_CP_MAC:-}'"
+  [[ "${EXTRA_NET_CP_IP:-}" =~ $_cidr_re ]] \
+    || fail "EXTRA_NETWORK is set but EXTRA_NET_CP_IP is missing/malformed (need CIDR like 10.0.0.241/24): '${EXTRA_NET_CP_IP:-}'"
+  [[ ${#EXTRA_NET_WORKER_MACS[@]} -eq ${#WORKER_NAMES[@]} ]] \
+    || fail "EXTRA_NET_WORKER_MACS has ${#EXTRA_NET_WORKER_MACS[@]} entries but WORKER_NAMES has ${#WORKER_NAMES[@]} — the arrays must be parallel"
+  [[ ${#EXTRA_NET_WORKER_IPS[@]} -eq ${#WORKER_NAMES[@]} ]] \
+    || fail "EXTRA_NET_WORKER_IPS has ${#EXTRA_NET_WORKER_IPS[@]} entries but WORKER_NAMES has ${#WORKER_NAMES[@]} — the arrays must be parallel"
+  for _i in "${!WORKER_NAMES[@]}"; do
+    [[ "${EXTRA_NET_WORKER_MACS[$_i]}" =~ $_mac_re ]] \
+      || fail "EXTRA_NET_WORKER_MACS[$_i] malformed: '${EXTRA_NET_WORKER_MACS[$_i]}'"
+    [[ "${EXTRA_NET_WORKER_IPS[$_i]}" =~ $_cidr_re ]] \
+      || fail "EXTRA_NET_WORKER_IPS[$_i] malformed: '${EXTRA_NET_WORKER_IPS[$_i]}'"
+  done
+  virsh -c qemu:///system net-info "$EXTRA_NETWORK" >/dev/null 2>&1 \
+    || fail "EXTRA_NETWORK='$EXTRA_NETWORK' is not a defined libvirt network on this host — define it first (see cluster.example.conf for a VF-pool example)"
+else
+  # Guard against a half-set family: worker arrays without the master knob
+  # would be silently ignored — that silence is the #373-family bug class.
+  if [[ -n "${EXTRA_NET_CP_MAC:-}${EXTRA_NET_CP_IP:-}${EXTRA_NET_WORKER_MACS[*]:-}${EXTRA_NET_WORKER_IPS[*]:-}" ]]; then
+    fail "EXTRA_NET_* values are set but EXTRA_NETWORK is empty — set EXTRA_NETWORK=<libvirt network> or clear the family"
+  fi
+fi
+# ---- end extra-network-validation ---
+
+log "config OK: CP=${CP_NAME}, workers=(${WORKER_NAMES[*]}), source=${IMAGE_SOURCE}, tag=${GHCR_TAG}${EXTRA_NETWORK:+, extra-net=${EXTRA_NETWORK}}"
 
 # ---- begin podman-preflight-block ---
 if [[ "$IMAGE_SOURCE" == "local" ]]; then
@@ -722,10 +792,19 @@ CP_USER_DATA="$(mktemp -t hbird-cp-userdata-XXXXXX.yaml)"
 # root/sudo checks) so the source-only test guard can expose it.
 render_cp_user_data > "$CP_USER_DATA"
 
+# Second NIC: ship a network-config in the seed so cloud-init-local
+# configures both NICs BEFORE NetworkManager starts (no DHCP race, no
+# second default route — see render_net2_network_config).
+CP_NET_CONFIG=""
+if [[ -n "${EXTRA_NETWORK:-}" ]]; then
+  CP_NET_CONFIG="$(mktemp -t hbird-cp-netconfig-XXXXXX.yaml)"
+  render_net2_network_config "$EXTRA_NET_CP_MAC" "$EXTRA_NET_CP_IP" > "$CP_NET_CONFIG"
+fi
+
 log "building CP cloud-init seed ${CP_SEED}"
-build_cloud_init_seed "$CP_NAME" "$CP_USER_DATA" "$CP_SEED"
+build_cloud_init_seed "$CP_NAME" "$CP_USER_DATA" "$CP_SEED" "$CP_NET_CONFIG"
 SEED_ISOS+=("$CP_SEED")
-rm -f "$CP_USER_DATA"
+rm -f "$CP_USER_DATA" ${CP_NET_CONFIG:+"$CP_NET_CONFIG"}
 
 # ---- Stage CP qcow2 + virt-install ------------------------------------------
 
@@ -745,6 +824,15 @@ if [[ $EUID -eq 0 ]]; then
   chmod 0644 "$CP_QCOW"
 fi
 
+# Optional second NIC. mac= pins the guest-visible MAC so the seed's
+# network-config (matched by MAC) deterministically finds the right
+# interface. For a hostdev/VF-pool network libvirt ignores model=, so
+# none is passed. Empty array when the knob is off — expands to nothing.
+CP_EXTRA_NET_ARGS=()
+if [[ -n "${EXTRA_NETWORK:-}" ]]; then
+  CP_EXTRA_NET_ARGS=(--network "network=${EXTRA_NETWORK},mac=${EXTRA_NET_CP_MAC}")
+fi
+
 log "virt-install ${CP_NAME} (memory=${CP_MEMORY} vcpus=${CP_VCPUS})"
 virt-install --connect qemu:///system \
   --name "$CP_NAME" \
@@ -754,6 +842,7 @@ virt-install --connect qemu:///system \
   --import \
   --os-variant fedora-unknown \
   --network network=default,model=virtio \
+  "${CP_EXTRA_NET_ARGS[@]}" \
   --graphics vnc,listen=127.0.0.1 \
   --noautoconsole
 
@@ -800,7 +889,8 @@ JOIN_CMD="$(cp_ssh "kubeadm token create --ttl ${TOKEN_TTL} --print-join-command
 # rendered worker user-data without invoking the rest of the script. (#254.)
 
 WORKER_PIDS=()
-for w in "${WORKER_NAMES[@]}"; do
+for w_idx in "${!WORKER_NAMES[@]}"; do
+  w="${WORKER_NAMES[$w_idx]}"
   if virsh -c qemu:///system dominfo "$w" >/dev/null 2>&1; then
     fail "worker VM '$w' is already defined — refusing to overwrite. Tear down first."
   fi
@@ -809,10 +899,20 @@ for w in "${WORKER_NAMES[@]}"; do
   w_seed="${POOL_DIR}/${w}-seed.iso"
   w_userdata="$(mktemp -t hbird-w-userdata-XXXXXX.yaml)"
 
+  # Second NIC (see the CP block above for the mechanism/rationale).
+  w_netconfig=""
+  w_extra_net_args=()
+  if [[ -n "${EXTRA_NETWORK:-}" ]]; then
+    w_netconfig="$(mktemp -t hbird-w-netconfig-XXXXXX.yaml)"
+    render_net2_network_config \
+      "${EXTRA_NET_WORKER_MACS[$w_idx]}" "${EXTRA_NET_WORKER_IPS[$w_idx]}" > "$w_netconfig"
+    w_extra_net_args=(--network "network=${EXTRA_NETWORK},mac=${EXTRA_NET_WORKER_MACS[$w_idx]}")
+  fi
+
   worker_user_data "$w" "$w_userdata"
-  build_cloud_init_seed "$w" "$w_userdata" "$w_seed"
+  build_cloud_init_seed "$w" "$w_userdata" "$w_seed" "$w_netconfig"
   SEED_ISOS+=("$w_seed")
-  rm -f "$w_userdata"
+  rm -f "$w_userdata" ${w_netconfig:+"$w_netconfig"}
 
   log "cloning worker qcow2 -> $w_qcow"
   cp --reflink=auto "$WORKER_TEMPLATE_QCOW" "$w_qcow"
@@ -831,6 +931,7 @@ for w in "${WORKER_NAMES[@]}"; do
     --import \
     --os-variant fedora-unknown \
     --network network=default,model=virtio \
+    "${w_extra_net_args[@]}" \
     --graphics vnc,listen=127.0.0.1 \
     --noautoconsole &
   WORKER_PIDS+=("$!")

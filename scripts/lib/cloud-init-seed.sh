@@ -15,10 +15,17 @@
 #
 # Public surface:
 #
-#   build_cloud_init_seed <hostname> <user-data-file> <out-iso>
+#   build_cloud_init_seed <hostname> <user-data-file> <out-iso> [network-config-file]
 #       hostname        — becomes meta-data's local-hostname.
 #       user-data-file  — path to a #cloud-config YAML file.
 #       out-iso         — destination ISO path; parent dir must exist.
+#       network-config-file — OPTIONAL path to a cloud-init network-config
+#           (v2) file. When given, it ships in the seed and cloud-init
+#           renders it during cloud-init-local — BEFORE NetworkManager
+#           starts. That ordering is the point: it is the only channel
+#           that can configure a second NIC without racing NM's
+#           auto-default DHCP (which would otherwise grab a default route
+#           on the new NIC and move node identity).
 #
 # The synthesized meta-data has a unique instance-id of
 # hbird-<epoch>-<random> so re-running the deploy regenerates a fresh
@@ -28,16 +35,20 @@
 
 # shellcheck shell=bash
 
-# build_cloud_init_seed <hostname> <user-data-file> <out-iso>
+# build_cloud_init_seed <hostname> <user-data-file> <out-iso> [network-config-file]
 build_cloud_init_seed() {
-  local hostname="$1" user_data="$2" out_iso="$3"
+  local hostname="$1" user_data="$2" out_iso="$3" net_config="${4:-}"
 
   if [[ -z "$hostname" || -z "$user_data" || -z "$out_iso" ]]; then
-    echo "build_cloud_init_seed: usage: build_cloud_init_seed <hostname> <user-data-file> <out-iso>" >&2
+    echo "build_cloud_init_seed: usage: build_cloud_init_seed <hostname> <user-data-file> <out-iso> [network-config-file]" >&2
     return 2
   fi
   if [[ ! -r "$user_data" ]]; then
     echo "build_cloud_init_seed: user-data file not readable: $user_data" >&2
+    return 2
+  fi
+  if [[ -n "$net_config" && ! -r "$net_config" ]]; then
+    echo "build_cloud_init_seed: network-config file not readable: $net_config" >&2
     return 2
   fi
 
@@ -55,20 +66,31 @@ instance-id: hbird-$(date +%s)-${RANDOM}
 local-hostname: ${hostname}
 EOF
 
+  # Optional network-config: NoCloud reads it from the ISO root as
+  # `network-config`. The extra-files array keeps the three tool branches
+  # in lockstep (cloud-localds takes it as a flag; the ISO tools just get
+  # another file argument).
+  local -a nc_localds=() nc_isofile=()
+  if [[ -n "$net_config" ]]; then
+    cp "$net_config" "$tmp/network-config"
+    nc_localds=(--network-config "$tmp/network-config")
+    nc_isofile=("$tmp/network-config")
+  fi
+
   if command -v cloud-localds >/dev/null 2>&1; then
-    if ! cloud-localds "$out_iso" "$tmp/user-data" "$tmp/meta-data" >/dev/null 2>&1; then
+    if ! cloud-localds "${nc_localds[@]}" "$out_iso" "$tmp/user-data" "$tmp/meta-data" >/dev/null 2>&1; then
       echo "build_cloud_init_seed: cloud-localds failed for ${hostname} -> ${out_iso}" >&2
       return 1
     fi
   elif command -v genisoimage >/dev/null 2>&1; then
     if ! genisoimage -output "$out_iso" -volid cidata -joliet -rock \
-        "$tmp/user-data" "$tmp/meta-data" >/dev/null 2>&1; then
+        "$tmp/user-data" "$tmp/meta-data" "${nc_isofile[@]}" >/dev/null 2>&1; then
       echo "build_cloud_init_seed: genisoimage failed for ${hostname} -> ${out_iso}" >&2
       return 1
     fi
   elif command -v mkisofs >/dev/null 2>&1; then
     if ! mkisofs -output "$out_iso" -volid cidata -joliet -rock \
-        "$tmp/user-data" "$tmp/meta-data" >/dev/null 2>&1; then
+        "$tmp/user-data" "$tmp/meta-data" "${nc_isofile[@]}" >/dev/null 2>&1; then
       echo "build_cloud_init_seed: mkisofs failed for ${hostname} -> ${out_iso}" >&2
       return 1
     fi
