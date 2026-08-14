@@ -46,22 +46,59 @@ sysctl --system >/dev/null
 # primary NIC — observed live: kubelet selected the second NIC's static
 # address as InternalIP even though that NIC carried no default route.
 #
-# Derivation: the address of the interface holding the default route —
-# the primary NIC BY CONSTRUCTION (the second NIC's cloud-init
-# network-config ships no gateway/DHCP/RA, so it can never own a default
-# route). Written to /etc/sysconfig/kubelet (the kubelet unit's
-# EnvironmentFile; the RPM default is an empty KUBELET_EXTRA_ARGS=) so
-# the flag survives kubeadm's own kubeadm-flags.env regeneration.
-_def_if="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-NODE_IP=""
-if [[ -n "$_def_if" ]]; then
-  NODE_IP="$(ip -4 -o addr show dev "$_def_if" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+# Derivation: the `src` of the default route — the primary NIC BY
+# CONSTRUCTION (the second NIC's cloud-init network-config ships no
+# gateway/DHCP, and its IPv6 is disabled by a first-boot runcmd, so it can
+# never own a default route). Using the route's own `src` rather than the
+# interface's first address matches what kubelet/kubeadm autodetection
+# would pick when the NIC carries several global addresses.
+#
+# Written to /etc/sysconfig/kubelet — the kubelet unit's EnvironmentFile.
+# This is the right home because the worker joins via a plain CLI
+# `kubeadm join` (no JoinConfiguration to carry kubeletExtraArgs), NOT
+# because kubeadm regenerates kubeadm-flags.env (it does not: kubeadm
+# v1.31 rewrites only /var/lib/kubelet/config.yaml on upgrade).
+#
+# NODE_IP may be pre-set in /etc/hummingbird/worker-init-local.env
+# (cloud-init write_files lands it before this service runs), mirroring
+# the CP's k8s-init-local.env contract.
+if [[ -r /etc/hummingbird/worker-init-local.env ]]; then
+  # shellcheck disable=SC1091
+  source /etc/hummingbird/worker-init-local.env
 fi
-if [[ -z "$NODE_IP" ]]; then
-  echo "FATAL: could not derive NODE_IP (no default route, or no global IPv4 on its interface)." >&2
+
+if [[ -z "${NODE_IP:-}" ]]; then
+  # Bounded retry: at first boot the DHCP lease and default route may not
+  # have landed yet, and this unit is Type=oneshot with no Restart — a
+  # single-shot check would leave the node permanently unjoined.
+  for _ in $(seq 1 30); do
+    NODE_IP="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    [[ -n "$NODE_IP" ]] && break
+    sleep 1
+  done
+fi
+if [[ -z "${NODE_IP:-}" ]]; then
+  # Fall back to the default-route interface's first global address for
+  # routes that carry no src hint.
+  _def_if="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  [[ -n "$_def_if" ]] && NODE_IP="$(ip -4 -o addr show dev "$_def_if" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+fi
+if [[ -z "${NODE_IP:-}" ]]; then
+  echo "FATAL: could not derive NODE_IP (no IPv4 default route after 30s, or no global IPv4 on its interface). Set NODE_IP= in /etc/hummingbird/worker-init-local.env to override." >&2
   exit 1
 fi
-echo "KUBELET_EXTRA_ARGS=--node-ip=${NODE_IP}" > /etc/sysconfig/kubelet
+
+# Merge rather than truncate: /etc/sysconfig/kubelet is kubeadm's
+# documented operator escape hatch, and an operator may have seeded
+# KUBELET_EXTRA_ARGS via cloud-init write_files (which lands before this
+# service). Our --node-ip goes FIRST so an explicit operator --node-ip
+# later in the string still wins under pflag last-wins.
+_existing=""
+if [[ -r /etc/sysconfig/kubelet ]]; then
+  # shellcheck disable=SC1091
+  _existing="$(. /etc/sysconfig/kubelet 2>/dev/null; printf '%s' "${KUBELET_EXTRA_ARGS:-}")"
+fi
+printf 'KUBELET_EXTRA_ARGS=--node-ip=%s%s\n' "$NODE_IP" "${_existing:+ ${_existing}}" > /etc/sysconfig/kubelet
 echo "worker node identity pinned to ${NODE_IP} (kubelet --node-ip via /etc/sysconfig/kubelet)"
 
 # Unique-ish hostname so kubelet doesn't claim "localhost.localdomain" on every

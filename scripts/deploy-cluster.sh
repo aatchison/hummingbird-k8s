@@ -104,6 +104,11 @@ render_cp_user_data() {
   # unconditionally on factory reset, so AUTO_UPDATE_CP=false alone was a
   # no-op pre-#181-round-2). #181 round-2 review.
   printf 'runcmd:\n'
+  # Before anything else: neutralise the second NIC's IPv6 (the v2 keys
+  # never reach NetworkManager — see emit_net2_ipv6_off_runcmd).
+  if [[ -n "${EXTRA_NETWORK:-}" && -n "${EXTRA_NET_CP_MAC:-}" ]]; then
+    emit_net2_ipv6_off_runcmd "$EXTRA_NET_CP_MAC"
+  fi
   if [[ "$SWITCH_TO_GHCR" = "true" ]]; then
     printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s:%s ]\n' "$GHCR_TAG"
   fi
@@ -142,6 +147,7 @@ render_cp_user_data() {
 # Inputs:
 #   $1 — worker_name (becomes the cloud-init hostname:)
 #   $2 — out_file path
+#   $3 — OPTIONAL second-NIC MAC; when non-empty, emits the IPv6-off runcmd
 # Env vars: SSH_PUBKEY_CONTENT, JOIN_CMD, BOOTC_UPDATE_SCHEDULE,
 #           BOOTC_UPDATE_REPO_WORKER, SWITCH_TO_GHCR, GHCR_TAG.
 #
@@ -149,7 +155,7 @@ render_cp_user_data() {
 # so tests/scripts/deploy-cluster.bats can exercise the rendered output
 # without invoking the rest of the script (root + libvirt + bib). (#254.)
 worker_user_data() {
-  local worker_name="$1" out_file="$2"
+  local worker_name="$1" out_file="$2" net2_mac="${3:-}"
   {
     printf '#cloud-config\n'
     printf 'hostname: %s\n' "$worker_name"
@@ -186,8 +192,12 @@ worker_user_data() {
       printf '      REPO=%s\n' "$BOOTC_UPDATE_REPO_WORKER"
       printf '      PREFIX=v\n'
     fi
-    if [[ "$SWITCH_TO_GHCR" = "true" || -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
+    if [[ "$SWITCH_TO_GHCR" = "true" || -n "${BOOTC_UPDATE_SCHEDULE:-}" || -n "$net2_mac" ]]; then
       printf 'runcmd:\n'
+      # First: neutralise the second NIC's IPv6 (see the CP path).
+      if [[ -n "$net2_mac" ]]; then
+        emit_net2_ipv6_off_runcmd "$net2_mac"
+      fi
       if [[ "$SWITCH_TO_GHCR" = "true" ]]; then
         printf '  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s-worker:%s ]\n' "$GHCR_TAG"
       fi
@@ -236,6 +246,41 @@ render_net2_network_config() {
   printf '    accept-ra: false\n'
   printf '    addresses:\n'
   printf '      - "%s"\n' "$ip"
+}
+
+# emit_net2_ipv6_off_runcmd — emit the runcmd entry that disables IPv6 on
+# the second NIC. Takes that NIC's MAC.
+#
+# WHY THIS EXISTS: render_net2_network_config emits `accept-ra: false` and
+# `dhcp6: false`, and cloud-init's NetworkManager renderer SILENTLY DROPS
+# BOTH — network_manager.py has no accept-ra handling at all, and with no
+# IPv6 subnet it never emits an [ipv6] section, so NetworkManager
+# normalizes the keyfile to ipv6.method=auto. VERIFIED on a live node: the
+# rendered cloud-init-net2.nmconnection had NO [ipv6] section and
+# `nmcli -g ipv6.method` reported `auto`.
+#
+# Left alone, an EXTRA_NETWORK segment carrying router advertisements
+# would SLAAC an address onto the second NIC and install an IPv6 default
+# route there — routing node IPv6 egress out the NIC that is supposed to
+# carry no default route at all. IPv4 identity (and NODE_IP derivation,
+# which is `ip -4`) is unaffected, which is precisely why an all-IPv4 test
+# on an RA-free segment cannot catch it.
+#
+# Resolved MAC -> device -> connection because the NM renderer names the
+# connection after the matched INTERFACE (observed: "cloud-init enp2s0"),
+# not after the network-config key ("net2") — so the name is not
+# predictable from here. Non-fatal on lookup failure: a missing NIC must
+# not block the rest of first boot.
+emit_net2_ipv6_off_runcmd() {
+  local mac="$1"
+  printf '  - |\n'
+  printf '    # Disable IPv6 on the second NIC (accept-ra/dhcp6 do not survive the NM renderer).\n'
+  printf '    dev=$(ip -o link | awk -v m=%s '\''tolower($0) ~ tolower(m) {gsub(/:/,"",$2); print $2; exit}'\'')\n' "$mac"
+  printf '    [ -n "$dev" ] || { echo "hbird: no interface with MAC %s" >&2; exit 0; }\n' "$mac"
+  printf '    con=$(nmcli -g GENERAL.CONNECTION device show "$dev")\n'
+  printf '    [ -n "$con" ] || { echo "hbird: no NM connection on $dev" >&2; exit 0; }\n'
+  printf '    nmcli connection modify "$con" ipv6.method disabled\n'
+  printf '    nmcli connection up "$con" >/dev/null\n'
 }
 
 # resolve_switch_to_ghcr: #374 guard against the second false-positive
@@ -606,7 +651,37 @@ fi
 # See cluster.example.conf for the schema and the host-side prerequisite
 # (the named libvirt network must exist — VF pool, bridge, whatever).
 _mac_re='^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'
-_cidr_re='^[0-9.]+/[0-9]+$'
+# Octet-range-accurate: the loose '^[0-9.]+/[0-9]+$' this replaced accepted
+# 10.0.0.256/24, 1.2.3/99 and 10.0.0.241/244 — defeating the fail-early
+# guarantee this block exists to provide.
+_cidr_re='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])/([0-9]|[12][0-9]|3[0-2])$'
+
+# Unset arrays are an error under `set -u`, which aborts with a raw
+# "unbound variable" instead of the crafted messages below — and an
+# entirely-unset array is the MOST likely misconfiguration.
+declare -p EXTRA_NET_WORKER_MACS >/dev/null 2>&1 || EXTRA_NET_WORKER_MACS=()
+declare -p EXTRA_NET_WORKER_IPS  >/dev/null 2>&1 || EXTRA_NET_WORKER_IPS=()
+
+# POD_CIDR / SERVICE_CIDR are printf'd into cloud-init YAML and sourced as
+# root by k8s-init.sh — validate whenever set, independent of EXTRA_NETWORK.
+for _knob in POD_CIDR SERVICE_CIDR; do
+  _v="${!_knob:-}"
+  [[ -z "$_v" || "$_v" =~ $_cidr_re ]] \
+    || fail "${_knob} is malformed (need CIDR like 10.244.0.0/16): '${_v}'"
+done
+
+# _ip_in_cidr <addr> <cidr> -> 0 when addr is inside cidr.
+_ip_in_cidr() {
+  local a="$1" c="${2%%/*}" p="${2##*/}" ai ci m o1 o2 o3 o4
+  [[ "$2" == */* ]] || return 1
+  local IFS=.
+  read -r o1 o2 o3 o4 <<<"$a"; ai=$(( (o1<<24)|(o2<<16)|(o3<<8)|o4 ))
+  read -r o1 o2 o3 o4 <<<"$c"; ci=$(( (o1<<24)|(o2<<16)|(o3<<8)|o4 ))
+  (( p == 0 )) && return 0
+  m=$(( (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF ))
+  (( (ai & m) == (ci & m) ))
+}
+
 if [[ -n "${EXTRA_NETWORK:-}" ]]; then
   [[ "${EXTRA_NET_CP_MAC:-}" =~ $_mac_re ]] \
     || fail "EXTRA_NETWORK is set but EXTRA_NET_CP_MAC is missing/malformed (need aa:bb:cc:dd:ee:ff): '${EXTRA_NET_CP_MAC:-}'"
@@ -622,8 +697,50 @@ if [[ -n "${EXTRA_NETWORK:-}" ]]; then
     [[ "${EXTRA_NET_WORKER_IPS[$_i]}" =~ $_cidr_re ]] \
       || fail "EXTRA_NET_WORKER_IPS[$_i] malformed: '${EXTRA_NET_WORKER_IPS[$_i]}'"
   done
+
+  # Uniqueness. A duplicate MAC or address is silently catastrophic: two
+  # VMs on one L2 segment answering for the same identity.
+  declare -A _seen_mac=() _seen_ip=()
+  for _m in "${EXTRA_NET_CP_MAC}" "${EXTRA_NET_WORKER_MACS[@]}"; do
+    _mk="${_m,,}"
+    [[ -z "${_seen_mac[$_mk]:-}" ]] \
+      || fail "duplicate MAC in the EXTRA_NET_* family: '${_m}' — every NIC needs a unique MAC"
+    _seen_mac[$_mk]=1
+  done
+  for _a in "${EXTRA_NET_CP_IP}" "${EXTRA_NET_WORKER_IPS[@]}"; do
+    _ak="${_a%%/*}"
+    [[ -z "${_seen_ip[$_ak]:-}" ]] \
+      || fail "duplicate address in the EXTRA_NET_* family: '${_ak}' — every NIC needs a unique address"
+    _seen_ip[$_ak]=1
+  done
+
+  # Overlap with the cluster's own ranges — the exact collision class that
+  # motivated this work (Cilium's 10.0.0.0/8 default swallowing the LAN).
+  for _a in "${EXTRA_NET_CP_IP}" "${EXTRA_NET_WORKER_IPS[@]}"; do
+    _bare="${_a%%/*}"
+    for _range_name in POD_CIDR SERVICE_CIDR; do
+      _range="${!_range_name:-}"
+      [[ -n "$_range" ]] || continue
+      ! _ip_in_cidr "$_bare" "$_range" \
+        || fail "EXTRA_NET address ${_bare} falls inside ${_range_name}=${_range} — traffic to it would be swallowed by the cluster network. Pick ranges that overlap neither."
+    done
+  done
+
   virsh -c qemu:///system net-info "$EXTRA_NETWORK" >/dev/null 2>&1 \
     || fail "EXTRA_NETWORK='$EXTRA_NETWORK' is not a defined libvirt network on this host — define it first (see cluster.example.conf for a VF-pool example)"
+  # Defined is not enough: an inactive network fails at virt-install time,
+  # after the templates are built and the CP qcow2 is cloned.
+  virsh -c qemu:///system net-info "$EXTRA_NETWORK" 2>/dev/null | awk '/^Active:/{print $2}' | grep -qi '^yes$' \
+    || fail "EXTRA_NETWORK='$EXTRA_NETWORK' is defined but NOT active — run 'virsh net-start ${EXTRA_NETWORK}' (and net-autostart) first"
+  # hostdev (SR-IOV VF) pool: ensure enough ports for 1 CP + N workers.
+  # Running out otherwise surfaces as a cryptic virt-install failure on the
+  # Nth VM, halfway through the deploy.
+  if virsh -c qemu:///system net-dumpxml "$EXTRA_NETWORK" 2>/dev/null | grep -q "forward mode='hostdev'"; then
+    _vf_count="$(virsh -c qemu:///system net-dumpxml "$EXTRA_NETWORK" 2>/dev/null | grep -c "<address type='pci'")"
+    _need=$(( 1 + ${#WORKER_NAMES[@]} ))
+    (( _vf_count >= _need )) \
+      || fail "EXTRA_NETWORK='$EXTRA_NETWORK' is a hostdev pool with ${_vf_count} VF(s) but this deploy needs ${_need} (1 CP + ${#WORKER_NAMES[@]} worker(s))"
+  fi
 else
   # Guard against a half-set family: worker arrays without the master knob
   # would be silently ignored — that silence is the #373-family bug class.
@@ -909,7 +1026,7 @@ for w_idx in "${!WORKER_NAMES[@]}"; do
     w_extra_net_args=(--network "network=${EXTRA_NETWORK},mac=${EXTRA_NET_WORKER_MACS[$w_idx]}")
   fi
 
-  worker_user_data "$w" "$w_userdata"
+  worker_user_data "$w" "$w_userdata" "${EXTRA_NETWORK:+${EXTRA_NET_WORKER_MACS[$w_idx]}}"
   build_cloud_init_seed "$w" "$w_userdata" "$w_seed" "$w_netconfig"
   SEED_ISOS+=("$w_seed")
   rm -f "$w_userdata" ${w_netconfig:+"$w_netconfig"}
