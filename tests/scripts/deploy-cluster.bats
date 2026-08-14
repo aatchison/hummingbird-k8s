@@ -390,6 +390,47 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# render_net2_network_config — second-NIC cloud-init network-config (v2)
+# ---------------------------------------------------------------------------
+#
+# The second NIC rides a seed network-config (rendered by cloud-init-local
+# BEFORE NetworkManager starts) so NM's auto-default DHCP can never grab a
+# default route on it and move node identity. These tests pin the load-
+# bearing properties: MAC match, static address, no gateway anywhere, RA
+# off, and the primary NIC still declared (providing any network-config
+# disables cloud-init's fallback DHCP — omitting primary would kill it).
+
+render_netcfg() {
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  render_net2_network_config "$@"
+}
+
+@test "deploy-cluster: net2 network-config matches by MAC with static addr" {
+  run render_netcfg "52:54:00:d2:00:01" "10.0.0.241/24"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'macaddress: "52:54:00:d2:00:01"'* ]]
+  [[ "$output" == *'- "10.0.0.241/24"'* ]]
+  [[ "$output" == *"dhcp4: false"* ]]
+  [[ "$output" == *"accept-ra: false"* ]]
+}
+
+@test "deploy-cluster: net2 network-config carries NO gateway/default route" {
+  run render_netcfg "52:54:00:d2:00:01" "10.0.0.241/24"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"gateway"* ]]
+  [[ "$output" != *"routes:"* ]]
+  [[ "$output" != *"0.0.0.0/0"* ]]
+}
+
+@test "deploy-cluster: net2 network-config keeps primary NIC on DHCP" {
+  run render_netcfg "52:54:00:d2:00:01" "10.0.0.241/24"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"name: enp1s0"* ]]
+  [[ "$output" == *"dhcp4: true"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # IMAGE_SOURCE default + validation (#231 — registry-first golden path)
 # ---------------------------------------------------------------------------
 #
