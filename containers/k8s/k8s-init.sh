@@ -74,19 +74,32 @@ CONTROL_PLANE_ENDPOINT="${CONTROL_PLANE_ENDPOINT:-}"
 # selected the second NIC's static address as InternalIP on every node
 # even though that NIC carried no default route.
 #
-# Derivation: the address of the interface holding the default route.
-# On these VMs that is the primary NIC BY CONSTRUCTION — the second NIC's
-# cloud-init network-config ships no gateway, no DHCP, accept-ra: false,
-# so it can never own a default route. An operator can still override by
-# setting NODE_IP in k8s-init-local.env.
+# Derivation: the `src` of the default route. On these VMs that is the
+# primary NIC BY CONSTRUCTION — the second NIC's cloud-init
+# network-config ships no gateway and no DHCP, and its IPv6 is disabled
+# by a first-boot runcmd, so it can never own a default route. Using the
+# route's own `src` rather than the interface's first address matches
+# what kubelet/kubeadm autodetection would pick when the NIC carries
+# several global addresses. An operator can override by setting NODE_IP
+# in k8s-init-local.env.
 if [[ -z "${NODE_IP:-}" ]]; then
-  _def_if="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-  if [[ -n "$_def_if" ]]; then
-    NODE_IP="$(ip -4 -o addr show dev "$_def_if" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
-  fi
+  # Bounded retry: at first boot the DHCP lease and default route may not
+  # have landed yet, and this unit is Type=oneshot with no Restart — a
+  # single-shot check would leave the node permanently uninitialised.
+  for _ in $(seq 1 30); do
+    NODE_IP="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    [[ -n "$NODE_IP" ]] && break
+    sleep 1
+  done
 fi
 if [[ -z "${NODE_IP:-}" ]]; then
-  echo "FATAL: could not derive NODE_IP (no default route, or no global IPv4 on its interface). Set NODE_IP in /etc/hummingbird/k8s-init-local.env." >&2
+  # Fall back to the default-route interface's first global address for
+  # routes that carry no src hint.
+  _def_if="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  [[ -n "$_def_if" ]] && NODE_IP="$(ip -4 -o addr show dev "$_def_if" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+fi
+if [[ -z "${NODE_IP:-}" ]]; then
+  echo "FATAL: could not derive NODE_IP (no IPv4 default route after 30s, or no global IPv4 on its interface). Set NODE_IP in /etc/hummingbird/k8s-init-local.env." >&2
   exit 1
 fi
 echo "node identity pinned to ${NODE_IP} (advertise-address + kubelet node-ip)"

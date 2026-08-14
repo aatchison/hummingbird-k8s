@@ -431,6 +431,59 @@ render_netcfg() {
 }
 
 # ---------------------------------------------------------------------------
+# IPv6-off runcmd — the accept-ra/dhcp6 keys never reach NetworkManager
+# ---------------------------------------------------------------------------
+#
+# cloud-init's NM renderer silently drops `accept-ra` and `dhcp6`, leaving
+# the keyfile with no [ipv6] section, which NM normalizes to
+# ipv6.method=auto (verified on a live node). Without the runcmd below, an
+# RA-bearing EXTRA_NETWORK would SLAAC an address and an IPv6 default
+# route onto the NIC that must carry no default route at all.
+
+@test "deploy-cluster: EXTRA_NETWORK emits the CP ipv6-off runcmd" {
+  EXTRA_NETWORK=sriov-vlan2
+  EXTRA_NET_CP_MAC=52:54:00:d2:00:01
+  run render
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ipv6.method disabled"* ]]
+  [[ "$output" == *"52:54:00:d2:00:01"* ]]
+  # Resolved MAC -> device -> connection: the NM renderer names the
+  # connection after the interface, not the network-config key.
+  [[ "$output" == *"GENERAL.CONNECTION"* ]]
+}
+
+@test "deploy-cluster: no EXTRA_NETWORK -> no ipv6-off runcmd" {
+  run render
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"ipv6.method"* ]]
+}
+
+@test "deploy-cluster: worker gets the ipv6-off runcmd when a net2 MAC is passed" {
+  out="${BATS_TEST_TMPDIR}/w.yaml"
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  JOIN_CMD="kubeadm join 1.2.3.4:6443 --token abc"
+  worker_user_data hbird-w1 "$out" "52:54:00:d2:00:02"
+  run cat "$out"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ipv6.method disabled"* ]]
+  [[ "$output" == *"52:54:00:d2:00:02"* ]]
+}
+
+@test "deploy-cluster: worker without a net2 MAC has no ipv6-off runcmd" {
+  out="${BATS_TEST_TMPDIR}/w2.yaml"
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  JOIN_CMD="kubeadm join 1.2.3.4:6443 --token abc"
+  SWITCH_TO_GHCR=false
+  BOOTC_UPDATE_SCHEDULE=""
+  worker_user_data hbird-w1 "$out" ""
+  run cat "$out"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"ipv6.method"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # IMAGE_SOURCE default + validation (#231 — registry-first golden path)
 # ---------------------------------------------------------------------------
 #

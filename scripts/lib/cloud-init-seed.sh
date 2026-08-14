@@ -77,26 +77,37 @@ EOF
     nc_isofile=("$tmp/network-config")
   fi
 
+  # Keep each tool's own diagnostic: discarding stderr left operators with
+  # a bare "X failed" and nothing to act on.
+  local _err
   if command -v cloud-localds >/dev/null 2>&1; then
-    if ! cloud-localds "${nc_localds[@]}" "$out_iso" "$tmp/user-data" "$tmp/meta-data" >/dev/null 2>&1; then
-      echo "build_cloud_init_seed: cloud-localds failed for ${hostname} -> ${out_iso}" >&2
+    if ! _err="$(cloud-localds "${nc_localds[@]}" "$out_iso" "$tmp/user-data" "$tmp/meta-data" 2>&1 >/dev/null)"; then
+      echo "build_cloud_init_seed: cloud-localds failed for ${hostname} -> ${out_iso}: ${_err}" >&2
       return 1
     fi
   elif command -v genisoimage >/dev/null 2>&1; then
-    if ! genisoimage -output "$out_iso" -volid cidata -joliet -rock \
-        "$tmp/user-data" "$tmp/meta-data" "${nc_isofile[@]}" >/dev/null 2>&1; then
-      echo "build_cloud_init_seed: genisoimage failed for ${hostname} -> ${out_iso}" >&2
+    if ! _err="$(genisoimage -output "$out_iso" -volid cidata -joliet -rock \
+        "$tmp/user-data" "$tmp/meta-data" "${nc_isofile[@]}" 2>&1 >/dev/null)"; then
+      echo "build_cloud_init_seed: genisoimage failed for ${hostname} -> ${out_iso}: ${_err}" >&2
       return 1
     fi
   elif command -v mkisofs >/dev/null 2>&1; then
-    if ! mkisofs -output "$out_iso" -volid cidata -joliet -rock \
-        "$tmp/user-data" "$tmp/meta-data" "${nc_isofile[@]}" >/dev/null 2>&1; then
-      echo "build_cloud_init_seed: mkisofs failed for ${hostname} -> ${out_iso}" >&2
+    if ! _err="$(mkisofs -output "$out_iso" -volid cidata -joliet -rock \
+        "$tmp/user-data" "$tmp/meta-data" "${nc_isofile[@]}" 2>&1 >/dev/null)"; then
+      echo "build_cloud_init_seed: mkisofs failed for ${hostname} -> ${out_iso}: ${_err}" >&2
+      return 1
+    fi
+  elif command -v xorrisofs >/dev/null 2>&1; then
+    # xorriso is the ISO tool actually present on modern Fedora hosts;
+    # genisoimage is frequently absent there.
+    if ! _err="$(xorrisofs -output "$out_iso" -volid cidata -joliet -rock \
+        "$tmp/user-data" "$tmp/meta-data" "${nc_isofile[@]}" 2>&1 >/dev/null)"; then
+      echo "build_cloud_init_seed: xorrisofs failed for ${hostname} -> ${out_iso}: ${_err}" >&2
       return 1
     fi
   else
-    echo "build_cloud_init_seed: need one of cloud-localds / genisoimage / mkisofs on PATH" >&2
-    echo "build_cloud_init_seed: install cloud-utils (provides cloud-localds) or genisoimage on this KVM host and retry." >&2
+    echo "build_cloud_init_seed: need one of cloud-localds / genisoimage / mkisofs / xorrisofs on PATH" >&2
+    echo "build_cloud_init_seed: install cloud-utils (provides cloud-localds), xorriso, or genisoimage on this KVM host and retry." >&2
     return 1
   fi
 }
