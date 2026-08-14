@@ -36,7 +36,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # render_cp_user_data — emit the CP cloud-init user-data YAML to stdout.
 # Inputs (env vars): CP_NAME, SSH_PUBKEY_CONTENT, GHCR_TAG, SWITCH_TO_GHCR,
-# AUTO_UPDATE_CP, BOOTC_UPDATE_SCHEDULE, BOOTC_UPDATE_REPO_K8S.
+# AUTO_UPDATE_CP, BOOTC_UPDATE_SCHEDULE, BOOTC_UPDATE_REPO_K8S,
+# POD_CIDR, SERVICE_CIDR (optional per-cluster CIDR overrides — written to
+# /etc/hummingbird/k8s-init-local.env, sourced by k8s-init.sh after the
+# image-baked k8s-init.env).
 #
 # Extracted from the inline `{ ... } > $CP_USER_DATA` block so
 # tests/scripts/deploy-cluster.bats can exercise the rendered output
@@ -55,10 +58,10 @@ render_cp_user_data() {
   printf '  - name: root\n'
   printf '    ssh_authorized_keys:\n'
   printf '      - %s\n' "$SSH_PUBKEY_CONTENT"
-  # write_files for bootc-semver-update overrides. Only emit the block
-  # when at least one override is set, otherwise the YAML stays clean
-  # (no empty write_files array).
-  if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" || -n "${BOOTC_UPDATE_REPO_K8S:-}" ]]; then
+  # write_files for bootc-semver-update + CIDR overrides. Only emit the
+  # block when at least one override is set, otherwise the YAML stays
+  # clean (no empty write_files array).
+  if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" || -n "${BOOTC_UPDATE_REPO_K8S:-}" || -n "${POD_CIDR:-}" || -n "${SERVICE_CIDR:-}" ]]; then
     printf 'write_files:\n'
     if [[ -n "${BOOTC_UPDATE_SCHEDULE:-}" ]]; then
       # Drop-in to override the image's OnCalendar=. Empty OnCalendar=
@@ -78,6 +81,22 @@ render_cp_user_data() {
       printf '    content: |\n'
       printf '      REPO=%s\n' "$BOOTC_UPDATE_REPO_K8S"
       printf '      PREFIX=v\n'
+    fi
+    if [[ -n "${POD_CIDR:-}" || -n "${SERVICE_CIDR:-}" ]]; then
+      # Per-cluster CIDR overrides for the first-boot k8s-init script.
+      # A SEPARATE file from the image-baked k8s-init.env so a bootc
+      # image update never clobbers operator config (and vice versa).
+      # k8s-init.sh sources this AFTER the baked env, so these win.
+      printf '  - path: /etc/hummingbird/k8s-init-local.env\n'
+      printf '    owner: root:root\n'
+      printf "    permissions: '0600'\n"
+      printf '    content: |\n'
+      if [[ -n "${POD_CIDR:-}" ]]; then
+        printf '      POD_CIDR=%s\n' "$POD_CIDR"
+      fi
+      if [[ -n "${SERVICE_CIDR:-}" ]]; then
+        printf '      SERVICE_CIDR=%s\n' "$SERVICE_CIDR"
+      fi
     fi
   fi
   # Always emit a runcmd block now: the AUTO_UPDATE_CP=false branch needs

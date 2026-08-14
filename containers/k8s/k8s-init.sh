@@ -50,7 +50,19 @@ if [[ -r /etc/hummingbird/k8s-init.env ]]; then
   source /etc/hummingbird/k8s-init.env
 fi
 
+# Per-cluster overrides: cloud-init write_files lands
+# /etc/hummingbird/k8s-init-local.env before this service starts (see
+# render_cp_user_data in scripts/deploy-cluster.sh). Sourced AFTER the
+# baked env so a cluster.local.conf POD_CIDR/SERVICE_CIDR wins over the
+# image-build ARG defaults. Kept as a separate file so a bootc image
+# update never clobbers operator config (and vice versa).
+if [[ -r /etc/hummingbird/k8s-init-local.env ]]; then
+  # shellcheck disable=SC1091
+  source /etc/hummingbird/k8s-init-local.env
+fi
+
 POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+SERVICE_CIDR="${SERVICE_CIDR:-10.96.0.0/12}"
 APISERVER_EXTRA_SANS="${APISERVER_EXTRA_SANS:-127.0.0.1,localhost}"
 CONTROL_PLANE_ENDPOINT="${CONTROL_PLANE_ENDPOINT:-}"
 
@@ -130,6 +142,7 @@ apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 ${CONTROL_PLANE_ENDPOINT_YAML}networking:
   podSubnet: ${POD_CIDR}
+  serviceSubnet: ${SERVICE_CIDR}
 apiServer:
   timeoutForControlPlane: 5m0s
   extraArgs:
@@ -199,8 +212,18 @@ chmod 0644 /etc/kubernetes/admin.conf
 # Hubble + relay are enabled for flow visibility (#78); the UI is left off
 # to keep the install lean — operators reach Hubble via
 # `cilium hubble port-forward` + `hubble observe`.
+# ipam.operator.clusterPoolIPv4PodCIDRList MUST be passed explicitly:
+# with ipam=cluster-pool (the chart default) Cilium IGNORES kubeadm's
+# networking.podSubnet and falls back to its own chart default of
+# 10.0.0.0/8 — silently swallowing any RFC-1918 10.x LAN the nodes can
+# reach, while `kubectl get nodes -o jsonpath={.spec.podCIDR}` keeps
+# reporting the (unused) kubeadm allocation. Observed live on
+# hbird-geary: pods allocated from 10.0.{0,1,2}.0/24 while node.spec
+# claimed 10.244.x — a latent collision with the 10.0.0.0/24 LAN.
 KUBECONFIG=/etc/kubernetes/admin.conf cilium install \
   --version 1.17.16 \
+  --set ipam.operator.clusterPoolIPv4PodCIDRList="${POD_CIDR}" \
+  --set ipam.operator.clusterPoolIPv4MaskSize=24 \
   --set kubeProxyReplacement=true \
   --set k8sServiceHost=auto \
   --set k8sServicePort=6443 \
