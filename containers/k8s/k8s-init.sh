@@ -66,6 +66,31 @@ SERVICE_CIDR="${SERVICE_CIDR:-10.96.0.0/12}"
 APISERVER_EXTRA_SANS="${APISERVER_EXTRA_SANS:-127.0.0.1,localhost}"
 CONTROL_PLANE_ENDPOINT="${CONTROL_PLANE_ENDPOINT:-}"
 
+# ---- Node identity pinning --------------------------------------------------
+# NODE_IP pins BOTH the kubelet's --node-ip and the apiserver's
+# advertise-address. Without it kubelet AUTODETECTS the node address, and
+# on a dual-NIC VM (EXTRA_NETWORK, deploy-cluster.sh) that autodetection
+# is not guaranteed to pick the primary NIC — observed live: kubelet
+# selected the second NIC's static address as InternalIP on every node
+# even though that NIC carried no default route.
+#
+# Derivation: the address of the interface holding the default route.
+# On these VMs that is the primary NIC BY CONSTRUCTION — the second NIC's
+# cloud-init network-config ships no gateway, no DHCP, accept-ra: false,
+# so it can never own a default route. An operator can still override by
+# setting NODE_IP in k8s-init-local.env.
+if [[ -z "${NODE_IP:-}" ]]; then
+  _def_if="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  if [[ -n "$_def_if" ]]; then
+    NODE_IP="$(ip -4 -o addr show dev "$_def_if" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+  fi
+fi
+if [[ -z "${NODE_IP:-}" ]]; then
+  echo "FATAL: could not derive NODE_IP (no default route, or no global IPv4 on its interface). Set NODE_IP in /etc/hummingbird/k8s-init-local.env." >&2
+  exit 1
+fi
+echo "node identity pinned to ${NODE_IP} (advertise-address + kubelet node-ip)"
+
 swapoff -a || true
 modprobe overlay
 modprobe br_netfilter
@@ -130,6 +155,8 @@ fi
 cat >/etc/kubernetes/kubeadm-init.yaml <<EOF
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: ${NODE_IP}
 nodeRegistration:
   criSocket: unix:///var/run/crio/crio.sock
   kubeletExtraArgs:
@@ -137,6 +164,8 @@ nodeRegistration:
       value: "true"
     - name: rotate-certificates
       value: "true"
+    - name: node-ip
+      value: "${NODE_IP}"
 ---
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
