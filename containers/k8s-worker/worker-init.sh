@@ -93,12 +93,22 @@ fi
 # KUBELET_EXTRA_ARGS via cloud-init write_files (which lands before this
 # service). Our --node-ip goes FIRST so an explicit operator --node-ip
 # later in the string still wins under pflag last-wins.
+#
+# Parsed textually rather than by sourcing: systemd EnvironmentFile takes
+# the whole rest of the line as the value, but `source` on an unquoted
+# multi-flag line (KUBELET_EXTRA_ARGS=--node-ip=X --max-pods=200) assigns
+# only the first token and tries to EXECUTE the rest — silently dropping
+# every other operator flag. We write the value quoted for the same reason.
 _existing=""
 if [[ -r /etc/sysconfig/kubelet ]]; then
-  # shellcheck disable=SC1091
-  _existing="$(. /etc/sysconfig/kubelet 2>/dev/null; printf '%s' "${KUBELET_EXTRA_ARGS:-}")"
+  _existing="$(sed -n 's/^[[:space:]]*KUBELET_EXTRA_ARGS=//p' /etc/sysconfig/kubelet | tail -1)"
+  if [[ "$_existing" == \"*\" || "$_existing" == \'*\' ]]; then
+    _existing="${_existing:1:${#_existing}-2}"
+  fi
+  # Drop any pre-existing --node-ip so ours is unambiguous.
+  _existing="$(sed -E 's/--node-ip=[^ ]*//g; s/  +/ /g; s/^ //; s/ $//' <<<"$_existing")"
 fi
-printf 'KUBELET_EXTRA_ARGS=--node-ip=%s%s\n' "$NODE_IP" "${_existing:+ ${_existing}}" > /etc/sysconfig/kubelet
+printf 'KUBELET_EXTRA_ARGS="--node-ip=%s%s"\n' "$NODE_IP" "${_existing:+ ${_existing}}" > /etc/sysconfig/kubelet
 echo "worker node identity pinned to ${NODE_IP} (kubelet --node-ip via /etc/sysconfig/kubelet)"
 
 # Unique-ish hostname so kubelet doesn't claim "localhost.localdomain" on every

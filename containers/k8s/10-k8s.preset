@@ -19,4 +19,5 @@ enable bootc-semver-update.timer
 enable crio.service
 enable kubelet.service
 enable k8s-init.service
+enable hbird-node-ip.service
 enable health-check-rollback.timer

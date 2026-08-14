@@ -283,6 +283,51 @@ emit_net2_ipv6_off_runcmd() {
   printf '    nmcli connection up "$con" >/dev/null\n'
 }
 
+# derive_primary_mac — deterministic MAC for a VM's PRIMARY NIC, derived
+# from its domain name. The same name always yields the same MAC.
+#
+# WHY (#409): the pinned kubelet --node-ip is a DHCP lease frozen at first
+# boot. Without a stable MAC a rebuilt VM gets a libvirt-random MAC, hence
+# a different lease, while the pinned --node-ip stays put — leaving kubelet
+# with an address on no interface. A name-derived MAC makes dnsmasq hand
+# back the same lease (its db is keyed on MAC) and makes an explicit
+# reservation possible.
+#
+# 52:54:00 is the QEMU/KVM OUI libvirt itself uses. The low three bytes are
+# the first 6 hex digits of the name's sha256; a collision across the
+# handful of VMs on one host is negligible, and validation checks for one
+# explicitly against the EXTRA_NET_* family.
+derive_primary_mac() {
+  local name="$1" h
+  h="$(printf '%s' "$name" | sha256sum | cut -c1-6)"
+  printf '52:54:00:%s:%s:%s' "${h:0:2}" "${h:2:2}" "${h:4:2}"
+}
+
+# ensure_dhcp_reservation — add a <host mac ip> entry to a libvirt network
+# so a VM's primary address is a RESERVATION, not merely a sticky lease.
+# Idempotent, and never fatal: a host that cannot net-update, or a network
+# that already carries the entry, must not abort a deploy.
+ensure_dhcp_reservation() {
+  local net="$1" mac="$2" ip="$3" name="$4"
+  [[ -n "$ip" ]] || return 0
+  if virsh -c qemu:///system net-dumpxml "$net" 2>/dev/null | grep -qi "mac='${mac}'"; then
+    log "DHCP reservation for ${name} (${mac} -> ${ip}) already present on network '${net}'"
+    return 0
+  fi
+  # Reserving an address another host already holds is worse than no
+  # reservation at all.
+  if virsh -c qemu:///system net-dumpxml "$net" 2>/dev/null | grep -q "ip='${ip}'"; then
+    log "WARN: ${ip} is already reserved on network '${net}' under a different MAC — skipping reservation for ${name}. Pick a free CP_IP/WORKER_IPS value or clear the stale entry."
+    return 0
+  fi
+  if virsh -c qemu:///system net-update "$net" add ip-dhcp-host \
+       "<host mac='${mac}' name='${name}' ip='${ip}'/>" --live --config >/dev/null 2>&1; then
+    log "added DHCP reservation on '${net}': ${name} ${mac} -> ${ip}"
+  else
+    log "WARN: could not add a DHCP reservation for ${name} on '${net}' (continuing — the pinned MAC still makes the lease sticky)"
+  fi
+}
+
 # resolve_switch_to_ghcr: #374 guard against the second false-positive
 # boot-test mechanism (sibling to #373's qcow2 cache reuse). FORCE_REBUILD=1
 # signals the operator is testing a SPECIFIC freshly-built image (a local
@@ -661,6 +706,24 @@ _cidr_re='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0
 # entirely-unset array is the MOST likely misconfiguration.
 declare -p EXTRA_NET_WORKER_MACS >/dev/null 2>&1 || EXTRA_NET_WORKER_MACS=()
 declare -p EXTRA_NET_WORKER_IPS  >/dev/null 2>&1 || EXTRA_NET_WORKER_IPS=()
+# Primary-NIC MAC overrides (#409); optional, and indexed the same way.
+declare -p WORKER_MACS >/dev/null 2>&1 || WORKER_MACS=()
+declare -p WORKER_IPS  >/dev/null 2>&1 || WORKER_IPS=()
+
+# Primary-NIC MACs, whether operator-set or name-derived, must not collide
+# with each other or with the second-NIC family — one duplicate MAC on a
+# segment is enough to break both VMs.
+declare -A _primary_macs=()
+_pm="${CP_MAC:-$(derive_primary_mac "$CP_NAME")}"
+[[ "$_pm" =~ $_mac_re ]] || fail "CP_MAC is malformed (need aa:bb:cc:dd:ee:ff): '${_pm}'"
+_primary_macs["${_pm,,}"]="$CP_NAME"
+for _i in "${!WORKER_NAMES[@]}"; do
+  _pm="${WORKER_MACS[$_i]:-$(derive_primary_mac "${WORKER_NAMES[$_i]}")}"
+  [[ "$_pm" =~ $_mac_re ]] || fail "WORKER_MACS[$_i] is malformed (need aa:bb:cc:dd:ee:ff): '${_pm}'"
+  [[ -z "${_primary_macs[${_pm,,}]:-}" ]] \
+    || fail "primary-NIC MAC collision: ${WORKER_NAMES[$_i]} and ${_primary_macs[${_pm,,}]} would both use ${_pm} — set CP_MAC/WORKER_MACS explicitly to break the tie"
+  _primary_macs["${_pm,,}"]="${WORKER_NAMES[$_i]}"
+done
 
 # POD_CIDR / SERVICE_CIDR are printf'd into cloud-init YAML and sourced as
 # root by k8s-init.sh — validate whenever set, independent of EXTRA_NETWORK.
@@ -705,6 +768,9 @@ if [[ -n "${EXTRA_NETWORK:-}" ]]; then
     _mk="${_m,,}"
     [[ -z "${_seen_mac[$_mk]:-}" ]] \
       || fail "duplicate MAC in the EXTRA_NET_* family: '${_m}' — every NIC needs a unique MAC"
+    # Also cross-check against the primary NICs' MACs (#409).
+    [[ -z "${_primary_macs[$_mk]:-}" ]] \
+      || fail "EXTRA_NET MAC '${_m}' collides with the primary-NIC MAC of ${_primary_macs[$_mk]} — every NIC on the host needs a unique MAC"
     _seen_mac[$_mk]=1
   done
   for _a in "${EXTRA_NET_CP_IP}" "${EXTRA_NET_WORKER_IPS[@]}"; do
@@ -950,7 +1016,13 @@ if [[ -n "${EXTRA_NETWORK:-}" ]]; then
   CP_EXTRA_NET_ARGS=(--network "network=${EXTRA_NETWORK},mac=${EXTRA_NET_CP_MAC}")
 fi
 
-log "virt-install ${CP_NAME} (memory=${CP_MEMORY} vcpus=${CP_VCPUS})"
+# Primary NIC MAC: deterministic from the domain name so a rebuilt VM
+# keeps its DHCP lease, which is what the pinned kubelet --node-ip depends
+# on (#409). Overridable per-cluster via CP_MAC.
+CP_PRIMARY_MAC="${CP_MAC:-$(derive_primary_mac "$CP_NAME")}"
+ensure_dhcp_reservation default "$CP_PRIMARY_MAC" "${CP_IP:-}" "$CP_NAME"
+
+log "virt-install ${CP_NAME} (memory=${CP_MEMORY} vcpus=${CP_VCPUS}, primary mac=${CP_PRIMARY_MAC})"
 virt-install --connect qemu:///system \
   --name "$CP_NAME" \
   --memory "$CP_MEMORY" --vcpus "$CP_VCPUS" \
@@ -958,7 +1030,7 @@ virt-install --connect qemu:///system \
   --disk path="$CP_SEED",device=cdrom,readonly=on \
   --import \
   --os-variant fedora-unknown \
-  --network network=default,model=virtio \
+  --network "network=default,model=virtio,mac=${CP_PRIMARY_MAC}" \
   "${CP_EXTRA_NET_ARGS[@]}" \
   --graphics vnc,listen=127.0.0.1 \
   --noautoconsole
@@ -1039,7 +1111,11 @@ for w_idx in "${!WORKER_NAMES[@]}"; do
     chmod 0644 "$w_qcow"
   fi
 
-  log "virt-install ${w} (memory=${WORKER_MEMORY} vcpus=${WORKER_VCPUS}) [bg]"
+  # Primary NIC MAC + optional reservation — see the CP block (#409).
+  w_primary_mac="${WORKER_MACS[$w_idx]:-$(derive_primary_mac "$w")}"
+  ensure_dhcp_reservation default "$w_primary_mac" "${WORKER_IPS[$w_idx]:-}" "$w"
+
+  log "virt-install ${w} (memory=${WORKER_MEMORY} vcpus=${WORKER_VCPUS}, primary mac=${w_primary_mac}) [bg]"
   virt-install --connect qemu:///system \
     --name "$w" \
     --memory "$WORKER_MEMORY" --vcpus "$WORKER_VCPUS" \
@@ -1047,7 +1123,7 @@ for w_idx in "${!WORKER_NAMES[@]}"; do
     --disk path="$w_seed",device=cdrom,readonly=on \
     --import \
     --os-variant fedora-unknown \
-    --network network=default,model=virtio \
+    --network "network=default,model=virtio,mac=${w_primary_mac}" \
     "${w_extra_net_args[@]}" \
     --graphics vnc,listen=127.0.0.1 \
     --noautoconsole &

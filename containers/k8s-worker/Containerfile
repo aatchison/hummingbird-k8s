@@ -120,6 +120,13 @@ COPY containers/k8s-worker/worker-init.sh /usr/libexec/worker-init.sh
 RUN chmod +x /usr/libexec/worker-init.sh
 COPY containers/k8s-worker/worker-init.service /etc/systemd/system/worker-init.service
 
+# Re-derive kubelet --node-ip on every boot so a changed DHCP lease cannot
+# strand the node with a --node-ip matching no local interface (#409).
+# worker-init.sh pins it once and is then short-circuited by its done-marker.
+COPY containers/shared/kubernetes/hbird-node-ip.sh /usr/libexec/hbird-node-ip.sh
+RUN chmod +x /usr/libexec/hbird-node-ip.sh
+COPY containers/shared/kubernetes/hbird-node-ip.service /etc/systemd/system/hbird-node-ip.service
+
 # Post-upgrade health-check + auto-rollback (#104). The timer fires 3 min
 # after every boot; the script only takes action when the marker file
 # /var/lib/bootc-just-upgraded is present (set by an ExecStartPost drop-in
@@ -149,6 +156,7 @@ RUN chmod +x /usr/libexec/bootc-semver-update.sh \
 
 COPY containers/k8s-worker/10-k8s-worker.preset /usr/lib/systemd/system-preset/10-k8s-worker.preset
 RUN systemctl preset crio.service kubelet.service worker-init.service \
+      hbird-node-ip.service \
       bootc-fetch-apply-updates.timer health-check-rollback.timer \
       bootc-semver-update.timer || true
 

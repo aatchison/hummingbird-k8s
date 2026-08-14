@@ -164,10 +164,17 @@ RUN chmod +x /usr/libexec/verify-encryption.sh
 
 COPY containers/k8s/k8s-init.service /etc/systemd/system/k8s-init.service
 
+# Re-derive kubelet --node-ip on every boot so a changed DHCP lease cannot
+# strand the node with a --node-ip matching no local interface (#409).
+# k8s-init.sh pins it once and is then short-circuited by its done-marker.
+COPY containers/shared/kubernetes/hbird-node-ip.sh /usr/libexec/hbird-node-ip.sh
+RUN chmod +x /usr/libexec/hbird-node-ip.sh
+COPY containers/shared/kubernetes/hbird-node-ip.service /etc/systemd/system/hbird-node-ip.service
+
 # Hummingbird ships a 99-default-disable.preset that strips unenabled symlinks
 # during image build. Override with a low-numbered preset that wins.
 COPY containers/k8s/10-k8s.preset /usr/lib/systemd/system-preset/10-k8s.preset
-RUN systemctl preset crio.service kubelet.service k8s-init.service || true
+RUN systemctl preset crio.service kubelet.service k8s-init.service hbird-node-ip.service || true
 
 # Security hardening config files (PodSecurity Admission + apiserver audit policy).
 # Read-only references mounted into the apiserver static pod by k8s-init.sh.
