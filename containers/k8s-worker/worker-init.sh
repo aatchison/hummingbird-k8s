@@ -39,6 +39,31 @@ modprobe overlay
 modprobe br_netfilter
 sysctl --system >/dev/null
 
+# ---- Node identity pinning --------------------------------------------------
+# Pin kubelet's --node-ip to the primary NIC's address BEFORE the join.
+# Without it kubelet autodetects, and on a dual-NIC VM (EXTRA_NETWORK in
+# deploy-cluster.sh) that autodetection is not guaranteed to pick the
+# primary NIC — observed live: kubelet selected the second NIC's static
+# address as InternalIP even though that NIC carried no default route.
+#
+# Derivation: the address of the interface holding the default route —
+# the primary NIC BY CONSTRUCTION (the second NIC's cloud-init
+# network-config ships no gateway/DHCP/RA, so it can never own a default
+# route). Written to /etc/sysconfig/kubelet (the kubelet unit's
+# EnvironmentFile; the RPM default is an empty KUBELET_EXTRA_ARGS=) so
+# the flag survives kubeadm's own kubeadm-flags.env regeneration.
+_def_if="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+NODE_IP=""
+if [[ -n "$_def_if" ]]; then
+  NODE_IP="$(ip -4 -o addr show dev "$_def_if" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+fi
+if [[ -z "$NODE_IP" ]]; then
+  echo "FATAL: could not derive NODE_IP (no default route, or no global IPv4 on its interface)." >&2
+  exit 1
+fi
+echo "KUBELET_EXTRA_ARGS=--node-ip=${NODE_IP}" > /etc/sysconfig/kubelet
+echo "worker node identity pinned to ${NODE_IP} (kubelet --node-ip via /etc/sysconfig/kubelet)"
+
 # Unique-ish hostname so kubelet doesn't claim "localhost.localdomain" on every
 # worker (kubeadm uses the local hostname as the node name).
 #
