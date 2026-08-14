@@ -470,6 +470,37 @@ render_netcfg() {
   [[ "$output" == *"52:54:00:d2:00:02"* ]]
 }
 
+# ---------------------------------------------------------------------------
+# derive_primary_mac — deterministic primary-NIC MAC (#409)
+# ---------------------------------------------------------------------------
+#
+# kubelet's --node-ip is pinned at first boot and never re-derived by the
+# init scripts, so the primary NIC's DHCP lease must be stable. A MAC
+# derived from the domain name means a rebuilt VM of the same name draws
+# the same lease instead of a fresh libvirt-random MAC.
+
+derive_mac() {
+  # shellcheck disable=SC1090
+  source "$SCRIPT"
+  derive_primary_mac "$@"
+}
+
+@test "deploy-cluster: derive_primary_mac is deterministic and uses the QEMU OUI" {
+  run derive_mac hbird-cp1
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ ^52:54:00:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$ ]]
+  first="$output"
+  run derive_mac hbird-cp1
+  [ "$output" = "$first" ]
+}
+
+@test "deploy-cluster: derive_primary_mac differs per VM name" {
+  run derive_mac hbird-cp1
+  a="$output"
+  run derive_mac hbird-w1
+  [ "$output" != "$a" ]
+}
+
 @test "deploy-cluster: worker without a net2 MAC has no ipv6-off runcmd" {
   out="${BATS_TEST_TMPDIR}/w2.yaml"
   # shellcheck disable=SC1090

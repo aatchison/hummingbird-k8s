@@ -1,0 +1,21 @@
+[Unit]
+Description=Re-derive kubelet --node-ip from the default route
+Documentation=https://github.com/aatchison/hummingbird-k8s/issues/409
+# Must land before kubelet reads its EnvironmentFile. network-online is
+# required because the derivation reads the default route, which on a cold
+# boot appears only once DHCP has completed.
+After=network-online.target
+Wants=network-online.target
+Before=kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/hbird-node-ip.sh
+RemainAfterExit=yes
+# Never block kubelet: the script exits 0 when it cannot derive an address,
+# and this makes even an unexpected failure non-fatal to the boot.
+SuccessExitStatus=0 1
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
