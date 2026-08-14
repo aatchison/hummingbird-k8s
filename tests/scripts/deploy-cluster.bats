@@ -65,6 +65,8 @@ setup() {
   export AUTO_UPDATE_CP=true
   export BOOTC_UPDATE_SCHEDULE=""
   export BOOTC_UPDATE_REPO_K8S=""
+  export POD_CIDR=""
+  export SERVICE_CIDR=""
 
   # ---- For #219 WORKER_NAMES resolver tests -------------------------------
   HARNESS="${BATS_TEST_TMPDIR}/resolve.sh"
@@ -340,6 +342,51 @@ EOF
   # Runcmd reloads + restarts the timer so the override takes effect this boot.
   [[ "$output" == *"systemctl, daemon-reload"* ]]
   [[ "$output" == *"systemctl, restart, bootc-semver-update.timer"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# render_cp_user_data — POD_CIDR / SERVICE_CIDR overrides
+# ---------------------------------------------------------------------------
+#
+# Per-cluster CIDR overrides ride cloud-init write_files into
+# /etc/hummingbird/k8s-init-local.env, which k8s-init.sh sources AFTER the
+# image-baked k8s-init.env. The same POD_CIDR value also drives the
+# explicit ipam.operator.clusterPoolIPv4PodCIDRList pass to cilium install
+# (without it Cilium's cluster-pool default 10.0.0.0/8 silently overrides
+# kubeadm's podSubnet).
+
+@test "deploy-cluster: POD_CIDR emits k8s-init-local.env write_files entry" {
+  POD_CIDR="10.244.0.0/16"
+  run render
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"path: /etc/hummingbird/k8s-init-local.env"* ]]
+  [[ "$output" == *"POD_CIDR=10.244.0.0/16"* ]]
+  # SERVICE_CIDR unset -> no line for it.
+  [[ "$output" != *"SERVICE_CIDR="* ]]
+}
+
+@test "deploy-cluster: SERVICE_CIDR alone also emits the env file" {
+  SERVICE_CIDR="10.97.0.0/16"
+  run render
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"path: /etc/hummingbird/k8s-init-local.env"* ]]
+  [[ "$output" == *"SERVICE_CIDR=10.97.0.0/16"* ]]
+  [[ "$output" != *"POD_CIDR="* ]]
+}
+
+@test "deploy-cluster: both CIDRs set emits both lines in one entry" {
+  POD_CIDR="10.244.0.0/16"
+  SERVICE_CIDR="10.97.0.0/16"
+  run render
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"POD_CIDR=10.244.0.0/16"* ]]
+  [[ "$output" == *"SERVICE_CIDR=10.97.0.0/16"* ]]
+}
+
+@test "deploy-cluster: no CIDR overrides -> no k8s-init-local.env entry" {
+  run render
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"k8s-init-local.env"* ]]
 }
 
 # ---------------------------------------------------------------------------
