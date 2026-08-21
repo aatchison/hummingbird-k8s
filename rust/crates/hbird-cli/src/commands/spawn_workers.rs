@@ -33,7 +33,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use clap::Args;
 use clap::builder::BoolishValueParser;
 
@@ -294,9 +294,31 @@ fn plan_worker_loop(
     injector: Injector,
 ) -> Result<()> {
     let template = plan.template_path();
-    log(&format!(
-        "DRY-RUN worker template qcow2: {template} (must exist; bash twin fails fast when missing)"
-    ));
+    if plan.dry_run {
+        log(&format!(
+            "DRY-RUN worker template qcow2: {template} (must exist; bash twin fails fast when missing)"
+        ));
+    } else {
+        // Two bugs fixed here, both seen during #289 S4 live validation:
+        //
+        // 1. This line was logged unconditionally, so a LIVE run printed a
+        //    "DRY-RUN ..." line. An operator reading the log could
+        //    reasonably conclude nothing had been created — while VMs were
+        //    in fact being installed.
+        // 2. It only CLAIMED the template "must exist"; nothing actually
+        //    checked. The bash twin fails fast when it is missing. Without
+        //    the check the clone step fails later with a qemu-img error
+        //    that does not name the template as the cause.
+        match conn.remote_path_exists(&template) {
+            Ok(true) => log(&format!("worker template qcow2: {template}")),
+            Ok(false) => bail!(
+                "worker template qcow2 {template} does not exist. Build it first \
+                 (`make image-worker` + bib, or `make spawn-workers` which builds it), \
+                 or point POOL_DIR at the directory that holds it."
+            ),
+            Err(e) => bail!("could not stat worker template qcow2 {template}: {e}"),
+        }
+    }
     for i in 1..=plan.count {
         let name = plan.worker_name(i);
         let qcow = format!("{}/{name}.qcow2", plan.pool_dir);
