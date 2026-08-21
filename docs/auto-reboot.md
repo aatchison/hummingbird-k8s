@@ -59,14 +59,14 @@ nightly timer ── ExecCondition ─▶ hbird-staged-check.sh
 
 [`docs/update-cluster.md`](update-cluster.md) describes `hbird update-cluster`
 as the coordinated roll, and it is the right long-term home for this logic —
-but as of `hbird` v0.0.1 its **live path is unimplemented**. A live invocation
-aborts with:
+and its live path is **now implemented** — including `timer_stop` /
+`timer_start`, the last two block-#4 helpers, plus `virsh domifaddr` IP
+resolution so static `CP_IP` / `WORKER_IPS` are no longer required.
 
-```text
-`timer_stop` requires a remote SSH/kubectl round-trip that is not yet
-implemented in the Rust path. ... Until the live-execution slice lands
-(tracked by #322), run with `--dry-run` to preview the plan
-```
+> **Historical note.** Through `hbird` v0.0.1 a live invocation aborted at
+> `timer_stop` with a "not yet implemented in the Rust path" diagnostic.
+> That is no longer true; the shell executor below is retained because it
+> is still the scheduling surface, not because the Rust path is missing.
 
 `--dry-run` succeeds and prints a complete, plausible plan (`succeeded (3)`),
 which makes this easy to miss when validating an unattended timer — the dry-run

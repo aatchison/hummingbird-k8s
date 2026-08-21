@@ -174,6 +174,14 @@ pub(crate) struct Timeouts {
     pub ssh_drop: u32,
     /// Seconds between batches (default 5).
     pub inter_node_sleep: u32,
+    /// Wall-clock budget for a single remote command (default 3600).
+    ///
+    /// `ConnectTimeout` only bounds the handshake, so before this existed a
+    /// wedged `bootc upgrade` blocked the rollout forever with no
+    /// diagnostic. The default is deliberately generous — an hour is far
+    /// above any legitimate `bootc upgrade`, so this catches a hang without
+    /// truncating real work. `0` disables the watchdog.
+    pub ssh_command: u32,
 }
 
 impl Default for Timeouts {
@@ -186,6 +194,7 @@ impl Default for Timeouts {
             ssh: 300,
             ssh_drop: 30,
             inter_node_sleep: 5,
+            ssh_command: 3600,
         }
     }
 }
@@ -260,6 +269,10 @@ impl Timeouts {
             std::env::var("INTER_NODE_SLEEP").unwrap_or_else(|_| "5".to_string());
         let inter_node_sleep = req_u32_nonneg("INTER_NODE_SLEEP", &inter_node_sleep)?;
 
+        let ssh_command =
+            std::env::var("SSH_COMMAND_TIMEOUT").unwrap_or_else(|_| "3600".to_string());
+        let ssh_command = req_u32_nonneg("SSH_COMMAND_TIMEOUT", &ssh_command)?;
+
         Ok(Self {
             drain,
             ready,
@@ -268,6 +281,7 @@ impl Timeouts {
             ssh,
             ssh_drop,
             inter_node_sleep,
+            ssh_command,
         })
     }
 }
@@ -374,7 +388,6 @@ pub(crate) struct Plan {
     /// means run libvirt directly (operator already on the KVM host).
     /// Threaded into [`Plan`] by round-2 review (lens L1 medium): the
     /// live-execution slice (#322) consumes this when it lands.
-    #[allow(dead_code)] // consumed by live-execution slice (#322).
     pub kvm_host: Option<String>,
     /// `HBIRD_REMOTE_NO_SUDO=1` toggle. When true, the libvirt-group
     /// operator path is in effect — virsh on the remote skips the sudo
@@ -431,17 +444,24 @@ impl Plan {
             }
             ("<resolved-at-runtime>".to_string(), m)
         } else {
-            // Operator-supplied IPs win over virsh resolution.
-            let cp_ip = config
-                .cp_ip
+            // Operator-supplied IPs win over virsh resolution; virsh is the
+            // fallback (#322 live-execution slice). One SSH client to
+            // KVM_HOST is built once and reused for every domain lookup, so
+            // an N-worker cluster costs N virsh round-trips over a single
+            // configured transport rather than N configured transports.
+            let kvm_host = args
+                .kvm_host
                 .clone()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "could not resolve CP IP for domain '{}' via virsh domifaddr (set CP_IP= in env to override)",
-                        config.cp_name
-                    )
-                })?;
+                .or_else(|| config.kvm_host.clone())
+                .filter(|s| !s.is_empty());
+            let virsh = kvm_host
+                .as_deref()
+                .map(|h| hbird_ssh::Client::new(hbird_ssh::SshOptions::new(h.to_string())));
+
+            let cp_ip = match config.cp_ip.clone().filter(|s| !s.is_empty()) {
+                Some(ip) => ip,
+                None => resolve_domain_ip(virsh.as_ref(), kvm_host.as_deref(), &config.cp_name)?,
+            };
 
             let mut m = HashMap::with_capacity(worker_names.len());
             if let Some(ips) = &config.worker_ips {
@@ -456,15 +476,14 @@ impl Plan {
                     m.insert(w.clone(), ip.clone());
                 }
             } else {
-                // No virsh-domifaddr fallback baked into this scaffold —
-                // operator must set WORKER_IPS until the live-execution
-                // path lands. See module docs.
-                bail!(
-                    "live-mode IP resolution not yet implemented in the Rust path. \
-                     Set WORKER_IPS=(...) and CP_IP= in cluster.local.conf, or run \
-                     under --dry-run, until the virsh-domifaddr resolution lands. \
-                     (Tracked by #322 for the live-execution slice.)"
-                );
+                // Resolve each worker the same way the bash twin populated
+                // WORKER_IP_MAP: one `virsh domifaddr` per domain on the
+                // KVM host. Failure names the specific domain, so an
+                // operator with one un-booted worker sees which one.
+                for w in &worker_names {
+                    let ip = resolve_domain_ip(virsh.as_ref(), kvm_host.as_deref(), w)?;
+                    m.insert(w.clone(), ip);
+                }
             }
             (cp_ip, m)
         };
@@ -1017,6 +1036,36 @@ fn bootc_booted_digest_with_exec(exec: &impl hbird_ssh::SshExec, ip: &str) -> Re
 
 // ---- block #4: timer stop/start --------------------------------------------
 
+/// Resolve one libvirt domain's IPv4 address via `virsh domifaddr` on the
+/// KVM host, reusing the shared resolver in [`crate::cp_resolve`].
+///
+/// `client` is `None` exactly when the operator supplied no `KVM_HOST`.
+/// There is then no transport to query libvirt through, so this fails with
+/// an actionable message naming both escape hatches rather than proceeding
+/// with an empty IP — a blank IP would surface later as an opaque SSH
+/// failure against `root@`.
+///
+/// Generic over [`hbird_ssh::SshExec`] so unit tests can drive the
+/// resolved / no-lease / no-KVM_HOST paths without a live libvirt.
+fn resolve_domain_ip<S: hbird_ssh::SshExec>(
+    client: Option<&S>,
+    kvm_host: Option<&str>,
+    domain: &str,
+) -> Result<String> {
+    let (client, host) = match (client, kvm_host) {
+        (Some(c), Some(h)) => (c, h),
+        _ => bail!(
+            "cannot resolve IP for libvirt domain '{domain}': no KVM_HOST is set and no \
+             explicit IP was configured. Either pin CP_IP= / WORKER_IPS=(...) in \
+             cluster.local.conf, or set KVM_HOST=<ssh-alias> so libvirt can be queried \
+             via `virsh domifaddr` over SSH (mirrors the deleted scripts/update-cluster.sh)."
+        ),
+    };
+    crate::cp_resolve::resolve_cp_ip_via_ssh(client, host, domain).with_context(|| {
+        format!("resolve IP via virsh-domifaddr on KVM_HOST={host} for domain={domain}")
+    })
+}
+
 /// Stop the bootc auto-update timer(s) on the node. Mirrors `timer_stop`
 /// (line 555). Honors `--skip-drain`. Dry-run emits the exact bash
 /// log line.
@@ -1033,10 +1082,31 @@ fn timer_stop(plan: &Plan, ip: &str) -> Result<()> {
         ));
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "timer_stop",
-        &format!("ssh root@{ip} systemctl stop bootc-{{semver,fetch-apply}}-update.timer"),
-    ))
+    let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+    timer_stop_with_exec(&client, ip)
+}
+
+/// [`timer_stop`] with the transport injected behind
+/// [`hbird_ssh::SshExec`] so unit tests can pin the best-effort contract
+/// without a live node.
+///
+/// Best-effort by construction, matching the bash twin (line 566-568):
+/// `systemctl stop ... 2>/dev/null || true` under an outer `|| true`.
+/// `systemctl stop` on an inactive unit is a no-op, and a host that never
+/// shipped one of the units exits non-zero — neither is a reason to abort a
+/// rolling upgrade, so every error is downgraded to a WARN.
+fn timer_stop_with_exec(exec: &impl hbird_ssh::SshExec, ip: &str) -> Result<()> {
+    // Both units unconditionally: post-#181 images ship
+    // bootc-semver-update.timer, pre-#181 hosts only have
+    // bootc-fetch-apply-updates.timer, and the fleet is mixed during the
+    // migration window.
+    let cmd = "systemctl stop bootc-semver-update.timer bootc-fetch-apply-updates.timer 2>/dev/null || true";
+    if let Err(e) = exec.run(cmd) {
+        log(&format!(
+            "  WARN: {ip}: could not stop bootc auto-update timer(s): {e}"
+        ));
+    }
+    Ok(())
 }
 
 /// Start the bootc-semver-update.timer, falling back to the legacy
@@ -1052,12 +1122,52 @@ fn timer_start(plan: &Plan, ip: &str) -> Result<()> {
     if plan.skip_drain {
         return Ok(());
     }
-    Err(live_mode_not_implemented(
-        "timer_start",
-        &format!(
-            "ssh root@{ip} systemctl start bootc-semver-update.timer (or fetch-apply fallback)"
-        ),
-    ))
+    let client = hbird_ssh::Client::new(node_ssh_opts(plan, ip));
+    timer_start_with_exec(&client, ip)
+}
+
+/// Remote probe-then-start block. Byte-for-byte the bash twin's heredoc
+/// (line 589-600) so the two surfaces stay diffable.
+///
+/// Exit 44 is a deliberate sentinel meaning "no auto-update timer unit
+/// exists on this host", which the caller reports differently from a real
+/// `systemctl start` failure (#181 round-2 review).
+const TIMER_START_PROBE: &str = r#"bash -c "
+    if systemctl cat bootc-semver-update.timer >/dev/null 2>&1; then
+      systemctl start bootc-semver-update.timer
+    elif systemctl cat bootc-fetch-apply-updates.timer >/dev/null 2>&1; then
+      systemctl start bootc-fetch-apply-updates.timer
+    else
+      exit 44
+    fi
+  ""#;
+
+/// [`timer_start`] with the transport injected behind
+/// [`hbird_ssh::SshExec`] so unit tests can pin the
+/// started / fell-back / no-timer-present / transport-failed paths.
+///
+/// Never fails the rolling upgrade: the bash twin logs a WARN and returns 0
+/// (line 601-603), because a node that came back healthy but without its
+/// auto-update timer is a degraded state an operator can fix by hand — it is
+/// not a reason to abort the remaining nodes. Blindly starting the semver
+/// timer on a pre-#181 host returns rc=5, so we probe first.
+fn timer_start_with_exec(exec: &impl hbird_ssh::SshExec, ip: &str) -> Result<()> {
+    match exec.run(TIMER_START_PROBE) {
+        Ok(_) => Ok(()),
+        Err(hbird_ssh::Error::NonZeroExit { status, .. }) if status.code() == Some(44) => {
+            // Sentinel: neither timer unit is defined on this host.
+            log(&format!(
+                "  WARN: {ip}: bootc auto-update timer not restored (no semver/fetch-apply timer present)"
+            ));
+            Ok(())
+        }
+        Err(e) => {
+            log(&format!(
+                "  WARN: {ip}: bootc auto-update timer not restored (systemctl start failed: {e})"
+            ));
+            Ok(())
+        }
+    }
 }
 
 // ---- block #6+9: wait helpers (Ready, bootID, DaemonSets) ------------------
@@ -2006,11 +2116,11 @@ fn bootc_upgrade_apply_with_exec(
 #[derive(Debug, Default)]
 struct InFlight {
     node: String,
-    #[allow(dead_code)] // consumed by live-execution slice (#322).
-    ip: String,
+    /// CP IP — the recovery command must be run against the control
+    /// plane's admin kubeconfig, not against the cordoned worker.
+    cp_ip: String,
     drained: bool,
     uncordoned: bool,
-    #[allow(dead_code)] // consumed by live-execution slice (#322).
     phase: String,
 }
 
@@ -2018,7 +2128,6 @@ impl InFlight {
     /// Mark that drain has completed for this node. Bash twin's
     /// `mark_in_flight ${node} drained` (line 614). Pinned as a named
     /// wrapper so a grep across both sides yields a hit (lens L9).
-    #[allow(dead_code)] // consumed by live-execution slice (#322).
     fn mark_drained(&mut self) {
         self.drained = true;
     }
@@ -2026,7 +2135,6 @@ impl InFlight {
     /// Mark that uncordon has completed for this node. Bash twin's
     /// `mark_in_flight ${node} uncordoned` (line 615). Pinned as a
     /// named wrapper so a grep across both sides yields a hit (lens L9).
-    #[allow(dead_code)] // consumed by live-execution slice (#322).
     fn mark_uncordoned(&mut self) {
         self.uncordoned = true;
     }
@@ -2035,7 +2143,6 @@ impl InFlight {
     /// drop semantics don't bleed across worker boundaries. Bash twin's
     /// `clear_in_flight` (line 622). Pinned as a named wrapper for
     /// grep-parity (lens L9).
-    #[allow(dead_code)] // consumed by live-execution slice (#322).
     fn clear_in_flight(&mut self) {
         *self = Self::default();
     }
@@ -2049,10 +2156,30 @@ impl Drop for InFlight {
         // (line 668) and we replicate the wording so an operator who
         // greps both sides finds the same string.
         if self.drained && !self.uncordoned && !self.node.is_empty() {
+            // Same shape and wording as the bash twin's cleanup_on_exit
+            // (line 668) so an operator grepping either side finds it,
+            // and — critically — so the printed command is one they can
+            // actually paste. `kubectl uncordon <node>` alone is not
+            // runnable from a workstation: it needs the CP's admin
+            // kubeconfig over SSH.
+            eprintln!();
             eprintln!(
-                "[update-cluster] node {} is cordoned and was not uncordoned; \
-                 recover with: kubectl uncordon {}",
-                self.node, self.node,
+                "[update-cluster] ============================================================"
+            );
+            eprintln!(
+                "[update-cluster] WARNING: node {} is cordoned and was not uncordoned.",
+                self.node
+            );
+            if !self.phase.is_empty() {
+                eprintln!("[update-cluster] in-flight phase: {}", self.phase);
+            }
+            eprintln!("[update-cluster] Restore it manually once you have verified its state:");
+            eprintln!(
+                "[update-cluster]   ssh root@{} \"kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon {}\"",
+                self.cp_ip, self.node
+            );
+            eprintln!(
+                "[update-cluster] ============================================================"
             );
         }
     }
@@ -2063,7 +2190,7 @@ impl Drop for InFlight {
 fn update_cp(plan: &Plan) -> Result<()> {
     let mut in_flight = InFlight {
         node: plan.cp_k8s_name.clone(),
-        ip: plan.cp_ip.clone(),
+        cp_ip: plan.cp_ip.clone(),
         phase: "pre-upgrade".to_string(),
         ..Default::default()
     };
@@ -2176,6 +2303,17 @@ struct Results {
 /// failure (so the caller can route through worker_fail to honor
 /// --continue-on-error).
 fn update_worker(plan: &Plan, name: &str, ip: &str, k8s_name: &str) -> Result<()> {
+    // Abort-recovery tracking. This is the ONLY path that drains, so it is
+    // the only path where an abort (Ctrl-C, panic, `?`) can leave a node
+    // cordoned. `InFlight`'s Drop prints the exact `kubectl uncordon`
+    // command; without this wiring the machinery existed but could never
+    // fire, which is the bash twin's cleanup_on_exit safety net missing.
+    let mut in_flight = InFlight {
+        node: k8s_name.to_string(),
+        cp_ip: plan.cp_ip.clone(),
+        phase: "pre-drain".to_string(),
+        ..Default::default()
+    };
     log("============================================================");
     if k8s_name == name {
         log(&format!("WORKER: {name} ({ip})"));
@@ -2197,6 +2335,8 @@ fn update_worker(plan: &Plan, name: &str, ip: &str, k8s_name: &str) -> Result<()
         }
         log(&format!("kubectl drain {k8s_name} {drain_flags}"));
         cp_kubectl(plan, &format!("drain {k8s_name} {drain_flags}"))?;
+        in_flight.mark_drained();
+        in_flight.phase = "post-drain".to_string();
     }
 
     let pre_bootid = capture_node_bootid(plan, k8s_name)?;
@@ -2219,8 +2359,10 @@ fn update_worker(plan: &Plan, name: &str, ip: &str, k8s_name: &str) -> Result<()
         if !plan.skip_drain {
             log(&format!("kubectl uncordon {k8s_name}"));
             cp_kubectl(plan, &format!("uncordon {k8s_name}"))?;
+            in_flight.mark_uncordoned();
         }
         timer_start(plan, ip)?;
+        in_flight.clear_in_flight();
         return Ok(());
     }
 
@@ -2229,8 +2371,10 @@ fn update_worker(plan: &Plan, name: &str, ip: &str, k8s_name: &str) -> Result<()
     // error chain (SSH stderr, kubectl exit code) instead of masking
     // it behind a fresh anyhow.
     let ssh_timeout = plan.timeouts.ssh;
+    in_flight.phase = "post-reboot-pre-ssh".to_string();
     wait_ssh_back(plan, ip)
         .with_context(|| format!("{name}: did not come back over SSH within {ssh_timeout}s"))?;
+    in_flight.phase = "post-bootID-pre-Ready".to_string();
     let ready_timeout = plan.timeouts.ready;
     wait_node_bootid_changed(plan, k8s_name, &pre_bootid).with_context(|| {
         format!(
@@ -2239,6 +2383,7 @@ fn update_worker(plan: &Plan, name: &str, ip: &str, k8s_name: &str) -> Result<()
     })?;
     wait_node_ready(plan, k8s_name)
         .with_context(|| format!("{name}: did not reach Ready within {ready_timeout}s"))?;
+    in_flight.phase = "post-Ready-pre-DaemonSet".to_string();
     let daemonset_timeout = plan.timeouts.daemonset;
     wait_node_daemonsets_ready(plan, k8s_name).with_context(|| {
         format!(
@@ -2246,9 +2391,13 @@ fn update_worker(plan: &Plan, name: &str, ip: &str, k8s_name: &str) -> Result<()
         )
     })?;
 
+    in_flight.phase = "post-DaemonSet-pre-uncordon".to_string();
     log(&format!("kubectl uncordon {k8s_name}"));
     cp_kubectl(plan, &format!("uncordon {k8s_name}"))?;
+    in_flight.mark_uncordoned();
     timer_start(plan, ip)?;
+    // Clean completion: nothing left cordoned, so Drop must stay quiet.
+    in_flight.clear_in_flight();
     log(&format!("node {name} updated"));
     Ok(())
 }
@@ -2479,6 +2628,11 @@ fn node_ssh_opts(plan: &Plan, ip: &str) -> hbird_ssh::SshOptions {
     if let Some(jump) = plan.kvm_host.as_deref() {
         opts = opts.with_proxy_jump(jump.to_string());
     }
+    // Local watchdog so a command that wedges AFTER auth cannot stall the
+    // whole rolling upgrade. Not an ssh option — to_argv() is unchanged.
+    if plan.timeouts.ssh_command > 0 {
+        opts = opts.with_command_timeout(Duration::from_secs(u64::from(plan.timeouts.ssh_command)));
+    }
     opts
 }
 
@@ -2663,25 +2817,6 @@ fn prefix8(s: &str) -> String {
 /// numeric convention in the summary log lines).
 fn b(v: bool) -> i32 {
     i32::from(v)
-}
-
-/// Construct the "not yet implemented in the Rust live path" error
-/// used by every helper that needs a real SSH round-trip. The error
-/// wording explicitly points at the follow-up issue so an operator
-/// hitting this in CI gets actionable guidance.
-///
-/// The tracking issue is [#322] — the live-execution slice — not
-/// [#286], which this PR closes with the dry-run parity surface
-/// (round-2 lens L4#1).
-///
-/// [#322]: https://github.com/aatchison/hummingbird-k8s/issues/322
-fn live_mode_not_implemented(helper: &str, equivalent: &str) -> anyhow::Error {
-    anyhow!(
-        "live-mode update-cluster: `{helper}` requires a remote SSH/kubectl round-trip that is not yet \
-         implemented in the Rust path. Bash equivalent: `{equivalent}`. \
-         Until the live-execution slice lands (tracked by #322), run with `--dry-run` to preview \
-         the plan, or use `make update-cluster CONFIG=… [FLAGS=…]` to actually upgrade."
-    )
 }
 
 // ---- unit tests ------------------------------------------------------------
@@ -2935,18 +3070,6 @@ mod tests {
         assert_eq!(_collect_unready_names(raw), vec!["cilium-abc"]);
     }
 
-    /// Regression: the helper-name field in the live-mode-not-implemented
-    /// error must be the bash function name verbatim so operators can
-    /// `grep scripts/update-cluster.sh` for the equivalent. (Block-by-block
-    /// traceability per #286.)
-    #[test]
-    fn live_mode_error_names_bash_helper() {
-        let e = live_mode_not_implemented("wait_node_ready", "...");
-        let s = e.to_string();
-        assert!(s.contains("wait_node_ready"), "missing helper name: {s}");
-        assert!(s.contains("--dry-run"), "missing remediation hint: {s}");
-    }
-
     /// The `Results::failed` summary's `exit 3` semantics from bash are
     /// mapped to a sentinel error wording — guard against accidental
     /// rewording that would mask the exit-code-3 channel.
@@ -2986,6 +3109,49 @@ mod tests {
         assert!(acquire_lock(true).expect("dry-run lock is no-op").is_none());
     }
 
+    /// The recovery hint must name the CP, not the cordoned worker: the
+    /// operator needs the control plane's admin kubeconfig to uncordon.
+    /// Regression guard for the earlier message, which printed a bare
+    /// `kubectl uncordon <node>` that is not runnable from a workstation.
+    #[test]
+    fn in_flight_recovery_hint_targets_the_cp() {
+        let src = include_str!("update_cluster.rs");
+        assert!(
+            src.contains("kubectl --kubeconfig=/etc/kubernetes/admin.conf uncordon"),
+            "recovery hint must use the CP admin kubeconfig",
+        );
+        assert!(
+            src.contains("[update-cluster]   ssh root@"),
+            "recovery hint must be a runnable ssh command",
+        );
+        assert!(
+            src.contains("in-flight phase: {}"),
+            "recovery hint must surface the in-flight phase like the bash twin",
+        );
+    }
+
+    /// The whole point of `InFlight` is that `update_worker` — the only
+    /// path that drains — actually maintains it. The struct and its
+    /// methods existed for several releases without a single caller, so
+    /// the recovery hint could never fire. Pin the wiring.
+    #[test]
+    fn update_worker_maintains_in_flight_state() {
+        let src = include_str!("update_cluster.rs");
+        let start = src.find("fn update_worker").expect("update_worker exists");
+        let body = &src[start..start + 9000];
+        for marker in [
+            "let mut in_flight = InFlight",
+            "in_flight.mark_drained()",
+            "in_flight.mark_uncordoned()",
+            "in_flight.clear_in_flight()",
+        ] {
+            assert!(
+                body.contains(marker),
+                "update_worker must maintain in-flight state: missing `{marker}`",
+            );
+        }
+    }
+
     /// Pin the InFlight field set so the live-execution slice (which
     /// consumes the recovery hints in cleanup_on_exit, bash line 668)
     /// surfaces here if a field is dropped or renamed.
@@ -2995,13 +3161,13 @@ mod tests {
         // path doesn't print to test stderr.
         let f = InFlight {
             node: "n".to_string(),
-            ip: "i".to_string(),
+            cp_ip: "i".to_string(),
             drained: true,
             uncordoned: true,
             phase: "p".to_string(),
         };
         assert_eq!(f.node, "n");
-        assert_eq!(f.ip, "i");
+        assert_eq!(f.cp_ip, "i");
         assert!(f.drained);
         assert!(f.uncordoned);
         assert_eq!(f.phase, "p");
@@ -3360,6 +3526,128 @@ mod tests {
             stdout: String::new(),
             stderr: stderr.to_string(),
         })
+    }
+
+    // ---- live IP resolution via virsh domifaddr (#322) -------------------
+
+    /// Canonical `virsh domifaddr` table. Column 3 (0-indexed) is the CIDR,
+    /// matching the awk pipeline the bash twin used.
+    const DOMIFADDR: &str = " Name       MAC address          Protocol     Address\n        -------------------------------------------------------------------------\n        \u{20}vnet0      52:54:00:ab:cd:ef    ipv4         192.168.122.47/24\n";
+
+    #[test]
+    fn resolve_domain_ip_uses_virsh_when_no_pinned_ip() {
+        let exec = MockSshExec::new(vec![ok_stdout(DOMIFADDR)]);
+        let ip = resolve_domain_ip(Some(&exec), Some("geary"), "hummingbird-k8s")
+            .expect("should resolve from domifaddr output");
+        assert_eq!(ip, "192.168.122.47");
+        let cmds = exec.commands();
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert!(cmds[0].contains("domifaddr"), "{cmds:?}");
+        assert!(
+            cmds[0].contains("hummingbird-k8s"),
+            "must query the requested domain: {cmds:?}"
+        );
+    }
+
+    /// Without KVM_HOST there is no transport to reach libvirt, so we must
+    /// fail loudly and name BOTH escape hatches. A blank IP would otherwise
+    /// surface later as an opaque `ssh root@` failure.
+    #[test]
+    fn resolve_domain_ip_without_kvm_host_names_both_escape_hatches() {
+        let err = resolve_domain_ip(None::<&MockSshExec>, None, "worker-1")
+            .expect_err("must fail without KVM_HOST");
+        let s = err.to_string();
+        assert!(s.contains("worker-1"), "must name the domain: {s}");
+        assert!(s.contains("WORKER_IPS"), "must offer the pin-IP hatch: {s}");
+        assert!(s.contains("KVM_HOST"), "must offer the virsh hatch: {s}");
+    }
+
+    /// A domain with no IPv4 lease (not booted yet) must name the specific
+    /// domain, so an operator with one bad worker knows which one.
+    #[test]
+    fn resolve_domain_ip_no_lease_names_the_domain() {
+        let exec = MockSshExec::new(vec![ok_stdout(" Name  MAC  Protocol  Address\n")]);
+        let err = resolve_domain_ip(Some(&exec), Some("geary"), "worker-3")
+            .expect_err("no ipv4 lease must be an error");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("worker-3"), "must name the domain: {chain}");
+    }
+
+    // ---- timer_stop / timer_start live paths (#322 block 4) --------------
+
+    /// `timer_stop` must send both timer units in one command, with the
+    /// bash twin's `2>/dev/null || true` suffix. Stopping an inactive unit
+    /// is a no-op, and the fleet is mixed pre/post-#181, so both are named
+    /// unconditionally.
+    #[test]
+    fn timer_stop_sends_both_units_best_effort() {
+        let exec = MockSshExec::new(vec![ok_stdout("")]);
+        timer_stop_with_exec(&exec, "10.0.0.5").expect("timer_stop must not fail");
+        let cmds = exec.commands();
+        assert_eq!(
+            cmds.len(),
+            1,
+            "expected exactly one ssh round-trip: {cmds:?}"
+        );
+        assert!(cmds[0].contains("bootc-semver-update.timer"), "{cmds:?}");
+        assert!(
+            cmds[0].contains("bootc-fetch-apply-updates.timer"),
+            "{cmds:?}"
+        );
+        assert!(
+            cmds[0].contains("|| true"),
+            "missing best-effort suffix: {cmds:?}"
+        );
+    }
+
+    /// A failed stop must NOT abort the rolling upgrade. The bash twin
+    /// swallows it with `|| true`; the Rust twin downgrades to a WARN.
+    #[test]
+    fn timer_stop_swallows_transport_failure() {
+        let exec = MockSshExec::new(vec![nonzero_exit(255, "ssh: connect refused")]);
+        let r = timer_stop_with_exec(&exec, "10.0.0.5");
+        assert!(r.is_ok(), "timer_stop must be best-effort, got {r:?}");
+    }
+
+    /// The probe must test for BOTH unit names and carry the exit-44
+    /// sentinel, so "no timer present" stays distinguishable from a real
+    /// `systemctl start` failure (#181 round-2).
+    #[test]
+    fn timer_start_probes_both_units_and_uses_exit_44_sentinel() {
+        let exec = MockSshExec::new(vec![ok_stdout("")]);
+        timer_start_with_exec(&exec, "10.0.0.6").expect("rc=0 must be Ok");
+        let cmds = exec.commands();
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        assert!(
+            cmds[0].contains("systemctl cat bootc-semver-update.timer"),
+            "{cmds:?}"
+        );
+        assert!(
+            cmds[0].contains("systemctl cat bootc-fetch-apply-updates.timer"),
+            "must fall back for pre-#181 hosts: {cmds:?}"
+        );
+        assert!(cmds[0].contains("exit 44"), "missing sentinel: {cmds:?}");
+    }
+
+    /// Exit 44 = neither timer unit exists. That is a degraded-but-live
+    /// node, so it WARNs and returns Ok rather than failing the roll.
+    #[test]
+    fn timer_start_exit_44_is_warn_not_failure() {
+        let exec = MockSshExec::new(vec![nonzero_exit(44, "")]);
+        let r = timer_start_with_exec(&exec, "10.0.0.6");
+        assert!(r.is_ok(), "exit 44 must not fail the upgrade, got {r:?}");
+    }
+
+    /// A real `systemctl start` failure (e.g. rc=5 on a pre-#181 host, or a
+    /// dropped connection) is also non-fatal — the operator can re-enable
+    /// the timer by hand, and the remaining nodes must still roll.
+    #[test]
+    fn timer_start_start_failure_is_warn_not_failure() {
+        for code in [1_i32, 5, 255] {
+            let exec = MockSshExec::new(vec![nonzero_exit(code, "boom")]);
+            let r = timer_start_with_exec(&exec, "10.0.0.6");
+            assert!(r.is_ok(), "rc={code} must not fail the upgrade, got {r:?}");
+        }
     }
 
     /// Sanity-check the `nonzero_exit` helper: the constructed

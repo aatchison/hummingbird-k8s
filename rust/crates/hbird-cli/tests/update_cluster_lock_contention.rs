@@ -150,6 +150,18 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
         .env("XDG_RUNTIME_DIR", &xdg.0)
         // Clear HBIRD_REMOTE_NO_SUDO so we don't get a different code path.
         .env_remove("HBIRD_REMOTE_NO_SUDO")
+        // Bound the blast radius if contention does NOT happen. The fixture
+        // config points at TEST-NET-1 (192.0.2.0/24), which blackholes, so a
+        // non-contended run would otherwise sit in the live SSH/poll path for
+        // ~54s before failing — turning a clear assertion failure into what
+        // looks like a hang. These budgets make the negative case fail fast
+        // and loudly instead. (They are irrelevant on the happy path: the
+        // lock check happens before any SSH.)
+        .env("SSH_COMMAND_TIMEOUT", "3")
+        .env("SSH_TIMEOUT", "3")
+        .env("READY_TIMEOUT", "3")
+        .env("APISERVER_TIMEOUT", "3")
+        .env("DRAIN_TIMEOUT", "3s")
         .args(["update-cluster", "--config", "cluster.local.conf"])
         .output()
         .expect("spawn second hbird");

@@ -219,6 +219,10 @@ struct Plan {
     bootc_update_schedule: Option<String>,
     bootc_update_repo_k8s: Option<String>,
     bootc_update_repo_worker: Option<String>,
+    /// Per-cluster CIDR overrides (#404). Emitted into
+    /// /etc/hummingbird/k8s-init-local.env on the CP only.
+    pod_cidr: Option<String>,
+    service_cidr: Option<String>,
     cp_ready_retries: u32,
     cp_ready_sleep_secs: u64,
     token_ttl: String,
@@ -269,6 +273,8 @@ impl Plan {
             bootc_update_schedule: config.bootc_update_schedule,
             bootc_update_repo_k8s: config.bootc_update_repo_k8s,
             bootc_update_repo_worker: config.bootc_update_repo_worker,
+            pod_cidr: config.pod_cidr.clone(),
+            service_cidr: config.service_cidr.clone(),
             cp_ready_retries: args.cp_ready_retries,
             cp_ready_sleep_secs: args.cp_ready_sleep_secs,
             token_ttl: args.token_ttl.clone(),
@@ -554,8 +560,12 @@ fn plan_cp_seed(plan: &Plan, conn: &Connection, pubkey_contents: &str) -> Result
         plan.switch_to_ghcr,
         &plan.ghcr_tag,
         plan.auto_update_cp,
-        plan.bootc_update_schedule.as_deref(),
-        plan.bootc_update_repo_k8s.as_deref(),
+        CpOverrides {
+            bootc_update_schedule: plan.bootc_update_schedule.as_deref(),
+            bootc_update_repo_k8s: plan.bootc_update_repo_k8s.as_deref(),
+            pod_cidr: plan.pod_cidr.as_deref(),
+            service_cidr: plan.service_cidr.as_deref(),
+        },
     );
 
     let ud_tmp = format!("/tmp/hbird-cp-ud-{}.yaml", std::process::id());
@@ -1067,15 +1077,40 @@ pub(crate) fn cp_ssh_cmd(privkey_path: &str, cp_ip: &str, remote_cmd: &str) -> S
 /// Render CP cloud-config YAML (bash twin: `render_cp_user_data`).
 ///
 /// Pure function — takes all inputs, returns YAML string.
+/// Cloud-init override inputs for the CP renderer.
+///
+/// Grouped into a struct rather than passed as four more positional
+/// parameters: `render_cp_user_data` had grown to 9 arguments (clippy's
+/// `too_many_arguments` limit is 7), and four consecutive
+/// `Option<&str>` arguments are trivially transposable at a call site —
+/// the compiler cannot catch swapping `pod_cidr` with `service_cidr`.
+/// Named fields make that class of bug impossible.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CpOverrides<'a> {
+    /// `BOOTC_UPDATE_SCHEDULE` — systemd `OnCalendar=` override.
+    pub bootc_update_schedule: Option<&'a str>,
+    /// `BOOTC_UPDATE_REPO_K8S` — registry the semver updater tracks.
+    pub bootc_update_repo_k8s: Option<&'a str>,
+    /// `POD_CIDR` — pod network passed to kubeadm/Cilium on first boot.
+    pub pod_cidr: Option<&'a str>,
+    /// `SERVICE_CIDR` — service network passed to kubeadm on first boot.
+    pub service_cidr: Option<&'a str>,
+}
+
 pub(crate) fn render_cp_user_data(
     cp_name: &str,
     pubkey_contents: &str,
     switch_to_ghcr: bool,
     ghcr_tag: &str,
     auto_update_cp: bool,
-    bootc_update_schedule: Option<&str>,
-    bootc_update_repo_k8s: Option<&str>,
+    overrides: CpOverrides<'_>,
 ) -> String {
+    let CpOverrides {
+        bootc_update_schedule,
+        bootc_update_repo_k8s,
+        pod_cidr,
+        service_cidr,
+    } = overrides;
     let mut out = String::new();
     out.push_str("#cloud-config\n");
     out.push_str(&format!("hostname: {cp_name}\n"));
@@ -1084,9 +1119,62 @@ pub(crate) fn render_cp_user_data(
     out.push_str("  - name: root\n");
     out.push_str("    ssh_authorized_keys:\n");
     out.push_str(&format!("      - {pubkey_contents}\n"));
-    // TODO: emit write_files block for bootc_update_schedule / bootc_update_repo_k8s
-    // when either is set. Omitted in S2c to keep scope focused — implement in follow-up.
-    let _ = (bootc_update_schedule, bootc_update_repo_k8s);
+    // Bash treats an empty var as unset (`-n "${VAR:-}"`), so normalize
+    // Some("") to None or we would emit a drop-in with a blank OnCalendar=
+    // and silently disarm the timer.
+    let bootc_update_schedule = bootc_update_schedule.filter(|s| !s.is_empty());
+    let bootc_update_repo_k8s = bootc_update_repo_k8s.filter(|s| !s.is_empty());
+    let pod_cidr = pod_cidr.filter(|s| !s.is_empty());
+    let service_cidr = service_cidr.filter(|s| !s.is_empty());
+    // write_files for bootc-semver-update + CIDR overrides. Only emit the
+    // block when at least one override is set, otherwise the YAML stays
+    // clean (no empty `write_files:` key). Mirrors deploy-cluster.sh:64-100.
+    if bootc_update_schedule.is_some()
+        || bootc_update_repo_k8s.is_some()
+        || pod_cidr.is_some()
+        || service_cidr.is_some()
+    {
+        out.push_str("write_files:\n");
+        if let Some(schedule) = bootc_update_schedule {
+            // The empty `OnCalendar=` FIRST clears the image-baked default;
+            // without it systemd unions the two schedules instead of
+            // replacing, and the node would still fire on the baked timer.
+            out.push_str(
+                "  - path: /etc/systemd/system/bootc-semver-update.timer.d/schedule.conf\n",
+            );
+            out.push_str("    owner: root:root\n");
+            out.push_str("    permissions: '0644'\n");
+            out.push_str("    content: |\n");
+            out.push_str("      [Timer]\n");
+            out.push_str("      OnCalendar=\n");
+            out.push_str(&format!("      OnCalendar={schedule}\n"));
+        }
+        if let Some(repo) = bootc_update_repo_k8s {
+            out.push_str("  - path: /etc/hummingbird/bootc-update.env\n");
+            out.push_str("    owner: root:root\n");
+            out.push_str("    permissions: '0644'\n");
+            out.push_str("    content: |\n");
+            out.push_str(&format!("      REPO={repo}\n"));
+            out.push_str("      PREFIX=v\n");
+        }
+        if pod_cidr.is_some() || service_cidr.is_some() {
+            // Deliberately a SEPARATE file from the image-baked
+            // k8s-init.env: k8s-init.sh sources this one AFTER the baked
+            // env, so operator values win and a bootc image update can
+            // never clobber them (and vice versa). Mode 0600 matches the
+            // bash twin.
+            out.push_str("  - path: /etc/hummingbird/k8s-init-local.env\n");
+            out.push_str("    owner: root:root\n");
+            out.push_str("    permissions: '0600'\n");
+            out.push_str("    content: |\n");
+            if let Some(pod) = pod_cidr {
+                out.push_str(&format!("      POD_CIDR={pod}\n"));
+            }
+            if let Some(svc) = service_cidr {
+                out.push_str(&format!("      SERVICE_CIDR={svc}\n"));
+            }
+        }
+    }
     out.push_str("runcmd:\n");
     if switch_to_ghcr {
         out.push_str(&format!(
@@ -1098,6 +1186,13 @@ pub(crate) fn render_cp_user_data(
         out.push_str("  - [ systemctl, disable, --now, bootc-fetch-apply-updates.timer ]\n");
     } else {
         out.push_str("  - [ systemctl, disable, --now, bootc-semver-update.timer ]\n");
+    }
+    // Re-read the drop-in cloud-init just wrote so the override takes effect
+    // THIS boot, not only the next one. Gated on auto_update_cp so the
+    // false-branch's `disable` above stays sticky (bash line 136-143).
+    if auto_update_cp && bootc_update_schedule.is_some() {
+        out.push_str("  - [ systemctl, daemon-reload ]\n");
+        out.push_str("  - [ systemctl, restart, bootc-semver-update.timer ]\n");
     }
     out
 }
@@ -1126,9 +1221,30 @@ pub(crate) fn render_worker_user_data(
     out.push_str("    permissions: '0600'\n");
     out.push_str("    content: |\n");
     out.push_str(&format!("      {join_cmd}\n"));
-    // TODO: emit write_files entries for bootc_update_schedule / bootc_update_repo_worker
-    // when either is set. Omitted in S2c to keep scope focused — implement in follow-up.
-    let _ = (bootc_update_repo_worker,);
+    // bootc-semver-update overrides, appended to the join.env block that is
+    // always present. Bash treats empty as unset, so normalize first.
+    // Mirrors deploy-cluster.sh:177-194.
+    let bootc_update_schedule = bootc_update_schedule.filter(|s| !s.is_empty());
+    let bootc_update_repo_worker = bootc_update_repo_worker.filter(|s| !s.is_empty());
+    if let Some(schedule) = bootc_update_schedule {
+        // Empty OnCalendar= first clears the image-baked default; see the
+        // CP renderer for why the union semantics matter.
+        out.push_str("  - path: /etc/systemd/system/bootc-semver-update.timer.d/schedule.conf\n");
+        out.push_str("    owner: root:root\n");
+        out.push_str("    permissions: '0644'\n");
+        out.push_str("    content: |\n");
+        out.push_str("      [Timer]\n");
+        out.push_str("      OnCalendar=\n");
+        out.push_str(&format!("      OnCalendar={schedule}\n"));
+    }
+    if let Some(repo) = bootc_update_repo_worker {
+        out.push_str("  - path: /etc/hummingbird/bootc-update.env\n");
+        out.push_str("    owner: root:root\n");
+        out.push_str("    permissions: '0644'\n");
+        out.push_str("    content: |\n");
+        out.push_str(&format!("      REPO={repo}\n"));
+        out.push_str("      PREFIX=v\n");
+    }
     if switch_to_ghcr || bootc_update_schedule.is_some() {
         out.push_str("runcmd:\n");
         if switch_to_ghcr {
@@ -1229,29 +1345,6 @@ pub(crate) fn find_repo_root() -> PathBuf {
     }
 
     PathBuf::from(".")
-}
-
-/// Construct the "not yet implemented in the Rust live path" error
-/// used by every helper that needs a real bib / virt-install /
-/// SSH round-trip. The error wording explicitly points at the follow-up
-/// issue so an operator hitting this in CI gets actionable guidance.
-///
-/// The tracking issue is [#335] — the live-execution slice for
-/// deploy + spawn — not [#289], which this PR closes with the
-/// dry-run parity surface.
-///
-/// Retained for backwards-compatibility with the existing test that validates
-/// the error wording; no longer invoked by any production path after S2c.
-///
-/// [#335]: https://github.com/aatchison/hummingbird-k8s/issues/335
-#[cfg(test)]
-fn live_mode_not_implemented(helper: &str, equivalent: &str) -> anyhow::Error {
-    anyhow!(
-        "live-mode deploy-cluster: `{helper}` requires a remote libvirt / bib / SSH round-trip \
-         that is not yet implemented in the Rust path. Bash equivalent: `{equivalent}`. \
-         Until the live-execution slice lands (tracked by #335), run with `--dry-run` to preview \
-         the plan, or use `make deploy-cluster CONFIG=…` to actually deploy."
-    )
 }
 
 // ---- Command-string builder functions (pure, unit-testable) ----------------
@@ -1494,16 +1587,6 @@ mod tests {
         assert!(plan.worker_names.is_empty());
     }
 
-    #[test]
-    fn live_mode_not_implemented_names_issue_and_bash_equivalent() {
-        let e = live_mode_not_implemented("plan_x", "ssh root@cp ...");
-        let s = format!("{e}");
-        assert!(s.contains("#335"), "must reference #335: {s}");
-        assert!(s.contains("plan_x"));
-        assert!(s.contains("ssh root@cp"));
-        assert!(s.contains("--dry-run"));
-    }
-
     // ---- image ref tests ---------------------------------------------------
 
     #[test]
@@ -1731,8 +1814,12 @@ mod tests {
             false,
             "v0.1.0",
             false,
-            None,
-            None,
+            CpOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_k8s: None,
+                pod_cidr: None,
+                service_cidr: None,
+            },
         );
         assert!(
             yaml.starts_with("#cloud-config\n"),
@@ -1764,8 +1851,12 @@ mod tests {
             true,
             "v0.42.0",
             false,
-            None,
-            None,
+            CpOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_k8s: None,
+                pod_cidr: None,
+                service_cidr: None,
+            },
         );
         assert!(yaml.contains("runcmd:\n"), "must have runcmd: {yaml}");
         assert!(
@@ -1782,8 +1873,12 @@ mod tests {
             false,
             "v0.1.0",
             false,
-            None,
-            None,
+            CpOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_k8s: None,
+                pod_cidr: None,
+                service_cidr: None,
+            },
         );
         assert!(
             yaml.contains("systemctl, disable, --now, bootc-semver-update.timer"),
@@ -1803,8 +1898,12 @@ mod tests {
             false,
             "v0.1.0",
             true,
-            None,
-            None,
+            CpOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_k8s: None,
+                pod_cidr: None,
+                service_cidr: None,
+            },
         );
         assert!(
             yaml.contains("systemctl, enable, --now, bootc-semver-update.timer"),
@@ -1814,6 +1913,260 @@ mod tests {
             yaml.contains("systemctl, disable, --now, bootc-fetch-apply-updates.timer"),
             "auto_update_cp=true must disable legacy timer: {yaml}"
         );
+    }
+
+    /// #404 parity: POD_CIDR / SERVICE_CIDR were parsed by nothing and
+    /// emitted by nothing in the Rust path, so a cluster deployed with
+    /// `hbird` silently ignored the operator's CIDRs while the bash twin
+    /// honored them. Same silent-drop class as the bootc_update_* bug.
+    #[test]
+    fn render_cp_user_data_emits_cidr_overrides() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "k",
+            false,
+            "v0.1.0",
+            true,
+            CpOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_k8s: None,
+                pod_cidr: Some("10.244.0.0/16"),
+                service_cidr: Some("10.96.0.0/12"),
+            },
+        );
+        assert!(yaml.contains("write_files:"), "{yaml}");
+        assert!(
+            yaml.contains("/etc/hummingbird/k8s-init-local.env"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("      POD_CIDR=10.244.0.0/16\n"), "{yaml}");
+        assert!(yaml.contains("      SERVICE_CIDR=10.96.0.0/12\n"), "{yaml}");
+        // 0600, not 0644: the bash twin is stricter for this file.
+        let idx = yaml.find("k8s-init-local.env").unwrap();
+        assert!(
+            yaml[idx..].contains("permissions: '0600'"),
+            "k8s-init-local.env must be 0600: {yaml}"
+        );
+    }
+
+    /// Only one of the two set is legal — emit just that key.
+    #[test]
+    fn render_cp_user_data_emits_partial_cidr() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "k",
+            false,
+            "v0.1.0",
+            true,
+            CpOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_k8s: None,
+                pod_cidr: Some("10.244.0.0/16"),
+                service_cidr: None,
+            },
+        );
+        assert!(yaml.contains("POD_CIDR=10.244.0.0/16"), "{yaml}");
+        assert!(
+            !yaml.contains("SERVICE_CIDR="),
+            "must omit unset key: {yaml}"
+        );
+    }
+
+    /// CIDRs alone must still open the write_files block, even with no
+    /// bootc_update_* overrides set.
+    #[test]
+    fn render_cp_user_data_cidr_alone_opens_write_files() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "k",
+            false,
+            "v0.1.0",
+            true,
+            CpOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_k8s: None,
+                pod_cidr: None,
+                service_cidr: Some("10.96.0.0/12"),
+            },
+        );
+        assert!(yaml.contains("write_files:"), "{yaml}");
+        assert!(yaml.contains("SERVICE_CIDR=10.96.0.0/12"), "{yaml}");
+    }
+
+    // ---- bootc_update_* write_files parity with the bash twin -------------
+
+    /// The regression this closes: the operator sets BOOTC_UPDATE_SCHEDULE,
+    /// the Rust planner parsed it, then threw it away (`let _ = (...)`),
+    /// so the node silently kept the image-baked schedule while the bash
+    /// twin honored it. Assert the drop-in is actually emitted.
+    #[test]
+    fn render_cp_user_data_emits_schedule_drop_in() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "ssh-ed25519 AAAA test",
+            false,
+            "v0.1.0",
+            true,
+            CpOverrides {
+                bootc_update_schedule: Some("daily"),
+                bootc_update_repo_k8s: None,
+                pod_cidr: None,
+                service_cidr: None,
+            },
+        );
+        assert!(yaml.contains("write_files:"), "{yaml}");
+        assert!(
+            yaml.contains("/etc/systemd/system/bootc-semver-update.timer.d/schedule.conf"),
+            "{yaml}"
+        );
+        // The blank OnCalendar= MUST precede the override, else systemd
+        // unions the schedules instead of replacing the baked default.
+        let blank = yaml
+            .find("      OnCalendar=\n")
+            .expect("missing clearing OnCalendar=");
+        let set = yaml
+            .find("      OnCalendar=daily\n")
+            .expect("missing override");
+        assert!(blank < set, "clearing OnCalendar= must come first: {yaml}");
+        // And the timer must be re-read so it applies this boot.
+        assert!(yaml.contains("systemctl, daemon-reload"), "{yaml}");
+        assert!(
+            yaml.contains("systemctl, restart, bootc-semver-update.timer"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn render_cp_user_data_emits_repo_env() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "k",
+            false,
+            "v0.1.0",
+            true,
+            CpOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_k8s: Some("ghcr.io/example/repo"),
+                pod_cidr: None,
+                service_cidr: None,
+            },
+        );
+        assert!(yaml.contains("/etc/hummingbird/bootc-update.env"), "{yaml}");
+        assert!(yaml.contains("      REPO=ghcr.io/example/repo\n"), "{yaml}");
+        assert!(yaml.contains("      PREFIX=v\n"), "{yaml}");
+    }
+
+    /// No overrides set => no `write_files:` key at all. The bash twin is
+    /// careful not to emit an empty block, and cloud-init rejects a
+    /// `write_files:` with no entries.
+    #[test]
+    fn render_cp_user_data_omits_write_files_when_unset() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "k",
+            false,
+            "v0.1.0",
+            true,
+            CpOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_k8s: None,
+                pod_cidr: None,
+                service_cidr: None,
+            },
+        );
+        assert!(!yaml.contains("write_files:"), "must stay clean: {yaml}");
+    }
+
+    /// Bash treats an empty var as unset. Some("") must therefore behave
+    /// exactly like None — emitting a blank OnCalendar= would disarm the
+    /// timer instead of scheduling it.
+    #[test]
+    fn render_cp_user_data_treats_empty_string_as_unset() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "k",
+            false,
+            "v0.1.0",
+            true,
+            CpOverrides {
+                bootc_update_schedule: Some(""),
+                bootc_update_repo_k8s: Some(""),
+                pod_cidr: None,
+                service_cidr: None,
+            },
+        );
+        assert!(!yaml.contains("write_files:"), "empty == unset: {yaml}");
+        assert!(!yaml.contains("daemon-reload"), "empty == unset: {yaml}");
+    }
+
+    /// auto_update_cp=false must NOT get the daemon-reload/restart pair,
+    /// or it would undo the sticky `disable` (bash line 136 gate).
+    #[test]
+    fn render_cp_user_data_no_restart_when_auto_update_off() {
+        let yaml = render_cp_user_data(
+            "hbird-cp1",
+            "k",
+            false,
+            "v0.1.0",
+            false,
+            CpOverrides {
+                bootc_update_schedule: Some("daily"),
+                bootc_update_repo_k8s: None,
+                pod_cidr: None,
+                service_cidr: None,
+            },
+        );
+        assert!(
+            yaml.contains("schedule.conf"),
+            "drop-in still written: {yaml}"
+        );
+        assert!(
+            !yaml.contains("systemctl, restart, bootc-semver-update.timer"),
+            "must not re-arm a deliberately disabled timer: {yaml}"
+        );
+    }
+
+    #[test]
+    fn render_worker_user_data_emits_schedule_and_repo() {
+        let yaml = render_worker_user_data(
+            "hbird-w1",
+            "k",
+            "kubeadm join ...",
+            false,
+            "v0.1.0",
+            Some("weekly"),
+            Some("ghcr.io/example/worker"),
+        );
+        assert!(yaml.contains("/etc/hummingbird/worker-join.env"), "{yaml}");
+        assert!(
+            yaml.contains("/etc/systemd/system/bootc-semver-update.timer.d/schedule.conf"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("      OnCalendar=weekly\n"), "{yaml}");
+        assert!(
+            yaml.contains("      REPO=ghcr.io/example/worker\n"),
+            "{yaml}"
+        );
+        assert!(yaml.contains("      PREFIX=v\n"), "{yaml}");
+        assert!(
+            yaml.contains("systemctl, restart, bootc-semver-update.timer"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn render_worker_user_data_treats_empty_string_as_unset() {
+        let yaml = render_worker_user_data(
+            "hbird-w1",
+            "k",
+            "kubeadm join ...",
+            false,
+            "v0.1.0",
+            Some(""),
+            Some(""),
+        );
+        assert!(!yaml.contains("schedule.conf"), "empty == unset: {yaml}");
+        assert!(!yaml.contains("bootc-update.env"), "empty == unset: {yaml}");
     }
 
     #[test]

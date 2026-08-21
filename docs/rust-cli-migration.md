@@ -199,12 +199,12 @@ byte-for-byte fixtures under
 cycles 1–4 ([PRs #325 #344 #346 #347]) — live drain/uncordon, bootID
 gate, DaemonSet-ready gate, and `wait_apiserver_back` all landed.
 
-**Deferred:** `timer_stop` / `timer_start` (block #4 of the live
-plan) remains stubbed because the geary cluster doesn't run the
-`bootc-semver-update.timer` the bash twin pauses/resumes during a
-roll. The Rust binary surfaces a stable
-`live_mode_not_implemented` diagnostic for these two helpers; the
-cluster-rotation paths themselves are complete. Tracked by [#322].
+**Complete:** `timer_stop` / `timer_start` (block #4 of the live
+plan) are now implemented. `timer_stop` stops both
+`bootc-semver-update.timer` and `bootc-fetch-apply-updates.timer`
+best-effort; `timer_start` probes which unit exists before starting it,
+and treats "no timer unit present" (exit 44) as a WARN rather than a
+roll-failing error. Closes the last of [#322]'s live-mode gaps.
 
 See [`docs/update-cluster.md`](update-cluster.md) for the full
 update-cluster reference (drain semantics, bootID gate, DaemonSet

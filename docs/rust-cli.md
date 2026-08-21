@@ -125,7 +125,7 @@ subcommands land per the phasing table in
 | [#284](https://github.com/aatchison/hummingbird-k8s/issues/284) | virt + `qemu+ssh` URI transport | landed (PR #318) |
 | [#285](https://github.com/aatchison/hummingbird-k8s/issues/285) | openssh transport | landed (PR #317) |
 | [#286](https://github.com/aatchison/hummingbird-k8s/issues/286) | `update-cluster` Phase 1A — dry-run parity + orchestration scaffold | landed (PR #321) |
-| [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycles 1 (`cp_kubectl` + drain/uncordon, PR #325) + 2 (bootID + bootc upgrade + SSH drop/back, PR #344) + 3 (DaemonSet-ready gate, [#328](https://github.com/aatchison/hummingbird-k8s/issues/328)) + 4 (`wait_apiserver_back`, [#329](https://github.com/aatchison/hummingbird-k8s/issues/329)) landed. Remaining `live_mode_not_implemented` sites: `timer_stop` / `timer_start` (block #4) — cluster doesn't run scheduled-update timers per bash twin, deferred outside Phase 1B cycle scope. |
+| [#322](https://github.com/aatchison/hummingbird-k8s/issues/322) | `update-cluster` Phase 1B — live-execution slice | cycles 1 (`cp_kubectl` + drain/uncordon, PR #325) + 2 (bootID + bootc upgrade + SSH drop/back, PR #344) + 3 (DaemonSet-ready gate, [#328](https://github.com/aatchison/hummingbird-k8s/issues/328)) + 4 (`wait_apiserver_back`, [#329](https://github.com/aatchison/hummingbird-k8s/issues/329)) landed. Block #4's `timer_stop` / `timer_start` are now implemented live (probe-then-start with the exit-44 no-timer sentinel; both WARN rather than fail the roll), and live IP resolution via `virsh domifaddr` landed alongside. No `live_mode_not_implemented` sites remain. |
 | [#287](https://github.com/aatchison/hummingbird-k8s/issues/287) | `verify-*` Phase 2 — encryption / hardening / app-deploy / all | landed (PR #330) — live-validated 2026-05-27 |
 | [#288](https://github.com/aatchison/hummingbird-k8s/issues/288) | Phase 3 — `export-argocd` / `get-kubeconfig` / `nodes` / `kubectl` | landed (PR #334) — live-validated 2026-05-27 |
 
@@ -361,14 +361,21 @@ enforcement that bash missed. Documented in
 `cycle_verify_hardening.txt`; the bug class is now moot since the bash
 twins have been deleted in the v0.1.0 cutover (#353).
 
-#### Still scaffolded (2 of 13 `live_mode_not_implemented` sites)
+#### No remaining `live_mode_not_implemented` sites
 
-Phase 1B cycles 1–4 are now complete. Only the scheduled-update timer
-helpers remain stubbed; they sit outside the Phase 1B cycle scope
-because the geary cluster doesn't run the systemd `hbird-bootc-update`
-timer the bash twin's `timer_stop`/`timer_start` pause and resume.
+Phase 1B cycles 1–4 are complete, and block #4's
+`timer_stop` / `timer_start` are now implemented live: `timer_stop`
+stops both timer units best-effort, and `timer_start` probes with
+`systemctl cat` before starting so a pre-#181 host falls back to
+`bootc-fetch-apply-updates.timer` instead of failing with rc=5. Neither
+fails the roll — both downgrade to a WARN, matching the bash twin.
 
-- `timer_stop` / `timer_start` (block #4)
+Live IP resolution is also implemented: when `CP_IP` / `WORKER_IPS` are
+unset, `update-cluster` resolves each domain via `virsh domifaddr` on
+`KVM_HOST`, so pinning static IPs is no longer required.
+
+The `live_mode_not_implemented` helper has been removed from the
+workspace — `grep -r live_mode_not_implemented rust/` returns nothing.
 
 Cycle 2 (#327) wired the bootID gate (`capture_node_bootid`,
 `wait_node_bootid_changed`), the bootc upgrade life-cycle

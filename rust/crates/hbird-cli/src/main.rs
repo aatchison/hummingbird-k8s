@@ -19,10 +19,11 @@
 //! hbird kubectl             <-> make kubectl
 //! ```
 //!
-//! For [#283] every subcommand returns
-//! `Err(anyhow!("not yet implemented — tracked by #XXX"))`. Real bodies
-//! land in [#286] (update-cluster), [#287] (verify-*), [#288] (kubeconfig
-//! + export-argocd), and [#289] (deploy / destroy / spawn).
+//! Every subcommand now has a real body. [#283] shipped the clap tree
+//! with placeholder `Err(anyhow!("not yet implemented"))` returns; those
+//! were replaced by [#286] (update-cluster), [#287] (verify-*), [#288]
+//! (kubeconfig + export-argocd), and [#289] (deploy / destroy / spawn).
+//! No subcommand returns a not-implemented error today.
 //!
 //! # Operator-mental-model contract
 //!
@@ -232,8 +233,8 @@ impl Command {
         }
     }
 
-    /// Dispatch to the chosen subcommand. Each delegate currently returns
-    /// `Err(anyhow!("not yet implemented — tracked by #XXX"))`.
+    /// Dispatch to the chosen subcommand. Every delegate is implemented;
+    /// the historical placeholder returns were removed as each phase landed.
     fn run(self) -> Result<()> {
         match self {
             Command::DeployCluster(args) => commands::deploy_cluster::run(args),

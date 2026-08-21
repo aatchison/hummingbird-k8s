@@ -1,9 +1,10 @@
 //! Subcommand modules — one per operator-facing `Makefile` target.
 //!
 //! Each module exports an `…Args` struct (clap-derive) and a
-//! `run(args) -> anyhow::Result<()>` function. For [#283] every `run`
-//! returns `Err(anyhow!("not yet implemented — tracked by #XXX"))`
-//! pointing at the sub-issue that owns the real implementation.
+//! `run(args) -> anyhow::Result<()>` function. [#283] landed these as
+//! placeholder `Err(anyhow!("not yet implemented"))` stubs; every one has
+//! since been given a real implementation, so no `run` returns a
+//! not-implemented error.
 
 pub mod deploy_cluster;
 pub mod destroy_cluster;

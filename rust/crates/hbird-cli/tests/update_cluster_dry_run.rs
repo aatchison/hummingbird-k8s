@@ -284,13 +284,12 @@ fn dry_run_continue_on_error_with_clean_run_exits_zero() {
 
 #[test]
 fn live_mode_without_static_ips_surfaces_remediation_diagnostic() {
-    // Confirm the live-mode failure surfaces a stable bash-twin-shaped
-    // diagnostic. The current scaffold rejects at the CP_IP resolution
-    // step (no virsh-domifaddr fallback yet); when WORKER_IPS lacks an
-    // entry we surface the "live-mode IP resolution not yet implemented"
-    // message. Either is acceptable evidence the live path is wired —
-    // we pin both wording snippets so a future fixture-shape change
-    // surfaces here.
+    // Live mode now resolves IPs via `virsh domifaddr` on KVM_HOST
+    // (#322 live-execution slice), so "not yet implemented" is gone.
+    // The remaining hard failure is the genuinely unresolvable case:
+    // no pinned IPs AND no KVM_HOST, i.e. no transport to reach libvirt
+    // through. That must still fail loudly rather than proceed with an
+    // empty IP, and must name both escape hatches.
     let tmp = tempdir_for_test();
     let conf_path = tmp.path().join("cluster.local.conf");
     write_fixture_config(&conf_path);
@@ -305,16 +304,19 @@ fn live_mode_without_static_ips_surfaces_remediation_diagnostic() {
         "live mode should fail in this scaffold"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let acceptable_messages = [
-        "live-mode IP resolution not yet implemented",
-        "Set WORKER_IPS",
-        // CP-IP-first failure path: bash twin's exact wording.
-        "could not resolve CP IP for domain",
-        "set CP_IP= in env to override",
+    // Every clause is load-bearing: an operator hitting this needs to know
+    // WHICH domain could not be resolved and BOTH ways out.
+    let required = [
+        "cannot resolve IP for libvirt domain",
+        "WORKER_IPS",
+        "CP_IP",
+        "KVM_HOST",
+        "virsh domifaddr",
     ];
-    assert!(
-        acceptable_messages.iter().any(|m| stderr.contains(m)),
-        "missing remediation diagnostic; stderr was:\n{stderr}\n\
-         expected one of: {acceptable_messages:?}",
-    );
+    for needle in required {
+        assert!(
+            stderr.contains(needle),
+            "remediation diagnostic missing {needle:?}; stderr was:\n{stderr}",
+        );
+    }
 }

@@ -129,6 +129,14 @@ pub struct ClusterConfig {
     /// `resolved_worker_names()`.
     pub worker_ips: Option<Vec<String>>,
 
+    // ---- Per-cluster CIDR overrides (#404) ---------------------------------
+    /// Pod network CIDR passed to `kubeadm init` / Cilium on first boot.
+    /// `None` = use the image-baked default.
+    pub pod_cidr: Option<String>,
+    /// Service network CIDR passed to `kubeadm init` on first boot.
+    /// `None` = use the image-baked default.
+    pub service_cidr: Option<String>,
+
     // ---- Non-fatal parser diagnostics --------------------------------------
     /// Warnings emitted while parsing — keys present in the input that
     /// no `ClusterConfig` field consumed. Empty on a clean parse.

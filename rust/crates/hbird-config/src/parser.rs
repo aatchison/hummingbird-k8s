@@ -311,6 +311,8 @@ fn build_config(
     let worker_names = take_optional_array(&mut raw, "WORKER_NAMES")?;
     let cp_ip = take_optional_scalar(&mut raw, "CP_IP")?;
     let worker_ips = take_optional_array(&mut raw, "WORKER_IPS")?;
+    let pod_cidr = take_optional_scalar(&mut raw, "POD_CIDR")?;
+    let service_cidr = take_optional_scalar(&mut raw, "SERVICE_CIDR")?;
 
     // Any keys still sitting in `raw` are unknown — no field consumed
     // them. Surface each as a `Warning::UnknownKey` so operator tooling
@@ -355,6 +357,8 @@ fn build_config(
         bootc_update_repo_worker,
         worker_names,
         cp_ip,
+        pod_cidr,
+        service_cidr,
         worker_ips,
         warnings,
     })

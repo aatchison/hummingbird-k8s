@@ -58,13 +58,14 @@
 //!   context + a [`crate::SpawnKind`] discriminator + a dedicated
 //!   [`Error::StdinWrite`] variant for the stdin-pipe-write path.
 //!
-//! # TODO before consumer crates land
+//! # Remaining follow-ups
 //!
-//! - **Wall-clock command timeout**: `ConnectTimeout=10` only covers
-//!   the TCP handshake. A hung remote command after auth still blocks
-//!   indefinitely. Tracked as a follow-up issue rather than landing
-//!   round-2 because it needs an API design call (`wait-timeout` crate
-//!   vs. stdlib watchdog thread vs. tokio if [#286] picks async).
+//! - ~~**Wall-clock command timeout**~~ — **done**. `ConnectTimeout=10`
+//!   only covers the TCP handshake, so a command that hangs after auth
+//!   used to block forever. [`SshOptions::with_command_timeout`] now adds
+//!   a local watchdog (stdlib threads, no new dependency) that kills the
+//!   `ssh` process and returns [`Error::Timeout`]. Opt-in per call site;
+//!   `update-cluster` enables it via `SSH_COMMAND_TIMEOUT` (default 3600s).
 //! - **`run_checked` variant**: today [`Client::run`] returns
 //!   `Err(Error::NonZeroExit { .. })` on remote-command non-zero exit.
 //!   Idiomatic Rust would split into `run() -> Result<RunOutput>`
@@ -88,8 +89,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::io::Write;
-use std::process::{Command, ExitStatus, Stdio};
+use std::io::{Read, Write};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 mod error;
 mod exec;
@@ -326,10 +328,13 @@ impl Client {
             // Dropping child_stdin closes the pipe; the remote sees EOF.
         }
 
-        let output = child.wait_with_output().map_err(|source| Error::Wait {
-            host: host.clone(),
-            source,
-        })?;
+        let output = match self.options.command_timeout() {
+            None => child.wait_with_output().map_err(|source| Error::Wait {
+                host: host.clone(),
+                source,
+            })?,
+            Some(budget) => wait_with_timeout(child, &host, budget)?,
+        };
 
         if !output.status.success() {
             tracing::debug!(
@@ -358,10 +363,165 @@ impl Client {
     }
 }
 
+/// Poll interval for the command watchdog. Small enough that a timeout is
+/// reported promptly, large enough that a long command costs negligible CPU
+/// (a 30-minute command wakes ~36k times, each a cheap `waitpid(WNOHANG)`).
+const WATCHDOG_POLL: Duration = Duration::from_millis(50);
+
+/// [`Child::wait_with_output`] with a wall-clock budget.
+///
+/// Drains stdout/stderr on separate threads — required for correctness, not
+/// just speed: a child that fills a 64 KiB pipe buffer blocks in `write`,
+/// so a parent that waited before reading would deadlock and the watchdog
+/// would misreport a full pipe as a hang.
+///
+/// On expiry the child is killed and reaped, then the reader threads are
+/// joined (they finish as soon as the pipes close), and whatever partial
+/// output arrived is discarded in favour of [`Error::Timeout`] — the
+/// operator needs to know it was killed, not see a truncated stdout that
+/// looks like a real result.
+fn wait_with_timeout(mut child: Child, host: &str, budget: Duration) -> Result<Output> {
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    // Two symmetric drain threads. `ChildStdout` and `ChildStderr` are
+    // distinct types, so this is a macro rather than a shared closure.
+    macro_rules! drain {
+        ($pipe:expr) => {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut p) = $pipe {
+                    let _ = p.read_to_end(&mut buf);
+                }
+                buf
+            })
+        };
+    }
+    let out_handle = drain!(stdout_pipe);
+    let err_handle = drain!(stderr_pipe);
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= budget {
+                    // Kill, then reap, so we never leave a zombie behind.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
+                    return Err(Error::Timeout {
+                        host: host.to_string(),
+                        timeout: budget,
+                    });
+                }
+                std::thread::sleep(WATCHDOG_POLL);
+            }
+            Err(source) => {
+                return Err(Error::Wait {
+                    host: host.to_string(),
+                    source,
+                });
+            }
+        }
+    };
+
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ---- wall-clock command watchdog -------------------------------------
+    //
+    // These drive real child processes (`sleep`, `sh -c`) rather than ssh,
+    // so the kill path is genuinely exercised without needing a live host.
+
+    fn spawn_for_test(args: &[&str]) -> Child {
+        Command::new(args[0])
+            .args(&args[1..])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn test child")
+    }
+
+    #[test]
+    fn watchdog_kills_a_hung_child_and_reports_timeout() {
+        let child = spawn_for_test(&["sleep", "30"]);
+        let start = Instant::now();
+        let err = wait_with_timeout(child, "test-host", Duration::from_millis(300))
+            .expect_err("a 30s sleep under a 300ms budget must time out");
+        let elapsed = start.elapsed();
+        match err {
+            Error::Timeout { host, timeout } => {
+                assert_eq!(host, "test-host");
+                assert_eq!(timeout, Duration::from_millis(300));
+            }
+            other => panic!("expected Error::Timeout, got {other:?}"),
+        }
+        // Must actually kill, not wait out the full 30s.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "watchdog did not kill promptly: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn watchdog_returns_output_when_child_finishes_in_time() {
+        let child = spawn_for_test(&["sh", "-c", "printf hello; printf oops >&2"]);
+        let out = wait_with_timeout(child, "test-host", Duration::from_secs(30))
+            .expect("fast child must not time out");
+        assert!(out.status.success(), "status={:?}", out.status);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "oops");
+    }
+
+    #[test]
+    fn watchdog_preserves_nonzero_exit_status() {
+        let child = spawn_for_test(&["sh", "-c", "exit 7"]);
+        let out = wait_with_timeout(child, "test-host", Duration::from_secs(30))
+            .expect("non-zero exit is still a completed run");
+        assert_eq!(out.status.code(), Some(7));
+    }
+
+    /// Regression guard for the deadlock this design avoids: a child that
+    /// writes more than one pipe buffer (64 KiB) must still complete,
+    /// because the readers drain concurrently with the wait.
+    #[test]
+    fn watchdog_does_not_deadlock_on_large_output() {
+        let child = spawn_for_test(&["sh", "-c", "yes abcdefgh | head -c 300000"]);
+        let out = wait_with_timeout(child, "test-host", Duration::from_secs(60))
+            .expect("large output must not deadlock");
+        assert_eq!(out.stdout.len(), 300_000, "truncated output");
+    }
+
+    #[test]
+    fn command_timeout_is_opt_in_and_absent_from_argv() {
+        let base = SshOptions::new("h");
+        assert!(
+            base.command_timeout().is_none(),
+            "must default to no timeout so long commands are never truncated"
+        );
+        let timed = SshOptions::new("h").with_command_timeout(Duration::from_secs(5));
+        assert_eq!(timed.command_timeout(), Some(Duration::from_secs(5)));
+        // The watchdog is local; it must not leak into the ssh argv, which
+        // is byte-pinned against the bash ssh_opts_array.
+        assert_eq!(
+            base.to_argv(),
+            timed.to_argv(),
+            "command_timeout must not change the ssh argv"
+        );
+    }
 
     #[test]
     fn client_holds_supplied_options() {
