@@ -996,6 +996,14 @@ mod tests {
     fn from_args_explicit_cp_ip_wins_over_config() {
         // Two-tier precedence: explicit --cp-ip beats a config file's
         // CP_IP. No SSH attempted because explicit IP is present.
+        //
+        // Uses `from_args_with` and an INJECTED hostname rather than the
+        // ambient one. With `from_args` this test asserted
+        // `kvm_host == Some("geary")` while reading the real hostname, so
+        // it failed on the KVM host itself — `cargo test` was red on
+        // geary, the very machine this tool targets, and green in CI.
+        // The ProxyJump-drop behaviour has its own dedicated coverage in
+        // `from_args_drops_kvm_host_when_local_matches`.
         let args = VerifyCommonArgs {
             config: None,
             cp_name: Some("hbird-cp1".into()),
@@ -1003,7 +1011,8 @@ mod tests {
             cp_ip: Some("10.0.0.1".into()),
             kubectl: None,
         };
-        let plan = VerifyPlan::from_args(&args).expect("explicit cp_ip resolves");
+        let plan = VerifyPlan::from_args_with(&args, || Some("workstation".to_string()))
+            .expect("explicit cp_ip resolves");
         assert_eq!(plan.target.cp_ip, "10.0.0.1");
         assert_eq!(plan.target.kvm_host.as_deref(), Some("geary"));
         assert_eq!(plan.cp_name, "hbird-cp1");

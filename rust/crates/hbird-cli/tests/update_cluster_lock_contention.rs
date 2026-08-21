@@ -106,41 +106,58 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
     // Solution: wrap the first hbird in a parent shell that holds the
     // lock externally via flock(1). Then the lock is held for as long
     // as the parent shell sleeps.
+
+    // Spawn the lock holder and confirm it is genuinely holding before we
+    // continue. There is a race here that made this test ~10% flaky under
+    // load (measured on the KVM host): the probe below uses `flock -n` too,
+    // so if a probe wins the lock before the holder does, the holder's own
+    // non-blocking `flock -n` fails and the holder exits. A later probe then
+    // finds the lock free. Retrying the whole holder+probe pair removes the
+    // race rather than tolerating it.
     let lock_path = xdg.0.join("hbird-update-cluster.lock");
-
-    let mut first = Command::new("flock")
-        .args([
-            "-n",
-            &lock_path.to_string_lossy(),
-            "-c",
-            "trap 'exit 0' TERM; while sleep 86400; do :; done",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn flock holder");
-
-    // Wait until the flock(1) parent has actually taken the lock. Race:
-    // on a heavily loaded host (parallel tests, podman + cargo) the bare
-    // 100ms sleep occasionally beats flock(1)'s startup, producing a
-    // flaky test. Probe in a small retry loop instead.
-    let mut held = false;
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(50));
-        let probe = Command::new("flock")
+    let spawn_holder = || {
+        Command::new("flock")
+            .args([
+                "-n",
+                &lock_path.to_string_lossy(),
+                "-c",
+                "trap 'exit 0' TERM; while sleep 86400; do :; done",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn flock holder")
+    };
+    let lock_held = || {
+        Command::new("flock")
             .args(["-n", &lock_path.to_string_lossy(), "-c", "true"])
-            .output();
-        if let Ok(p) = probe
-            && p.status.code() == Some(1)
-        {
-            held = true;
-            break;
+            .output()
+            .map(|p| p.status.code() == Some(1))
+            .unwrap_or(false)
+    };
+
+    let mut first = spawn_holder();
+    let mut held = false;
+    'outer: for _attempt in 0..5 {
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if lock_held() {
+                held = true;
+                break 'outer;
+            }
+            // Holder lost the race and exited — restart it and re-probe.
+            if matches!(first.try_wait(), Ok(Some(_))) {
+                break;
+            }
         }
+        let _ = first.kill();
+        let _ = first.wait();
+        first = spawn_holder();
     }
     assert!(
         held,
-        "flock(1) holder never actually took the lock within 1.5s — test fixture bug"
+        "flock(1) holder never took the lock across 5 attempts — test fixture bug"
     );
 
     // Second invocation: configure XDG_RUNTIME_DIR to the same dir and
@@ -166,6 +183,9 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
         .output()
         .expect("spawn second hbird");
 
+    // Was the fixture still holding when hbird ran? Distinguishes "hbird
+    // failed to detect contention" from "the fixture lost its own lock".
+    let lock_held_after = lock_held();
     // Tear down the lock holder.
     let _ = first.kill();
     let _ = first.wait();
@@ -177,6 +197,7 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(
         stderr.contains("another update-cluster run is in progress"),
-        "missing contention diagnostic; stderr was:\n{stderr}"
+        "missing contention diagnostic (lock still held at assert time: {}); stderr was:\n{stderr}",
+        lock_held_after,
     );
 }

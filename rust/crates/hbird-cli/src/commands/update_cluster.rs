@@ -779,6 +779,29 @@ pub(crate) fn acquire_lock(dry_run: bool) -> Result<Option<LockGuard>> {
         .output();
     let mut child = child;
 
+    // Wait for our own `flock -n` child to SETTLE before trusting anything.
+    //
+    // This window is load-bearing. `flock -n` never blocks: if the lock is
+    // already held it exits 1 almost immediately. Previously the code read
+    // the probe first and treated `probe rc == 1` as "our child holds it" —
+    // but rc == 1 only proves SOMEONE holds it. When another run held the
+    // lock and our child had not yet been scheduled to exit, that check
+    // passed and `acquire_lock` returned success to BOTH runs. Measured at
+    // ~5-10% under load on a busy KVM host; the consequence is two
+    // concurrent rolling updates rebooting the same nodes, which is the
+    // exact failure this lock exists to prevent.
+    //
+    // Polling for the child to exit first makes contention unambiguous.
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break, // exited — inspect below
+            Ok(None) if std::time::Instant::now() >= settle_deadline => break, // alive ⇒ holds it
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
+        }
+    }
+
     // Always check whether the held-alive child died first — if flock
     // itself failed (bad path, no perms, util-linux missing) the probe
     // will succeed misleadingly.
@@ -808,7 +831,10 @@ pub(crate) fn acquire_lock(dry_run: bool) -> Result<Option<LockGuard>> {
 
     match probe {
         Ok(p) if p.status.code() == Some(1) => {
-            // Expected: our child holds the lock, the probe saw contention.
+            // The probe saw contention. Because the settle loop above
+            // already established that our own `flock -n` child did NOT
+            // exit, the holder must be our child rather than a competing
+            // run — `flock -n` would have exited 1 otherwise.
         }
         Ok(p) => {
             // Probe acquired the lock — our child didn't actually take it.
