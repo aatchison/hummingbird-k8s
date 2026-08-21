@@ -43,7 +43,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use clap::Args;
 use clap::builder::BoolishValueParser;
 
@@ -238,7 +238,27 @@ impl Plan {
         let repo_root = if let Some(ref root) = args.repo_root {
             root.clone()
         } else if config.image_source == "local" {
-            find_repo_root()
+            // `find_repo_root` falls back to "." when it can find neither a
+            // git toplevel nor the repo markers by walking up from cwd.
+            // Silently accepting that produced `make -C .` in whatever
+            // directory the operator happened to be in, and a baffling
+            // "No rule to make target 'image-k8s-with-cloud-init'" —
+            // observed live on the KVM host when invoking hbird from $HOME
+            // with an absolute --config path. Fail with the actionable
+            // remedy instead. (S4 live validation, #289.)
+            let root = find_repo_root();
+            if !path_has_repo_markers(&root) {
+                bail!(
+                    "IMAGE_SOURCE=local needs the hummingbird-k8s repo to run \
+                     `make image-*`, but the repo root could not be located from \
+                     the current directory ({}). Either run hbird from inside a \
+                     checkout, or pass --repo-root <path> (env: REPO_ROOT).",
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("?"))
+                        .display(),
+                );
+            }
+            root
         } else {
             // For registry pulls, repo_root is not used for image acquisition,
             // but we provide a sane default (cwd) to avoid failing the plan.
