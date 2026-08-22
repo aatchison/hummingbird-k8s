@@ -13,6 +13,9 @@
 //! hbird verify hardening    <-> make verify-hardening
 //! hbird verify app-deploy   <-> make verify-app-deploy
 //! hbird verify all          <-> make verify-all
+//! hbird etcd backup         <-> make backup-etcd LABEL=...
+//! hbird etcd restore        <-> make restore-etcd SNAP=...
+//! hbird etcd rotate-key     <-> make rotate-etcd-key
 //! hbird get-kubeconfig      <-> make get-kubeconfig
 //! hbird export-argocd       <-> make export-argocd
 //! hbird nodes               <-> make nodes
@@ -56,7 +59,7 @@ mod virt_bridge;
 
 use commands::{
     clean_vms::CleanVmsArgs, deploy_cluster::DeployClusterArgs,
-    destroy_cluster::DestroyClusterArgs, export_argocd::ExportArgocdArgs,
+    destroy_cluster::DestroyClusterArgs, etcd::EtcdArgs, export_argocd::ExportArgocdArgs,
     get_kubeconfig::GetKubeconfigArgs, kube_bench::KubeBenchArgs, kubectl::KubectlArgs,
     nodes::NodesArgs, preflight::PreflightArgs, spawn_workers::SpawnWorkersArgs,
     switch_to_ghcr::SwitchToGhcrArgs, update_cluster::UpdateClusterArgs, verify::VerifyArgs,
@@ -188,6 +191,16 @@ enum Command {
     /// tracked by #287.
     Verify(VerifyArgs),
 
+    /// etcd snapshot / restore / encryption-key rotation.
+    ///
+    /// Bash twins: `scripts/backup-etcd.sh`, `scripts/restore-etcd.sh`,
+    /// `scripts/rotate-etcd-encryption-key.sh` (via `make backup-etcd
+    /// LABEL=…`, `make restore-etcd SNAP=…`, `make rotate-etcd-key`).
+    /// `restore` and `rotate-key` are destructive and gate on an
+    /// interactive confirmation; every sub-subcommand takes
+    /// `--dry-run`.
+    Etcd(EtcdArgs),
+
     /// Fetch a kubeconfig from the cluster, defaulting to a kubectl-shaped
     /// context name (companion to `export-argocd`; daily-use sibling).
     ///
@@ -258,6 +271,7 @@ impl Command {
             Command::SpawnWorkers(_) => "spawn-workers",
             Command::UpdateCluster(_) => "update-cluster",
             Command::Verify(_) => "verify",
+            Command::Etcd(_) => "etcd",
             Command::GetKubeconfig(_) => "get-kubeconfig",
             Command::ExportArgocd(_) => "export-argocd",
             Command::Nodes(_) => "nodes",
@@ -278,6 +292,7 @@ impl Command {
             Command::SpawnWorkers(args) => commands::spawn_workers::run(args),
             Command::UpdateCluster(args) => commands::update_cluster::run(args),
             Command::Verify(args) => commands::verify::run(args),
+            Command::Etcd(args) => commands::etcd::run(args),
             Command::GetKubeconfig(args) => commands::get_kubeconfig::run(args),
             Command::ExportArgocd(args) => commands::export_argocd::run(args),
             Command::Nodes(args) => commands::nodes::run(args),
@@ -337,6 +352,17 @@ mod tests {
             (
                 &["hbird", "verify", "all", "--config", "/dev/null"],
                 "verify",
+            ),
+            (
+                &[
+                    "hbird",
+                    "etcd",
+                    "backup",
+                    "--dry-run",
+                    "--cp-ip",
+                    "10.0.0.5",
+                ],
+                "etcd",
             ),
             (
                 &["hbird", "get-kubeconfig", "--config", "/dev/null"],

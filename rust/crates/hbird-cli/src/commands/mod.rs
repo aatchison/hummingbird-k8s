@@ -9,6 +9,7 @@
 pub mod clean_vms;
 pub mod deploy_cluster;
 pub mod destroy_cluster;
+pub mod etcd;
 pub mod export_argocd;
 pub mod get_kubeconfig;
 pub mod kube_bench;
