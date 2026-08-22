@@ -13,7 +13,7 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Run shellcheck (errors fail; warnings printed)
         run: |
           shopt -s nullglob
@@ -33,7 +33,7 @@ jobs:
   hadolint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Run hadolint on each Containerfile (errors fail; warnings printed)
         run: |
           shopt -s nullglob
@@ -49,7 +49,7 @@ jobs:
   actionlint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Run actionlint (workflow YAML only, no embedded-script linting)
         run: |
           ACTIONLINT_VERSION=1.7.7
@@ -65,7 +65,7 @@ jobs:
     # Bakes repo into bats/bats image via docker build (no bind mounts needed).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: bats unit tests for lib/
         run: |
           docker build -t ci-bats-lib -f - . <<'DOCKERFILE'
@@ -80,7 +80,7 @@ jobs:
     # post-v0.1.0 cutover (#353). Same docker build pattern as unit-tests-lib.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: bats unit tests for scripts/
         run: |
           docker build -t ci-bats-scripts -f - . <<'DOCKERFILE'
@@ -99,7 +99,7 @@ jobs:
     # a drift fence that never ran. Same docker build pattern as the others.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: bats unit tests for containers/
         run: |
           docker build -t ci-bats-containers -f - . <<'DOCKERFILE'
@@ -112,7 +112,7 @@ jobs:
   render-bib-config-snapshot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Render bib-config fixtures and diff against committed snapshots
         run: |
           set -euo pipefail
@@ -141,7 +141,7 @@ jobs:
     # containerfile-build downloads packages during docker build).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Run bats Makefile tests
         run: |
           docker build -t ci-bats-make -f - . <<'DOCKERFILE'
@@ -159,7 +159,7 @@ jobs:
       matrix:
         flavor: [k8s, k8s-worker]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
 
       - name: Stub worker-join.env for the worker OCI build
         if: matrix.flavor == 'k8s-worker'
@@ -204,9 +204,10 @@ jobs:
       # while regressions still cannot land silently. Lower the baseline
       # after any dependency bump that reduces the count — it only ratchets
       # down.
-      - name: Trivy scan (ratchet against committed baseline)
+      - name: Trivy scan (count ratchet + known-ID gate)
         env:
           IMAGE_TAG: ${{ steps.cf.outputs.image }}:pr-${{ github.event.pull_request.number || github.run_id }}
+          TRIVY: aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7
         run: |
           set -euo pipefail
           baseline_file=.github/trivy-critical-baseline
@@ -217,23 +218,44 @@ jobs:
           # heredoc-indentation or shell-quoting hazards. NOTE: the naive
           # `{{ len (index . 0).Vulnerabilities }}` returns 0 here — the
           # criticals are spread across SEVERAL result sections (OS packages,
-          # each gobinary), not just the first. Verified against a real image:
-          # this template returns 12, the naive one returns 0.
+          # each gobinary), not just the first.
           count=$(docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest image --scanners vuln \
+            "$TRIVY" image --scanners vuln \
             --severity CRITICAL --ignore-unfixed \
             --format template --template '{{- range . }}{{- range .Vulnerabilities }}x{{ end }}{{ end }}' \
             "$IMAGE_TAG" 2>/dev/null | tr -dc 'x' | wc -c)
           count=$(printf '%s' "${count:-0}" | tr -d '[:space:]')
-          echo "fixable CRITICAL count: $count (baseline $baseline)"
 
-          # Always show what they are, so the log is actionable.
+          # Distinct vulnerability IDs, one per line.
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest image --scanners vuln \
+            "$TRIVY" image --scanners vuln \
+            --severity CRITICAL --ignore-unfixed \
+            --format template --template '{{- range . }}{{- range .Vulnerabilities }}{{ .VulnerabilityID }}{{ "\n" }}{{ end }}{{ end }}' \
+            "$IMAGE_TAG" 2>/dev/null | grep -E '^(CVE|GHSA)-' | sort -u > seen-ids.txt || true
+
+          echo "fixable CRITICAL count: $count (baseline $baseline)"
+          echo "distinct IDs observed:"; sed 's/^/  /' seen-ids.txt
+
+          # Always show the full table, so the log is actionable.
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            "$TRIVY" image --scanners vuln \
             --severity CRITICAL --ignore-unfixed "$IMAGE_TAG" || true
 
+          # GATE 1 — known-ID set. A pure count ratchet can be satisfied by
+          # swapping N old CVEs for N brand-new ones, so the count alone is
+          # NOT sufficient. Any ID absent from the committed allowlist fails,
+          # even when the total does not rise.
+          grep -E '^id=' "$baseline_file" | cut -d= -f2 | sort -u > known-ids.txt
+          if ! new_ids=$(comm -23 seen-ids.txt known-ids.txt) || [ -n "$new_ids" ]; then
+            echo "::error::${{ matrix.flavor }}: NEW fixable CRITICAL id(s) not in the committed allowlist:" >&2
+            echo "$new_ids" | sed 's/^/  /' >&2
+            echo "Investigate, then add the id to $baseline_file only if it is genuinely accepted." >&2
+            exit 1
+          fi
+
+          # GATE 2 — count ratchet.
           if [ "$count" -gt "$baseline" ]; then
-            echo "::error::${{ matrix.flavor }}: $count fixable CRITICAL vulns exceeds baseline $baseline — this PR introduces new critical vulnerabilities." >&2
+            echo "::error::${{ matrix.flavor }}: $count fixable CRITICAL vulns exceeds baseline $baseline." >&2
             exit 1
           fi
           if [ "$count" -lt "$baseline" ]; then

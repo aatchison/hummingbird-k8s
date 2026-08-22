@@ -8,8 +8,30 @@
 #
 # Measured 2026-08-22 against the images built from the pinned base digest.
 # 2026-08-22: base bumped 3bed2fc1 -> 2e29eb2b, 12 -> 11 on both images.
-# The base's own CRITICAL is gone; the remaining 11 are in packages this
-# repo layers on (Go stdlib x6 + grpc x4 in the k8s/cri-o binaries,
-# capnp x1) and need a K8S_VERSION / cri-o bump, not a base bump.
-k8s=11
-k8s-worker=11
+# 2026-08-22: K8S_VERSION v1.31 -> v1.32, 11 -> 8 on both images, measured
+# by this job in CI (PR #413). The v1.32 pkgs.k8s.io channel ships k8s and
+# cri-o binaries rebuilt with a newer Go toolchain, which cleared three of
+# the Go-stdlib instances of CVE-2025-68121.
+#
+# The remaining 8 are still upstream-owned, not introduced here:
+#   CVE-2026-33186      google.golang.org/grpc  (vendored in k8s/cri-o bins)
+#   CVE-2025-68121      Go stdlib crypto/tls    (bins still built on Go 1.22.x)
+#   GHSA-5w5r-mf82-595p capnp
+# They clear when upstream rebuilds those binaries; there is no pin in this
+# repo that removes them today. Cilium 1.17.16 caps us at k8s 1.32, so the
+# next reduction needs a Cilium bump first (see docs/cilium-migration.md).
+k8s=8
+k8s-worker=8
+
+# ---- Known-ID allowlist (GATE 1) ----------------------------------------
+# The count ratchet alone is NOT sufficient: it can be satisfied by swapping
+# N old CVEs for N brand-new ones. CI therefore also fails on any fixable
+# CRITICAL id that is not listed here, even when the total does not rise.
+# Raised by forge-security in review of PR #413.
+#
+# Every id below is upstream-owned and present in the k8s/cri-o binaries
+# shipped by the pkgs.k8s.io v1.32 channel. Adding an id here is an explicit,
+# reviewable act of acceptance — do not add one to make CI green.
+id=CVE-2025-68121
+id=CVE-2026-33186
+id=GHSA-5w5r-mf82-595p
