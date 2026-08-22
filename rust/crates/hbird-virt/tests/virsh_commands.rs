@@ -342,6 +342,150 @@ fn undefine_domain_emits_virsh_undefine_with_nvram() {
     );
 }
 
+// ---- running_domains / undefine --remove-all-storage / remote_ls -----------
+// Added with `hbird switch-to-ghcr` + `hbird clean-vms` (bash twins
+// `scripts/switch-to-ghcr.sh`, `scripts/clean-vms.sh`).
+
+#[test]
+fn running_domains_omits_all_flag() {
+    let stub = Arc::new(StubSshClient::new());
+    // Bash twin `scripts/switch-to-ghcr.sh::236` uses `virsh list --name`
+    // WITHOUT `--all`: a shut-off domain has no sshd to switch.
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system list --name",
+        Reply::Ok(
+            "hummingbird-k8s
+hummingbird-k8s-worker-1
+
+"
+            .to_string(),
+        ),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    let doms = conn.running_domains().expect("ok");
+    let names: Vec<_> = doms.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, vec!["hummingbird-k8s", "hummingbird-k8s-worker-1"]);
+    assert_eq!(
+        stub.calls(),
+        vec![(
+            "op@kvm.example".to_string(),
+            "virsh -c qemu:///system list --name".to_string()
+        )],
+        "running_domains must NOT pass --all",
+    );
+}
+
+#[test]
+fn running_domains_returns_empty_when_nothing_is_up() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system list --name",
+        Reply::Ok(
+            "
+"
+            .to_string(),
+        ),
+    );
+    let conn = make_conn(stub);
+    assert!(conn.running_domains().unwrap().is_empty());
+}
+
+#[test]
+fn running_domains_surfaces_virsh_failure() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system list --name",
+        Reply::NonZero {
+            stderr: "error: failed to connect to the hypervisor".to_string(),
+            exit_code: 1,
+        },
+    );
+    let conn = make_conn(stub);
+    let err = conn
+        .running_domains()
+        .expect_err("non-zero virsh must error");
+    assert!(matches!(err, Error::VirshFailed { .. }), "got {err:?}");
+}
+
+#[test]
+fn undefine_domain_remove_all_storage_matches_bash_flag_order() {
+    let stub = Arc::new(StubSshClient::new());
+    // Bash twin `scripts/clean-vms.sh::57`:
+    //   virsh -c qemu:///system undefine "$d" --remove-all-storage
+    // Name first, flag second — pinned so the command stays greppable.
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system undefine hummingbird-k8s --remove-all-storage",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.undefine_domain_remove_all_storage("hummingbird-k8s")
+        .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(
+        calls[0].1,
+        "virsh -c qemu:///system undefine hummingbird-k8s --remove-all-storage"
+    );
+}
+
+#[test]
+fn undefine_domain_remove_all_storage_quotes_hostile_name() {
+    let stub = Arc::new(StubSshClient::new());
+    let conn = make_conn(Arc::clone(&stub));
+    let _ = conn.undefine_domain_remove_all_storage("evil; rm -rf /");
+    let calls = stub.calls();
+    assert!(
+        calls[0].1.contains("'evil; rm -rf /'"),
+        "hostile name must be single-quoted: {:?}",
+        calls[0].1
+    );
+}
+
+#[test]
+fn remote_ls_emits_ls_1_and_splits_lines() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "ls -1 -- '/var/lib/libvirt/images'",
+        Reply::Ok(
+            "hummingbird-k8s.qcow2
+hbird-geary-1.qcow2
+
+"
+            .to_string(),
+        ),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    let names = conn.remote_ls("/var/lib/libvirt/images").expect("ok");
+    assert_eq!(names, vec!["hummingbird-k8s.qcow2", "hbird-geary-1.qcow2"]);
+    assert_eq!(calls_first(&stub), "ls -1 -- '/var/lib/libvirt/images'");
+}
+
+#[test]
+fn remote_ls_surfaces_missing_directory_as_virshfailed() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "ls -1 -- '/no/such/pool'",
+        Reply::NonZero {
+            stderr: "ls: cannot access '/no/such/pool': No such file or directory".to_string(),
+            exit_code: 2,
+        },
+    );
+    let conn = make_conn(stub);
+    let err = conn.remote_ls("/no/such/pool").expect_err("must error");
+    assert!(matches!(err, Error::VirshFailed { .. }), "got {err:?}");
+}
+
+/// First command string the stub observed. Small helper so the new
+/// tests read as one assertion per behaviour.
+fn calls_first(stub: &Arc<StubSshClient>) -> String {
+    stub.calls()[0].1.clone()
+}
+
 #[test]
 fn remote_rm_f_emits_rm_f_with_quoted_path() {
     let stub = Arc::new(StubSshClient::new());

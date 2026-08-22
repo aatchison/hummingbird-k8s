@@ -19,6 +19,8 @@
 //! hbird kubectl             <-> make kubectl
 //! hbird preflight cilium    <-> make check-cilium-k8s-compat
 //! hbird kube-bench          <-> make kube-bench
+//! hbird switch-to-ghcr      <-> make switch-to-ghcr
+//! hbird clean-vms           <-> make clean-vms
 //! ```
 //!
 //! Every subcommand now has a real body. [#283] shipped the clap tree
@@ -53,10 +55,11 @@ mod cp_resolve;
 mod virt_bridge;
 
 use commands::{
-    deploy_cluster::DeployClusterArgs, destroy_cluster::DestroyClusterArgs,
-    export_argocd::ExportArgocdArgs, get_kubeconfig::GetKubeconfigArgs, kube_bench::KubeBenchArgs,
-    kubectl::KubectlArgs, nodes::NodesArgs, preflight::PreflightArgs,
-    spawn_workers::SpawnWorkersArgs, update_cluster::UpdateClusterArgs, verify::VerifyArgs,
+    clean_vms::CleanVmsArgs, deploy_cluster::DeployClusterArgs,
+    destroy_cluster::DestroyClusterArgs, export_argocd::ExportArgocdArgs,
+    get_kubeconfig::GetKubeconfigArgs, kube_bench::KubeBenchArgs, kubectl::KubectlArgs,
+    nodes::NodesArgs, preflight::PreflightArgs, spawn_workers::SpawnWorkersArgs,
+    switch_to_ghcr::SwitchToGhcrArgs, update_cluster::UpdateClusterArgs, verify::VerifyArgs,
 };
 
 /// Top-level entry point. Parse argv, dispatch to the chosen subcommand.
@@ -225,6 +228,19 @@ enum Command {
     ///
     /// Bash twin: `scripts/run-kube-bench.sh` (via `make kube-bench`).
     KubeBench(KubeBenchArgs),
+    /// Switch deployed VMs from `localhost/…` to the GHCR-published image
+    /// so the bootc auto-update timer has a remote to pull from.
+    ///
+    /// Bash twin: `scripts/switch-to-ghcr.sh` (via `make switch-to-ghcr`).
+    /// Tracked by #138.
+    SwitchToGhcr(SwitchToGhcrArgs),
+
+    /// Destroy every `hummingbird-*` VM and sweep stale qcow2 / seed ISOs
+    /// from `POOL_DIR`.
+    ///
+    /// Bash twin: `scripts/clean-vms.sh` (via `make clean-vms`).
+    /// Tracked by #221.
+    CleanVms(CleanVmsArgs),
 }
 
 impl Command {
@@ -248,6 +264,8 @@ impl Command {
             Command::Kubectl(_) => "kubectl",
             Command::Preflight(_) => "preflight",
             Command::KubeBench(_) => "kube-bench",
+            Command::SwitchToGhcr(_) => "switch-to-ghcr",
+            Command::CleanVms(_) => "clean-vms",
         }
     }
 
@@ -266,6 +284,8 @@ impl Command {
             Command::Kubectl(args) => commands::kubectl::run(args),
             Command::Preflight(args) => commands::preflight::run(args),
             Command::KubeBench(args) => commands::kube_bench::run(args),
+            Command::SwitchToGhcr(args) => commands::switch_to_ghcr::run(args),
+            Command::CleanVms(args) => commands::clean_vms::run(args),
         }
     }
 }
@@ -344,6 +364,12 @@ mod tests {
                 "preflight",
             ),
             (&["hbird", "kube-bench", "--dry-run"], "kube-bench"),
+            (&["hbird", "switch-to-ghcr"], "switch-to-ghcr"),
+            (
+                &["hbird", "switch-to-ghcr", "hummingbird-k8s-worker-1"],
+                "switch-to-ghcr",
+            ),
+            (&["hbird", "clean-vms"], "clean-vms"),
         ];
         for (argv, expected) in cases {
             let cli = Cli::try_parse_from(*argv)

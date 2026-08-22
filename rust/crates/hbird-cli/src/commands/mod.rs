@@ -6,6 +6,7 @@
 //! since been given a real implementation, so no `run` returns a
 //! not-implemented error.
 
+pub mod clean_vms;
 pub mod deploy_cluster;
 pub mod destroy_cluster;
 pub mod export_argocd;
@@ -15,5 +16,6 @@ pub mod kubectl;
 pub mod nodes;
 pub mod preflight;
 pub mod spawn_workers;
+pub mod switch_to_ghcr;
 pub mod update_cluster;
 pub mod verify;

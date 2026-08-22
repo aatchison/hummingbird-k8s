@@ -210,14 +210,34 @@ impl Connection {
     fn domains_inner(&self) -> Result<Vec<Domain>> {
         let cmd = format!("virsh -c {} list --all --name", self.uri.remote_uri());
         let stdout = self.run(&cmd)?;
-        Ok(stdout
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| Domain {
-                name: s.to_string(),
-            })
-            .collect())
+        Ok(parse_domain_list(&stdout))
+    }
+
+    /// Enumerate only the **running** VMs (`virsh list --name`, without
+    /// `--all`).
+    ///
+    /// Bash twin: `scripts/switch-to-ghcr.sh::236` —
+    /// `virsh -c qemu:///system list --name 2>/dev/null | grep '^hummingbird-'`.
+    ///
+    /// Distinct from [`Self::domains`], which passes `--all` and therefore
+    /// also returns shut-off domains. `switch-to-ghcr` must NOT touch a
+    /// shut-off domain (there is no sshd to reach), so the two call sites
+    /// need different virsh invocations rather than a post-filter.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] when `virsh` exits non-zero.
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri))]
+    pub fn running_domains(&self) -> Result<Vec<Domain>> {
+        self.running_domains_inner()
+            .inspect_err(|err| tracing::debug!(error = ?err, "virsh running domains failed"))
+    }
+
+    fn running_domains_inner(&self) -> Result<Vec<Domain>> {
+        let cmd = format!("virsh -c {} list --name", self.uri.remote_uri());
+        let stdout = self.run(&cmd)?;
+        Ok(parse_domain_list(&stdout))
     }
 
     /// Resolve a domain's IPv4 lease via `virsh domifaddr`.
@@ -348,6 +368,73 @@ impl Connection {
         self.run(&cmd)
             .map(|_| ())
             .inspect_err(|err| tracing::debug!(error = ?err, "virsh undefine failed"))
+    }
+
+    /// Undefine a domain **and delete every storage volume it owns**
+    /// (`virsh undefine <NAME> --remove-all-storage`).
+    ///
+    /// Bash twin: `scripts/clean-vms.sh::57` —
+    /// `virsh -c qemu:///system undefine "$d" --remove-all-storage 2>/dev/null || true`.
+    ///
+    /// **DESTRUCTIVE and distinct from [`Self::undefine_domain`]**: that
+    /// one passes `--nvram` and leaves the qcow2 on disk (destroy-cluster
+    /// removes the files itself, by path). This one asks libvirt to drop
+    /// the backing volumes, which is what `make clean-vms` wants — it
+    /// sweeps domains it did not necessarily deploy, so it cannot know
+    /// their disk paths.
+    ///
+    /// Flag order mirrors the bash twin (name first, flag second) so the
+    /// emitted command string is greppable against `scripts/clean-vms.sh`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] when `virsh` exits non-zero (e.g. domain
+    ///   not defined, or a volume libvirt refuses to delete).
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
+    pub fn undefine_domain_remove_all_storage(&self, domain: &str) -> Result<()> {
+        let cmd = format!(
+            "virsh -c {} undefine {} --remove-all-storage",
+            self.uri.remote_uri(),
+            shell_quote(domain),
+        );
+        self.run(&cmd).map(|_| ()).inspect_err(
+            |err| tracing::debug!(error = ?err, "virsh undefine --remove-all-storage failed"),
+        )
+    }
+
+    /// List the entries of a directory on the KVM host (`ls -1 -- <dir>`).
+    ///
+    /// Bash twin: the `shopt -s nullglob` + `"$POOL_DIR"/hummingbird-*.qcow2`
+    /// glob block in `scripts/clean-vms.sh::62-72`. Expanding the glob in
+    /// bash means the *remote shell* decides what matches; doing the
+    /// listing here and the matching in the caller keeps the match rule in
+    /// Rust where it can be unit-tested (and cannot be widened by a stray
+    /// `shopt`).
+    ///
+    /// Returns bare entry names (no directory prefix), in the order `ls`
+    /// emitted them. Empty lines are dropped.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] (overloaded — captures `ls`'s stderr) when
+    ///   `ls` exits non-zero, e.g. the directory does not exist. Callers
+    ///   that treat a missing pool dir as "nothing to sweep" must map that
+    ///   variant themselves; `nullglob` in the bash twin silently yields an
+    ///   empty list for the same case.
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, dir))]
+    pub fn remote_ls(&self, dir: &str) -> Result<Vec<String>> {
+        let cmd = format!("ls -1 -- {}", shell_quote(dir));
+        let stdout = self
+            .run(&cmd)
+            .inspect_err(|err| tracing::debug!(error = ?err, "remote ls failed"))?;
+        Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     /// Remove a file on the remote (or local) KVM host via the SSH
@@ -680,6 +767,23 @@ fn shell_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Split `virsh list [--all] --name` stdout into [`Domain`] values.
+///
+/// `virsh list --name` emits one name per line plus a trailing blank
+/// separator line; both call sites want the same trim-and-drop-empties
+/// treatment, so the rule lives here rather than being duplicated in
+/// [`Connection::domains`] and [`Connection::running_domains`].
+fn parse_domain_list(stdout: &str) -> Vec<Domain> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Domain {
+            name: s.to_string(),
+        })
+        .collect()
 }
 
 /// Parse `virsh domifaddr` output. Visible for unit tests in the
