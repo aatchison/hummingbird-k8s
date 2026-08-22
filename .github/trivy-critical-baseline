@@ -1,0 +1,12 @@
+# Fixable CRITICAL vulnerability counts per image, measured by the
+# `containerfile-build` job in pr-validate.yml.
+#
+# This is a RATCHET. A PR fails if its count EXCEEDS the number here; it
+# never fails for being under. Both counts below are inherited from the
+# bootc-os base image, not introduced by this repo — see the CVE list in
+# the workflow comment. Lower these whenever the base image is bumped, so
+# the improvement is locked in and cannot silently regress.
+#
+# Measured 2026-08-22 against the images built from the pinned base digest.
+k8s=12
+k8s-worker=12

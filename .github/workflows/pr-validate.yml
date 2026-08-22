@@ -90,6 +90,25 @@ jobs:
           DOCKERFILE
           docker run --rm ci-bats-scripts tests/scripts/
 
+  unit-tests-containers:
+    # bats fences over containers/ — the Containerfile dependency/repo-pin
+    # assertions and the worker-init regression guards. These suites existed
+    # but were wired to NOTHING: no make target, no workflow job. So the
+    # #397 Rawhide-metalink fence, the #265 `cloud-init status --wait` fence
+    # and the #254 hostnamectl fence were all dead letters — the docs claimed
+    # a drift fence that never ran. Same docker build pattern as the others.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: bats unit tests for containers/
+        run: |
+          docker build -t ci-bats-containers -f - . <<'DOCKERFILE'
+          FROM bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300
+          COPY . /repo
+          WORKDIR /repo
+          DOCKERFILE
+          docker run --rm ci-bats-containers tests/containers/
+
   render-bib-config-snapshot:
     runs-on: ubuntu-latest
     steps:
@@ -171,3 +190,53 @@ jobs:
             --tag "${{ steps.cf.outputs.image }}:pr-${{ github.event.pull_request.number || github.run_id }}" \
             --file "${{ steps.cf.outputs.path }}" \
             .
+
+      # Trivy on PRs (shift-left). Images were previously scanned ONLY at
+      # publish time in build-k8s.yml/build-worker.yml, and with
+      # exit-code 0 — so a vulnerable base layer was invisible until after
+      # merge, and never failed anything.
+      #
+      # This is a RATCHET, not an absolute gate: measured on the images at
+      # the time it was added, both carry 12 fixable CRITICALs inherited
+      # from the base image (CVE-2025-68121 Go stdlib crypto/tls cert
+      # validation, CVE-2026-33186, GHSA-5w5r-mf82-595p capnp). A blocking
+      # gate would therefore fail every PR on day one. Instead we fail only
+      # when a PR pushes the count ABOVE the committed baseline, so
+      # inherited debt does not block work while regressions still cannot
+      # land silently. Lower the baseline when the base image is bumped —
+      # it only ever ratchets down.
+      - name: Trivy scan (ratchet against committed baseline)
+        env:
+          IMAGE_TAG: ${{ steps.cf.outputs.image }}:pr-${{ github.event.pull_request.number || github.run_id }}
+        run: |
+          set -euo pipefail
+          baseline_file=.github/trivy-critical-baseline
+          baseline=$(grep -E "^${{ matrix.flavor }}=" "$baseline_file" | cut -d= -f2)
+          [ -n "$baseline" ] || { echo "no baseline row for ${{ matrix.flavor }} in $baseline_file" >&2; exit 1; }
+
+          # Count via trivy's own template renderer — no inline python, so no
+          # heredoc-indentation or shell-quoting hazards. NOTE: the naive
+          # `{{ len (index . 0).Vulnerabilities }}` returns 0 here — the
+          # criticals are spread across SEVERAL result sections (OS packages,
+          # each gobinary), not just the first. Verified against a real image:
+          # this template returns 12, the naive one returns 0.
+          count=$(docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --scanners vuln \
+            --severity CRITICAL --ignore-unfixed \
+            --format template --template '{{- range . }}{{- range .Vulnerabilities }}x{{ end }}{{ end }}' \
+            "$IMAGE_TAG" 2>/dev/null | tr -dc 'x' | wc -c)
+          count=$(printf '%s' "${count:-0}" | tr -d '[:space:]')
+          echo "fixable CRITICAL count: $count (baseline $baseline)"
+
+          # Always show what they are, so the log is actionable.
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --scanners vuln \
+            --severity CRITICAL --ignore-unfixed "$IMAGE_TAG" || true
+
+          if [ "$count" -gt "$baseline" ]; then
+            echo "::error::${{ matrix.flavor }}: $count fixable CRITICAL vulns exceeds baseline $baseline — this PR introduces new critical vulnerabilities." >&2
+            exit 1
+          fi
+          if [ "$count" -lt "$baseline" ]; then
+            echo "::notice::${{ matrix.flavor }}: criticals dropped to $count (baseline $baseline) — lower the baseline in $baseline_file to lock in the improvement."
+          fi

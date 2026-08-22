@@ -129,7 +129,7 @@ endif
         backup-etcd restore-etcd rotate-etcd-key \
         ci-build-k8s ci-build-worker \
         print-containerfile-k8s print-containerfile-worker \
-        test-lib test-scripts test-all \
+        test-lib test-scripts test-containers test-all \
         clean-vms clean-images clean
 
 # ---- help ---------------------------------------------------------------
@@ -466,7 +466,10 @@ test-lib: ## Run bats unit tests for lib/build-common.sh
 test-scripts: ## Run bats unit tests for scripts/ (scripts/*.sh suites)
 	podman run --rm -v "$(CURDIR):/repo:Z" -w /repo $(BATS_IMAGE) tests/scripts/
 
-test-all: test-lib test-scripts ## Run all bats unit suites (lib + scripts)
+test-containers: ## Run bats unit tests for containers/ (Containerfile + init-script fences)
+	podman run --rm -v "$(CURDIR):/repo:Z" -w /repo $(BATS_IMAGE) tests/containers/
+
+test-all: test-lib test-scripts test-containers ## Run all bats unit suites (lib + scripts + containers)
 
 # ---- cleanup -----------------------------------------------------------
 
