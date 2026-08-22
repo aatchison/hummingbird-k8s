@@ -342,6 +342,43 @@ jobs:
               --data-binary "@$f"
           done
 
+      # Publish to the Forgejo GENERIC PACKAGE registry (Forgejo only).
+      # Distinct from the release above: generic packages have STABLE,
+      # predictable URLs —
+      #   {SERVER}/api/packages/{OWNER}/generic/hbird/{VERSION}/{FILE}
+      # — which is what lets a CI runner or operator host download-and-call
+      # the exact tested binary with a bare curl, no auth, no install:
+      #   curl -sSO .../generic/hbird/$V/hbird-$V-x86_64-unknown-linux-musl
+      #   make deploy-cluster CONFIG=... HBIRD=$PWD/hbird-$V-...
+      # (Release assets get UUID attachment URLs; they cannot be fetched by
+      # a version-derived path, so they don't serve the bootstrap use-case.)
+      - name: Publish binary to Forgejo generic package registry
+        if: steps.v.outputs.dry_run == 'false' && github.server_url != 'https://github.com'
+        env:
+          FORGEJO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+          SERVER: ${{ github.server_url }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          base="${SERVER}/api/packages/${OWNER}/generic/hbird/${VERSION}"
+          for f in "dist/hbird-${VERSION}-x86_64-unknown-linux-musl" \
+                   "dist/hbird-${VERSION}-SHA256SUMS"; do
+            # PUT is idempotent-hostile in the generic registry (409 on
+            # re-upload of the same version+file); delete-then-put keeps a
+            # re-run of a failed publish from wedging on its own partial
+            # success, while a genuinely different re-publish of the same
+            # VERSION still fails loudly at the release step above.
+            curl -sS -o /dev/null -X DELETE \
+              -H "Authorization: token ${FORGEJO_TOKEN}" \
+              "${base}/$(basename "$f")" || true
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT \
+              -H "Authorization: token ${FORGEJO_TOKEN}" \
+              --upload-file "$f" "${base}/$(basename "$f")")
+            [ "$code" = "201" ] || { echo "generic publish of $(basename "$f") got HTTP $code" >&2; exit 1; }
+            echo "published ${base}/$(basename "$f")"
+          done
+
       - name: Dry-run summary
         if: steps.v.outputs.dry_run == 'true'
         env:

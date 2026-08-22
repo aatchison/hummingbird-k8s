@@ -481,3 +481,18 @@ make_dry() {
     return 1
   fi
 }
+
+@test "25. HBIRD=/abs/path overrides the binary in every hbird recipe (download-and-call, no install)" {
+  # CI runners download the exact tested binary from the Forgejo generic
+  # registry and pass HBIRD=<abs path> — no install, no PATH mutation, and
+  # (unlike PATH) a make variable survives `sudo make ...` because it is
+  # argv, not environment. This is the supported no-checkout-install path.
+  make_dry backup-etcd HBIRD=/opt/ci/hbird
+  [[ "$output" == *"/opt/ci/hbird etcd backup"* ]]
+  make_dry deploy-cluster CONFIG=cluster.example.conf HBIRD=/opt/ci/hbird
+  [[ "$output" == *"/opt/ci/hbird deploy-cluster"* ]]
+  # And the default stays a bare PATH lookup.
+  make_dry backup-etcd
+  [[ "$output" == *"hbird etcd backup"* ]]
+  [[ "$output" != *"/opt/ci/hbird"* ]]
+}
