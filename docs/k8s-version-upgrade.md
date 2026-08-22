@@ -153,7 +153,7 @@ For the homelab use case, the rebuild path is strongly preferred.
 - Kubernetes officially supports skipping at most one minor at a time
   (`v1.31` → `v1.32` is fine; `v1.31` → `v1.33` is not). Multi-minor jumps
   require intermediate hops.
-- Hummingbird pinning: `K8S_VERSION=v1.31` resolves to the latest `1.31.x`
+- Hummingbird pinning: `K8S_VERSION=v1.32` resolves to the latest `1.32.x`
   patch at build time, so patch bumps roll forward automatically on every
   image rebuild.
 

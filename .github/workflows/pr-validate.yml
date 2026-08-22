@@ -196,15 +196,14 @@ jobs:
       # exit-code 0 — so a vulnerable base layer was invisible until after
       # merge, and never failed anything.
       #
-      # This is a RATCHET, not an absolute gate: measured on the images at
-      # the time it was added, both carry 12 fixable CRITICALs inherited
-      # from the base image (CVE-2025-68121 Go stdlib crypto/tls cert
-      # validation, CVE-2026-33186, GHSA-5w5r-mf82-595p capnp). A blocking
-      # gate would therefore fail every PR on day one. Instead we fail only
-      # when a PR pushes the count ABOVE the committed baseline, so
-      # inherited debt does not block work while regressions still cannot
-      # land silently. Lower the baseline when the base image is bumped —
-      # it only ever ratchets down.
+      # This is a RATCHET, not an absolute gate. The images had existing
+      # fixable CRITICAL findings when this was introduced, from both the
+      # base and layered packages. A zero-tolerance gate would have failed
+      # every PR on day one. Instead we fail only when a PR pushes the count
+      # ABOVE the committed baseline, so existing debt does not block work
+      # while regressions still cannot land silently. Lower the baseline
+      # after any dependency bump that reduces the count — it only ratchets
+      # down.
       - name: Trivy scan (ratchet against committed baseline)
         env:
           IMAGE_TAG: ${{ steps.cf.outputs.image }}:pr-${{ github.event.pull_request.number || github.run_id }}

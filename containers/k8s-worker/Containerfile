@@ -11,8 +11,8 @@ FROM quay.io/hummingbird-community/bootc-os@sha256:2e29eb2ba2d17b304529e7b2503ea
 # (#397; #399: F43 EOL early December 2026 per the current Fedora schedule).
 ARG FEDORA_RELEASE=43
 
-# K8S_VERSION pins the major.minor only (e.g. v1.31). pkgs.k8s.io URLs are
-# major.minor-scoped, so dnf installs the latest 1.31.x patch at build time.
+# K8S_VERSION pins the major.minor only (e.g. v1.32). pkgs.k8s.io URLs are
+# major.minor-scoped, so dnf installs the latest 1.32.x patch at build time.
 # This means patch-level CVE fixes ride in on every rebuild without manual
 # bumps; the trade-off is determinism — two builds of the same Containerfile
 # at different times can produce different images. Acceptable for a lab.
@@ -20,7 +20,7 @@ ARG FEDORA_RELEASE=43
 # Must match the control-plane image's K8S_VERSION so worker kubelet stays
 # in lock-step with the CP. Bump deliberately (e.g., v1.32) when promoting
 # to a new minor release.
-ARG K8S_VERSION=v1.31
+ARG K8S_VERSION=v1.32
 
 # Optional cloud-init support. Default OFF — the canonical Hummingbird
 # customization path is the bib `[[customizations.user]]` blocks rendered

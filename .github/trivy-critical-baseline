@@ -2,10 +2,9 @@
 # `containerfile-build` job in pr-validate.yml.
 #
 # This is a RATCHET. A PR fails if its count EXCEEDS the number here; it
-# never fails for being under. Both counts below are inherited from the
-# bootc-os base image, not introduced by this repo — see the CVE list in
-# the workflow comment. Lower these whenever the base image is bumped, so
-# the improvement is locked in and cannot silently regress.
+# never fails for being under. Findings can come from the base or packages
+# layered on by this repo. Lower these numbers whenever a dependency bump
+# reduces the measured count, so the improvement cannot silently regress.
 #
 # Measured 2026-08-22 against the images built from the pinned base digest.
 # 2026-08-22: base bumped 3bed2fc1 -> 2e29eb2b, 12 -> 11 on both images.

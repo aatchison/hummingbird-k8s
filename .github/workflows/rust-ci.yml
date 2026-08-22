@@ -176,7 +176,13 @@ jobs:
             -e CARGO_TERM_COLOR=always \
             -e CARGO_INCREMENTAL=0 \
             ci-rust-test \
-            cargo test --workspace --no-fail-fast --locked
+            bash -euo pipefail -c '
+              cargo test --workspace --no-fail-fast --locked
+              # Read the actual committed Containerfile + k8s-init.sh pins.
+              # --strict turns a Cilium/Kubernetes matrix mismatch into rc=1.
+              cargo run --locked -p hbird-cli --bin hbird -- \
+                preflight cilium --strict --repo-root ..
+            '
 
   deny:
     runs-on: ubuntu-latest
