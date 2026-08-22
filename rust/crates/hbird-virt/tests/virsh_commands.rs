@@ -418,7 +418,7 @@ fn undefine_domain_remove_all_storage_matches_bash_flag_order() {
     // Name first, flag second — pinned so the command stays greppable.
     stub.expect(
         "op@kvm.example",
-        "virsh -c qemu:///system undefine hummingbird-k8s --remove-all-storage",
+        "virsh -c qemu:///system undefine hummingbird-k8s --remove-all-storage --nvram",
         Reply::Ok(String::new()),
     );
     let conn = make_conn(Arc::clone(&stub));
@@ -427,7 +427,7 @@ fn undefine_domain_remove_all_storage_matches_bash_flag_order() {
     let calls = stub.calls();
     assert_eq!(
         calls[0].1,
-        "virsh -c qemu:///system undefine hummingbird-k8s --remove-all-storage"
+        "virsh -c qemu:///system undefine hummingbird-k8s --remove-all-storage --nvram"
     );
 }
 
@@ -1229,4 +1229,37 @@ fn net_info_command_shape_and_passthrough() {
     let conn = make_conn(Arc::clone(&stub));
     let got = conn.net_info("vf-pool").expect("info");
     assert_eq!(got, info);
+}
+
+#[test]
+fn net_update_delete_ip_dhcp_host_mirrors_the_add_shape() {
+    // Counterpart to net_update_add_ip_dhcp_host. destroy-cluster hands
+    // back the element exactly as net-dumpxml printed it, because virsh
+    // matches on the XML it is given.
+    let stub = Arc::new(StubSshClient::new());
+    let host_xml = "<host mac='52:54:00:f0:1d:bd' name='hbird-cp1' ip='192.168.122.10'/>";
+    let expected_cmd = r#"virsh -c qemu:///system net-update default delete ip-dhcp-host '<host mac='\''52:54:00:f0:1d:bd'\'' name='\''hbird-cp1'\'' ip='\''192.168.122.10'\''/>' --live --config"#;
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.net_update_delete_ip_dhcp_host("default", host_xml)
+        .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, expected_cmd);
+}
+
+#[test]
+fn undefine_remove_all_storage_passes_nvram() {
+    // A UEFI/Q35 guest cannot be undefined while it has an NVRAM file
+    // unless --nvram is given. bash clean-vms.sh omitted it and swallowed
+    // the failure with `2>/dev/null || true`, so the domain silently
+    // stayed defined. undefine_domain (destroy-cluster) always had it.
+    let stub = Arc::new(StubSshClient::new());
+    let expected_cmd =
+        "virsh -c qemu:///system undefine hummingbird-k8s-worker-1 --remove-all-storage --nvram";
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.undefine_domain_remove_all_storage("hummingbird-k8s-worker-1")
+        .expect("ok");
+    assert_eq!(stub.calls()[0].1, expected_cmd);
 }

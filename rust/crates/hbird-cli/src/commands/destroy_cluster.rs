@@ -41,6 +41,10 @@ use clap::builder::BoolishValueParser;
 use hbird_config::ClusterConfig;
 use hbird_virt::{Connection, Error as VirtError};
 
+/// Network deploy-cluster writes DHCP reservations onto (it hardcodes
+/// `default`, matching the bash twin). Kept in sync with deploy_cluster.
+const RESERVATION_NET: &str = "default";
+
 // ---- Arguments (block #1: clap surface) ------------------------------------
 
 /// Arguments for `hbird destroy-cluster`.
@@ -217,6 +221,35 @@ fn destroy_one(conn: &Connection, plan: &Plan, name: &str) -> Result<usize> {
                 "WARN: virsh undefine returned non-zero for {name}: {e}"
             ));
             warnings += 1;
+        }
+        // Step 3b: remove the DHCP reservation deploy created for this VM.
+        // deploy-cluster writes `<host mac=… name=<vm> ip=…/>` onto the
+        // `default` network; nothing removed it, so reservations accumulated
+        // across every deploy/destroy cycle and eventually collided with a
+        // later deploy asking for the same address. Keyed on name= so we only
+        // ever delete a reservation we created. Best-effort: a missing
+        // reservation is the normal case for a cluster deployed without
+        // pinned IPs, and must not fail the teardown.
+        match conn.net_dumpxml(RESERVATION_NET) {
+            Ok(net_xml) => {
+                if let Some(host_xml) = hbird_virt::find_ip_dhcp_host_by_name(&net_xml, name) {
+                    match conn.net_update_delete_ip_dhcp_host(RESERVATION_NET, &host_xml) {
+                        Ok(()) => log(&format!(
+                            "removed DHCP reservation on '{RESERVATION_NET}' for {name}"
+                        )),
+                        Err(e) => {
+                            log_warn(&format!(
+                                "WARN: could not remove DHCP reservation for {name}: {e}"
+                            ));
+                            warnings += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => log_warn(&format!(
+                "WARN: could not read network '{RESERVATION_NET}' to check for a \
+                 DHCP reservation for {name}: {e}"
+            )),
         }
     } else {
         log(&format!("{name}: no such domain (already torn down)"));

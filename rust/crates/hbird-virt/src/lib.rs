@@ -429,7 +429,13 @@ impl Connection {
     #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
     pub fn undefine_domain_remove_all_storage(&self, domain: &str) -> Result<()> {
         let cmd = format!(
-            "virsh -c {} undefine {} --remove-all-storage",
+            // `--nvram` matches undefine_domain and the deleted bash
+            // destroy-cluster.sh. Without it libvirt REFUSES to undefine a
+            // UEFI/Q35 guest that has an NVRAM file, and clean-vms.sh
+            // swallowed that failure with `2>/dev/null || true` — so the
+            // domain silently stayed defined. (Flagged during the tier-1
+            // port; bash clean-vms.sh had the same gap.)
+            "virsh -c {} undefine {} --remove-all-storage --nvram",
             self.uri.remote_uri(),
             shell_quote(domain),
         );
@@ -781,6 +787,23 @@ impl Connection {
             .inspect_err(|err| tracing::debug!(error = ?err, "net-update failed"))
     }
 
+    /// `virsh net-update <network> delete ip-dhcp-host "<host …/>" --live --config`.
+    ///
+    /// Counterpart to [`Self::net_update_add_ip_dhcp_host`]. `host_xml` must
+    /// be the element as it appears in `net-dumpxml` (see
+    /// [`find_ip_dhcp_host_by_name`]) — virsh matches on what it is given.
+    pub fn net_update_delete_ip_dhcp_host(&self, network: &str, host_xml: &str) -> Result<()> {
+        let cmd = format!(
+            "virsh -c {} net-update {} delete ip-dhcp-host {} --live --config",
+            self.uri.remote_uri(),
+            shell_quote(network),
+            shell_quote(host_xml),
+        );
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "net-update delete failed"))
+    }
+
     /// Execute an arbitrary shell command via this connection's transport.
     ///
     /// For a local transport ([`LocalClient`]): runs via `sh -c` on this
@@ -987,6 +1010,26 @@ pub fn parse_dominfo(stdout: &str, command: &str) -> Result<DomainInfo> {
     })
 }
 
+/// Find the `<host …/>` DHCP-reservation element for `name` in a
+/// `virsh net-dumpxml` document.
+///
+/// Returns the element verbatim so it can be handed straight back to
+/// `net-update … delete ip-dhcp-host`, which matches on the XML it is
+/// given. Keyed on `name=` because that is what
+/// [`Connection::net_update_add_ip_dhcp_host`] sets it to — the VM name —
+/// so a destroy only ever removes a reservation IT created, never an
+/// unrelated one that happens to share a MAC or address.
+///
+/// Pure + exhaustively testable: the caller does the I/O.
+pub fn find_ip_dhcp_host_by_name(net_xml: &str, name: &str) -> Option<String> {
+    let needle = format!("name='{name}'");
+    net_xml
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("<host ") && l.contains(&needle))
+        .map(|l| l.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,5 +1121,46 @@ mod tests {
         let cmd = "virsh -c qemu:///system dominfo x";
         let err = parse_dominfo(out, cmd).expect_err("missing State must error");
         assert!(matches!(err, Error::UnparseableOutput { .. }));
+    }
+
+    // ---- ip-dhcp-host reservation lookup (#destroy reservation cleanup) --
+
+    const RES_NET_XML: &str = r#"<network>
+  <name>default</name>
+  <ip address='192.168.122.1' netmask='255.255.255.0'>
+    <dhcp>
+      <host mac='52:54:00:aa:bb:cc' name='hbird-forge-cp' ip='192.168.122.70'/>
+      <host mac='52:54:00:dd:ee:ff' name='hbird-test-cp' ip='192.168.122.60'/>
+    </dhcp>
+  </ip>
+</network>"#;
+
+    #[test]
+    fn find_ip_dhcp_host_returns_the_element_verbatim() {
+        assert_eq!(
+            find_ip_dhcp_host_by_name(RES_NET_XML, "hbird-test-cp").expect("present"),
+            "<host mac='52:54:00:dd:ee:ff' name='hbird-test-cp' ip='192.168.122.60'/>"
+        );
+    }
+
+    #[test]
+    fn find_ip_dhcp_host_absent_is_none() {
+        assert!(find_ip_dhcp_host_by_name(RES_NET_XML, "hbird-nope").is_none());
+    }
+
+    /// THE safety property. Keyed on `name=`, so tearing down one cluster can
+    /// never delete another's reservation — including the live production
+    /// entries this very host carries. A prefix must not match either.
+    #[test]
+    fn find_ip_dhcp_host_never_matches_a_different_vm() {
+        let got = find_ip_dhcp_host_by_name(RES_NET_XML, "hbird-test-cp").unwrap();
+        assert!(
+            !got.contains("forge"),
+            "matched the wrong reservation: {got}"
+        );
+        assert!(
+            find_ip_dhcp_host_by_name(RES_NET_XML, "hbird-test").is_none(),
+            "a prefix of a real name must not match"
+        );
     }
 }

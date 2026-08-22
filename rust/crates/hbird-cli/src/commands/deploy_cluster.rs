@@ -1559,7 +1559,12 @@ pub(crate) fn render_worker_user_data(
 }
 
 /// Build the shell script that writes a user-data YAML tmpfile and runs
-/// cloud-localds / genisoimage / mkisofs to produce a seed ISO.
+/// cloud-localds / genisoimage / mkisofs / xorrisofs to produce a seed ISO.
+///
+/// The xorrisofs branch is NOT in the bash twin: modern Fedora ships
+/// xorriso and often drops genisoimage/mkisofs, so a KVM host with only
+/// cloud-utils missing would fail the seed build with all three legacy
+/// tools absent. xorrisofs is mkisofs-argument-compatible for this use.
 ///
 /// Mirrors `scripts/lib/cloud-init-seed.sh`.
 ///
@@ -1603,8 +1608,11 @@ fn cloud_init_seed_cmd(
          elif command -v mkisofs >/dev/null 2>&1; then \
            mkisofs -output {iso_q} -volid cidata -joliet -rock \
              \"$_tmp/user-data\" \"$_tmp/meta-data\"{nc_isofile} >/dev/null 2>&1; \
+         elif command -v xorrisofs >/dev/null 2>&1; then \
+           xorrisofs -output {iso_q} -volid cidata -joliet -rock \
+             \"$_tmp/user-data\" \"$_tmp/meta-data\"{nc_isofile} >/dev/null 2>&1; \
          else \
-           echo 'build_cloud_init_seed: need cloud-localds / genisoimage / mkisofs' >&2; exit 1; \
+           echo 'build_cloud_init_seed: need cloud-localds / genisoimage / mkisofs / xorrisofs' >&2; exit 1; \
          fi; \
          rm -rf -- \"$_tmp\"; \
          rm -f -- {ud_q}{rm_nc}"
@@ -2786,9 +2794,12 @@ mod tests {
         assert_eq!(
             cmd.matches("\"$_tmp/meta-data\" \"$_tmp/network-config\"")
                 .count(),
-            2,
-            "genisoimage + mkisofs branches must both carry the file: {cmd}"
+            3,
+            "genisoimage + mkisofs + xorrisofs branches must ALL carry the file: {cmd}"
         );
+        // xorrisofs is a Rust-side addition (not in the bash twin): modern
+        // Fedora ships xorriso and often drops genisoimage/mkisofs.
+        assert!(cmd.contains("elif command -v xorrisofs"), "cmd: {cmd}");
         // And the remote tmpfile is cleaned up.
         assert!(
             cmd.trim_end()
