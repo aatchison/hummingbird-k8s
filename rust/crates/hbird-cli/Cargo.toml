@@ -1,6 +1,6 @@
 [package]
 name = "hbird-cli"
-version = "0.0.1"
+version = "0.2.0"
 description = "hummingbird-k8s operator CLI — `hbird` binary. Mirrors the operator-facing Makefile targets (deploy-cluster, destroy-cluster, update-cluster, verify-*, get-kubeconfig, export-argocd, nodes, kubectl) as clap subcommands."
 edition.workspace = true
 license.workspace = true
@@ -52,7 +52,7 @@ anyhow = "1"
 # tracked by #322).
 # Path deps stay path-only — no version bumps until release engineering
 # (#290) wires cargo-dist.
-hbird-config = { path = "../hbird-config", version = "0.0.1" }
+hbird-config = { path = "../hbird-config", version = "0.2.0" }
 
 # Phase 1B (#322): SSH transport used by `cp_kubectl` to wire the live
 # execution path. The shim takes a `Plan` (carries cp_ip + kvm_host)
@@ -60,7 +60,7 @@ hbird-config = { path = "../hbird-config", version = "0.0.1" }
 # `with_controlmaster` for now (no async runtime required). Bash twin's
 # `cp_kubectl` (scripts/update-cluster.sh:425) is the operator-mental-model
 # contract this wraps.
-hbird-ssh = { path = "../hbird-ssh", version = "0.0.1" }
+hbird-ssh = { path = "../hbird-ssh", version = "0.2.0" }
 
 # Phase 4 (#289): libvirt wrapper used by `destroy-cluster` for the
 # `virsh destroy / undefine / domifaddr / dominfo` round-trips plus the
@@ -68,7 +68,7 @@ hbird-ssh = { path = "../hbird-ssh", version = "0.0.1" }
 # `commands/destroy_cluster.rs::CliSshBridge` adapts `hbird-ssh::Client`
 # to `hbird-virt::SshClient` so the libvirt verbs and the `rm -f` runs
 # share one SSH session.
-hbird-virt = { path = "../hbird-virt", version = "0.0.1" }
+hbird-virt = { path = "../hbird-virt", version = "0.2.0" }
 
 # Signal handling for the SIGINT/SIGTERM lock-release path (round-2
 # review of #321, lens L3#1). `LockGuard::Drop` doesn't fire when the

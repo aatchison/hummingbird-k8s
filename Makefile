@@ -13,11 +13,12 @@
 #   * clean-*         — tear down local VMs / images
 #
 # Cluster-lifecycle targets (deploy-cluster, destroy-cluster,
-# update-cluster, update-workers, update-node) run without `sudo` on the
-# client. The wrapped scripts re-exec themselves over SSH to `KVM_HOST`
-# (set in the operator's config or environment), where sudo happens
-# transparently. On-KVM-host operators running locally still need root —
-# the scripts probe for it and fail with a one-line hint if missing.
+# update-cluster, update-workers, update-node) delegate to `hbird` and run
+# without `sudo` on the client. `hbird` selects its transport natively:
+# libvirt over SSH when KVM_HOST is set, locally when it is not — so the
+# same command works from a workstation and on the KVM host itself. The
+# bash re-exec shim (scripts/lib/ssh-wrap.sh) that used to do this was
+# deleted in the tier-1 cutover.
 # The `image-*` and `push-image-*` targets are rootless: they only
 # invoke `podman build` / `podman push` and run entirely as the calling
 # user.
@@ -25,6 +26,15 @@
 # Run `make help` to see the discoverable target list.
 
 SHELL := /usr/bin/env bash
+
+# The hbird binary to use. Default: whatever is on PATH. CI and pinned-version
+# workflows override with an absolute path — `make backup-etcd HBIRD=/tmp/bin/hbird`
+# — which (unlike PATH) survives `sudo make ...` because make variables are
+# argv, not environment. Download-and-call, no install required:
+#   V=0.2.0-e977dcd
+#   curl -sSO https://forgejo.atchison.io/api/packages/aatchison/generic/hbird/$V/hbird-$V-x86_64-linux-gnu
+#   make deploy-cluster CONFIG=... HBIRD=$PWD/hbird-$V-x86_64-linux-gnu
+HBIRD ?= hbird
 
 # Mirror the LOCAL_IMAGE names build-*.sh use, so image-* targets agree
 # with the rest of the toolchain.
@@ -143,7 +153,28 @@ help: ## Show this target list
 #
 # $(PODMAN_BUILD_OPTS) threads STORAGE_DRIVER / PODMAN_ROOT /
 # PODMAN_RUNROOT through when the operator wants storage isolation
-# (issue #199 — concurrent integration runs on a shared host). Unset =
+# (issue #199 — concurrent integration runs on a shared host). Unset =# ---------------------------------------------------------------------------
+# WHAT BELONGS IN THIS MAKEFILE
+#
+# This Makefile is for operations that NEED THE REPO: image builds, pushes,
+# the bats suites, and the CI entry points. Those all read Containerfiles,
+# containers/, or tests/ off disk, so a checkout is a hard requirement and
+# `make` is the honest interface.
+#
+# CLUSTER OPERATIONS DO NOT BELONG HERE. deploy, destroy, spawn-workers,
+# update, verify, etcd, kube-bench, preflight, switch-to-ghcr, clean-vms,
+# kubectl/nodes/kubeconfig are all `hbird` subcommands and run from an
+# INSTALLED BINARY WITH NO CHECKOUT. The recipes below that call `hbird` are
+# thin conveniences for operators who happen to be in a checkout — they are
+# not the supported path and nothing may depend on them.
+#
+# The one crossing: `deploy-cluster` with IMAGE_SOURCE=local shells back to
+# `make image-*`, so it needs the repo. It takes --repo-root (or infers it)
+# and fails with an actionable message when it cannot find one, rather than
+# running `make -C .` wherever it happens to be.
+# ---------------------------------------------------------------------------
+
+
 # default podman storage = no extra flags emitted.
 
 image-k8s: ## podman build the k8s control-plane OCI image (rootless)
@@ -250,13 +281,30 @@ push-image-all: push-image-k8s push-image-worker ## podman push both OCI images 
 # each script probes EUID and prints a one-line "need root locally OR
 # set KVM_HOST=…" hint if neither path is available. The Makefile no
 # longer makes the sudo-vs-SSH decision; that's the script's job.
-deploy-cluster: ## Deploy a hybrid bib+cloud-init cluster from CONFIG=<path> (see cluster.example.conf)
+# deploy-cluster / destroy-cluster delegate to the Rust twins (#289 S4
+# cutover). Live-validated on the KVM host before this flip: deploy brought
+# up a net-new CP + worker and reported all nodes Ready; destroy tore them
+# down leaving no VMs, qcow2s or seed ISOs; spawn-workers added a third node
+# that joined; update-cluster completed a full rolling upgrade.
+#
+# FLAGS= is a passthrough (e.g. --dry-run, --repo-root=…, --no-sudo) so
+# operators don't have to drop to the raw `hbird` invocation.
+#
+# NOTE: unlike update-cluster (#396), `hbird deploy-cluster` / `destroy-cluster`
+# do NOT read CONFIG from the environment — the path is passed as --config
+# here explicitly. Do not "simplify" this to CONFIG="$(CONFIG)".
+#
+# Cross-runtime dependency: `hbird` must be on PATH and recent enough to
+# carry the S4 fixes. See docs/rust-cli.md for install.
+deploy-cluster: ## Deploy a hybrid bib+cloud-init cluster from CONFIG=<path> (see cluster.example.conf) (FLAGS=… passthrough)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required (start from cluster.example.conf)' >&2; exit 2; }
-	bash scripts/deploy-cluster.sh "$(CONFIG)"
+	@command -v "$(HBIRD)" >/dev/null || { echo 'hbird not found ($(HBIRD)) — install it or pass HBIRD=/path/to/hbird; see docs/rust-cli.md (make deploy-cluster now delegates to the Rust CLI)' >&2; exit 2; }
+	$(HBIRD) deploy-cluster --config "$(CONFIG)" $(FLAGS)
 
-destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs + qcow2s + seed ISOs)
+destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs + qcow2s + seed ISOs) (FLAGS=… passthrough)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	bash scripts/destroy-cluster.sh "$(CONFIG)"
+	@command -v "$(HBIRD)" >/dev/null || { echo 'hbird not found ($(HBIRD)) — install it or pass HBIRD=/path/to/hbird; see docs/rust-cli.md (make destroy-cluster now delegates to the Rust CLI)' >&2; exit 2; }
+	$(HBIRD) destroy-cluster --config "$(CONFIG)" $(FLAGS)
 
 # update-cluster delegates to the Rust twin `hbird update-cluster`
 # (v0.1.0 cutover, #353). FLAGS= is a passthrough for extra flags so
@@ -271,16 +319,16 @@ destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs +
 # in v0.1.0.
 update-cluster: ## Rolling bootc upgrade across CP + workers (with bootID + daemonset gates) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" hbird update-cluster $(FLAGS)
+	@CONFIG="$(CONFIG)" $(HBIRD) update-cluster $(FLAGS)
 
 update-workers: ## Rolling bootc upgrade across workers only (with bootID + daemonset gates) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" hbird update-cluster --workers-only $(FLAGS)
+	@CONFIG="$(CONFIG)" $(HBIRD) update-cluster --workers-only $(FLAGS)
 
 update-node: ## Update a single node (NODE=name) (with bootID + daemonset gates) from CONFIG=<path> (FLAGS=… for extra flags)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
 	@[ -n "$(NODE)" ]   || { echo 'NODE=<name> required (CP_NAME or one of WORKER_NAMES)' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" NODE="$(NODE)" hbird update-cluster --node="$(NODE)" $(FLAGS)
+	@CONFIG="$(CONFIG)" NODE="$(NODE)" $(HBIRD) update-cluster --node="$(NODE)" $(FLAGS)
 
 # export-argocd / get-kubeconfig — delegate to the Rust twin
 # `hbird export-argocd` / `hbird get-kubeconfig` (v0.1.0 cutover, #353).
@@ -288,7 +336,7 @@ update-node: ## Update a single node (NODE=name) (with bootID + daemonset gates)
 # scripts/export-argocd.sh was removed in v0.1.0.
 export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CONTEXT=, FORCE=1, PROXY_JUMP=)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" hbird export-argocd \
+	@CONFIG="$(CONFIG)" $(HBIRD) export-argocd \
 		$(if $(OUTPUT),--output "$(OUTPUT)",) \
 		$(if $(SERVER),--server "$(SERVER)",) \
 		$(if $(CONTEXT),--context-name "$(CONTEXT)",) \
@@ -302,7 +350,7 @@ export-argocd: ## Export an ArgoCD-registerable kubeconfig (OUTPUT=, SERVER=, CO
 # CONTEXT=/SERVER=/FORCE= still pass through.
 get-kubeconfig: ## Fetch kubeconfig.yaml from CONFIG=<path> (OUTPUT=, SERVER=, CONTEXT=, FORCE=1, PROXY_JUMP=)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	@CONFIG="$(CONFIG)" hbird get-kubeconfig \
+	@CONFIG="$(CONFIG)" $(HBIRD) get-kubeconfig \
 		$(if $(OUTPUT),--output "$(OUTPUT)",) \
 		$(if $(CONTEXT),--context-name "$(CONTEXT)",) \
 		$(if $(SERVER),--server "$(SERVER)",) \
@@ -310,7 +358,8 @@ get-kubeconfig: ## Fetch kubeconfig.yaml from CONFIG=<path> (OUTPUT=, SERVER=, C
 		$(if $(FORCE),--force,)
 
 switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
-	bash scripts/switch-to-ghcr.sh
+	@command -v "$(HBIRD)" >/dev/null || { echo 'hbird not found ($(HBIRD)) — install it or pass HBIRD=/path/to/hbird; see docs/rust-cli.md' >&2; exit 2; }
+	$(HBIRD) switch-to-ghcr $(FLAGS)
 
 # ---- convenience -------------------------------------------------------
 # nodes / kubectl — delegate to `hbird kubectl` (v0.1.0 cutover, #353).
@@ -318,10 +367,10 @@ switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbir
 # scripts/kubectl-k8s.sh was removed in v0.1.0.
 
 nodes: ## kubectl get nodes via hbird (CONFIG=<path> to read CP_NAME/KVM_HOST from cluster.local.conf)
-	@CONFIG="$(CONFIG)" hbird kubectl get nodes
+	@CONFIG="$(CONFIG)" $(HBIRD) kubectl get nodes
 
 kubectl: ## kubectl pass-through; ARGS='get pods -A' (CONFIG=<path> to read CP_NAME/KVM_HOST from cluster.local.conf)
-	@CONFIG="$(CONFIG)" hbird kubectl $(ARGS)
+	@CONFIG="$(CONFIG)" $(HBIRD) kubectl $(ARGS)
 
 # ---- verification ------------------------------------------------------
 # Every verify-* recipe forwards BOTH CONFIG and KVM_HOST so workstation
@@ -337,16 +386,16 @@ kubectl: ## kubectl pass-through; ARGS='get pods -A' (CONFIG=<path> to read CP_N
 # canonical implementations.
 
 verify-encryption: ## Verify etcd encryption-at-rest on the control plane (CONFIG=<path>, KVM_HOST=<alias>)
-	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" hbird verify encryption
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" $(HBIRD) verify encryption
 
 verify-hardening: ## Verify PSA + audit + kubelet protect-kernel-defaults (CONFIG=<path>, KVM_HOST=<alias>)
-	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" hbird verify hardening
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" $(HBIRD) verify hardening
 
 verify-app-deploy: ## End-to-end PSA-restricted nginx + pod-to-pod test (CONFIG=<path>, KVM_HOST=<alias> for workstation operation)
-	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" hbird verify app-deploy
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" $(HBIRD) verify app-deploy
 
 verify-all: ## All three verifiers in sequence (CONFIG=<path>, KVM_HOST=<alias>)
-	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" hbird verify all
+	@CONFIG="$(CONFIG)" KVM_HOST="$(KVM_HOST)" $(HBIRD) verify all
 
 # Pre-flight: warn (or fail with STRICT=1) when the pinned Cilium version
 # doesn't cover the pinned (or target) K8s minor. See issue #303 and
@@ -355,27 +404,32 @@ verify-all: ## All three verifiers in sequence (CONFIG=<path>, KVM_HOST=<alias>)
 # bumping Cilium?"); STRICT=1 escalates a mismatch from warning to
 # exit-1 for use as a pre-merge gate.
 check-cilium-k8s-compat: ## Warn on Cilium/K8s version-compatibility mismatch (CILIUM=X.Y.Z, K8S=vX.Y, STRICT=1)
-	@bash scripts/check-cilium-k8s-compat.sh \
+	@command -v "$(HBIRD)" >/dev/null || { echo 'hbird not found ($(HBIRD)) — install it or pass HBIRD=/path/to/hbird; see docs/rust-cli.md' >&2; exit 2; }
+	@$(HBIRD) preflight cilium \
 	  $(if $(CILIUM),--cilium=$(CILIUM),) \
 	  $(if $(K8S),--k8s=$(K8S),) \
 	  $(if $(STRICT),--strict,)
 
 kube-bench: ## Run CIS Kubernetes Benchmark (kube-bench) against the cluster
-	bash scripts/run-kube-bench.sh
+	@command -v "$(HBIRD)" >/dev/null || { echo 'hbird not found ($(HBIRD)) — install it or pass HBIRD=/path/to/hbird; see docs/rust-cli.md' >&2; exit 2; }
+	$(HBIRD) kube-bench $(FLAGS)
 
 # ---- backup / restore --------------------------------------------------
 # etcd snapshot lifecycle. See docs/backup-restore.md for cadence,
 # encryption-key handling, and full DR walkthrough.
 
 backup-etcd: ## Snapshot etcd; optional LABEL=<text> appends to filename
-	bash scripts/backup-etcd.sh $(if $(LABEL),--label $(LABEL),)
+	@command -v "$(HBIRD)" >/dev/null || { echo 'hbird not found ($(HBIRD)) — install it or pass HBIRD=/path/to/hbird; see docs/rust-cli.md' >&2; exit 2; }
+	$(HBIRD) etcd backup $(if $(LABEL),--label $(LABEL),) $(FLAGS)
 
 restore-etcd: ## Restore etcd from a snapshot (SNAP=path.db required)
 	@[ -n "$(SNAP)" ] || { echo 'SNAP=<path-to-snapshot.db> required' >&2; exit 2; }
-	bash scripts/restore-etcd.sh "$(SNAP)"
+	@command -v "$(HBIRD)" >/dev/null || { echo 'hbird not found ($(HBIRD)) — install it or pass HBIRD=/path/to/hbird; see docs/rust-cli.md' >&2; exit 2; }
+	$(HBIRD) etcd restore --snapshot "$(SNAP)" $(FLAGS)
 
 rotate-etcd-key: ## Walk the operator through etcd encryption-key rotation (#120)
-	bash scripts/rotate-etcd-encryption-key.sh
+	@command -v "$(HBIRD)" >/dev/null || { echo 'hbird not found ($(HBIRD)) — install it or pass HBIRD=/path/to/hbird; see docs/rust-cli.md' >&2; exit 2; }
+	$(HBIRD) etcd rotate-key $(FLAGS)
 
 # ---- CI integration ----------------------------------------------------
 # The redhat-actions/buildah-build action in .github/workflows/build-*.yml
@@ -417,7 +471,8 @@ test-all: test-lib test-scripts ## Run all bats unit suites (lib + scripts)
 # ---- cleanup -----------------------------------------------------------
 
 clean-vms: ## Destroy hummingbird-* VMs + sweep stale qcow2/seed-ISO from POOL_DIR (honors KVM_HOST)
-	bash scripts/clean-vms.sh
+	@command -v "$(HBIRD)" >/dev/null || { echo 'hbird not found ($(HBIRD)) — install it or pass HBIRD=/path/to/hbird; see docs/rust-cli.md' >&2; exit 2; }
+	$(HBIRD) clean-vms $(FLAGS)
 
 clean-images: ## Remove the local OCI build outputs
 	-podman image rm $(IMAGE_K8S) $(IMAGE_WORKER) 2>/dev/null || true

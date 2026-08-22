@@ -206,6 +206,7 @@ the `make` command line for the targets that use them.
 | ---                 | ---                           | ---                           |
 | `CONFIG`            | (required)                    | `deploy-cluster`, `destroy-cluster`, `update-cluster`, `update-workers`, `update-node`, `export-argocd`, `get-kubeconfig`, `nodes`, `kubectl` (CONFIG is optional for `nodes`/`kubectl`; when set, the script reads CP_NAME/KVM_HOST from it) |
 | `NODE`              | (required for `update-node`)  | `update-node`                 |
+| `HBIRD`             | `hbird` (PATH lookup)         | every `hbird`-delegating target. Override with an absolute path to run a downloaded binary without installing it — `make backup-etcd HBIRD=$PWD/hbird-0.2.0-…`. Unlike PATH, a make variable survives `sudo make …`, so CI runners download the exact tested binary from the Forgejo generic registry and pass it here. |
 | `FLAGS`             | empty                         | `update-cluster`, `update-workers`, `update-node` (pass-through to `hbird update-cluster` (post-#353, was `scripts/update-cluster.sh`): `--dry-run`, `--parallel=N`, `--start-from=NAME`, `--continue-on-error`, `--no-delete-emptydir-data`, `--skip-drain`) |
 | `ARGS`              | empty                         | `kubectl` (pass-through, e.g. `ARGS='get pods -A'`) |
 | `LABEL`             | empty                         | `backup-etcd` (optional `--label <text>` suffix on the snapshot filename) |

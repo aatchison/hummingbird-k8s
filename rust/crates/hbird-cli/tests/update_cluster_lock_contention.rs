@@ -40,9 +40,26 @@
 //!
 //! That's how we deterministically pin contention.
 
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
+
+/// Kill a spawned holder and every process in its group, then reap it.
+/// `Child::kill` alone leaves the shell that holds the inherited lock fd.
+fn kill_group(child: &mut std::process::Child) {
+    let pgid = child.id() as i32;
+    // TERM the whole group, then KILL it: a holder that ignores or defers
+    // TERM must not survive and keep the lock held.
+    let _ = Command::new("kill")
+        .args(["-TERM", &format!("-{pgid}")])
+        .status();
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{pgid}")])
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 fn hbird_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hbird"))
@@ -106,41 +123,61 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
     // Solution: wrap the first hbird in a parent shell that holds the
     // lock externally via flock(1). Then the lock is held for as long
     // as the parent shell sleeps.
+
+    // Spawn the lock holder and confirm it is genuinely holding before we
+    // continue. There is a race here that made this test ~10% flaky under
+    // load (measured on the KVM host): the probe below uses `flock -n` too,
+    // so if a probe wins the lock before the holder does, the holder's own
+    // non-blocking `flock -n` fails and the holder exits. A later probe then
+    // finds the lock free. Retrying the whole holder+probe pair removes the
+    // race rather than tolerating it.
     let lock_path = xdg.0.join("hbird-update-cluster.lock");
-
-    let mut first = Command::new("flock")
-        .args([
-            "-n",
-            &lock_path.to_string_lossy(),
-            "-c",
-            "trap 'exit 0' TERM; while sleep 86400; do :; done",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn flock holder");
-
-    // Wait until the flock(1) parent has actually taken the lock. Race:
-    // on a heavily loaded host (parallel tests, podman + cargo) the bare
-    // 100ms sleep occasionally beats flock(1)'s startup, producing a
-    // flaky test. Probe in a small retry loop instead.
-    let mut held = false;
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(50));
-        let probe = Command::new("flock")
+    let spawn_holder = || {
+        Command::new("flock")
+            // Own process group: `flock -c` runs its command in a child
+            // shell that inherits the locked fd, so killing flock alone
+            // leaks that shell (and its `sleep`) — the same defect this
+            // suite found in acquire_lock. Kill the group instead.
+            .process_group(0)
+            // No `-c`: flock EXECs sleep directly, so the holder is a
+            // single process with no shell wrapper. A shell wrapper defers
+            // its TERM trap until the foreground `sleep` returns, which is
+            // why the previous form leaked two processes per run.
+            .args(["-n", &lock_path.to_string_lossy(), "sleep", "86400"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn flock holder")
+    };
+    let lock_held = || {
+        Command::new("flock")
             .args(["-n", &lock_path.to_string_lossy(), "-c", "true"])
-            .output();
-        if let Ok(p) = probe
-            && p.status.code() == Some(1)
-        {
-            held = true;
-            break;
+            .output()
+            .map(|p| p.status.code() == Some(1))
+            .unwrap_or(false)
+    };
+
+    let mut first = spawn_holder();
+    let mut held = false;
+    'outer: for _attempt in 0..5 {
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(50));
+            if lock_held() {
+                held = true;
+                break 'outer;
+            }
+            // Holder lost the race and exited — restart it and re-probe.
+            if matches!(first.try_wait(), Ok(Some(_))) {
+                break;
+            }
         }
+        kill_group(&mut first);
+        first = spawn_holder();
     }
     assert!(
         held,
-        "flock(1) holder never actually took the lock within 1.5s — test fixture bug"
+        "flock(1) holder never took the lock across 5 attempts — test fixture bug"
     );
 
     // Second invocation: configure XDG_RUNTIME_DIR to the same dir and
@@ -150,13 +187,27 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
         .env("XDG_RUNTIME_DIR", &xdg.0)
         // Clear HBIRD_REMOTE_NO_SUDO so we don't get a different code path.
         .env_remove("HBIRD_REMOTE_NO_SUDO")
+        // Bound the blast radius if contention does NOT happen. The fixture
+        // config points at TEST-NET-1 (192.0.2.0/24), which blackholes, so a
+        // non-contended run would otherwise sit in the live SSH/poll path for
+        // ~54s before failing — turning a clear assertion failure into what
+        // looks like a hang. These budgets make the negative case fail fast
+        // and loudly instead. (They are irrelevant on the happy path: the
+        // lock check happens before any SSH.)
+        .env("SSH_COMMAND_TIMEOUT", "3")
+        .env("SSH_TIMEOUT", "3")
+        .env("READY_TIMEOUT", "3")
+        .env("APISERVER_TIMEOUT", "3")
+        .env("DRAIN_TIMEOUT", "3s")
         .args(["update-cluster", "--config", "cluster.local.conf"])
         .output()
         .expect("spawn second hbird");
 
-    // Tear down the lock holder.
-    let _ = first.kill();
-    let _ = first.wait();
+    // Was the fixture still holding when hbird ran? Distinguishes "hbird
+    // failed to detect contention" from "the fixture lost its own lock".
+    let lock_held_after = lock_held();
+    // Tear down the lock holder (whole group — see spawn_holder).
+    kill_group(&mut first);
 
     assert!(
         !second.status.success(),
@@ -165,6 +216,7 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(
         stderr.contains("another update-cluster run is in progress"),
-        "missing contention diagnostic; stderr was:\n{stderr}"
+        "missing contention diagnostic (lock still held at assert time: {}); stderr was:\n{stderr}",
+        lock_held_after,
     );
 }

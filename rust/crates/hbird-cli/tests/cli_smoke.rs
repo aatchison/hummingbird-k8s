@@ -51,10 +51,15 @@ fn help_lists_every_operator_facing_subcommand() {
         "spawn-workers",
         "update-cluster",
         "verify",
+        "etcd",
         "get-kubeconfig",
         "export-argocd",
         "nodes",
         "kubectl",
+        // #303 preflight + kube-bench ports of
+        // scripts/check-cilium-k8s-compat.sh and scripts/run-kube-bench.sh.
+        "preflight",
+        "kube-bench",
     ] {
         assert!(
             stdout.contains(sub),
@@ -76,6 +81,31 @@ fn verify_help_lists_all_three_verifiers_plus_all() {
             "hbird verify --help missing sub `{sub}`. Output was:\n{stdout}"
         );
     }
+}
+
+/// Mirror of the three etcd `Makefile` targets: `backup-etcd`,
+/// `restore-etcd`, `rotate-etcd-key`.
+#[test]
+fn etcd_help_lists_all_three_etcd_subcommands() {
+    let (status, stdout, _stderr) = run(&["etcd", "--help"]);
+    assert!(status.success(), "hbird etcd --help exited non-zero");
+
+    for sub in ["backup", "restore", "rotate-key"] {
+        assert!(
+            stdout.contains(sub),
+            "hbird etcd --help missing sub `{sub}`. Output was:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn preflight_help_lists_the_cilium_check() {
+    let (status, stdout, _stderr) = run(&["preflight", "--help"]);
+    assert!(status.success(), "hbird preflight --help exited non-zero");
+    assert!(
+        stdout.contains("cilium"),
+        "hbird preflight --help missing sub `cilium`. Output was:\n{stdout}"
+    );
 }
 
 #[test]

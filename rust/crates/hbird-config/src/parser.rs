@@ -311,6 +311,19 @@ fn build_config(
     let worker_names = take_optional_array(&mut raw, "WORKER_NAMES")?;
     let cp_ip = take_optional_scalar(&mut raw, "CP_IP")?;
     let worker_ips = take_optional_array(&mut raw, "WORKER_IPS")?;
+    let pod_cidr = take_optional_scalar(&mut raw, "POD_CIDR")?;
+    let service_cidr = take_optional_scalar(&mut raw, "SERVICE_CIDR")?;
+    // Primary-NIC MAC overrides (#409) + the optional-second-NIC family
+    // (#405-#408). Exactly the set of keys the bash twin reads — parsing
+    // them here is what stops `Warning::UnknownKey` from firing on
+    // configs that legitimately use the dual-NIC / pinned-MAC knobs.
+    let cp_mac = take_optional_scalar(&mut raw, "CP_MAC")?;
+    let worker_macs = take_optional_array(&mut raw, "WORKER_MACS")?;
+    let extra_network = take_optional_scalar(&mut raw, "EXTRA_NETWORK")?;
+    let extra_net_cp_mac = take_optional_scalar(&mut raw, "EXTRA_NET_CP_MAC")?;
+    let extra_net_cp_ip = take_optional_scalar(&mut raw, "EXTRA_NET_CP_IP")?;
+    let extra_net_worker_macs = take_optional_array(&mut raw, "EXTRA_NET_WORKER_MACS")?;
+    let extra_net_worker_ips = take_optional_array(&mut raw, "EXTRA_NET_WORKER_IPS")?;
 
     // Any keys still sitting in `raw` are unknown — no field consumed
     // them. Surface each as a `Warning::UnknownKey` so operator tooling
@@ -355,7 +368,16 @@ fn build_config(
         bootc_update_repo_worker,
         worker_names,
         cp_ip,
+        pod_cidr,
+        service_cidr,
         worker_ips,
+        cp_mac,
+        worker_macs,
+        extra_network,
+        extra_net_cp_mac,
+        extra_net_cp_ip,
+        extra_net_worker_macs,
+        extra_net_worker_ips,
         warnings,
     })
 }

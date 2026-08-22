@@ -157,7 +157,7 @@ jobs:
           # HOME is preserved so cluster.ci.conf's SSH_PUBKEY_FILE=$HOME/.ssh/...
           # resolves to the runner user's key (generated above), not /root.
           sudo --preserve-env=HOME,STORAGE_DRIVER,PODMAN_ROOT,PODMAN_RUNROOT \
-            make deploy-cluster CONFIG="${CONFIG}"
+            make deploy-cluster CONFIG="${CONFIG}" HBIRD="$PWD/rust/target/release/hbird"
 
       - name: Verify CP + workers Ready by name
         # deploy-cluster.sh already gates on EXPECTED_NODES Ready before
@@ -299,7 +299,10 @@ jobs:
           # HOME preserved so destroy-cluster.sh's source of cluster.ci.conf
           # resolves $HOME/.ssh/integration_test_key.pub to the runner user's
           # key path (same reason as the deploy step above).
-          sudo --preserve-env=HOME make destroy-cluster CONFIG="${CONFIG}" || true
+          # HBIRD= as a make VARIABLE (argv), not PATH: sudo secure_path
+          # discards GITHUB_PATH, which silently broke bare `hbird` here
+          # after the #289 cutover. argv survives sudo.
+          sudo --preserve-env=HOME make destroy-cluster CONFIG="${CONFIG}" HBIRD="$PWD/rust/target/release/hbird" || true
 
       - name: Force-clean integration VMs (always)
         # Belt-and-suspenders teardown. Match only the per-run suffix so

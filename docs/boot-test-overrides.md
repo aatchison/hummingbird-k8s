@@ -11,7 +11,7 @@ kubeadm/k3s config) that `pr-validate` (build-only) cannot. To trust its result 
 force the deploy off the cached/published path and onto your working tree.
 
 The knobs below are read by `scripts/deploy-cluster.sh`, `scripts/spawn-workers.sh`, and
-`scripts/switch-to-ghcr.sh` (cache freshness lives in `lib/cache-utils.sh`). They are
+`hbird switch-to-ghcr` (cache freshness lives in `rust/crates/hbird-cli/src/cache.rs`). They are
 environment-overridable and forwarded across the `KVM_HOST=` re-exec via the
 `scripts/lib/ssh-wrap.sh` allowlist. CLI env wins over sourced config (#377/#381).
 
@@ -45,7 +45,7 @@ See [deploy-cluster.md](deploy-cluster.md) for the full config surface and
 ### `STRICT_CACHE`
 
 - **What it does:** makes the qcow2/image freshness check fail-closed. The deploy records a
-  build-identity sidecar per template (`<template>.qcow2.build-ref`, `lib/cache-utils.sh`)
+  build-identity sidecar per template (`<template>.qcow2.build-ref`, `rust/crates/hbird-cli/src/cache.rs`)
   and acts only on a *confirmed same-source mismatch*: under `IMAGE_SOURCE=local` a mismatch
   auto-rebuilds with a `WARN`; `STRICT_CACHE=1` turns that confirmed-stale `WARN` into a hard
   failure instead (mirrors `HBIRD_REMOTE_STRICT`). An *unverifiable* identity (e.g. a published

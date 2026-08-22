@@ -13,16 +13,24 @@
 //! hbird verify hardening    <-> make verify-hardening
 //! hbird verify app-deploy   <-> make verify-app-deploy
 //! hbird verify all          <-> make verify-all
+//! hbird etcd backup         <-> make backup-etcd LABEL=...
+//! hbird etcd restore        <-> make restore-etcd SNAP=...
+//! hbird etcd rotate-key     <-> make rotate-etcd-key
 //! hbird get-kubeconfig      <-> make get-kubeconfig
 //! hbird export-argocd       <-> make export-argocd
 //! hbird nodes               <-> make nodes
 //! hbird kubectl             <-> make kubectl
+//! hbird preflight cilium    <-> make check-cilium-k8s-compat
+//! hbird kube-bench          <-> make kube-bench
+//! hbird switch-to-ghcr      <-> make switch-to-ghcr
+//! hbird clean-vms           <-> make clean-vms
 //! ```
 //!
-//! For [#283] every subcommand returns
-//! `Err(anyhow!("not yet implemented — tracked by #XXX"))`. Real bodies
-//! land in [#286] (update-cluster), [#287] (verify-*), [#288] (kubeconfig
-//! + export-argocd), and [#289] (deploy / destroy / spawn).
+//! Every subcommand now has a real body. [#283] shipped the clap tree
+//! with placeholder `Err(anyhow!("not yet implemented"))` returns; those
+//! were replaced by [#286] (update-cluster), [#287] (verify-*), [#288]
+//! (kubeconfig + export-argocd), and [#289] (deploy / destroy / spawn).
+//! No subcommand returns a not-implemented error today.
 //!
 //! # Operator-mental-model contract
 //!
@@ -50,10 +58,11 @@ mod cp_resolve;
 mod virt_bridge;
 
 use commands::{
-    deploy_cluster::DeployClusterArgs, destroy_cluster::DestroyClusterArgs,
-    export_argocd::ExportArgocdArgs, get_kubeconfig::GetKubeconfigArgs, kubectl::KubectlArgs,
-    nodes::NodesArgs, spawn_workers::SpawnWorkersArgs, update_cluster::UpdateClusterArgs,
-    verify::VerifyArgs,
+    clean_vms::CleanVmsArgs, deploy_cluster::DeployClusterArgs,
+    destroy_cluster::DestroyClusterArgs, etcd::EtcdArgs, export_argocd::ExportArgocdArgs,
+    get_kubeconfig::GetKubeconfigArgs, kube_bench::KubeBenchArgs, kubectl::KubectlArgs,
+    nodes::NodesArgs, preflight::PreflightArgs, spawn_workers::SpawnWorkersArgs,
+    switch_to_ghcr::SwitchToGhcrArgs, update_cluster::UpdateClusterArgs, verify::VerifyArgs,
 };
 
 /// Top-level entry point. Parse argv, dispatch to the chosen subcommand.
@@ -182,6 +191,16 @@ enum Command {
     /// tracked by #287.
     Verify(VerifyArgs),
 
+    /// etcd snapshot / restore / encryption-key rotation.
+    ///
+    /// Bash twins: `scripts/backup-etcd.sh`, `scripts/restore-etcd.sh`,
+    /// `scripts/rotate-etcd-encryption-key.sh` (via `make backup-etcd
+    /// LABEL=…`, `make restore-etcd SNAP=…`, `make rotate-etcd-key`).
+    /// `restore` and `rotate-key` are destructive and gate on an
+    /// interactive confirmation; every sub-subcommand takes
+    /// `--dry-run`.
+    Etcd(EtcdArgs),
+
     /// Fetch a kubeconfig from the cluster, defaulting to a kubectl-shaped
     /// context name (companion to `export-argocd`; daily-use sibling).
     ///
@@ -208,6 +227,33 @@ enum Command {
     /// Bash twin: `scripts/kubectl-k8s.sh "$@"` (via `make kubectl`).
     /// Implementation tracked by #288.
     Kubectl(KubectlArgs),
+
+    /// Pre-deploy checks that need no live cluster (today: the
+    /// Cilium/K8s version-compatibility matrix).
+    ///
+    /// Bash twin: `scripts/check-cilium-k8s-compat.sh` (via
+    /// `make check-cilium-k8s-compat`). Deliberately a separate family
+    /// from `verify`: `preflight` runs BEFORE (or independent of) a
+    /// deploy and reads committed repo pins, not cluster state.
+    Preflight(PreflightArgs),
+
+    /// Run the CIS Kubernetes Benchmark (kube-bench) against the cluster.
+    ///
+    /// Bash twin: `scripts/run-kube-bench.sh` (via `make kube-bench`).
+    KubeBench(KubeBenchArgs),
+    /// Switch deployed VMs from `localhost/…` to the GHCR-published image
+    /// so the bootc auto-update timer has a remote to pull from.
+    ///
+    /// Bash twin: `scripts/switch-to-ghcr.sh` (via `make switch-to-ghcr`).
+    /// Tracked by #138.
+    SwitchToGhcr(SwitchToGhcrArgs),
+
+    /// Destroy every `hummingbird-*` VM and sweep stale qcow2 / seed ISOs
+    /// from `POOL_DIR`.
+    ///
+    /// Bash twin: `scripts/clean-vms.sh` (via `make clean-vms`).
+    /// Tracked by #221.
+    CleanVms(CleanVmsArgs),
 }
 
 impl Command {
@@ -225,15 +271,20 @@ impl Command {
             Command::SpawnWorkers(_) => "spawn-workers",
             Command::UpdateCluster(_) => "update-cluster",
             Command::Verify(_) => "verify",
+            Command::Etcd(_) => "etcd",
             Command::GetKubeconfig(_) => "get-kubeconfig",
             Command::ExportArgocd(_) => "export-argocd",
             Command::Nodes(_) => "nodes",
             Command::Kubectl(_) => "kubectl",
+            Command::Preflight(_) => "preflight",
+            Command::KubeBench(_) => "kube-bench",
+            Command::SwitchToGhcr(_) => "switch-to-ghcr",
+            Command::CleanVms(_) => "clean-vms",
         }
     }
 
-    /// Dispatch to the chosen subcommand. Each delegate currently returns
-    /// `Err(anyhow!("not yet implemented — tracked by #XXX"))`.
+    /// Dispatch to the chosen subcommand. Every delegate is implemented;
+    /// the historical placeholder returns were removed as each phase landed.
     fn run(self) -> Result<()> {
         match self {
             Command::DeployCluster(args) => commands::deploy_cluster::run(args),
@@ -241,10 +292,15 @@ impl Command {
             Command::SpawnWorkers(args) => commands::spawn_workers::run(args),
             Command::UpdateCluster(args) => commands::update_cluster::run(args),
             Command::Verify(args) => commands::verify::run(args),
+            Command::Etcd(args) => commands::etcd::run(args),
             Command::GetKubeconfig(args) => commands::get_kubeconfig::run(args),
             Command::ExportArgocd(args) => commands::export_argocd::run(args),
             Command::Nodes(args) => commands::nodes::run(args),
             Command::Kubectl(args) => commands::kubectl::run(args),
+            Command::Preflight(args) => commands::preflight::run(args),
+            Command::KubeBench(args) => commands::kube_bench::run(args),
+            Command::SwitchToGhcr(args) => commands::switch_to_ghcr::run(args),
+            Command::CleanVms(args) => commands::clean_vms::run(args),
         }
     }
 }
@@ -298,6 +354,17 @@ mod tests {
                 "verify",
             ),
             (
+                &[
+                    "hbird",
+                    "etcd",
+                    "backup",
+                    "--dry-run",
+                    "--cp-ip",
+                    "10.0.0.5",
+                ],
+                "etcd",
+            ),
+            (
                 &["hbird", "get-kubeconfig", "--config", "/dev/null"],
                 "get-kubeconfig",
             ),
@@ -318,6 +385,17 @@ mod tests {
                 ],
                 "kubectl",
             ),
+            (
+                &["hbird", "preflight", "cilium", "--cilium=1.17.16"],
+                "preflight",
+            ),
+            (&["hbird", "kube-bench", "--dry-run"], "kube-bench"),
+            (&["hbird", "switch-to-ghcr"], "switch-to-ghcr"),
+            (
+                &["hbird", "switch-to-ghcr", "hummingbird-k8s-worker-1"],
+                "switch-to-ghcr",
+            ),
+            (&["hbird", "clean-vms"], "clean-vms"),
         ];
         for (argv, expected) in cases {
             let cli = Cli::try_parse_from(*argv)

@@ -284,13 +284,12 @@ fn dry_run_continue_on_error_with_clean_run_exits_zero() {
 
 #[test]
 fn live_mode_without_static_ips_surfaces_remediation_diagnostic() {
-    // Confirm the live-mode failure surfaces a stable bash-twin-shaped
-    // diagnostic. The current scaffold rejects at the CP_IP resolution
-    // step (no virsh-domifaddr fallback yet); when WORKER_IPS lacks an
-    // entry we surface the "live-mode IP resolution not yet implemented"
-    // message. Either is acceptable evidence the live path is wired —
-    // we pin both wording snippets so a future fixture-shape change
-    // surfaces here.
+    // Live mode now resolves IPs via `virsh domifaddr` on KVM_HOST
+    // (#322 live-execution slice), so "not yet implemented" is gone.
+    // The remaining hard failure is the genuinely unresolvable case:
+    // no pinned IPs AND no KVM_HOST, i.e. no transport to reach libvirt
+    // through. That must still fail loudly rather than proceed with an
+    // empty IP, and must name both escape hatches.
     let tmp = tempdir_for_test();
     let conf_path = tmp.path().join("cluster.local.conf");
     write_fixture_config(&conf_path);
@@ -305,16 +304,22 @@ fn live_mode_without_static_ips_surfaces_remediation_diagnostic() {
         "live mode should fail in this scaffold"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let acceptable_messages = [
-        "live-mode IP resolution not yet implemented",
-        "Set WORKER_IPS",
-        // CP-IP-first failure path: bash twin's exact wording.
-        "could not resolve CP IP for domain",
-        "set CP_IP= in env to override",
-    ];
+    // With no pinned IPs, update-cluster now RESOLVES via `virsh domifaddr`
+    // — locally when KVM_HOST is unset, which is how it runs on the KVM
+    // host itself. In this test environment virsh is absent, so the failure
+    // must still name the domain, the command it tried, and where it tried.
+    let required = ["virsh", "domifaddr", "hbird-cp1", "no KVM_HOST set"];
+    for needle in required {
+        assert!(
+            stderr.contains(needle),
+            "resolution diagnostic missing {needle:?}; stderr was:\n{stderr}",
+        );
+    }
+    // Regression guard: it must NOT demand KVM_HOST as a precondition.
+    // Requiring it would make update-cluster the only command unable to run
+    // where the VMs live (#289 S4 finding).
     assert!(
-        acceptable_messages.iter().any(|m| stderr.contains(m)),
-        "missing remediation diagnostic; stderr was:\n{stderr}\n\
-         expected one of: {acceptable_messages:?}",
+        !stderr.contains("no KVM_HOST is set and no explicit IP was configured"),
+        "must attempt local resolution rather than demanding KVM_HOST; stderr was:\n{stderr}",
     );
 }

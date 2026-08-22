@@ -121,4 +121,26 @@ pub enum Error {
         /// Path the caller passed as `identity_file`.
         path: PathBuf,
     },
+
+    /// The remote command exceeded the configured wall-clock budget and
+    /// the local `ssh` process was killed.
+    ///
+    /// `ConnectTimeout` only bounds the TCP/auth handshake. A command that
+    /// hangs *after* authentication — a wedged `bootc upgrade`, a remote
+    /// process waiting on a lock — would otherwise block forever, and for
+    /// a tool that reboots nodes in sequence that stalls the whole rollout
+    /// with no diagnostic. This variant is what makes that case
+    /// observable: the operator sees which host and which budget.
+    ///
+    /// Opt-in per call site via
+    /// [`crate::SshOptions::with_command_timeout`]; unset means "wait
+    /// forever", which stays the default so existing long-running
+    /// commands are never silently truncated.
+    #[error("ssh to {host} exceeded the {timeout:?} command timeout; killed the local ssh process")]
+    Timeout {
+        /// Host the command was issued against.
+        host: String,
+        /// The budget that was exceeded.
+        timeout: std::time::Duration,
+    },
 }

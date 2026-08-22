@@ -10,19 +10,32 @@ what's the equivalent `hbird` invocation?".
 > kubectl now delegate to `hbird` directly (the underlying bash scripts
 > were **removed**). Phase 4 (deploy-cluster / destroy-cluster /
 > spawn-workers) bash scripts are **retained** in v0.1.0 — full removal
-> blocked on [#289] (Rust destructive impl), scheduled for v0.2.0.
+> resolved in v0.2.0 (#289 S4): deploy/destroy flipped to `hbird` after
+> live validation, and their bash twins deleted.
 >
 > **Cross-runtime dependency:** the post-cutover Makefile recipes
 > require `hbird` CLI on PATH. See "Install the binary" below.
+
+
+> **`make deploy-cluster` / `make destroy-cluster` now delegate to `hbird`**
+> (#289 S4 cutover). Both were live-validated on a KVM host before the flip:
+> deploy brought up a net-new CP + worker and reported all nodes Ready,
+> destroy tore them down leaving no VMs, qcow2s or seed ISOs.
+>
+> **This makes a current `hbird` a hard requirement.** The v0.0.1 binary
+> still carries a guard that refuses live `destroy-cluster` unless
+> `--kvm-host` is set, and tells you to run `bash scripts/destroy-cluster.sh`
+> — a script that v0.2.0 removes. Install a build that carries the S4 fixes
+> before relying on these targets on the KVM host itself.
 
 ## TL;DR — side-by-side
 
 | Workflow | `make` (delegates to hbird in v0.1.0) | `hbird` (Rust, canonical) | Status |
 |----------|----------------------------------------|----------------------------|--------|
-| Deploy cluster | `make deploy-cluster CONFIG=cluster.local.conf` | `hbird deploy-cluster --config cluster.local.conf` (dry-run only; live tracked by [#289]) | **Bash retained** in v0.1.0 (Phase 4 deferred to v0.2.0) |
-| Tear down cluster | `make destroy-cluster CONFIG=cluster.local.conf` | `hbird destroy-cluster --config cluster.local.conf` (dry-run only; live tracked by [#289]) | **Bash retained** in v0.1.0 (Phase 4 deferred to v0.2.0) |
+| Deploy cluster | `make deploy-cluster CONFIG=cluster.local.conf` | `hbird deploy-cluster --config cluster.local.conf` | **Rust canonical** since v0.2.0 (#289 S4); bash twin deleted |
+| Tear down cluster | `make destroy-cluster CONFIG=cluster.local.conf` | `hbird destroy-cluster --config cluster.local.conf` | **Rust canonical** since v0.2.0 (#289 S4); bash twin deleted |
 | Rolling upgrade | `make update-cluster CONFIG=cluster.local.conf` | `hbird update-cluster --config cluster.local.conf` | **Rust canonical** (bash `scripts/update-cluster.sh` removed in v0.1.0 [#353]) |
-| Spawn N workers | `make spawn-workers CONFIG=cluster.local.conf COUNT=2` | `hbird spawn-workers --config cluster.local.conf --count 2` (dry-run only; live tracked by [#289]) | **Bash retained** in v0.1.0 (Phase 4 deferred to v0.2.0) |
+| Spawn N workers | *(no `make` target exists)* | `hbird spawn-workers --config cluster.local.conf --count 2` | Live-validated in v0.2.0 (#289 S4); `scripts/spawn-workers.sh` retained |
 | Verify encryption | `make verify-encryption CONFIG=cluster.local.conf` | `hbird verify encryption --config cluster.local.conf` | **Rust canonical** (bash `scripts/verify-encryption.sh` removed in v0.1.0 [#353]) |
 | Verify hardening | `make verify-hardening CONFIG=cluster.local.conf` | `hbird verify hardening --config cluster.local.conf` | **Rust canonical** (bash `scripts/verify-hardening.sh` removed in v0.1.0 [#353]) |
 | Verify app-deploy | `make verify-app-deploy CONFIG=cluster.local.conf` | `hbird verify app-deploy --config cluster.local.conf` | **Rust canonical** (bash `scripts/verify-app-deploy.sh` removed in v0.1.0 [#353]) |
@@ -199,12 +212,12 @@ byte-for-byte fixtures under
 cycles 1–4 ([PRs #325 #344 #346 #347]) — live drain/uncordon, bootID
 gate, DaemonSet-ready gate, and `wait_apiserver_back` all landed.
 
-**Deferred:** `timer_stop` / `timer_start` (block #4 of the live
-plan) remains stubbed because the geary cluster doesn't run the
-`bootc-semver-update.timer` the bash twin pauses/resumes during a
-roll. The Rust binary surfaces a stable
-`live_mode_not_implemented` diagnostic for these two helpers; the
-cluster-rotation paths themselves are complete. Tracked by [#322].
+**Complete:** `timer_stop` / `timer_start` (block #4 of the live
+plan) are now implemented. `timer_stop` stops both
+`bootc-semver-update.timer` and `bootc-fetch-apply-updates.timer`
+best-effort; `timer_start` probes which unit exists before starting it,
+and treats "no timer unit present" (exit 44) as a WARN rather than a
+roll-failing error. Closes the last of [#322]'s live-mode gaps.
 
 See [`docs/update-cluster.md`](update-cluster.md) for the full
 update-cluster reference (drain semantics, bootID gate, DaemonSet
@@ -445,7 +458,7 @@ spelling change for the SSH-via-KVM-host path.
 | Concern | Canonical today | Status |
 |---------|-----------------|--------|
 | Cluster lifecycle — update | `rust/crates/hbird-cli/src/commands/update_cluster.rs` | Bash removed in v0.1.0 [#353] |
-| Cluster lifecycle — deploy/destroy/spawn | `scripts/{deploy,destroy,spawn-workers}-cluster.sh` (bash); Rust dry-run only in `rust/crates/hbird-cli/src/commands/{deploy_cluster,destroy_cluster,spawn_workers}.rs` | **Bash retained** in v0.1.0; live Rust tracked by [#289] / Phase 4 deferred to v0.2.0 |
+| Cluster lifecycle — deploy/destroy/spawn | Rust: `rust/crates/hbird-cli/src/commands/{deploy_cluster,destroy_cluster,spawn_workers}.rs` | **Rust canonical** since v0.2.0 (#289 S4). `scripts/{deploy,destroy}-cluster.sh` deleted; `spawn-workers.sh` + `lib/ssh-wrap.sh` retained (ssh-wrap still sourced by clean-vms/switch-to-ghcr) |
 | Verifiers | `rust/crates/hbird-cli/src/commands/verify.rs` | Bash removed in v0.1.0 [#353] |
 | Kubeconfig export | `rust/crates/hbird-cli/src/commands/{export_argocd,get_kubeconfig}.rs` (shared core) | Bash `scripts/export-argocd.sh` removed in v0.1.0 [#353] |
 | kubectl SSH-tunnel wrapper | `rust/crates/hbird-cli/src/commands/{nodes,kubectl}.rs` + `rust/crates/hbird-cli/src/cp_kubectl.rs` | Bash `scripts/kubectl-k8s.sh` removed in v0.1.0 [#353] |

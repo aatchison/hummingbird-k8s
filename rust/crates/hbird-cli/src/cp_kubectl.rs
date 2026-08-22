@@ -180,6 +180,52 @@ pub(crate) fn cp_kubectl_raw_with_exec(
         .inspect_err(|err| tracing::debug!(error = ?err, "cp_kubectl_raw failed"))
 }
 
+/// Run a kubectl command on the CP via SSH, tolerating a non-zero
+/// remote exit, with the transport injected behind
+/// [`hbird_ssh::SshExec`].
+///
+/// Same kubectl-prefix wrapping and metacharacter rejection as
+/// [`cp_kubectl_raw_with_exec`], but a non-zero remote exit is folded
+/// into [`CpExecOutput::success = false`] instead of an `Err`. That is
+/// the shape `kube-bench` needs: `kubectl wait --for=condition=complete`
+/// exits non-zero on timeout, and the command has to react to that
+/// (dump pod status + last logs) rather than lose the captured output
+/// inside an error chain.
+///
+/// Bash twin: the plain `kc …` calls in `scripts/run-kube-bench.sh`,
+/// whose non-zero exits are inspected by `if ! kc …; then` blocks.
+///
+/// # Errors
+///
+/// Only transport-level SSH failures (auth, ProxyJump, DNS, spawn) —
+/// plus the metacharacter rejection, which fires before the executor is
+/// touched at all.
+pub(crate) fn cp_kubectl_lenient_with_exec(
+    exec: &impl hbird_ssh::SshExec,
+    cp_ip: &str,
+    command: &str,
+) -> Result<CpExecOutput> {
+    reject_shell_metachars("cp_kubectl_lenient", command)?;
+    let remote = format!("kubectl --kubeconfig=/etc/kubernetes/admin.conf {command}");
+    match exec.run(&remote) {
+        Ok(out) => Ok(CpExecOutput {
+            success: true,
+            stdout: out.stdout_lossy(),
+            stderr: out.stderr_lossy(),
+        }),
+        Err(hbird_ssh::Error::NonZeroExit { stdout, stderr, .. }) => Ok(CpExecOutput {
+            success: false,
+            stdout,
+            stderr,
+        }),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "cp_kubectl_lenient: ssh-run failed for `kubectl ... {command}` against {cp_ip}"
+            )
+        }),
+    }
+}
+
 /// Run a kubectl command on the CP via SSH, piping `stdin` to it.
 /// Tolerates non-zero exit — verify-hardening's PSA-rejection check
 /// relies on `kubectl apply -f -` returning exit 1 with `violates
@@ -574,5 +620,70 @@ mod tests {
                 exec.commands(),
             );
         }
+    }
+
+    // ---- lenient exec seam (kube-bench consumer) ----
+
+    fn nonzero(code: i32, stdout: &str, stderr: &str) -> Result<RunOutput, SshErr> {
+        Err(SshErr::NonZeroExit {
+            host: "192.168.122.42".to_string(),
+            status: ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        })
+    }
+
+    /// The lenient variant wraps the command with the same kubectl
+    /// prefix as the strict one — the two must not drift apart.
+    #[test]
+    fn cp_kubectl_lenient_with_exec_prefixes_kubectl_command() {
+        let exec = CapturingExec::new(ok_stdout("condition met"));
+        let out = cp_kubectl_lenient_with_exec(&exec, "192.168.122.42", "wait job/x")
+            .expect("happy path ok");
+        assert!(out.success);
+        assert_eq!(out.stdout.trim(), "condition met");
+        assert_eq!(
+            exec.commands(),
+            vec!["kubectl --kubeconfig=/etc/kubernetes/admin.conf wait job/x".to_string()]
+        );
+    }
+
+    /// Non-zero remote exit MUST be folded into `success = false` with
+    /// stdout/stderr intact — kube-bench's `wait` timeout branch keys
+    /// off exactly this.
+    #[test]
+    fn cp_kubectl_lenient_with_exec_folds_nonzero_exit() {
+        let exec = CapturingExec::new(nonzero(1, "partial", "timed out waiting"));
+        let out = cp_kubectl_lenient_with_exec(&exec, "192.168.122.42", "wait job/x")
+            .expect("non-zero exit must not be an Err");
+        assert!(!out.success);
+        assert_eq!(out.stdout, "partial");
+        assert_eq!(out.stderr, "timed out waiting");
+    }
+
+    /// Transport failures still surface as `Err` — "ssh is broken" is
+    /// not the same class of event as "kubectl said no".
+    #[test]
+    fn cp_kubectl_lenient_with_exec_errors_on_transport_failure() {
+        let exec = CapturingExec::new(Err(SshErr::Spawn {
+            program: "ssh".to_string(),
+            host: "192.168.122.42".to_string(),
+            kind: hbird_ssh::SpawnKind::SshBinaryMissing,
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "ssh missing"),
+        }));
+        let err = cp_kubectl_lenient_with_exec(&exec, "192.168.122.42", "get nodes")
+            .expect_err("transport failure must be an Err");
+        assert!(err.to_string().contains("ssh-run failed"), "{err}");
+    }
+
+    /// Metacharacter defense applies to the lenient path too, and still
+    /// fires before the executor is called.
+    #[test]
+    fn cp_kubectl_lenient_with_exec_rejects_metachars_before_exec() {
+        let exec = CapturingExec::new(ok_stdout("should-never-be-returned"));
+        let err = cp_kubectl_lenient_with_exec(&exec, "192.168.122.42", "logs job/x; rm -rf /")
+            .expect_err("metachar must be rejected");
+        assert!(err.to_string().contains("shell metacharacter"), "{err}");
+        assert!(exec.commands().is_empty());
     }
 }

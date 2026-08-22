@@ -11,6 +11,27 @@ make deploy-cluster CONFIG=cluster.local.conf
 
 This is the only supported way to stand up a cluster.
 
+
+> **EXTRA_NETWORK live validation (2026-08-22).** The dual-NIC path is
+> live-proven on the KVM host: a deploy with `EXTRA_NETWORK`, pinned primary
+> MACs and pinned `CP_IP`/`WORKER_IPS` brought up a guest with
+> `enp1s0 192.168.122.84/24` (from the libvirt DHCP reservation) and
+> `enp2s0 10.0.0.245/24` (from the rendered cloud-init `network-config` v2),
+> with the second interface attached as a vfio hostdev VF carrying the
+> configured MAC.
+>
+> **Pool sizing gotcha.** A `mode='hostdev'` SR-IOV network hands out VFs from
+> the fixed address list in its `<forward>` block. When every address is taken,
+> virt-install fails with *"requires exclusive access to interfaces, but none
+> are available"* — which reads like VF exhaustion but is a pool-size limit;
+> the host may have many free VFs. Check `connections='N'` in
+> `virsh net-dumpxml <net>` against the number of `<address>` entries. Widening
+> the pool needs `net-define` on edited XML: `virsh net-update ... add
+> forward-interface` only accepts `<interface dev='ethX'/>` and cannot express
+> a PCI-address pool. The added addresses go live only after a network restart,
+> which detaches VFs from running guests — so plan that with a maintenance
+> window, or test against a different SR-IOV network that has free capacity.
+
 ## The hybrid model
 
 State is split along a clean seam:
@@ -283,7 +304,7 @@ or changing a `containers/*/Containerfile`, the on-disk qcow2 could be
 out of date and the deploy would quietly boot the *old* bits (a
 false-positive "cluster came up OK" against pre-change code). Deploy now
 records the build identity alongside each template
-(`<template>.qcow2.build-ref`, written by `lib/cache-utils.sh`, namespaced
+(`<template>.qcow2.build-ref`, written by `rust/crates/hbird-cli/src/cache.rs`, namespaced
 by source as `local:<hash>` / `ghcr:<ref>`) and acts **only on a confirmed
 mismatch** before reusing:
 

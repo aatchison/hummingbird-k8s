@@ -150,7 +150,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hbird-cli"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -165,18 +165,18 @@ dependencies = [
 
 [[package]]
 name = "hbird-common"
-version = "0.0.1"
+version = "0.2.0"
 
 [[package]]
 name = "hbird-config"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "hbird-ssh"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "thiserror",
  "tracing",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "hbird-virt"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "thiserror",
  "tracing",

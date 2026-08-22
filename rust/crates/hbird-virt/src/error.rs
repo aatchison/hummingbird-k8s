@@ -57,11 +57,18 @@ pub enum Error {
         source: SshError,
     },
 
-    /// `virsh` ran on the remote and exited non-zero. The captured
+    /// A command ran on the target host and exited non-zero. The captured
     /// stderr is preserved so the operator sees the same diagnostic the
-    /// bash twin would print (the bash twin shells out to `virsh` and
-    /// surfaces its stderr verbatim).
-    #[error("virsh failed for command {command:?}: {stderr}")]
+    /// bash twin would print (the bash twin shells out and surfaces
+    /// stderr verbatim).
+    ///
+    /// The wording deliberately says "remote command" rather than
+    /// "virsh": [`crate::Connection::exec_shell`] carries `make`,
+    /// `podman`, `qemu-img` and `ssh` invocations too, and labelling a
+    /// failed `make` as a virsh failure sent an operator to the wrong
+    /// layer during #289 S4 live validation. The command itself is in the
+    /// message, so nothing is lost by naming the category accurately.
+    #[error("remote command failed: {command:?}: {stderr}")]
     VirshFailed {
         /// The `virsh` command that was run (verb + args, without the
         /// `virsh -c URI` prefix).

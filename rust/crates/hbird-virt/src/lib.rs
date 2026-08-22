@@ -91,6 +91,41 @@ pub struct Domain {
     pub name: String,
 }
 
+/// Full VM description for [`Connection::virt_install_vm`] (#405/#409).
+///
+/// Groups what would otherwise be seven positional arguments (clippy's
+/// `too_many_arguments`, and four adjacent `&str`s a call site could
+/// silently transpose). Lifetimed borrows — the spec is a per-call view,
+/// not an owned model.
+#[derive(Debug, Clone)]
+pub struct VmSpec<'a> {
+    /// Libvirt domain name.
+    pub name: &'a str,
+    /// Memory in MiB (`--memory`).
+    pub memory_mib: u64,
+    /// vCPU count (`--vcpus`).
+    pub vcpus: u32,
+    /// Primary qcow2 disk path.
+    pub disk_path: &'a str,
+    /// Optional cloud-init seed ISO attached as a read-only cdrom.
+    pub cdrom: Option<&'a str>,
+    /// Optional pinned MAC for the primary NIC (deploy-cluster #409).
+    /// Callers must pass a validated `aa:bb:cc:dd:ee:ff` string.
+    pub primary_mac: Option<&'a str>,
+    /// Optional second NIC (deploy-cluster #405 `EXTRA_NETWORK`).
+    pub extra_nic: Option<ExtraNic<'a>>,
+}
+
+/// Second-NIC attachment for [`VmSpec`]: a named libvirt network plus the
+/// guest-visible MAC that the cloud-init network-config matches on.
+#[derive(Debug, Clone)]
+pub struct ExtraNic<'a> {
+    /// Libvirt network name (`EXTRA_NETWORK`).
+    pub network: &'a str,
+    /// Validated `aa:bb:cc:dd:ee:ff` MAC (`EXTRA_NET_*_MAC`).
+    pub mac: &'a str,
+}
+
 /// Parsed `virsh dominfo <NAME>` output (subset).
 ///
 /// The bash twin's `update-cluster` flow reads exactly four fields from
@@ -210,14 +245,34 @@ impl Connection {
     fn domains_inner(&self) -> Result<Vec<Domain>> {
         let cmd = format!("virsh -c {} list --all --name", self.uri.remote_uri());
         let stdout = self.run(&cmd)?;
-        Ok(stdout
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| Domain {
-                name: s.to_string(),
-            })
-            .collect())
+        Ok(parse_domain_list(&stdout))
+    }
+
+    /// Enumerate only the **running** VMs (`virsh list --name`, without
+    /// `--all`).
+    ///
+    /// Bash twin: `scripts/switch-to-ghcr.sh::236` —
+    /// `virsh -c qemu:///system list --name 2>/dev/null | grep '^hummingbird-'`.
+    ///
+    /// Distinct from [`Self::domains`], which passes `--all` and therefore
+    /// also returns shut-off domains. `switch-to-ghcr` must NOT touch a
+    /// shut-off domain (there is no sshd to reach), so the two call sites
+    /// need different virsh invocations rather than a post-filter.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] when `virsh` exits non-zero.
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri))]
+    pub fn running_domains(&self) -> Result<Vec<Domain>> {
+        self.running_domains_inner()
+            .inspect_err(|err| tracing::debug!(error = ?err, "virsh running domains failed"))
+    }
+
+    fn running_domains_inner(&self) -> Result<Vec<Domain>> {
+        let cmd = format!("virsh -c {} list --name", self.uri.remote_uri());
+        let stdout = self.run(&cmd)?;
+        Ok(parse_domain_list(&stdout))
     }
 
     /// Resolve a domain's IPv4 lease via `virsh domifaddr`.
@@ -348,6 +403,79 @@ impl Connection {
         self.run(&cmd)
             .map(|_| ())
             .inspect_err(|err| tracing::debug!(error = ?err, "virsh undefine failed"))
+    }
+
+    /// Undefine a domain **and delete every storage volume it owns**
+    /// (`virsh undefine <NAME> --remove-all-storage`).
+    ///
+    /// Bash twin: `scripts/clean-vms.sh::57` —
+    /// `virsh -c qemu:///system undefine "$d" --remove-all-storage 2>/dev/null || true`.
+    ///
+    /// **DESTRUCTIVE and distinct from [`Self::undefine_domain`]**: that
+    /// one passes `--nvram` and leaves the qcow2 on disk (destroy-cluster
+    /// removes the files itself, by path). This one asks libvirt to drop
+    /// the backing volumes, which is what `make clean-vms` wants — it
+    /// sweeps domains it did not necessarily deploy, so it cannot know
+    /// their disk paths.
+    ///
+    /// Flag order mirrors the bash twin (name first, flag second) so the
+    /// emitted command string is greppable against `scripts/clean-vms.sh`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] when `virsh` exits non-zero (e.g. domain
+    ///   not defined, or a volume libvirt refuses to delete).
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, domain))]
+    pub fn undefine_domain_remove_all_storage(&self, domain: &str) -> Result<()> {
+        let cmd = format!(
+            // `--nvram` matches undefine_domain and the deleted bash
+            // destroy-cluster.sh. Without it libvirt REFUSES to undefine a
+            // UEFI/Q35 guest that has an NVRAM file, and clean-vms.sh
+            // swallowed that failure with `2>/dev/null || true` — so the
+            // domain silently stayed defined. (Flagged during the tier-1
+            // port; bash clean-vms.sh had the same gap.)
+            "virsh -c {} undefine {} --remove-all-storage --nvram",
+            self.uri.remote_uri(),
+            shell_quote(domain),
+        );
+        self.run(&cmd).map(|_| ()).inspect_err(
+            |err| tracing::debug!(error = ?err, "virsh undefine --remove-all-storage failed"),
+        )
+    }
+
+    /// List the entries of a directory on the KVM host (`ls -1 -- <dir>`).
+    ///
+    /// Bash twin: the `shopt -s nullglob` + `"$POOL_DIR"/hummingbird-*.qcow2`
+    /// glob block in `scripts/clean-vms.sh::62-72`. Expanding the glob in
+    /// bash means the *remote shell* decides what matches; doing the
+    /// listing here and the matching in the caller keeps the match rule in
+    /// Rust where it can be unit-tested (and cannot be widened by a stray
+    /// `shopt`).
+    ///
+    /// Returns bare entry names (no directory prefix), in the order `ls`
+    /// emitted them. Empty lines are dropped.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Ssh`] for SSH transport failures.
+    /// - [`Error::VirshFailed`] (overloaded — captures `ls`'s stderr) when
+    ///   `ls` exits non-zero, e.g. the directory does not exist. Callers
+    ///   that treat a missing pool dir as "nothing to sweep" must map that
+    ///   variant themselves; `nullglob` in the bash twin silently yields an
+    ///   empty list for the same case.
+    #[tracing::instrument(level = "debug", skip(self), fields(uri = %self.uri, dir))]
+    pub fn remote_ls(&self, dir: &str) -> Result<Vec<String>> {
+        let cmd = format!("ls -1 -- {}", shell_quote(dir));
+        let stdout = self
+            .run(&cmd)
+            .inspect_err(|err| tracing::debug!(error = ?err, "remote ls failed"))?;
+        Ok(stdout
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     /// Remove a file on the remote (or local) KVM host via the SSH
@@ -544,27 +672,136 @@ impl Connection {
         disk_path: &str,
         cdrom: Option<&str>,
     ) -> Result<()> {
+        self.virt_install_vm(&VmSpec {
+            name,
+            memory_mib,
+            vcpus,
+            disk_path,
+            cdrom,
+            primary_mac: None,
+            extra_nic: None,
+        })
+    }
+
+    /// `virt-install` with full NIC control (#405/#409).
+    ///
+    /// Same command skeleton as [`Connection::virt_install`], plus:
+    /// - `spec.primary_mac` pins the primary NIC's MAC
+    ///   (`--network network=default,model=virtio,mac=<mac>`) so a rebuilt
+    ///   VM keeps its DHCP lease — bash twin `deploy-cluster.sh` #409.
+    /// - `spec.extra_nic` appends a second `--network network=<net>,mac=<mac>`.
+    ///   No `model=` on the second NIC: for a hostdev/VF-pool network
+    ///   libvirt ignores it (bash twin comment, deploy-cluster.sh ~L1010).
+    ///
+    /// Takes a [`VmSpec`] rather than positional args: seven-plus
+    /// parameters is clippy's `too_many_arguments` territory and the
+    /// string-typed fields would be silently transposable at call sites.
+    pub fn virt_install_vm(&self, spec: &VmSpec<'_>) -> Result<()> {
         let mut cmd = format!(
             "virt-install --connect {} --name {} --memory {} --vcpus {} --disk {},format=qcow2,bus=virtio",
             self.uri.remote_uri(),
-            shell_quote(name),
-            memory_mib,
-            vcpus,
-            shell_quote(disk_path),
+            shell_quote(spec.name),
+            spec.memory_mib,
+            spec.vcpus,
+            shell_quote(spec.disk_path),
         );
-        if let Some(cdrom_path) = cdrom {
+        if let Some(cdrom_path) = spec.cdrom {
             cmd.push_str(&format!(
                 " --disk path={},device=cdrom,readonly=on",
                 shell_quote(cdrom_path),
             ));
         }
+        // NIC arguments stay unquoted (byte-parity with the historical
+        // command shape pinned by tests/virsh_commands.rs). MACs are
+        // caller-validated `aa:bb:cc:dd:ee:ff` strings; only the operator-
+        // supplied extra-network NAME goes through shell_quote.
         cmd.push_str(
-            " --import --os-variant fedora-unknown --network network=default,model=virtio \
-             --graphics vnc,listen=127.0.0.1 --noautoconsole",
+            " --import --os-variant fedora-unknown --network network=default,model=virtio",
         );
+        if let Some(mac) = spec.primary_mac {
+            cmd.push_str(&format!(",mac={mac}"));
+        }
+        if let Some(extra) = &spec.extra_nic {
+            cmd.push_str(&format!(
+                " --network network={},mac={}",
+                shell_quote(extra.network),
+                extra.mac,
+            ));
+        }
+        cmd.push_str(" --graphics vnc,listen=127.0.0.1 --noautoconsole");
         self.run(&cmd)
             .map(|_| ())
             .inspect_err(|err| tracing::debug!(error = ?err, "virt-install failed"))
+    }
+
+    /// `virsh net-dumpxml <network>` — raw XML of a libvirt network.
+    ///
+    /// Used by deploy-cluster's DHCP-reservation idempotency probe (bash
+    /// twin `ensure_dhcp_reservation`, deploy-cluster.sh #409): the caller
+    /// greps the XML for an existing `mac='…'` / `ip='…'` entry before
+    /// attempting `net-update`.
+    pub fn net_dumpxml(&self, network: &str) -> Result<String> {
+        let cmd = format!(
+            "virsh -c {} net-dumpxml {}",
+            self.uri.remote_uri(),
+            shell_quote(network),
+        );
+        self.run(&cmd)
+    }
+
+    /// `virsh net-info <network>` — raw human-readable network summary.
+    ///
+    /// deploy-cluster's EXTRA_NETWORK preflight (#405) reads two facts
+    /// from it: whether the network is defined at all (exit code) and the
+    /// `Active:` line (bash: `awk '/^Active:/{print $2}' | grep -qi yes`).
+    pub fn net_info(&self, network: &str) -> Result<String> {
+        let cmd = format!(
+            "virsh -c {} net-info {}",
+            self.uri.remote_uri(),
+            shell_quote(network),
+        );
+        self.run(&cmd)
+    }
+
+    /// `virsh net-update <network> add ip-dhcp-host "<host …/>" --live --config`.
+    ///
+    /// Adds a DHCP reservation so a VM's primary address is a RESERVATION,
+    /// not merely a sticky lease. XML payload mirrors the bash twin
+    /// byte-for-byte: `<host mac='<mac>' name='<name>' ip='<ip>'/>`.
+    pub fn net_update_add_ip_dhcp_host(
+        &self,
+        network: &str,
+        mac: &str,
+        name: &str,
+        ip: &str,
+    ) -> Result<()> {
+        let xml = format!("<host mac='{mac}' name='{name}' ip='{ip}'/>");
+        let cmd = format!(
+            "virsh -c {} net-update {} add ip-dhcp-host {} --live --config",
+            self.uri.remote_uri(),
+            shell_quote(network),
+            shell_quote(&xml),
+        );
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "net-update failed"))
+    }
+
+    /// `virsh net-update <network> delete ip-dhcp-host "<host …/>" --live --config`.
+    ///
+    /// Counterpart to [`Self::net_update_add_ip_dhcp_host`]. `host_xml` must
+    /// be the element as it appears in `net-dumpxml` (see
+    /// [`find_ip_dhcp_host_by_name`]) — virsh matches on what it is given.
+    pub fn net_update_delete_ip_dhcp_host(&self, network: &str, host_xml: &str) -> Result<()> {
+        let cmd = format!(
+            "virsh -c {} net-update {} delete ip-dhcp-host {} --live --config",
+            self.uri.remote_uri(),
+            shell_quote(network),
+            shell_quote(host_xml),
+        );
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "net-update delete failed"))
     }
 
     /// Execute an arbitrary shell command via this connection's transport.
@@ -682,6 +919,23 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
+/// Split `virsh list [--all] --name` stdout into [`Domain`] values.
+///
+/// `virsh list --name` emits one name per line plus a trailing blank
+/// separator line; both call sites want the same trim-and-drop-empties
+/// treatment, so the rule lives here rather than being duplicated in
+/// [`Connection::domains`] and [`Connection::running_domains`].
+fn parse_domain_list(stdout: &str) -> Vec<Domain> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Domain {
+            name: s.to_string(),
+        })
+        .collect()
+}
+
 /// Parse `virsh domifaddr` output. Visible for unit tests in the
 /// `tests/` integration suite; not part of the public API.
 #[doc(hidden)]
@@ -754,6 +1008,26 @@ pub fn parse_dominfo(stdout: &str, command: &str) -> Result<DomainInfo> {
             reason: "dominfo output missing 'OS Type:' row",
         })?,
     })
+}
+
+/// Find the `<host …/>` DHCP-reservation element for `name` in a
+/// `virsh net-dumpxml` document.
+///
+/// Returns the element verbatim so it can be handed straight back to
+/// `net-update … delete ip-dhcp-host`, which matches on the XML it is
+/// given. Keyed on `name=` because that is what
+/// [`Connection::net_update_add_ip_dhcp_host`] sets it to — the VM name —
+/// so a destroy only ever removes a reservation IT created, never an
+/// unrelated one that happens to share a MAC or address.
+///
+/// Pure + exhaustively testable: the caller does the I/O.
+pub fn find_ip_dhcp_host_by_name(net_xml: &str, name: &str) -> Option<String> {
+    let needle = format!("name='{name}'");
+    net_xml
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("<host ") && l.contains(&needle))
+        .map(|l| l.to_string())
 }
 
 #[cfg(test)]
@@ -847,5 +1121,46 @@ mod tests {
         let cmd = "virsh -c qemu:///system dominfo x";
         let err = parse_dominfo(out, cmd).expect_err("missing State must error");
         assert!(matches!(err, Error::UnparseableOutput { .. }));
+    }
+
+    // ---- ip-dhcp-host reservation lookup (#destroy reservation cleanup) --
+
+    const RES_NET_XML: &str = r#"<network>
+  <name>default</name>
+  <ip address='192.168.122.1' netmask='255.255.255.0'>
+    <dhcp>
+      <host mac='52:54:00:aa:bb:cc' name='hbird-forge-cp' ip='192.168.122.70'/>
+      <host mac='52:54:00:dd:ee:ff' name='hbird-test-cp' ip='192.168.122.60'/>
+    </dhcp>
+  </ip>
+</network>"#;
+
+    #[test]
+    fn find_ip_dhcp_host_returns_the_element_verbatim() {
+        assert_eq!(
+            find_ip_dhcp_host_by_name(RES_NET_XML, "hbird-test-cp").expect("present"),
+            "<host mac='52:54:00:dd:ee:ff' name='hbird-test-cp' ip='192.168.122.60'/>"
+        );
+    }
+
+    #[test]
+    fn find_ip_dhcp_host_absent_is_none() {
+        assert!(find_ip_dhcp_host_by_name(RES_NET_XML, "hbird-nope").is_none());
+    }
+
+    /// THE safety property. Keyed on `name=`, so tearing down one cluster can
+    /// never delete another's reservation — including the live production
+    /// entries this very host carries. A prefix must not match either.
+    #[test]
+    fn find_ip_dhcp_host_never_matches_a_different_vm() {
+        let got = find_ip_dhcp_host_by_name(RES_NET_XML, "hbird-test-cp").unwrap();
+        assert!(
+            !got.contains("forge"),
+            "matched the wrong reservation: {got}"
+        );
+        assert!(
+            find_ip_dhcp_host_by_name(RES_NET_XML, "hbird-test").is_none(),
+            "a prefix of a real name must not match"
+        );
     }
 }

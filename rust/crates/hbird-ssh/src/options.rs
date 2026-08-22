@@ -48,6 +48,11 @@ pub struct SshOptions {
     pub(crate) batch_mode: bool,
     pub(crate) control_master: bool,
     pub(crate) include_identity_flag: bool,
+    /// Wall-clock budget for the whole remote command, enforced locally by
+    /// killing the `ssh` process. Deliberately NOT part of
+    /// [`Self::to_argv`] — it is a local watchdog, not an SSH option, so
+    /// the argv stays byte-identical to the bash `ssh_opts_array`.
+    pub(crate) command_timeout: Option<Duration>,
 }
 
 impl SshOptions {
@@ -78,7 +83,31 @@ impl SshOptions {
             batch_mode: true,
             control_master: false,
             include_identity_flag: true,
+            command_timeout: None,
         }
+    }
+
+    /// Set a wall-clock budget for the whole remote command.
+    ///
+    /// `ConnectTimeout` (an SSH option) only bounds the handshake. This is
+    /// a LOCAL watchdog covering everything after auth: when the budget
+    /// expires the `ssh` process is killed and
+    /// [`crate::Error::Timeout`] is returned.
+    ///
+    /// Unset by default. Callers that run genuinely long operations
+    /// (`bootc upgrade` over a slow link) should either leave it unset or
+    /// pick a bound above the worst legitimate case — the point is to
+    /// catch a wedge, not to truncate real work.
+    #[must_use]
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = Some(timeout);
+        self
+    }
+
+    /// The configured wall-clock command budget, if any.
+    #[must_use]
+    pub fn command_timeout(&self) -> Option<Duration> {
+        self.command_timeout
     }
 
     /// Override the remote user. Equivalent to `ssh user@host`; the bash

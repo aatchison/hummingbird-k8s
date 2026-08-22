@@ -342,6 +342,150 @@ fn undefine_domain_emits_virsh_undefine_with_nvram() {
     );
 }
 
+// ---- running_domains / undefine --remove-all-storage / remote_ls -----------
+// Added with `hbird switch-to-ghcr` + `hbird clean-vms` (bash twins
+// `scripts/switch-to-ghcr.sh`, `scripts/clean-vms.sh`).
+
+#[test]
+fn running_domains_omits_all_flag() {
+    let stub = Arc::new(StubSshClient::new());
+    // Bash twin `scripts/switch-to-ghcr.sh::236` uses `virsh list --name`
+    // WITHOUT `--all`: a shut-off domain has no sshd to switch.
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system list --name",
+        Reply::Ok(
+            "hummingbird-k8s
+hummingbird-k8s-worker-1
+
+"
+            .to_string(),
+        ),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    let doms = conn.running_domains().expect("ok");
+    let names: Vec<_> = doms.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, vec!["hummingbird-k8s", "hummingbird-k8s-worker-1"]);
+    assert_eq!(
+        stub.calls(),
+        vec![(
+            "op@kvm.example".to_string(),
+            "virsh -c qemu:///system list --name".to_string()
+        )],
+        "running_domains must NOT pass --all",
+    );
+}
+
+#[test]
+fn running_domains_returns_empty_when_nothing_is_up() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system list --name",
+        Reply::Ok(
+            "
+"
+            .to_string(),
+        ),
+    );
+    let conn = make_conn(stub);
+    assert!(conn.running_domains().unwrap().is_empty());
+}
+
+#[test]
+fn running_domains_surfaces_virsh_failure() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system list --name",
+        Reply::NonZero {
+            stderr: "error: failed to connect to the hypervisor".to_string(),
+            exit_code: 1,
+        },
+    );
+    let conn = make_conn(stub);
+    let err = conn
+        .running_domains()
+        .expect_err("non-zero virsh must error");
+    assert!(matches!(err, Error::VirshFailed { .. }), "got {err:?}");
+}
+
+#[test]
+fn undefine_domain_remove_all_storage_matches_bash_flag_order() {
+    let stub = Arc::new(StubSshClient::new());
+    // Bash twin `scripts/clean-vms.sh::57`:
+    //   virsh -c qemu:///system undefine "$d" --remove-all-storage
+    // Name first, flag second — pinned so the command stays greppable.
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system undefine hummingbird-k8s --remove-all-storage --nvram",
+        Reply::Ok(String::new()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    conn.undefine_domain_remove_all_storage("hummingbird-k8s")
+        .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(
+        calls[0].1,
+        "virsh -c qemu:///system undefine hummingbird-k8s --remove-all-storage --nvram"
+    );
+}
+
+#[test]
+fn undefine_domain_remove_all_storage_quotes_hostile_name() {
+    let stub = Arc::new(StubSshClient::new());
+    let conn = make_conn(Arc::clone(&stub));
+    let _ = conn.undefine_domain_remove_all_storage("evil; rm -rf /");
+    let calls = stub.calls();
+    assert!(
+        calls[0].1.contains("'evil; rm -rf /'"),
+        "hostile name must be single-quoted: {:?}",
+        calls[0].1
+    );
+}
+
+#[test]
+fn remote_ls_emits_ls_1_and_splits_lines() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "ls -1 -- '/var/lib/libvirt/images'",
+        Reply::Ok(
+            "hummingbird-k8s.qcow2
+hbird-geary-1.qcow2
+
+"
+            .to_string(),
+        ),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    let names = conn.remote_ls("/var/lib/libvirt/images").expect("ok");
+    assert_eq!(names, vec!["hummingbird-k8s.qcow2", "hbird-geary-1.qcow2"]);
+    assert_eq!(calls_first(&stub), "ls -1 -- '/var/lib/libvirt/images'");
+}
+
+#[test]
+fn remote_ls_surfaces_missing_directory_as_virshfailed() {
+    let stub = Arc::new(StubSshClient::new());
+    stub.expect(
+        "op@kvm.example",
+        "ls -1 -- '/no/such/pool'",
+        Reply::NonZero {
+            stderr: "ls: cannot access '/no/such/pool': No such file or directory".to_string(),
+            exit_code: 2,
+        },
+    );
+    let conn = make_conn(stub);
+    let err = conn.remote_ls("/no/such/pool").expect_err("must error");
+    assert!(matches!(err, Error::VirshFailed { .. }), "got {err:?}");
+}
+
+/// First command string the stub observed. Small helper so the new
+/// tests read as one assertion per behaviour.
+fn calls_first(stub: &Arc<StubSshClient>) -> String {
+    stub.calls()[0].1.clone()
+}
+
 #[test]
 fn remote_rm_f_emits_rm_f_with_quoted_path() {
     let stub = Arc::new(StubSshClient::new());
@@ -926,4 +1070,196 @@ fn local_virt_install_with_cdrom_mirrors_ssh_command() {
 /// Helper: extract just the command strings from a stub's call log.
 fn calls_commands(stub: &StubSshClient) -> Vec<String> {
     stub.calls().into_iter().map(|(_, cmd)| cmd).collect()
+}
+
+// ---- virt_install_vm: NIC control (deploy-cluster #405/#409) ----------------
+
+#[test]
+fn virt_install_vm_pins_primary_mac_and_extra_nic() {
+    // Bash twin: deploy-cluster.sh lines 1026-1036 —
+    //   --network "network=default,model=virtio,mac=${CP_PRIMARY_MAC}"
+    //   --network "network=${EXTRA_NETWORK},mac=${EXTRA_NET_CP_MAC}"
+    // (no model= on the second NIC: hostdev/VF-pool networks ignore it).
+    let stub = Arc::new(StubSshClient::new());
+    let expected_cmd = concat!(
+        "virt-install --connect qemu:///system",
+        " --name hbird-cp1",
+        " --memory 8192 --vcpus 4",
+        " --disk '/mnt/pool/hbird-cp1.qcow2',format=qcow2,bus=virtio",
+        " --disk path='/mnt/pool/hbird-cp1-seed.iso',device=cdrom,readonly=on",
+        " --import",
+        " --os-variant fedora-unknown",
+        " --network network=default,model=virtio,mac=52:54:00:f0:1d:bd",
+        " --network network=vf-pool,mac=02:11:22:33:44:55",
+        " --graphics vnc,listen=127.0.0.1",
+        " --noautoconsole",
+    );
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.virt_install_vm(&hbird_virt::VmSpec {
+        name: "hbird-cp1",
+        memory_mib: 8192,
+        vcpus: 4,
+        disk_path: "/mnt/pool/hbird-cp1.qcow2",
+        cdrom: Some("/mnt/pool/hbird-cp1-seed.iso"),
+        primary_mac: Some("52:54:00:f0:1d:bd"),
+        extra_nic: Some(hbird_virt::ExtraNic {
+            network: "vf-pool",
+            mac: "02:11:22:33:44:55",
+        }),
+    })
+    .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, expected_cmd);
+}
+
+#[test]
+fn virt_install_vm_without_nic_extras_matches_legacy_shape() {
+    // No primary_mac / extra_nic — byte-identical to the historical
+    // `virt_install` shape (regression pin for the wrapper delegation,
+    // and for the deploy dry-run invariant: no new knobs => no drift).
+    let stub = Arc::new(StubSshClient::new());
+    let expected_cmd = concat!(
+        "virt-install --connect qemu:///system",
+        " --name hbird-w1",
+        " --memory 2048 --vcpus 2",
+        " --disk '/mnt/mass2/vms/hbird-w1.qcow2',format=qcow2,bus=virtio",
+        " --import",
+        " --os-variant fedora-unknown",
+        " --network network=default,model=virtio",
+        " --graphics vnc,listen=127.0.0.1",
+        " --noautoconsole",
+    );
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.virt_install_vm(&hbird_virt::VmSpec {
+        name: "hbird-w1",
+        memory_mib: 2048,
+        vcpus: 2,
+        disk_path: "/mnt/mass2/vms/hbird-w1.qcow2",
+        cdrom: None,
+        primary_mac: None,
+        extra_nic: None,
+    })
+    .expect("ok");
+    assert_eq!(stub.calls()[0].1, expected_cmd);
+}
+
+// ---- net-dumpxml / net-update (deploy-cluster #409 DHCP reservations) -------
+
+#[test]
+fn net_dumpxml_returns_raw_xml() {
+    let stub = Arc::new(StubSshClient::new());
+    let xml = "<network>\n  <name>default</name>\n</network>\n";
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system net-dumpxml default",
+        Reply::Ok(xml.to_string()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    let got = conn.net_dumpxml("default").expect("xml");
+    assert_eq!(got, xml);
+}
+
+#[test]
+fn net_update_add_ip_dhcp_host_mirrors_bash_invocation() {
+    // Bash twin (deploy-cluster.sh ensure_dhcp_reservation):
+    //   virsh -c qemu:///system net-update "$net" add ip-dhcp-host \
+    //     "<host mac='${mac}' name='${name}' ip='${ip}'/>" --live --config
+    // The XML payload is byte-identical; the Rust side single-quotes it
+    // for the remote shell (bash passes it as one argv token instead).
+    let stub = Arc::new(StubSshClient::new());
+    let expected_cmd = r#"virsh -c qemu:///system net-update default add ip-dhcp-host '<host mac='\''52:54:00:f0:1d:bd'\'' name='\''hbird-cp1'\'' ip='\''192.168.122.10'\''/>' --live --config"#;
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.net_update_add_ip_dhcp_host(
+        "default",
+        "52:54:00:f0:1d:bd",
+        "hbird-cp1",
+        "192.168.122.10",
+    )
+    .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, expected_cmd);
+}
+
+#[test]
+fn net_update_nonzero_exit_maps_to_virsh_failed() {
+    // deploy-cluster treats a failed net-update as a WARN-and-continue,
+    // so the classification (VirshFailed = virsh ran and refused, vs
+    // Ssh = transport died) is what the caller keys on.
+    let stub = Arc::new(StubSshClient::new());
+    let expected_cmd = r#"virsh -c qemu:///system net-update default add ip-dhcp-host '<host mac='\''52:54:00:f0:1d:bd'\'' name='\''hbird-cp1'\'' ip='\''192.168.122.10'\''/>' --live --config"#;
+    stub.expect(
+        "op@kvm.example",
+        expected_cmd,
+        Reply::NonZero {
+            stderr: "error: this network does not support dhcp host updates".to_string(),
+            exit_code: 1,
+        },
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    let err = conn
+        .net_update_add_ip_dhcp_host(
+            "default",
+            "52:54:00:f0:1d:bd",
+            "hbird-cp1",
+            "192.168.122.10",
+        )
+        .expect_err("must fail");
+    match err {
+        Error::VirshFailed { stderr, .. } => {
+            assert!(stderr.contains("does not support"), "stderr: {stderr}");
+        }
+        other => panic!("expected VirshFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn net_info_command_shape_and_passthrough() {
+    let stub = Arc::new(StubSshClient::new());
+    let info = "Name:           vf-pool\nActive:         yes\n";
+    stub.expect(
+        "op@kvm.example",
+        "virsh -c qemu:///system net-info vf-pool",
+        Reply::Ok(info.to_string()),
+    );
+    let conn = make_conn(Arc::clone(&stub));
+    let got = conn.net_info("vf-pool").expect("info");
+    assert_eq!(got, info);
+}
+
+#[test]
+fn net_update_delete_ip_dhcp_host_mirrors_the_add_shape() {
+    // Counterpart to net_update_add_ip_dhcp_host. destroy-cluster hands
+    // back the element exactly as net-dumpxml printed it, because virsh
+    // matches on the XML it is given.
+    let stub = Arc::new(StubSshClient::new());
+    let host_xml = "<host mac='52:54:00:f0:1d:bd' name='hbird-cp1' ip='192.168.122.10'/>";
+    let expected_cmd = r#"virsh -c qemu:///system net-update default delete ip-dhcp-host '<host mac='\''52:54:00:f0:1d:bd'\'' name='\''hbird-cp1'\'' ip='\''192.168.122.10'\''/>' --live --config"#;
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.net_update_delete_ip_dhcp_host("default", host_xml)
+        .expect("ok");
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, expected_cmd);
+}
+
+#[test]
+fn undefine_remove_all_storage_passes_nvram() {
+    // A UEFI/Q35 guest cannot be undefined while it has an NVRAM file
+    // unless --nvram is given. bash clean-vms.sh omitted it and swallowed
+    // the failure with `2>/dev/null || true`, so the domain silently
+    // stayed defined. undefine_domain (destroy-cluster) always had it.
+    let stub = Arc::new(StubSshClient::new());
+    let expected_cmd =
+        "virsh -c qemu:///system undefine hummingbird-k8s-worker-1 --remove-all-storage --nvram";
+    stub.expect("op@kvm.example", expected_cmd, Reply::Ok(String::new()));
+    let conn = make_conn(Arc::clone(&stub));
+    conn.undefine_domain_remove_all_storage("hummingbird-k8s-worker-1")
+        .expect("ok");
+    assert_eq!(stub.calls()[0].1, expected_cmd);
 }

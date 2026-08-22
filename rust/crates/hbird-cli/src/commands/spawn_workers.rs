@@ -33,7 +33,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use clap::Args;
 use clap::builder::BoolishValueParser;
 
@@ -294,9 +294,31 @@ fn plan_worker_loop(
     injector: Injector,
 ) -> Result<()> {
     let template = plan.template_path();
-    log(&format!(
-        "DRY-RUN worker template qcow2: {template} (must exist; bash twin fails fast when missing)"
-    ));
+    if plan.dry_run {
+        log(&format!(
+            "DRY-RUN worker template qcow2: {template} (must exist; bash twin fails fast when missing)"
+        ));
+    } else {
+        // Two bugs fixed here, both seen during #289 S4 live validation:
+        //
+        // 1. This line was logged unconditionally, so a LIVE run printed a
+        //    "DRY-RUN ..." line. An operator reading the log could
+        //    reasonably conclude nothing had been created — while VMs were
+        //    in fact being installed.
+        // 2. It only CLAIMED the template "must exist"; nothing actually
+        //    checked. The bash twin fails fast when it is missing. Without
+        //    the check the clone step fails later with a qemu-img error
+        //    that does not name the template as the cause.
+        match conn.remote_path_exists(&template) {
+            Ok(true) => log(&format!("worker template qcow2: {template}")),
+            Ok(false) => bail!(
+                "worker template qcow2 {template} does not exist. Build it first \
+                 (`make image-worker` + bib, or `make spawn-workers` which builds it), \
+                 or point POOL_DIR at the directory that holds it."
+            ),
+            Err(e) => bail!("could not stat worker template qcow2 {template}: {e}"),
+        }
+    }
     for i in 1..=plan.count {
         let name = plan.worker_name(i);
         let qcow = format!("{}/{name}.qcow2", plan.pool_dir);
@@ -533,16 +555,6 @@ pub fn run(args: SpawnWorkersArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn live_mode_not_implemented(helper: &str, equivalent: &str) -> anyhow::Error {
-    anyhow!(
-        "live-mode spawn-workers: `{helper}` requires a remote libvirt / guestfish / SSH \
-         round-trip that is not yet implemented in the Rust path. Bash equivalent: `{equivalent}`. \
-         Until the live-execution slice lands (tracked by #335), run with `--dry-run` to preview \
-         the plan, or use `make spawn-workers COUNT=N` to actually spawn workers."
-    )
-}
-
 // ---- Guestfish / virt-customize command builders (pure, unit-testable) ------
 
 /// Build the guestfish discovery command for the ostree stateroot.
@@ -700,15 +712,6 @@ mod tests {
     fn template_path_under_pool_dir() {
         let p = Plan::from_args(&args(true, 1), cfg());
         assert_eq!(p.template_path(), "/mnt/pool/hummingbird-k8s-worker.qcow2");
-    }
-
-    #[test]
-    fn live_mode_error_names_issue_and_bash_equivalent() {
-        let e = live_mode_not_implemented("plan_x", "guestfish ...");
-        let s = format!("{e}");
-        assert!(s.contains("#335"));
-        assert!(s.contains("plan_x"));
-        assert!(s.contains("guestfish"));
     }
 
     // ---- guestfish command shape tests ----------------------------------------

@@ -258,7 +258,7 @@ RUN curl -fsSL --retry 3 --retry-delay 2 -o "/tmp/cilium-linux-${TARGETARCH}.tar
  && /usr/bin/cilium version --client
 
 # org.opencontainers.image.revision stamps the building commit SHA so the
-# #373/#384 GHCR cache-freshness gate (lib/cache-utils.sh hbird_image_vcs_ref)
+# #373/#384 GHCR cache-freshness gate (hbird cache::image_vcs_ref)
 # can detect a published image that predates the on-disk Containerfile (#385).
 # Declared here, at the very end of the build, so the per-commit REVISION value
 # only invalidates this trailing metadata layer — the expensive package/RUN
