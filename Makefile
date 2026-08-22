@@ -327,7 +327,8 @@ get-kubeconfig: ## Fetch kubeconfig.yaml from CONFIG=<path> (OUTPUT=, SERVER=, C
 		$(if $(FORCE),--force,)
 
 switch-to-ghcr: ## Switch all deployed VMs to track ghcr.io/aatchison/hummingbird-<flavor>:latest (#138)
-	bash scripts/switch-to-ghcr.sh
+	@command -v hbird >/dev/null || { echo 'hbird not on PATH — see docs/rust-cli.md' >&2; exit 2; }
+	hbird switch-to-ghcr $(FLAGS)
 
 # ---- convenience -------------------------------------------------------
 # nodes / kubectl — delegate to `hbird kubectl` (v0.1.0 cutover, #353).
@@ -372,27 +373,32 @@ verify-all: ## All three verifiers in sequence (CONFIG=<path>, KVM_HOST=<alias>)
 # bumping Cilium?"); STRICT=1 escalates a mismatch from warning to
 # exit-1 for use as a pre-merge gate.
 check-cilium-k8s-compat: ## Warn on Cilium/K8s version-compatibility mismatch (CILIUM=X.Y.Z, K8S=vX.Y, STRICT=1)
-	@bash scripts/check-cilium-k8s-compat.sh \
+	@command -v hbird >/dev/null || { echo 'hbird not on PATH — see docs/rust-cli.md' >&2; exit 2; }
+	@hbird preflight cilium \
 	  $(if $(CILIUM),--cilium=$(CILIUM),) \
 	  $(if $(K8S),--k8s=$(K8S),) \
 	  $(if $(STRICT),--strict,)
 
 kube-bench: ## Run CIS Kubernetes Benchmark (kube-bench) against the cluster
-	bash scripts/run-kube-bench.sh
+	@command -v hbird >/dev/null || { echo 'hbird not on PATH — see docs/rust-cli.md' >&2; exit 2; }
+	hbird kube-bench $(FLAGS)
 
 # ---- backup / restore --------------------------------------------------
 # etcd snapshot lifecycle. See docs/backup-restore.md for cadence,
 # encryption-key handling, and full DR walkthrough.
 
 backup-etcd: ## Snapshot etcd; optional LABEL=<text> appends to filename
-	bash scripts/backup-etcd.sh $(if $(LABEL),--label $(LABEL),)
+	@command -v hbird >/dev/null || { echo 'hbird not on PATH — see docs/rust-cli.md' >&2; exit 2; }
+	hbird etcd backup $(if $(LABEL),--label $(LABEL),) $(FLAGS)
 
 restore-etcd: ## Restore etcd from a snapshot (SNAP=path.db required)
 	@[ -n "$(SNAP)" ] || { echo 'SNAP=<path-to-snapshot.db> required' >&2; exit 2; }
-	bash scripts/restore-etcd.sh "$(SNAP)"
+	@command -v hbird >/dev/null || { echo 'hbird not on PATH — see docs/rust-cli.md' >&2; exit 2; }
+	hbird etcd restore --snapshot "$(SNAP)" $(FLAGS)
 
 rotate-etcd-key: ## Walk the operator through etcd encryption-key rotation (#120)
-	bash scripts/rotate-etcd-encryption-key.sh
+	@command -v hbird >/dev/null || { echo 'hbird not on PATH — see docs/rust-cli.md' >&2; exit 2; }
+	hbird etcd rotate-key $(FLAGS)
 
 # ---- CI integration ----------------------------------------------------
 # The redhat-actions/buildah-build action in .github/workflows/build-*.yml
@@ -434,7 +440,8 @@ test-all: test-lib test-scripts ## Run all bats unit suites (lib + scripts)
 # ---- cleanup -----------------------------------------------------------
 
 clean-vms: ## Destroy hummingbird-* VMs + sweep stale qcow2/seed-ISO from POOL_DIR (honors KVM_HOST)
-	bash scripts/clean-vms.sh
+	@command -v hbird >/dev/null || { echo 'hbird not on PATH — see docs/rust-cli.md' >&2; exit 2; }
+	hbird clean-vms $(FLAGS)
 
 clean-images: ## Remove the local OCI build outputs
 	-podman image rm $(IMAGE_K8S) $(IMAGE_WORKER) 2>/dev/null || true

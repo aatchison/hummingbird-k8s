@@ -11,8 +11,8 @@
 #   3.  `make -n destroy-cluster CONFIG=…` -> hbird destroy-cluster (#289 S4)
 #   4.  `make -n update-cluster CONFIG=…` -> hbird update-cluster (#353)
 #   5.  `make -n verify-all`     -> hbird verify all (#353)
-#   6.  `make -n backup-etcd`    -> bash scripts/backup-etcd.sh (no LABEL)
-#   7.  `make -n switch-to-ghcr` -> bash scripts/switch-to-ghcr.sh
+#   6.  `make -n backup-etcd`    -> hbird etcd backup (no LABEL)
+#   7.  `make -n switch-to-ghcr` -> hbird switch-to-ghcr
 #   8.  `make -n clean`          -> includes clean-vms (scripts/clean-vms.sh) + clean-images
 #   9.  Every `.PHONY:` target is also a defined target (and vice versa).
 #   10. Every target referenced from `make -n <t>` actually exists.
@@ -109,24 +109,30 @@ make_dry() {
   [[ "$output" == *"hbird verify all"* ]]
 }
 
-@test "6. make -n backup-etcd invokes scripts/backup-etcd.sh with no LABEL" {
+@test "6. make -n backup-etcd invokes hbird etcd backup with no LABEL (tier 1)" {
   make_dry backup-etcd
-  [[ "$output" == *"bash scripts/backup-etcd.sh"* ]]
+  [[ "$output" == *"hbird etcd backup"* ]]
+  [[ "$output" != *"bash scripts/"* ]]
   # Sanity: no LABEL= leakage in the dry-run.
   [[ "$output" != *"LABEL="* ]]
 }
 
-@test "7. make -n switch-to-ghcr invokes scripts/switch-to-ghcr.sh" {
+@test "7. make -n switch-to-ghcr invokes hbird switch-to-ghcr (tier 1)" {
   make_dry switch-to-ghcr
-  [[ "$output" == *"bash scripts/switch-to-ghcr.sh"* ]]
+  [[ "$output" == *"hbird switch-to-ghcr"* ]]
+  [[ "$output" != *"bash scripts/"* ]]
 }
 
 @test "8. make -n clean includes both clean-vms and clean-images recipes" {
   # `clean` depends on clean-vms + clean-images; dry-run should expand both.
   make_dry clean
-  # clean-vms recipe: invokes scripts/clean-vms.sh (which sources the C3
-  # SSH-wrap shim + sweeps qcow2/seed-ISO stragglers — see #271 F5 + #221).
-  [[ "$output" == *"bash scripts/clean-vms.sh"* ]]
+  # clean-vms recipe: delegates to `hbird clean-vms` (tier 1). The Rust
+  # twin sweeps qcow2/seed-ISO stragglers natively — and unlike the bash
+  # original, its match patterns are anchored to `hummingbird-`, so a
+  # production hbird-geary-*/hbird-forge-* seed ISO in the same POOL_DIR
+  # is never swept (#221; the unanchored glob was a live footgun).
+  [[ "$output" == *"hbird clean-vms"* ]]
+  [[ "$output" != *"bash scripts/clean-vms.sh"* ]]
   # clean-images recipe: `podman image rm` on the two local images.
   [[ "$output" == *"podman image rm"* ]]
   [[ "$output" == *"localhost/hummingbird-k8s:latest"* ]]
