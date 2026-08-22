@@ -40,9 +40,26 @@
 //!
 //! That's how we deterministically pin contention.
 
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
+
+/// Kill a spawned holder and every process in its group, then reap it.
+/// `Child::kill` alone leaves the shell that holds the inherited lock fd.
+fn kill_group(child: &mut std::process::Child) {
+    let pgid = child.id() as i32;
+    // TERM the whole group, then KILL it: a holder that ignores or defers
+    // TERM must not survive and keep the lock held.
+    let _ = Command::new("kill")
+        .args(["-TERM", &format!("-{pgid}")])
+        .status();
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{pgid}")])
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 fn hbird_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hbird"))
@@ -117,12 +134,16 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
     let lock_path = xdg.0.join("hbird-update-cluster.lock");
     let spawn_holder = || {
         Command::new("flock")
-            .args([
-                "-n",
-                &lock_path.to_string_lossy(),
-                "-c",
-                "trap 'exit 0' TERM; while sleep 86400; do :; done",
-            ])
+            // Own process group: `flock -c` runs its command in a child
+            // shell that inherits the locked fd, so killing flock alone
+            // leaks that shell (and its `sleep`) — the same defect this
+            // suite found in acquire_lock. Kill the group instead.
+            .process_group(0)
+            // No `-c`: flock EXECs sleep directly, so the holder is a
+            // single process with no shell wrapper. A shell wrapper defers
+            // its TERM trap until the foreground `sleep` returns, which is
+            // why the previous form leaked two processes per run.
+            .args(["-n", &lock_path.to_string_lossy(), "sleep", "86400"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -151,8 +172,7 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
                 break;
             }
         }
-        let _ = first.kill();
-        let _ = first.wait();
+        kill_group(&mut first);
         first = spawn_holder();
     }
     assert!(
@@ -186,9 +206,8 @@ fn second_invocation_fails_with_lock_contention_diagnostic() {
     // Was the fixture still holding when hbird ran? Distinguishes "hbird
     // failed to detect contention" from "the fixture lost its own lock".
     let lock_held_after = lock_held();
-    // Tear down the lock holder.
-    let _ = first.kill();
-    let _ = first.wait();
+    // Tear down the lock holder (whole group — see spawn_holder).
+    kill_group(&mut first);
 
     assert!(
         !second.status.success(),

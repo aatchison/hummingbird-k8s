@@ -52,6 +52,7 @@
 //! [#327]: https://github.com/aatchison/hummingbird-k8s/issues/327
 
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -454,13 +455,9 @@ impl Plan {
                 .clone()
                 .or_else(|| config.kvm_host.clone())
                 .filter(|s| !s.is_empty());
-            let virsh = kvm_host
-                .as_deref()
-                .map(|h| hbird_ssh::Client::new(hbird_ssh::SshOptions::new(h.to_string())));
-
             let cp_ip = match config.cp_ip.clone().filter(|s| !s.is_empty()) {
                 Some(ip) => ip,
-                None => resolve_domain_ip(virsh.as_ref(), kvm_host.as_deref(), &config.cp_name)?,
+                None => resolve_domain_ip(kvm_host.as_deref(), &config.cp_name)?,
             };
 
             let mut m = HashMap::with_capacity(worker_names.len());
@@ -481,7 +478,7 @@ impl Plan {
                 // KVM host. Failure names the specific domain, so an
                 // operator with one un-booted worker sees which one.
                 for w in &worker_names {
-                    let ip = resolve_domain_ip(virsh.as_ref(), kvm_host.as_deref(), w)?;
+                    let ip = resolve_domain_ip(kvm_host.as_deref(), w)?;
                     m.insert(w.clone(), ip);
                 }
             }
@@ -750,7 +747,16 @@ pub(crate) fn acquire_lock(dry_run: bool) -> Result<Option<LockGuard>> {
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow!("lock path is not valid UTF-8: {}", path.display()))?;
+    // `process_group(0)` puts flock AND the shell it spawns into a fresh
+    // process group. `flock -c` runs its command in a child shell that
+    // INHERITS the locked fd, so killing flock alone leaves that shell (and
+    // its `sleep`) alive still holding the lock. Observed live on the KVM
+    // host: one failed update-cluster run left an orphaned bash+sleep
+    // holding /run/user/1000/hbird-update-cluster.lock, and every later run
+    // aborted with "another update-cluster run is in progress" until the
+    // orphan was killed by hand. Killing the whole group fixes it.
     let child = Command::new("flock")
+        .process_group(0)
         .args([
             "-n",
             path_str,
@@ -908,8 +914,10 @@ fn install_signal_handler() {
                     // We can't use libc::kill under `unsafe_code = "forbid"`;
                     // shell out via `kill(1)` instead. Coreutils `kill` is
                     // present everywhere this project targets.
+                    // Negative pid = process group: flock plus the shell
+                    // that actually holds the inherited lock fd.
                     let _ = Command::new("kill")
-                        .args(["-TERM", &pid.to_string()])
+                        .args(["-TERM", &format!("-{pid}")])
                         .status();
                 }
                 // Re-raise with default disposition. signal-hook offers a
@@ -934,6 +942,13 @@ impl Drop for LockGuard {
         // shell, for example), and the lock will be released anyway
         // when the orphan reaps.
         if let Some(mut child) = self.child.take() {
+            // Kill the whole process GROUP (negative pid). `child.kill()`
+            // alone only reaps flock; the shell holding the inherited fd
+            // would survive and keep the lock held forever.
+            let pgid = child.id() as i32;
+            let _ = Command::new("kill")
+                .args(["-TERM", &format!("-{pgid}")])
+                .status();
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -1062,34 +1077,37 @@ fn bootc_booted_digest_with_exec(exec: &impl hbird_ssh::SshExec, ip: &str) -> Re
 
 // ---- block #4: timer stop/start --------------------------------------------
 
-/// Resolve one libvirt domain's IPv4 address via `virsh domifaddr` on the
-/// KVM host, reusing the shared resolver in [`crate::cp_resolve`].
+/// Resolve one libvirt domain's IPv4 address via `virsh domifaddr`.
 ///
-/// `client` is `None` exactly when the operator supplied no `KVM_HOST`.
-/// There is then no transport to query libvirt through, so this fails with
-/// an actionable message naming both escape hatches rather than proceeding
-/// with an empty IP — a blank IP would surface later as an opaque SSH
-/// failure against `root@`.
-///
-/// Generic over [`hbird_ssh::SshExec`] so unit tests can drive the
-/// resolved / no-lease / no-KVM_HOST paths without a live libvirt.
-fn resolve_domain_ip<S: hbird_ssh::SshExec>(
-    client: Option<&S>,
-    kvm_host: Option<&str>,
+/// Routes through [`crate::virt_bridge::build_connection`], which picks the
+/// SSH transport when `kvm_host` is set and a LOCAL transport when it is
+/// not. That local case matters: the bash twin ran on the KVM host, and so
+/// does `deploy-cluster`, so requiring `KVM_HOST` here would have made
+/// `update-cluster` the only command that could not run where the VMs
+/// actually live. (Caught during #289 S4 live validation on geary.)
+fn resolve_domain_ip(kvm_host: Option<&str>, domain: &str) -> Result<String> {
+    let conn = crate::virt_bridge::build_connection(kvm_host);
+    let where_ = kvm_host.unwrap_or("this host (no KVM_HOST set)");
+    resolve_domain_ip_with(&conn, where_, domain)
+}
+
+/// [`resolve_domain_ip`] with the transport injected, so the no-lease and
+/// transport-error branches are unit-testable without a live libvirt.
+fn resolve_domain_ip_with(
+    conn: &hbird_virt::Connection,
+    where_: &str,
     domain: &str,
 ) -> Result<String> {
-    let (client, host) = match (client, kvm_host) {
-        (Some(c), Some(h)) => (c, h),
-        _ => bail!(
-            "cannot resolve IP for libvirt domain '{domain}': no KVM_HOST is set and no \
-             explicit IP was configured. Either pin CP_IP= / WORKER_IPS=(...) in \
-             cluster.local.conf, or set KVM_HOST=<ssh-alias> so libvirt can be queried \
-             via `virsh domifaddr` over SSH (mirrors the deleted scripts/update-cluster.sh)."
+    match conn.domifaddr(domain) {
+        Ok(Some(ip)) => Ok(ip.to_string()),
+        Ok(None) => bail!(
+            "libvirt domain '{domain}' has no IPv4 lease yet (queried via {where_}). \
+             The VM may still be booting, or it may not be defined. Pin CP_IP= / \
+             WORKER_IPS=(...) in cluster.local.conf to bypass resolution."
         ),
-    };
-    crate::cp_resolve::resolve_cp_ip_via_ssh(client, host, domain).with_context(|| {
-        format!("resolve IP via virsh-domifaddr on KVM_HOST={host} for domain={domain}")
-    })
+        Err(e) => Err(anyhow!(e))
+            .with_context(|| format!("resolve IP via `virsh domifaddr {domain}` on {where_}")),
+    }
 }
 
 /// Stop the bootc auto-update timer(s) on the node. Mirrors `timer_stop`
@@ -3556,47 +3574,56 @@ mod tests {
 
     // ---- live IP resolution via virsh domifaddr (#322) -------------------
 
-    /// Canonical `virsh domifaddr` table. Column 3 (0-indexed) is the CIDR,
-    /// matching the awk pipeline the bash twin used.
-    const DOMIFADDR: &str = " Name       MAC address          Protocol     Address\n        -------------------------------------------------------------------------\n        \u{20}vnet0      52:54:00:ab:cd:ef    ipv4         192.168.122.47/24\n";
+    /// Canned [`hbird_virt::SshClient`] so the resolver's branches can be
+    /// driven without a libvirt daemon.
+    struct CannedVirt(String);
+    impl hbird_virt::SshClient for CannedVirt {
+        fn run(&self, _host: &str, _command: &str) -> Result<String, hbird_virt::SshError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn conn_returning(stdout: &str) -> hbird_virt::Connection {
+        hbird_virt::Connection::new_local_with_client(std::sync::Arc::new(CannedVirt(
+            stdout.to_string(),
+        )))
+    }
 
     #[test]
-    fn resolve_domain_ip_uses_virsh_when_no_pinned_ip() {
-        let exec = MockSshExec::new(vec![ok_stdout(DOMIFADDR)]);
-        let ip = resolve_domain_ip(Some(&exec), Some("geary"), "hummingbird-k8s")
-            .expect("should resolve from domifaddr output");
+    fn resolve_domain_ip_parses_the_ipv4_lease() {
+        let table = " Name       MAC address          Protocol     Address\n\
+                     -------------------------------------------------------\n\
+                     vnet0      52:54:00:ab:cd:ef    ipv4         192.168.122.47/24\n";
+        let conn = conn_returning(table);
+        let ip = resolve_domain_ip_with(&conn, "geary", "hummingbird-k8s").expect("resolves");
         assert_eq!(ip, "192.168.122.47");
-        let cmds = exec.commands();
-        assert_eq!(cmds.len(), 1, "{cmds:?}");
-        assert!(cmds[0].contains("domifaddr"), "{cmds:?}");
+    }
+
+    /// A domain with no IPv4 lease yet (still booting) must name the domain
+    /// AND offer the pin-IP escape hatch.
+    #[test]
+    fn resolve_domain_ip_no_lease_names_domain_and_hatch() {
+        let conn = conn_returning(" Name  MAC  Protocol  Address\n");
+        let err = resolve_domain_ip_with(&conn, "geary", "worker-3")
+            .expect_err("no lease must be an error");
+        let s = format!("{err:#}");
+        assert!(s.contains("worker-3"), "must name the domain: {s}");
+        assert!(s.contains("WORKER_IPS"), "must offer the pin hatch: {s}");
+    }
+
+    /// Regression for the S4 finding: running ON the KVM host (no KVM_HOST)
+    /// must still resolve. The error text is what an operator sees, so pin
+    /// that it describes the local case rather than demanding KVM_HOST.
+    #[test]
+    fn resolve_domain_ip_local_case_is_described_as_this_host() {
+        let conn = conn_returning("");
+        let err = resolve_domain_ip_with(&conn, "this host (no KVM_HOST set)", "cp1")
+            .expect_err("empty output has no lease");
+        let s = format!("{err:#}");
         assert!(
-            cmds[0].contains("hummingbird-k8s"),
-            "must query the requested domain: {cmds:?}"
+            s.contains("this host"),
+            "local resolution must not blame a missing KVM_HOST: {s}"
         );
-    }
-
-    /// Without KVM_HOST there is no transport to reach libvirt, so we must
-    /// fail loudly and name BOTH escape hatches. A blank IP would otherwise
-    /// surface later as an opaque `ssh root@` failure.
-    #[test]
-    fn resolve_domain_ip_without_kvm_host_names_both_escape_hatches() {
-        let err = resolve_domain_ip(None::<&MockSshExec>, None, "worker-1")
-            .expect_err("must fail without KVM_HOST");
-        let s = err.to_string();
-        assert!(s.contains("worker-1"), "must name the domain: {s}");
-        assert!(s.contains("WORKER_IPS"), "must offer the pin-IP hatch: {s}");
-        assert!(s.contains("KVM_HOST"), "must offer the virsh hatch: {s}");
-    }
-
-    /// A domain with no IPv4 lease (not booted yet) must name the specific
-    /// domain, so an operator with one bad worker knows which one.
-    #[test]
-    fn resolve_domain_ip_no_lease_names_the_domain() {
-        let exec = MockSshExec::new(vec![ok_stdout(" Name  MAC  Protocol  Address\n")]);
-        let err = resolve_domain_ip(Some(&exec), Some("geary"), "worker-3")
-            .expect_err("no ipv4 lease must be an error");
-        let chain = format!("{err:#}");
-        assert!(chain.contains("worker-3"), "must name the domain: {chain}");
     }
 
     // ---- timer_stop / timer_start live paths (#322 block 4) --------------

@@ -304,19 +304,22 @@ fn live_mode_without_static_ips_surfaces_remediation_diagnostic() {
         "live mode should fail in this scaffold"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // Every clause is load-bearing: an operator hitting this needs to know
-    // WHICH domain could not be resolved and BOTH ways out.
-    let required = [
-        "cannot resolve IP for libvirt domain",
-        "WORKER_IPS",
-        "CP_IP",
-        "KVM_HOST",
-        "virsh domifaddr",
-    ];
+    // With no pinned IPs, update-cluster now RESOLVES via `virsh domifaddr`
+    // — locally when KVM_HOST is unset, which is how it runs on the KVM
+    // host itself. In this test environment virsh is absent, so the failure
+    // must still name the domain, the command it tried, and where it tried.
+    let required = ["virsh", "domifaddr", "hbird-cp1", "no KVM_HOST set"];
     for needle in required {
         assert!(
             stderr.contains(needle),
-            "remediation diagnostic missing {needle:?}; stderr was:\n{stderr}",
+            "resolution diagnostic missing {needle:?}; stderr was:\n{stderr}",
         );
     }
+    // Regression guard: it must NOT demand KVM_HOST as a precondition.
+    // Requiring it would make update-cluster the only command unable to run
+    // where the VMs live (#289 S4 finding).
+    assert!(
+        !stderr.contains("no KVM_HOST is set and no explicit IP was configured"),
+        "must attempt local resolution rather than demanding KVM_HOST; stderr was:\n{stderr}",
+    );
 }
