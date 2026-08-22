@@ -32,6 +32,10 @@ k8s-worker=8
 # Every id below is upstream-owned and present in the k8s/cri-o binaries
 # shipped by the pkgs.k8s.io v1.32 channel. Adding an id here is an explicit,
 # reviewable act of acceptance — do not add one to make CI green.
-id=CVE-2025-68121
-id=CVE-2026-33186
-id=GHSA-5w5r-mf82-595p
+# FORMAT: id=<ID>  # added=<YYYY-MM-DD> reason=<why accepted> review=<date>
+# Trailing comments are stripped by the parser. An id without a reason and a
+# review date should not survive code review — an anonymous entry is
+# indistinguishable from someone silencing a finding to get a green check.
+id=CVE-2025-68121  # added=2026-08-22 reason=Go-stdlib crypto/tls in upstream k8s/cri-o binaries; no repo-side pin removes it review=2026-11-22
+id=CVE-2026-33186  # added=2026-08-22 reason=grpc vendored in upstream k8s/cri-o binaries; clears on upstream rebuild review=2026-11-22
+id=GHSA-5w5r-mf82-595p  # added=2026-08-22 reason=capnp 0.19.6 from the base OS package set; fix is 0.24.0 upstream review=2026-11-22
