@@ -32,9 +32,24 @@ json="$workdir/trivy.json"
 seen="$workdir/seen-ids.txt"
 known="$workdir/known-ids.txt"
 
-baseline=$(grep -E "^${flavor}=" "$baseline_file" | cut -d= -f2 || true)
-if [ -z "$baseline" ]; then
+# BASELINE VALIDATION. A malformed row is a fail-open input: with
+# `k8s=banana`, both `[ "$count" -gt banana ]` and `-lt` print "integer
+# expression expected" and return FALSE inside `if`, which `set -e` does not
+# abort on — so the ratchet silently degrades to "always pass". Duplicate
+# rows produce a multiline operand with the same effect. Require exactly one
+# row and a canonical non-negative decimal integer.
+rows=$(grep -cE "^${flavor}=" "$baseline_file" || true)
+if [ "$rows" -eq 0 ]; then
   echo "::error::no baseline row for ${flavor} in ${baseline_file}" >&2
+  exit 1
+fi
+if [ "$rows" -gt 1 ]; then
+  echo "::error::${flavor}: ${rows} baseline rows in ${baseline_file} — exactly one required." >&2
+  exit 1
+fi
+baseline=$(grep -E "^${flavor}=" "$baseline_file" | cut -d= -f2)
+if ! printf '%s' "$baseline" | grep -qE '^(0|[1-9][0-9]*)$'; then
+  echo "::error::${flavor}: baseline '${baseline}' is not a non-negative integer — refusing to run a gate whose comparison cannot be trusted." >&2
   exit 1
 fi
 
@@ -42,15 +57,42 @@ fi
 # PRODUCES gate input: that turns scanner/docker/template failure into
 # "0 findings", which SATISFIES the gate. A gate that reports green when the
 # scanner did not run is worse than no gate at all.
-default_scan="docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-  ${TRIVY:-aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7} \
-  image --scanners vuln --severity CRITICAL --ignore-unfixed --format json ${image}"
-if ! eval "${SCAN_CMD:-$default_scan}" > "$json"; then
-  echo "::error::${flavor}: scanner invocation failed — refusing to treat this as a clean image." >&2
+# Production path is a direct argv call — no `eval` on anything that runs in
+# CI. SCAN_CMD is an explicitly TEST-ONLY injection interface used by
+# tests/scripts/ci-trivy-gate.bats to simulate scanner failure modes.
+if [ -n "${SCAN_CMD:-}" ]; then
+  scan_ok=0
+  bash -c "$SCAN_CMD" > "$json" || scan_ok=$?
+else
+  scan_ok=0
+  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+    "${TRIVY:-aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7}" \
+    image --scanners vuln --severity CRITICAL --ignore-unfixed \
+    --format json "$image" > "$json" || scan_ok=$?
+fi
+if [ "$scan_ok" -ne 0 ]; then
+  echo "::error::${flavor}: scanner invocation failed (rc=${scan_ok}) — refusing to treat this as a clean image." >&2
   exit 1
 fi
-if ! jq -e 'has("Results")' "$json" > /dev/null 2>&1; then
-  echo "::error::${flavor}: scanner output is not valid scan JSON (no .Results) — refusing to infer 0 findings." >&2
+
+# SCHEMA VALIDATION, not mere presence. `has("Results")` is true for
+# {"Results":null} and {"Results":"broken"}; the optional iterators `[]?`
+# then yield nothing, count=0 and the id set is empty — indistinguishable
+# from a genuinely clean scan. Require .Results to be an ARRAY whose entries
+# are objects whose Vulnerabilities is absent, null, or an array. This still
+# accepts the legitimate clean forms ({"Results":[]} and result objects with
+# no findings).
+if ! jq -e '
+      (.Results | type) == "array"
+      and (all(
+            .Results[];
+            (type == "object")
+            and ((has("Vulnerabilities") | not)
+                 or (.Vulnerabilities == null)
+                 or ((.Vulnerabilities | type) == "array"))
+          ))
+    ' "$json" > /dev/null 2>&1; then
+  echo "::error::${flavor}: scanner output does not match the expected scan schema (.Results must be an array of objects whose Vulnerabilities is absent/null/array) — refusing to infer 0 findings." >&2
   exit 1
 fi
 

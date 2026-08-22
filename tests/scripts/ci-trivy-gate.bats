@@ -82,19 +82,19 @@ _run_gate() { # $1 = scan command
 @test "PREDICTED RED: scanner emitting nothing must fail closed" {
   _run_gate "true"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"not valid scan JSON"* ]]
+  [[ "$output" == *"expected scan schema"* ]]
 }
 
 @test "PREDICTED RED: malformed JSON must fail closed" {
   _run_gate "printf 'not json at all'"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"not valid scan JSON"* ]]
+  [[ "$output" == *"expected scan schema"* ]]
 }
 
 @test "PREDICTED RED: valid JSON without .Results must fail closed" {
   _run_gate "printf '{\"SchemaVersion\":2}'"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"not valid scan JSON"* ]]
+  [[ "$output" == *"expected scan schema"* ]]
 }
 
 @test "PREDICTED RED: count>0 with unusable ids must fail closed" {
@@ -156,4 +156,122 @@ _run_gate() { # $1 = scan command
   [ "$status" -ne 0 ]
   [[ "$output" == *"not in the committed allowlist"* ]]
   [[ "$output" == *"CVE-2025-68121"* ]]
+}
+
+# ---- predicted-red: SCANNER OUTPUT SCHEMA (forge-security round 3) -------
+#
+# `has("Results")` is true for {"Results":null} and {"Results":"broken"}.
+# The optional iterators `[]?` then yield nothing, so count=0 and the id set
+# is empty — indistinguishable from a genuinely clean scan. Reproduced
+# reaching "gate: PASS" before the fix.
+
+@test "PREDICTED RED: Results is null" {
+  _run_gate "printf '{\"Results\":null}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: Results is a string" {
+  _run_gate "printf '{\"Results\":\"broken\"}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: Results is an object" {
+  _run_gate "printf '{\"Results\":{}}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: Results is a scalar" {
+  _run_gate "printf '{\"Results\":5}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: Results entry is not an object" {
+  _run_gate "printf '{\"Results\":[\"x\"]}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: Vulnerabilities is a string" {
+  _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":\"broken\"}]}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: Vulnerabilities is an object" {
+  _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":{\"a\":1}}]}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: Vulnerabilities is a scalar" {
+  _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":7}]}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+# Legitimate clean shapes must NOT be rejected — a schema check that also
+# fails on real clean scans would just be a different kind of broken gate.
+
+@test "clean form accepted: Results is an empty array" {
+  _run_gate "printf '{\"Results\":[]}'"
+  [ "$status" -eq 0 ]
+}
+
+@test "clean form accepted: result entry with no Vulnerabilities key" {
+  _run_gate "printf '{\"Results\":[{\"Target\":\"os\"}]}'"
+  [ "$status" -eq 0 ]
+}
+
+@test "clean form accepted: Vulnerabilities null" {
+  _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":null}]}'"
+  [ "$status" -eq 0 ]
+}
+
+@test "clean form accepted: Vulnerabilities empty array" {
+  _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":[]}]}'"
+  [ "$status" -eq 0 ]
+}
+
+# ---- predicted-red: BASELINE ROW VALIDATION -----------------------------
+#
+# `[ "$count" -gt banana ]` prints "integer expression expected" and returns
+# FALSE inside `if`; `set -e` does not abort. Both comparisons then silently
+# no-op and the ratchet degrades to "always pass". Reproduced reaching
+# "gate: PASS" before the fix.
+
+_bl() { printf "$1" > "$TMP/bl"; echo "$TMP/bl"; }
+_gate_bl() { # $1 = baseline file
+  SCAN_CMD="$(printf 'printf %q' "$(_json_with CVE-2025-68121)")" \
+    run "$GATE" k8s "$1" dummy-image:tag
+}
+
+@test "PREDICTED RED: non-numeric baseline" {
+  _gate_bl "$(_bl 'k8s=banana\nid=CVE-2025-68121\n')"
+  [ "$status" -ne 0 ]; [[ "$output" == *"not a non-negative integer"* ]]
+}
+
+@test "PREDICTED RED: negative baseline" {
+  _gate_bl "$(_bl 'k8s=-5\nid=CVE-2025-68121\n')"
+  [ "$status" -ne 0 ]; [[ "$output" == *"not a non-negative integer"* ]]
+}
+
+@test "PREDICTED RED: empty baseline value" {
+  _gate_bl "$(_bl 'k8s=\nid=CVE-2025-68121\n')"
+  [ "$status" -ne 0 ]; [[ "$output" == *"not a non-negative integer"* ]]
+}
+
+@test "PREDICTED RED: baseline with trailing junk" {
+  _gate_bl "$(_bl 'k8s=8abc\nid=CVE-2025-68121\n')"
+  [ "$status" -ne 0 ]; [[ "$output" == *"not a non-negative integer"* ]]
+}
+
+@test "PREDICTED RED: non-canonical baseline (007)" {
+  _gate_bl "$(_bl 'k8s=007\nid=CVE-2025-68121\n')"
+  [ "$status" -ne 0 ]; [[ "$output" == *"not a non-negative integer"* ]]
+}
+
+@test "PREDICTED RED: duplicate baseline rows" {
+  _gate_bl "$(_bl 'k8s=8\nk8s=99\nid=CVE-2025-68121\n')"
+  [ "$status" -ne 0 ]; [[ "$output" == *"exactly one required"* ]]
+}
+
+@test "baseline of 0 is valid and still ratchets" {
+  _gate_bl "$(_bl 'k8s=0\nid=CVE-2025-68121\n')"
+  [ "$status" -ne 0 ]; [[ "$output" == *"exceeds baseline"* ]]
 }
