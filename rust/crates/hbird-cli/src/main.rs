@@ -17,6 +17,8 @@
 //! hbird export-argocd       <-> make export-argocd
 //! hbird nodes               <-> make nodes
 //! hbird kubectl             <-> make kubectl
+//! hbird preflight cilium    <-> make check-cilium-k8s-compat
+//! hbird kube-bench          <-> make kube-bench
 //! ```
 //!
 //! Every subcommand now has a real body. [#283] shipped the clap tree
@@ -52,9 +54,9 @@ mod virt_bridge;
 
 use commands::{
     deploy_cluster::DeployClusterArgs, destroy_cluster::DestroyClusterArgs,
-    export_argocd::ExportArgocdArgs, get_kubeconfig::GetKubeconfigArgs, kubectl::KubectlArgs,
-    nodes::NodesArgs, spawn_workers::SpawnWorkersArgs, update_cluster::UpdateClusterArgs,
-    verify::VerifyArgs,
+    export_argocd::ExportArgocdArgs, get_kubeconfig::GetKubeconfigArgs, kube_bench::KubeBenchArgs,
+    kubectl::KubectlArgs, nodes::NodesArgs, preflight::PreflightArgs,
+    spawn_workers::SpawnWorkersArgs, update_cluster::UpdateClusterArgs, verify::VerifyArgs,
 };
 
 /// Top-level entry point. Parse argv, dispatch to the chosen subcommand.
@@ -209,6 +211,20 @@ enum Command {
     /// Bash twin: `scripts/kubectl-k8s.sh "$@"` (via `make kubectl`).
     /// Implementation tracked by #288.
     Kubectl(KubectlArgs),
+
+    /// Pre-deploy checks that need no live cluster (today: the
+    /// Cilium/K8s version-compatibility matrix).
+    ///
+    /// Bash twin: `scripts/check-cilium-k8s-compat.sh` (via
+    /// `make check-cilium-k8s-compat`). Deliberately a separate family
+    /// from `verify`: `preflight` runs BEFORE (or independent of) a
+    /// deploy and reads committed repo pins, not cluster state.
+    Preflight(PreflightArgs),
+
+    /// Run the CIS Kubernetes Benchmark (kube-bench) against the cluster.
+    ///
+    /// Bash twin: `scripts/run-kube-bench.sh` (via `make kube-bench`).
+    KubeBench(KubeBenchArgs),
 }
 
 impl Command {
@@ -230,6 +246,8 @@ impl Command {
             Command::ExportArgocd(_) => "export-argocd",
             Command::Nodes(_) => "nodes",
             Command::Kubectl(_) => "kubectl",
+            Command::Preflight(_) => "preflight",
+            Command::KubeBench(_) => "kube-bench",
         }
     }
 
@@ -246,6 +264,8 @@ impl Command {
             Command::ExportArgocd(args) => commands::export_argocd::run(args),
             Command::Nodes(args) => commands::nodes::run(args),
             Command::Kubectl(args) => commands::kubectl::run(args),
+            Command::Preflight(args) => commands::preflight::run(args),
+            Command::KubeBench(args) => commands::kube_bench::run(args),
         }
     }
 }
@@ -319,6 +339,11 @@ mod tests {
                 ],
                 "kubectl",
             ),
+            (
+                &["hbird", "preflight", "cilium", "--cilium=1.17.16"],
+                "preflight",
+            ),
+            (&["hbird", "kube-bench", "--dry-run"], "kube-bench"),
         ];
         for (argv, expected) in cases {
             let cli = Cli::try_parse_from(*argv)
