@@ -12,7 +12,8 @@ for the workspace layout and the epic for the architectural plan.
 >
 > Phase 4 bash scripts (`scripts/{deploy,destroy,spawn-workers}-cluster.sh`)
 > are **retained** in v0.1.0 — full removal blocked on [#289] (the
-> Rust destructive impl is dry-run-only today), scheduled for v0.2.0.
+> Rust destructive impl) — **done in v0.2.0**: deploy/destroy/spawn/update
+> were live-validated on a KVM host and the deploy/destroy bash twins deleted.
 
 ## Install (from a tagged release)
 

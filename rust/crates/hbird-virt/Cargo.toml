@@ -1,6 +1,6 @@
 [package]
 name = "hbird-virt"
-version = "0.0.1"
+version = "0.2.0"
 description = "libvirt CLI (virsh) wrapper over SSH, plus a typed qemu+ssh:// URI parser. Used by hummingbird-k8s Rust subcommands to talk to a remote KVM host."
 edition.workspace = true
 license.workspace = true

@@ -683,7 +683,7 @@ hbird_ssh_wrap_maybe_reexec() {
   # Rewrite any positional arg matching the local CONFIG path to the
   # scp'd remote temp path. This closes #245: scripts like
   # deploy-cluster.sh take CONFIG as a positional arg via the Makefile
-  # (`bash scripts/deploy-cluster.sh "$(CONFIG)"`) and prefer $1 over
+  # (positional CONFIG path) and prefer $1 over
   # the CONFIG env var. Without this rewrite, the env-var fix above is
   # silently bypassed and the remote reads a stale ~/hummingbird-k8s
   # checkout's CONFIG file instead of the operator's freshly-scp'd one.

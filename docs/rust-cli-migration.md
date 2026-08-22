@@ -10,7 +10,8 @@ what's the equivalent `hbird` invocation?".
 > kubectl now delegate to `hbird` directly (the underlying bash scripts
 > were **removed**). Phase 4 (deploy-cluster / destroy-cluster /
 > spawn-workers) bash scripts are **retained** in v0.1.0 — full removal
-> blocked on [#289] (Rust destructive impl), scheduled for v0.2.0.
+> resolved in v0.2.0 (#289 S4): deploy/destroy flipped to `hbird` after
+> live validation, and their bash twins deleted.
 >
 > **Cross-runtime dependency:** the post-cutover Makefile recipes
 > require `hbird` CLI on PATH. See "Install the binary" below.
@@ -31,10 +32,10 @@ what's the equivalent `hbird` invocation?".
 
 | Workflow | `make` (delegates to hbird in v0.1.0) | `hbird` (Rust, canonical) | Status |
 |----------|----------------------------------------|----------------------------|--------|
-| Deploy cluster | `make deploy-cluster CONFIG=cluster.local.conf` | `hbird deploy-cluster --config cluster.local.conf` (dry-run only; live tracked by [#289]) | **Bash retained** in v0.1.0 (Phase 4 deferred to v0.2.0) |
-| Tear down cluster | `make destroy-cluster CONFIG=cluster.local.conf` | `hbird destroy-cluster --config cluster.local.conf` (dry-run only; live tracked by [#289]) | **Bash retained** in v0.1.0 (Phase 4 deferred to v0.2.0) |
+| Deploy cluster | `make deploy-cluster CONFIG=cluster.local.conf` | `hbird deploy-cluster --config cluster.local.conf` | **Rust canonical** since v0.2.0 (#289 S4); bash twin deleted |
+| Tear down cluster | `make destroy-cluster CONFIG=cluster.local.conf` | `hbird destroy-cluster --config cluster.local.conf` | **Rust canonical** since v0.2.0 (#289 S4); bash twin deleted |
 | Rolling upgrade | `make update-cluster CONFIG=cluster.local.conf` | `hbird update-cluster --config cluster.local.conf` | **Rust canonical** (bash `scripts/update-cluster.sh` removed in v0.1.0 [#353]) |
-| Spawn N workers | `make spawn-workers CONFIG=cluster.local.conf COUNT=2` | `hbird spawn-workers --config cluster.local.conf --count 2` (dry-run only; live tracked by [#289]) | **Bash retained** in v0.1.0 (Phase 4 deferred to v0.2.0) |
+| Spawn N workers | *(no `make` target exists)* | `hbird spawn-workers --config cluster.local.conf --count 2` | Live-validated in v0.2.0 (#289 S4); `scripts/spawn-workers.sh` retained |
 | Verify encryption | `make verify-encryption CONFIG=cluster.local.conf` | `hbird verify encryption --config cluster.local.conf` | **Rust canonical** (bash `scripts/verify-encryption.sh` removed in v0.1.0 [#353]) |
 | Verify hardening | `make verify-hardening CONFIG=cluster.local.conf` | `hbird verify hardening --config cluster.local.conf` | **Rust canonical** (bash `scripts/verify-hardening.sh` removed in v0.1.0 [#353]) |
 | Verify app-deploy | `make verify-app-deploy CONFIG=cluster.local.conf` | `hbird verify app-deploy --config cluster.local.conf` | **Rust canonical** (bash `scripts/verify-app-deploy.sh` removed in v0.1.0 [#353]) |
@@ -457,7 +458,7 @@ spelling change for the SSH-via-KVM-host path.
 | Concern | Canonical today | Status |
 |---------|-----------------|--------|
 | Cluster lifecycle — update | `rust/crates/hbird-cli/src/commands/update_cluster.rs` | Bash removed in v0.1.0 [#353] |
-| Cluster lifecycle — deploy/destroy/spawn | `scripts/{deploy,destroy,spawn-workers}-cluster.sh` (bash); Rust dry-run only in `rust/crates/hbird-cli/src/commands/{deploy_cluster,destroy_cluster,spawn_workers}.rs` | **Bash retained** in v0.1.0; live Rust tracked by [#289] / Phase 4 deferred to v0.2.0 |
+| Cluster lifecycle — deploy/destroy/spawn | Rust: `rust/crates/hbird-cli/src/commands/{deploy_cluster,destroy_cluster,spawn_workers}.rs` | **Rust canonical** since v0.2.0 (#289 S4). `scripts/{deploy,destroy}-cluster.sh` deleted; `spawn-workers.sh` + `lib/ssh-wrap.sh` retained (ssh-wrap still sourced by clean-vms/switch-to-ghcr) |
 | Verifiers | `rust/crates/hbird-cli/src/commands/verify.rs` | Bash removed in v0.1.0 [#353] |
 | Kubeconfig export | `rust/crates/hbird-cli/src/commands/{export_argocd,get_kubeconfig}.rs` (shared core) | Bash `scripts/export-argocd.sh` removed in v0.1.0 [#353] |
 | kubectl SSH-tunnel wrapper | `rust/crates/hbird-cli/src/commands/{nodes,kubectl}.rs` + `rust/crates/hbird-cli/src/cp_kubectl.rs` | Bash `scripts/kubectl-k8s.sh` removed in v0.1.0 [#353] |

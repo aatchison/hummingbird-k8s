@@ -1,6 +1,6 @@
 [package]
 name = "hbird-config"
-version = "0.0.1"
+version = "0.2.0"
 description = "Parser for hummingbird-k8s cluster.local.conf (bash-sourced KEY=value / KEY=(array) format)."
 edition.workspace = true
 license.workspace = true

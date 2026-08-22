@@ -261,8 +261,8 @@ invoke_shim() {
 # #245: positional CONFIG arg rewrite
 # ---------------------------------------------------------------------------
 #
-# deploy-cluster.sh (and friends) take CONFIG as a positional arg via the
-# Makefile recipe `bash scripts/deploy-cluster.sh "$(CONFIG)"`, and the
+# The wrapped scripts (clean-vms.sh, switch-to-ghcr.sh, spawn-workers.sh)
+# take CONFIG as a positional arg, and the
 # script's CONFIG_PATH="${1:-...}" prefers $1 over $CONFIG. If the shim
 # only rewrites the CONFIG env var (as it did pre-#245), the operator's
 # local file gets scp'd but then ignored — the remote reads whatever
@@ -277,9 +277,8 @@ invoke_shim() {
   echo "# test config" > "$tmp_cfg"
 
   # Pass the same path both as CONFIG env AND as a positional arg —
-  # mirrors `make deploy-cluster CONFIG=./cluster.local.conf` which
-  # expands to `bash scripts/deploy-cluster.sh ./cluster.local.conf`
-  # with CONFIG=./cluster.local.conf in the env.
+  # the shape every ssh-wrapped script is invoked with (CONFIG in the
+  # env plus the same path as $1).
   KVM_HOST=otherhost \
     HBIRD_SSH_WRAP_DRY_RUN=1 \
     HBIRD_SSH_WRAP_DRY_RUN_PREFLIGHT=1 \
@@ -570,15 +569,12 @@ EOF
 # That way a future refactor that accidentally drops the shim from one
 # script gets caught immediately.
 
-@test "ssh-wrap: deploy-cluster.sh sources lib/ssh-wrap.sh + invokes the shim" {
-  grep -q 'source "${SCRIPT_DIR}/lib/ssh-wrap.sh"' "${REPO_ROOT}/scripts/deploy-cluster.sh"
-  grep -q 'hbird_ssh_wrap_maybe_reexec "$0" "$@"' "${REPO_ROOT}/scripts/deploy-cluster.sh"
-}
-
-@test "ssh-wrap: destroy-cluster.sh sources lib/ssh-wrap.sh + invokes the shim" {
-  grep -q 'source "${SCRIPT_DIR}/lib/ssh-wrap.sh"' "${REPO_ROOT}/scripts/destroy-cluster.sh"
-  grep -q 'hbird_ssh_wrap_maybe_reexec "$0" "$@"' "${REPO_ROOT}/scripts/destroy-cluster.sh"
-}
+# deploy-cluster.sh / destroy-cluster.sh had shim-wiring tests here. Both
+# scripts were deleted in the v0.2.0 cutover (#289 S4) — `make deploy-cluster`
+# and `make destroy-cluster` now delegate to `hbird`, which does its own
+# transport selection via hbird-virt rather than the bash re-exec shim.
+# The shim itself is RETAINED and still covered below, because clean-vms.sh,
+# switch-to-ghcr.sh and spawn-workers.sh continue to source it.
 
 # update-cluster.sh removed in v0.1.0 partial bash->Rust cutover (#353);
 # Rust twin `hbird update-cluster` is the canonical implementation.
