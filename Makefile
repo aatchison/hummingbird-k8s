@@ -250,13 +250,30 @@ push-image-all: push-image-k8s push-image-worker ## podman push both OCI images 
 # each script probes EUID and prints a one-line "need root locally OR
 # set KVM_HOST=…" hint if neither path is available. The Makefile no
 # longer makes the sudo-vs-SSH decision; that's the script's job.
-deploy-cluster: ## Deploy a hybrid bib+cloud-init cluster from CONFIG=<path> (see cluster.example.conf)
+# deploy-cluster / destroy-cluster delegate to the Rust twins (#289 S4
+# cutover). Live-validated on the KVM host before this flip: deploy brought
+# up a net-new CP + worker and reported all nodes Ready; destroy tore them
+# down leaving no VMs, qcow2s or seed ISOs; spawn-workers added a third node
+# that joined; update-cluster completed a full rolling upgrade.
+#
+# FLAGS= is a passthrough (e.g. --dry-run, --repo-root=…, --no-sudo) so
+# operators don't have to drop to the raw `hbird` invocation.
+#
+# NOTE: unlike update-cluster (#396), `hbird deploy-cluster` / `destroy-cluster`
+# do NOT read CONFIG from the environment — the path is passed as --config
+# here explicitly. Do not "simplify" this to CONFIG="$(CONFIG)".
+#
+# Cross-runtime dependency: `hbird` must be on PATH and recent enough to
+# carry the S4 fixes. See docs/rust-cli.md for install.
+deploy-cluster: ## Deploy a hybrid bib+cloud-init cluster from CONFIG=<path> (see cluster.example.conf) (FLAGS=… passthrough)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required (start from cluster.example.conf)' >&2; exit 2; }
-	bash scripts/deploy-cluster.sh "$(CONFIG)"
+	@command -v hbird >/dev/null || { echo 'hbird not on PATH — see docs/rust-cli.md (make deploy-cluster now delegates to the Rust CLI)' >&2; exit 2; }
+	hbird deploy-cluster --config "$(CONFIG)" $(FLAGS)
 
-destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs + qcow2s + seed ISOs)
+destroy-cluster: ## Tear down a cluster defined in CONFIG=<path> (destroys VMs + qcow2s + seed ISOs) (FLAGS=… passthrough)
 	@[ -n "$(CONFIG)" ] || { echo 'CONFIG=<path-to-cluster.local.conf> required' >&2; exit 2; }
-	bash scripts/destroy-cluster.sh "$(CONFIG)"
+	@command -v hbird >/dev/null || { echo 'hbird not on PATH — see docs/rust-cli.md (make destroy-cluster now delegates to the Rust CLI)' >&2; exit 2; }
+	hbird destroy-cluster --config "$(CONFIG)" $(FLAGS)
 
 # update-cluster delegates to the Rust twin `hbird update-cluster`
 # (v0.1.0 cutover, #353). FLAGS= is a passthrough for extra flags so

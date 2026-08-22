@@ -15,6 +15,18 @@ what's the equivalent `hbird` invocation?".
 > **Cross-runtime dependency:** the post-cutover Makefile recipes
 > require `hbird` CLI on PATH. See "Install the binary" below.
 
+
+> **`make deploy-cluster` / `make destroy-cluster` now delegate to `hbird`**
+> (#289 S4 cutover). Both were live-validated on a KVM host before the flip:
+> deploy brought up a net-new CP + worker and reported all nodes Ready,
+> destroy tore them down leaving no VMs, qcow2s or seed ISOs.
+>
+> **This makes a current `hbird` a hard requirement.** The v0.0.1 binary
+> still carries a guard that refuses live `destroy-cluster` unless
+> `--kvm-host` is set, and tells you to run `bash scripts/destroy-cluster.sh`
+> — a script that v0.2.0 removes. Install a build that carries the S4 fixes
+> before relying on these targets on the KVM host itself.
+
 ## TL;DR — side-by-side
 
 | Workflow | `make` (delegates to hbird in v0.1.0) | `hbird` (Rust, canonical) | Status |
