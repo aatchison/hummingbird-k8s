@@ -138,7 +138,7 @@ fi
 : "${VM_USER_GROUPS:=}"
 : "${ENABLE_ROOT_SSH:=1}"
 : "${POOL_DIR:=/var/lib/libvirt/images}"
-: "${BASE_IMAGE:=quay.io/hummingbird-community/bootc-os@sha256:3bed2fc1bd96ad56a3e4357270ff0f22286fb41c9e00b4f3c9a862696e3bfb84}"
+: "${BASE_IMAGE:=quay.io/hummingbird-community/bootc-os@sha256:2e29eb2ba2d17b304529e7b2503ea3a1c65ba90a26b87eb91613a59e1d199218}"
 : "${BIB:=quay.io/centos-bootc/bootc-image-builder:latest}"
 : "${ENABLE_CLOUD_INIT:=0}"
 

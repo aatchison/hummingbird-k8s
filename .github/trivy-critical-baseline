@@ -8,5 +8,9 @@
 # the improvement is locked in and cannot silently regress.
 #
 # Measured 2026-08-22 against the images built from the pinned base digest.
-k8s=12
-k8s-worker=12
+# 2026-08-22: base bumped 3bed2fc1 -> 2e29eb2b, 12 -> 11 on both images.
+# The base's own CRITICAL is gone; the remaining 11 are in packages this
+# repo layers on (Go stdlib x6 + grpc x4 in the k8s/cri-o binaries,
+# capnp x1) and need a K8S_VERSION / cri-o bump, not a base bump.
+k8s=11
+k8s-worker=11
