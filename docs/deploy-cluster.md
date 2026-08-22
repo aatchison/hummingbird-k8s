@@ -283,7 +283,7 @@ or changing a `containers/*/Containerfile`, the on-disk qcow2 could be
 out of date and the deploy would quietly boot the *old* bits (a
 false-positive "cluster came up OK" against pre-change code). Deploy now
 records the build identity alongside each template
-(`<template>.qcow2.build-ref`, written by `lib/cache-utils.sh`, namespaced
+(`<template>.qcow2.build-ref`, written by `rust/crates/hbird-cli/src/cache.rs`, namespaced
 by source as `local:<hash>` / `ghcr:<ref>`) and acts **only on a confirmed
 mismatch** before reusing:
 

@@ -377,6 +377,47 @@ fn plan_image_acquisition(plan: &Plan, conn: &Connection) -> Result<(String, Str
                 .map_err(|e| anyhow!("podman pull {cp_ref} failed: {e}"))?;
             conn.exec_shell(&worker_cmd)
                 .map_err(|e| anyhow!("podman pull {worker_ref} failed: {e}"))?;
+            // #373: confirm the PULLED image actually reflects the on-disk
+            // Containerfile. Without this a `IMAGE_SOURCE=ghcr` deploy
+            // silently boot-tests the PUBLISHED image while the operator
+            // believes they are testing their local edit. The bash twin
+            // (the deleted lib/cache-utils.sh::hbird_assess_ghcr_image) did this; the
+            // Rust ghcr path shipped without it.
+            //
+            // Freshness needs git, so on a checkout-free host this is
+            // Unverifiable — which is normal here and only fatal under
+            // STRICT_CACHE=1, where the operator has explicitly asked for
+            // proof.
+            for (image, label, containerfile) in [
+                (&cp_ref, "CP image", "containers/k8s/Containerfile"),
+                (
+                    &worker_ref,
+                    "worker image",
+                    "containers/k8s-worker/Containerfile",
+                ),
+            ] {
+                let vcs = crate::cache::image_vcs_ref(image).unwrap_or_default();
+                let freshness = if vcs.is_empty() {
+                    crate::cache::ImageFreshness::Unverifiable
+                } else {
+                    crate::cache::containerfile_changed_since(
+                        &plan.repo_root,
+                        &vcs,
+                        &[containerfile],
+                    )
+                };
+                match crate::cache::assess_ghcr_image(
+                    freshness,
+                    label,
+                    &vcs,
+                    containerfile,
+                    plan.strict_cache,
+                ) {
+                    crate::cache::GhcrAssessResult::Fresh => {}
+                    crate::cache::GhcrAssessResult::Warn(msg) => log(&msg),
+                    crate::cache::GhcrAssessResult::StrictFail(msg) => bail!("{msg}"),
+                }
+            }
         }
         "local" => {
             let cp_cmd = make_image_cmd(&plan.repo_root, "image-k8s-with-cloud-init");

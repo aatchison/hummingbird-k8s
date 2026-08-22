@@ -13,11 +13,12 @@
 #   * clean-*         — tear down local VMs / images
 #
 # Cluster-lifecycle targets (deploy-cluster, destroy-cluster,
-# update-cluster, update-workers, update-node) run without `sudo` on the
-# client. The wrapped scripts re-exec themselves over SSH to `KVM_HOST`
-# (set in the operator's config or environment), where sudo happens
-# transparently. On-KVM-host operators running locally still need root —
-# the scripts probe for it and fail with a one-line hint if missing.
+# update-cluster, update-workers, update-node) delegate to `hbird` and run
+# without `sudo` on the client. `hbird` selects its transport natively:
+# libvirt over SSH when KVM_HOST is set, locally when it is not — so the
+# same command works from a workstation and on the KVM host itself. The
+# bash re-exec shim (scripts/lib/ssh-wrap.sh) that used to do this was
+# deleted in the tier-1 cutover.
 # The `image-*` and `push-image-*` targets are rootless: they only
 # invoke `podman build` / `podman push` and run entirely as the calling
 # user.
@@ -143,7 +144,28 @@ help: ## Show this target list
 #
 # $(PODMAN_BUILD_OPTS) threads STORAGE_DRIVER / PODMAN_ROOT /
 # PODMAN_RUNROOT through when the operator wants storage isolation
-# (issue #199 — concurrent integration runs on a shared host). Unset =
+# (issue #199 — concurrent integration runs on a shared host). Unset =# ---------------------------------------------------------------------------
+# WHAT BELONGS IN THIS MAKEFILE
+#
+# This Makefile is for operations that NEED THE REPO: image builds, pushes,
+# the bats suites, and the CI entry points. Those all read Containerfiles,
+# containers/, or tests/ off disk, so a checkout is a hard requirement and
+# `make` is the honest interface.
+#
+# CLUSTER OPERATIONS DO NOT BELONG HERE. deploy, destroy, spawn-workers,
+# update, verify, etcd, kube-bench, preflight, switch-to-ghcr, clean-vms,
+# kubectl/nodes/kubeconfig are all `hbird` subcommands and run from an
+# INSTALLED BINARY WITH NO CHECKOUT. The recipes below that call `hbird` are
+# thin conveniences for operators who happen to be in a checkout — they are
+# not the supported path and nothing may depend on them.
+#
+# The one crossing: `deploy-cluster` with IMAGE_SOURCE=local shells back to
+# `make image-*`, so it needs the repo. It takes --repo-root (or infers it)
+# and fails with an actionable message when it cannot find one, rather than
+# running `make -C .` wherever it happens to be.
+# ---------------------------------------------------------------------------
+
+
 # default podman storage = no extra flags emitted.
 
 image-k8s: ## podman build the k8s control-plane OCI image (rootless)

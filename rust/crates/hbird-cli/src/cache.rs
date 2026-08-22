@@ -1,6 +1,6 @@
 //! Pure cache-assessment logic for qcow2 template freshness checks.
 //!
-//! Mirrors `lib/cache-utils.sh::hbird_assess_qcow2_cache` from the bash
+//! Mirrors `the deleted lib/cache-utils.sh::hbird_assess_qcow2_cache` from the bash
 //! twin. All functions in this module are pure (no subprocesses, no
 //! network); they exist so callers can unit-test the policy without running
 //! real `podman` commands.
@@ -41,7 +41,7 @@ pub enum CacheAssessResult {
 ///
 /// Under `STRICT_CACHE=1` (`strict=true`), **unverifiable** freshness (either
 /// ID missing or empty) also returns [`StrictFail`] rather than [`Reuse`].
-/// This mirrors the bash twin `lib/cache-utils.sh::hbird_assess_ghcr_image`
+/// This mirrors the bash twin `the deleted lib/cache-utils.sh::hbird_assess_ghcr_image`
 /// (`rc 3` for unverifiable under `STRICT_CACHE=1`, merged PR #25 `fbe2082`).
 ///
 /// # Arguments
@@ -186,6 +186,139 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 
 // ---- Tests -----------------------------------------------------------------
 
+// ---- GHCR image freshness (#373) -------------------------------------------
+
+/// Whether a pulled image reflects the on-disk Containerfile.
+///
+/// Bash twin: `the deleted lib/cache-utils.sh::hbird_containerfile_changed_since` rc
+/// 0/1/2, consumed by `hbird_assess_ghcr_image`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFreshness {
+    /// The Containerfile is unchanged since the image's revision commit.
+    InSync,
+    /// On-disk Containerfile has drifted from the image's revision commit.
+    Drifted,
+    /// Cannot prove either way: no revision label, no repo available, or the
+    /// commit is not in this checkout's history.
+    Unverifiable,
+}
+
+/// Outcome of assessing a pulled GHCR/Forgejo image.
+///
+/// There is no local rebuild path here — rebuilding needs `IMAGE_SOURCE=local`
+/// — so the outcome is warn-or-abort, never auto-rebuild. Mirrors the bash
+/// twin's rc 0 (proceed, possibly after a WARN) / rc 3 (caller MUST abort).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhcrAssessResult {
+    /// Proceed silently.
+    Fresh,
+    /// Proceed, but emit this operator-facing warning first.
+    Warn(String),
+    /// Abort: `STRICT_CACHE=1` and freshness is drifted or unprovable.
+    StrictFail(String),
+}
+
+/// Classify a pulled image against the on-disk Containerfile.
+///
+/// Pure: callers supply the already-determined [`ImageFreshness`] and the
+/// image's revision label, so this is exhaustively unit-testable without
+/// podman or git. The impure lookups live in [`image_vcs_ref`] and
+/// [`containerfile_changed_since`].
+///
+/// Wording is preserved from the bash twin verbatim — operators grep
+/// "does NOT reflect on-disk" and "cannot prove freshness".
+pub fn assess_ghcr_image(
+    freshness: ImageFreshness,
+    label: &str,
+    vcs_ref: &str,
+    containerfiles: &str,
+    strict: bool,
+) -> GhcrAssessResult {
+    match freshness {
+        ImageFreshness::InSync => GhcrAssessResult::Fresh,
+        ImageFreshness::Drifted if strict => GhcrAssessResult::StrictFail(format!(
+            "pulled {label} (vcs-ref {vcs_ref}) predates on-disk {containerfiles} — \
+             STRICT_CACHE=1 refuses a stale boot-test. Rebuild from source: \
+             IMAGE_SOURCE=local FORCE_REBUILD=1."
+        )),
+        ImageFreshness::Drifted => GhcrAssessResult::Warn(format!(
+            "WARN: pulled {label} (vcs-ref {vcs_ref}) does NOT reflect on-disk \
+             {containerfiles}; this deploy tests the PUBLISHED image, not your local \
+             change. Use IMAGE_SOURCE=local FORCE_REBUILD=1 to test local edits. (#373)"
+        )),
+        ImageFreshness::Unverifiable if strict => GhcrAssessResult::StrictFail(
+            "cannot prove freshness under STRICT_CACHE=1; rebuild with FORCE_REBUILD=1. \
+             (Freshness needs the repo: run from a checkout or pass --repo-root.)"
+                .to_string(),
+        ),
+        ImageFreshness::Unverifiable => GhcrAssessResult::Fresh,
+    }
+}
+
+/// Read an image's `org.opencontainers.image.revision` label via podman.
+///
+/// Returns `None` when podman is absent, the image is not present, or the
+/// label is unset — all of which the caller treats as [`ImageFreshness::
+/// Unverifiable`], matching the bash twin's `|| true`.
+pub fn image_vcs_ref(image: &str) -> Option<String> {
+    let out = std::process::Command::new("podman")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{ index .Config.Labels \"org.opencontainers.image.revision\" }}",
+            image,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || s == "<no value>" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Is the on-disk Containerfile changed since `vcs_ref`?
+///
+/// Needs a git checkout, so under the checkout-free operating model (where
+/// `hbird` runs from an installed binary with no repo) this returns
+/// [`ImageFreshness::Unverifiable`] rather than failing — the caller decides
+/// whether that is fatal via `STRICT_CACHE`.
+pub fn containerfile_changed_since(
+    repo_root: &Path,
+    vcs_ref: &str,
+    containerfiles: &[&str],
+) -> ImageFreshness {
+    if vcs_ref.is_empty() {
+        return ImageFreshness::Unverifiable;
+    }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+    };
+    if git(&["rev-parse", "--is-inside-work-tree"]).is_none() {
+        return ImageFreshness::Unverifiable;
+    }
+    // Commit must exist in THIS checkout's history, else we cannot compare.
+    if git(&["cat-file", "-e", &format!("{vcs_ref}^{{commit}}")]).is_none() {
+        return ImageFreshness::Unverifiable;
+    }
+    let mut args: Vec<&str> = vec!["diff", "--quiet", vcs_ref, "--"];
+    args.extend_from_slice(containerfiles);
+    match git(&args) {
+        Some(_) => ImageFreshness::InSync,
+        None => ImageFreshness::Drifted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +438,120 @@ mod tests {
             build_id("local", "000011112222"),
             Some("local:000011112222".to_string())
         );
+    }
+
+    // ---- GHCR freshness (#373) -----------------------------------------
+
+    #[test]
+    fn ghcr_in_sync_is_fresh_in_both_modes() {
+        for strict in [false, true] {
+            assert_eq!(
+                assess_ghcr_image(
+                    ImageFreshness::InSync,
+                    "CP image",
+                    "abc123",
+                    "Containerfile",
+                    strict
+                ),
+                GhcrAssessResult::Fresh,
+            );
+        }
+    }
+
+    /// Non-strict drift must WARN and proceed — there is no rebuild path on
+    /// the ghcr source, so aborting would be worse than telling the operator.
+    #[test]
+    fn ghcr_drift_warns_when_not_strict() {
+        let r = assess_ghcr_image(
+            ImageFreshness::Drifted,
+            "CP image",
+            "abc123",
+            "containers/k8s/Containerfile",
+            false,
+        );
+        match r {
+            GhcrAssessResult::Warn(msg) => {
+                // Operators grep this wording; it is preserved from the twin.
+                assert!(msg.contains("does NOT reflect on-disk"), "{msg}");
+                assert!(msg.contains("abc123"), "must name the vcs-ref: {msg}");
+                assert!(msg.contains("IMAGE_SOURCE=local FORCE_REBUILD=1"), "{msg}");
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ghcr_drift_hard_fails_under_strict() {
+        let r = assess_ghcr_image(
+            ImageFreshness::Drifted,
+            "CP image",
+            "abc123",
+            "Containerfile",
+            true,
+        );
+        match r {
+            GhcrAssessResult::StrictFail(msg) => {
+                assert!(msg.contains("predates on-disk"), "{msg}");
+                assert!(msg.contains("STRICT_CACHE=1"), "{msg}");
+            }
+            other => panic!("expected StrictFail, got {other:?}"),
+        }
+    }
+
+    /// The checkout-free case. `hbird` is expected to run from an installed
+    /// binary with no repo, so "cannot prove" is NORMAL and must not fail a
+    /// default deploy — but STRICT_CACHE=1 explicitly asks for proof, and
+    /// unprovable is not proof.
+    #[test]
+    fn ghcr_unverifiable_is_fresh_by_default_and_fatal_under_strict() {
+        assert_eq!(
+            assess_ghcr_image(
+                ImageFreshness::Unverifiable,
+                "CP image",
+                "",
+                "Containerfile",
+                false
+            ),
+            GhcrAssessResult::Fresh,
+        );
+        match assess_ghcr_image(
+            ImageFreshness::Unverifiable,
+            "CP image",
+            "",
+            "Containerfile",
+            true,
+        ) {
+            GhcrAssessResult::StrictFail(msg) => {
+                assert!(msg.contains("cannot prove freshness"), "{msg}");
+                assert!(
+                    msg.contains("--repo-root"),
+                    "must tell them how to enable it: {msg}"
+                );
+            }
+            other => panic!("expected StrictFail, got {other:?}"),
+        }
+    }
+
+    /// An empty vcs-ref can never be compared — guard the git path from
+    /// being invoked with a meaningless revision.
+    #[test]
+    fn containerfile_changed_since_empty_ref_is_unverifiable() {
+        assert_eq!(
+            containerfile_changed_since(Path::new("/nonexistent"), "", &["Containerfile"]),
+            ImageFreshness::Unverifiable,
+        );
+    }
+
+    /// No repo at the given root => unverifiable, never a panic or a false
+    /// "in sync". This is the path taken on a host with no checkout.
+    #[test]
+    fn containerfile_changed_since_without_a_repo_is_unverifiable() {
+        let tmp = std::env::temp_dir().join(format!("hbird-cache-norepo-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        assert_eq!(
+            containerfile_changed_since(&tmp, "deadbeef", &["Containerfile"]),
+            ImageFreshness::Unverifiable,
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
