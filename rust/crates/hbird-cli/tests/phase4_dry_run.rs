@@ -368,3 +368,197 @@ fn deploy_cluster_rejects_cloud_init_zero() {
         "expected ENABLE_CLOUD_INIT diagnostic; got:\n{stderr}"
     );
 }
+
+/// Deploy helper for #405-#410 tests: run `hbird deploy-cluster --dry-run`
+/// against an arbitrary config body, returning (success, stdout+stderr).
+fn run_deploy_dry_run_with_config(config_body: &str) -> (bool, String) {
+    let tmp = tempdir_for_test();
+    let conf_path = tmp.path().join("cluster.local.conf");
+    std::fs::write(&conf_path, config_body).expect("write config");
+    let out = Command::new(hbird_bin())
+        .current_dir(tmp.path())
+        .args([
+            "deploy-cluster",
+            "--config",
+            "cluster.local.conf",
+            "--dry-run",
+        ])
+        .output()
+        .expect("spawn hbird");
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    (out.status.success(), combined)
+}
+
+/// Unknown config keys must surface as WARN lines at plan time (#405-#410
+/// root cause: bash `source` silently eats unknown keys, and the Rust
+/// parser's warnings were computed but never printed — a typo'd knob
+/// vanished without a trace).
+#[test]
+fn deploy_cluster_dry_run_prints_unknown_key_warnings() {
+    let (ok, out) = run_deploy_dry_run_with_config(
+        "CP_NAME=hbird-cp1\n\
+         SSH_PUBKEY_FILE=/k\n\
+         ENABLE_CLOUD_INIT=1\n\
+         WORKER_NAMES=()\n\
+         POOL_DIR=/mnt/pool\n\
+         GHCR_TAG=v0.42.0\n\
+         WROKER_MACS=(02:00:00:00:00:01)\n",
+    );
+    assert!(ok, "dry-run must still succeed on unknown keys:\n{out}");
+    assert!(
+        out.contains("[deploy-cluster] WARN: config: unknown key \"WROKER_MACS\""),
+        "typo'd key must be surfaced as a WARN line; got:\n{out}"
+    );
+}
+
+/// CP_MAC + CP_IP: the dry-run plan shows the DHCP reservation and the
+/// pinned primary MAC on the virt-install line (#409).
+#[test]
+fn deploy_cluster_dry_run_plans_mac_pin_and_reservation() {
+    let (ok, out) = run_deploy_dry_run_with_config(
+        "CP_NAME=hbird-cp1\n\
+         SSH_PUBKEY_FILE=/k\n\
+         ENABLE_CLOUD_INIT=1\n\
+         POOL_DIR=/mnt/pool\n\
+         GHCR_TAG=v0.42.0\n\
+         WORKER_NAMES=(hbird-w1)\n\
+         CP_MAC=02:00:00:00:00:01\n\
+         CP_IP=192.168.122.10\n\
+         WORKER_MACS=(02:00:00:00:00:02)\n\
+         WORKER_IPS=(192.168.122.21)\n",
+    );
+    assert!(ok, "dry-run failed:\n{out}");
+    assert!(
+        out.contains(
+            "would ensure DHCP reservation on 'default': hbird-cp1 02:00:00:00:00:01 -> 192.168.122.10"
+        ),
+        "missing CP reservation plan line:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "would ensure DHCP reservation on 'default': hbird-w1 02:00:00:00:00:02 -> 192.168.122.21"
+        ),
+        "missing worker reservation plan line:\n{out}"
+    );
+    assert!(
+        out.contains("(memory=8192 vcpus=4, primary mac=02:00:00:00:00:01)"),
+        "CP virt-install plan line must show the pinned MAC:\n{out}"
+    );
+    assert!(
+        out.contains("(memory=4096 vcpus=2, primary mac=02:00:00:00:00:02)"),
+        "worker virt-install plan line must show the pinned MAC:\n{out}"
+    );
+}
+
+/// CP_IP alone (no CP_MAC): bash still reserves, with the name-derived
+/// MAC — deterministic, so the plan can print it.
+#[test]
+fn deploy_cluster_dry_run_reserves_with_derived_mac_when_only_ip_set() {
+    let (ok, out) = run_deploy_dry_run_with_config(
+        "CP_NAME=hbird-cp1\n\
+         SSH_PUBKEY_FILE=/k\n\
+         ENABLE_CLOUD_INIT=1\n\
+         POOL_DIR=/mnt/pool\n\
+         GHCR_TAG=v0.42.0\n\
+         WORKER_NAMES=()\n\
+         CP_IP=192.168.122.10\n",
+    );
+    assert!(ok, "dry-run failed:\n{out}");
+    // sha256("hbird-cp1") starts f01dbd — bash derive_primary_mac parity.
+    assert!(
+        out.contains(
+            "would ensure DHCP reservation on 'default': hbird-cp1 52:54:00:f0:1d:bd -> 192.168.122.10"
+        ),
+        "derived-MAC reservation plan line missing:\n{out}"
+    );
+    // No CP_MAC => the virt-install plan line keeps its legacy shape.
+    assert!(
+        out.contains("would virt-install hbird-cp1 (memory=8192 vcpus=4) attaching"),
+        "virt-install plan line must NOT grow a mac note without CP_MAC:\n{out}"
+    );
+}
+
+/// Malformed CP_MAC fails fast, before any side effects, with the
+/// bash-twin diagnostic.
+#[test]
+fn deploy_cluster_rejects_malformed_cp_mac() {
+    let (ok, out) = run_deploy_dry_run_with_config(
+        "CP_NAME=hbird-cp1\n\
+         SSH_PUBKEY_FILE=/k\n\
+         ENABLE_CLOUD_INIT=1\n\
+         POOL_DIR=/mnt/pool\n\
+         CP_MAC=zz:zz:zz:zz:zz:zz\n",
+    );
+    assert!(!ok, "malformed CP_MAC must fail:\n{out}");
+    assert!(
+        out.contains("CP_MAC is malformed (need aa:bb:cc:dd:ee:ff): 'zz:zz:zz:zz:zz:zz'"),
+        "missing bash-twin diagnostic:\n{out}"
+    );
+}
+
+/// Full EXTRA_NETWORK family: dry-run surfaces the extra-net suffix on
+/// `config OK`, the host preflight, the per-VM network-config renders,
+/// and the second-NIC attach lines (#405-#408).
+#[test]
+fn deploy_cluster_dry_run_plans_extra_network() {
+    let (ok, out) = run_deploy_dry_run_with_config(
+        "CP_NAME=hbird-cp1\n\
+         SSH_PUBKEY_FILE=/k\n\
+         ENABLE_CLOUD_INIT=1\n\
+         POOL_DIR=/mnt/pool\n\
+         GHCR_TAG=v0.42.0\n\
+         WORKER_NAMES=(hbird-w1)\n\
+         EXTRA_NETWORK=vf-pool\n\
+         EXTRA_NET_CP_MAC=02:11:22:33:44:55\n\
+         EXTRA_NET_CP_IP=10.0.0.241/24\n\
+         EXTRA_NET_WORKER_MACS=(02:11:22:33:44:56)\n\
+         EXTRA_NET_WORKER_IPS=(10.0.0.242/24)\n",
+    );
+    assert!(ok, "dry-run failed:\n{out}");
+    // Byte-parity with bash 819: `, extra-net=<net>` suffix on config OK.
+    assert!(
+        out.contains("config OK: CP=hbird-cp1, workers=(hbird-w1), source=ghcr, tag=v0.42.0, extra-net=vf-pool"),
+        "config OK suffix missing:\n{out}"
+    );
+    assert!(
+        out.contains("would verify EXTRA_NETWORK 'vf-pool' is defined + active"),
+        "host preflight plan line missing:\n{out}"
+    );
+    assert!(
+        out.contains("would render net2 network-config for hbird-cp1 (mac=02:11:22:33:44:55, ip=10.0.0.241/24) into the seed"),
+        "CP net2 render line missing:\n{out}"
+    );
+    assert!(
+        out.contains("would render net2 network-config for hbird-w1 (mac=02:11:22:33:44:56, ip=10.0.0.242/24) into the seed"),
+        "worker net2 render line missing:\n{out}"
+    );
+    assert!(
+        out.contains("would attach second NIC: network=vf-pool,mac=02:11:22:33:44:55"),
+        "CP second-NIC attach line missing:\n{out}"
+    );
+    assert!(
+        out.contains("would attach second NIC: network=vf-pool,mac=02:11:22:33:44:56"),
+        "worker second-NIC attach line missing:\n{out}"
+    );
+}
+
+/// Half-set family (EXTRA_NET_* without EXTRA_NETWORK) fails fast with
+/// the bash-twin diagnostic — the silent-ignore path is the bug class
+/// this block exists to kill.
+#[test]
+fn deploy_cluster_rejects_half_set_extra_net_family() {
+    let (ok, out) = run_deploy_dry_run_with_config(
+        "CP_NAME=hbird-cp1\n\
+         SSH_PUBKEY_FILE=/k\n\
+         ENABLE_CLOUD_INIT=1\n\
+         POOL_DIR=/mnt/pool\n\
+         WORKER_NAMES=()\n\
+         EXTRA_NET_CP_MAC=02:11:22:33:44:55\n",
+    );
+    assert!(!ok, "half-set family must fail:\n{out}");
+    assert!(
+        out.contains("EXTRA_NET_* values are set but EXTRA_NETWORK is empty"),
+        "missing diagnostic:\n{out}"
+    );
+}

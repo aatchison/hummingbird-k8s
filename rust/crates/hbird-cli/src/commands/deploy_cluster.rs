@@ -223,6 +223,21 @@ struct Plan {
     /// /etc/hummingbird/k8s-init-local.env on the CP only.
     pod_cidr: Option<String>,
     service_cidr: Option<String>,
+    /// Primary-NIC identity (#409): optional static IPs that become DHCP
+    /// reservations on the `default` network, plus optional MAC overrides.
+    /// The MAC is ALWAYS pinned at virt-install time (operator-set or
+    /// name-derived) so a rebuilt VM keeps its DHCP lease.
+    cp_ip: Option<String>,
+    worker_ips: Option<Vec<String>>,
+    cp_mac: Option<String>,
+    worker_macs: Option<Vec<String>>,
+    /// Optional second NIC (#405-#408): pre-existing libvirt network +
+    /// per-VM MAC/CIDR family. `extra_network=None` = single-NIC deploy.
+    extra_network: Option<String>,
+    extra_net_cp_mac: Option<String>,
+    extra_net_cp_ip: Option<String>,
+    extra_net_worker_macs: Option<Vec<String>>,
+    extra_net_worker_ips: Option<Vec<String>>,
     cp_ready_retries: u32,
     cp_ready_sleep_secs: u64,
     token_ttl: String,
@@ -295,6 +310,15 @@ impl Plan {
             bootc_update_repo_worker: config.bootc_update_repo_worker,
             pod_cidr: config.pod_cidr.clone(),
             service_cidr: config.service_cidr.clone(),
+            cp_ip: config.cp_ip.clone(),
+            worker_ips: config.worker_ips.clone(),
+            cp_mac: config.cp_mac.clone(),
+            worker_macs: config.worker_macs.clone(),
+            extra_network: config.extra_network.clone().filter(|s| !s.is_empty()),
+            extra_net_cp_mac: config.extra_net_cp_mac.clone(),
+            extra_net_cp_ip: config.extra_net_cp_ip.clone(),
+            extra_net_worker_macs: config.extra_net_worker_macs.clone(),
+            extra_net_worker_ips: config.extra_net_worker_ips.clone(),
             cp_ready_retries: args.cp_ready_retries,
             cp_ready_sleep_secs: args.cp_ready_sleep_secs,
             token_ttl: args.token_ttl.clone(),
@@ -604,13 +628,27 @@ fn compute_expected_build_id(plan: &Plan, image_ref: &str, conn: &Connection) ->
 // ---- Block #6+7: CP cloud-init seed + virt-install --------------------------
 
 /// Plan the CP cloud-init user-data + seed ISO step. Mirrors lines 465-478.
-fn plan_cp_seed(plan: &Plan, conn: &Connection, pubkey_contents: &str) -> Result<String> {
+fn plan_cp_seed(
+    plan: &Plan,
+    conn: &Connection,
+    pubkey_contents: &str,
+    net2: Option<&Net2>,
+) -> Result<String> {
     let cp_seed = format!("{}/{}-seed.iso", plan.pool_dir, plan.cp_name);
     if plan.dry_run {
         log(&format!(
             "DRY-RUN would render CP cloud-init user-data (auto-update-cp={}, switch-to-ghcr={}, ghcr-tag={})",
             plan.auto_update_cp, plan.switch_to_ghcr, plan.ghcr_tag,
         ));
+        // Second NIC: the seed grows a network-config file so
+        // cloud-init-local configures both NICs BEFORE NetworkManager
+        // starts (no DHCP race, no second default route).
+        if let Some(n) = net2 {
+            log(&format!(
+                "DRY-RUN would render net2 network-config for {} (mac={}, ip={}) into the seed",
+                plan.cp_name, n.mac, n.ip,
+            ));
+        }
         log(&format!("DRY-RUN would build CP cloud-init seed {cp_seed}"));
         return Ok(cp_seed);
     }
@@ -626,6 +664,7 @@ fn plan_cp_seed(plan: &Plan, conn: &Connection, pubkey_contents: &str) -> Result
             bootc_update_repo_k8s: plan.bootc_update_repo_k8s.as_deref(),
             pod_cidr: plan.pod_cidr.as_deref(),
             service_cidr: plan.service_cidr.as_deref(),
+            net2_mac: net2.map(|n| n.mac.as_str()),
         },
     );
 
@@ -637,21 +676,45 @@ fn plan_cp_seed(plan: &Plan, conn: &Connection, pubkey_contents: &str) -> Result
     conn.exec_shell(&write_cmd)
         .map_err(|e| anyhow!("could not write CP user-data to {ud_tmp}: {e}"))?;
 
-    let seed_cmd = cloud_init_seed_cmd(&plan.cp_name, &ud_tmp, &cp_seed);
+    let nc_tmp = write_net2_config_tmp(conn, net2, &format!("cp-{}", std::process::id()))?;
+
+    let seed_cmd = cloud_init_seed_cmd(&plan.cp_name, &ud_tmp, &cp_seed, nc_tmp.as_deref());
     conn.exec_shell(&seed_cmd)
         .map_err(|e| anyhow!("cloud-init seed build for CP failed: {e}"))?;
 
     Ok(cp_seed)
 }
 
-/// Plan the CP virt-install step. Mirrors lines 480-508.
+/// Write the rendered net2 network-config to a remote tmpfile; returns
+/// its path (`None` when the second NIC is off).
+fn write_net2_config_tmp(
+    conn: &Connection,
+    net2: Option<&Net2>,
+    tag: &str,
+) -> Result<Option<String>> {
+    let Some(n) = net2 else {
+        return Ok(None);
+    };
+    let nc_tmp = format!("/tmp/hbird-netcfg-{tag}.yaml");
+    let content = render_net2_network_config(&n.mac, &n.ip);
+    let write_cmd = format!("cat > '{nc_tmp}' << 'HBIRD_CI_EOF'\n{content}\nHBIRD_CI_EOF");
+    conn.exec_shell(&write_cmd)
+        .map_err(|e| anyhow!("could not write net2 network-config to {nc_tmp}: {e}"))?;
+    Ok(Some(nc_tmp))
+}
+
+/// Plan the CP virt-install step. Mirrors lines 480-508 (+#409 MAC pin
+/// and DHCP reservation, bash lines 1019-1036).
 fn plan_cp_virt_install(
     plan: &Plan,
     conn: &Connection,
     cp_template: &str,
     cp_seed: &str,
+    macs: &PrimaryMacs,
+    net2: Option<&Net2>,
 ) -> Result<String> {
     let cp_qcow = format!("{}/{}.qcow2", plan.pool_dir, plan.cp_name);
+    let cp_ip = plan.cp_ip.as_deref().filter(|s| !s.is_empty());
     if plan.dry_run {
         log(&format!(
             "DRY-RUN would refuse to overwrite if CP VM '{}' already defined",
@@ -660,8 +723,31 @@ fn plan_cp_virt_install(
         log(&format!(
             "DRY-RUN would clone {cp_template} -> {cp_qcow} (reflink=auto)"
         ));
+        // Reservation line only when CP_IP is configured — bash's
+        // `ensure_dhcp_reservation` early-returns on an empty ip.
+        if let Some(ip) = cp_ip {
+            log(&format!(
+                "DRY-RUN would ensure DHCP reservation on 'default': {} {} -> {ip}",
+                plan.cp_name, macs.cp,
+            ));
+        }
+        // INVARIANT (#409 port): a config without CP_MAC renders the
+        // pre-#409 plan line byte-for-byte (pinned by the phase4 dry-run
+        // fixture). The live path ALWAYS pins the (derived) MAC; the plan
+        // only surfaces it when the operator set it explicitly.
+        let mac_note = if plan.cp_mac.as_deref().is_some_and(|m| !m.is_empty()) {
+            format!(", primary mac={}", macs.cp)
+        } else {
+            String::new()
+        };
+        if let Some(n) = net2 {
+            log(&format!(
+                "DRY-RUN would attach second NIC: network={},mac={}",
+                n.network, n.mac,
+            ));
+        }
         log(&format!(
-            "DRY-RUN would virt-install {} (memory={} vcpus={}) attaching {cp_qcow} + {cp_seed}",
+            "DRY-RUN would virt-install {} (memory={} vcpus={}{mac_note}) attaching {cp_qcow} + {cp_seed}",
             plan.cp_name, plan.cp_memory, plan.cp_vcpus,
         ));
         return Ok(cp_qcow);
@@ -683,17 +769,31 @@ fn plan_cp_virt_install(
     conn.remote_cp_reflink(cp_template, &cp_qcow)
         .map_err(|e| anyhow!("reflink clone {cp_template} -> {cp_qcow} failed: {e}"))?;
 
+    // Primary NIC MAC: deterministic from the domain name so a rebuilt VM
+    // keeps its DHCP lease (#409). Overridable per-cluster via CP_MAC.
+    if let Some(ip) = cp_ip {
+        ensure_dhcp_reservation(conn, "default", &macs.cp, ip, &plan.cp_name);
+    }
+
+    // Operator-visible wording mirrors bash line 1025 (incl. primary mac).
     log(&format!(
-        "virt-install {} (memory={} vcpus={})",
-        plan.cp_name, plan.cp_memory, plan.cp_vcpus
+        "virt-install {} (memory={} vcpus={}, primary mac={})",
+        plan.cp_name, plan.cp_memory, plan.cp_vcpus, macs.cp,
     ));
-    conn.virt_install(
-        &plan.cp_name,
-        plan.cp_memory as u64,
-        plan.cp_vcpus,
-        &cp_qcow,
-        Some(cp_seed),
-    )
+    conn.virt_install_vm(&hbird_virt::VmSpec {
+        name: &plan.cp_name,
+        memory_mib: plan.cp_memory as u64,
+        vcpus: plan.cp_vcpus,
+        disk_path: &cp_qcow,
+        cdrom: Some(cp_seed),
+        primary_mac: Some(&macs.cp),
+        // mac= pins the guest-visible MAC so the seed's network-config
+        // (matched by MAC) deterministically finds the right interface.
+        extra_nic: net2.map(|n| hbird_virt::ExtraNic {
+            network: &n.network,
+            mac: &n.mac,
+        }),
+    })
     .map_err(|e| anyhow!("virt-install {} failed: {e}", plan.cp_name))?;
 
     Ok(cp_qcow)
@@ -813,17 +913,17 @@ fn plan_join_token(
 
 // ---- Block #10: per-worker seed + spawn ------------------------------------
 
-/// Plan the per-worker seed + virt-install step. Mirrors lines 547-597.
+/// Plan the per-worker seed + virt-install step. Mirrors lines 547-597
+/// (+#409 MAC pin and DHCP reservation, bash lines 1114-1129).
 fn plan_worker_spawn(
     plan: &Plan,
     conn: &Connection,
     worker_template: &str,
     join_cmd: &str,
-    cp_ip: &str,
-    privkey_path: &str,
     pubkey_contents: &str,
+    macs: &PrimaryMacs,
+    net2s: Option<&[Net2]>,
 ) -> Result<()> {
-    let _ = (cp_ip, privkey_path); // used in future cluster-ready polling; declared for signature parity
     if plan.worker_names.is_empty() {
         if plan.dry_run {
             log("DRY-RUN WORKER_NAMES=() — CP-only deploy, no workers to spawn");
@@ -831,20 +931,45 @@ fn plan_worker_spawn(
         return Ok(());
     }
     if plan.dry_run {
-        for w in &plan.worker_names {
+        for (i, w) in plan.worker_names.iter().enumerate() {
             let w_qcow = format!("{}/{}.qcow2", plan.pool_dir, w);
             let w_seed = format!("{}/{}-seed.iso", plan.pool_dir, w);
             log(&format!(
                 "DRY-RUN would refuse to overwrite if worker VM '{w}' already defined"
             ));
+            if let Some(n) = net2s.and_then(|v| v.get(i)) {
+                log(&format!(
+                    "DRY-RUN would render net2 network-config for {w} (mac={}, ip={}) into the seed",
+                    n.mac, n.ip,
+                ));
+            }
             log(&format!(
                 "DRY-RUN would render worker cloud-init user-data with join command + build seed {w_seed}"
             ));
             log(&format!(
                 "DRY-RUN would clone {worker_template} -> {w_qcow} (reflink=auto)"
             ));
+            // See the CP block: reservation line only when the matching
+            // WORKER_IPS entry exists; mac note only when operator-set.
+            if let Some(ip) = worker_ip(plan, i) {
+                log(&format!(
+                    "DRY-RUN would ensure DHCP reservation on 'default': {w} {} -> {ip}",
+                    macs.workers[i],
+                ));
+            }
+            let mac_note = if worker_mac_configured(plan, i) {
+                format!(", primary mac={}", macs.workers[i])
+            } else {
+                String::new()
+            };
+            if let Some(n) = net2s.and_then(|v| v.get(i)) {
+                log(&format!(
+                    "DRY-RUN would attach second NIC: network={},mac={}",
+                    n.network, n.mac,
+                ));
+            }
             log(&format!(
-                "DRY-RUN would virt-install {w} (memory={} vcpus={}) attaching {w_qcow} + {w_seed} [parallel]",
+                "DRY-RUN would virt-install {w} (memory={} vcpus={}{mac_note}) attaching {w_qcow} + {w_seed} [parallel]",
                 plan.worker_memory, plan.worker_vcpus,
             ));
         }
@@ -855,7 +980,7 @@ fn plan_worker_spawn(
         return Ok(());
     }
 
-    for w in &plan.worker_names {
+    for (i, w) in plan.worker_names.iter().enumerate() {
         // Guard: fail if worker VM already defined.
         match conn.dominfo(w) {
             Ok(_) => {
@@ -871,14 +996,18 @@ fn plan_worker_spawn(
         let w_seed = format!("{}/{w}-seed.iso", plan.pool_dir);
         let ud_tmp = format!("/tmp/hbird-w-ud-{}-{w}.yaml", std::process::id());
 
+        let w_net2 = net2s.and_then(|v| v.get(i));
         let user_data = render_worker_user_data(
             w,
             pubkey_contents,
             join_cmd,
             plan.switch_to_ghcr,
             &plan.ghcr_tag,
-            plan.bootc_update_schedule.as_deref(),
-            plan.bootc_update_repo_worker.as_deref(),
+            WorkerOverrides {
+                bootc_update_schedule: plan.bootc_update_schedule.as_deref(),
+                bootc_update_repo_worker: plan.bootc_update_repo_worker.as_deref(),
+                net2_mac: w_net2.map(|n| n.mac.as_str()),
+            },
         );
 
         let write_cmd = format!(
@@ -888,7 +1017,9 @@ fn plan_worker_spawn(
         conn.exec_shell(&write_cmd)
             .map_err(|e| anyhow!("could not write worker user-data to {ud_tmp}: {e}"))?;
 
-        let seed_cmd = cloud_init_seed_cmd(w, &ud_tmp, &w_seed);
+        let nc_tmp = write_net2_config_tmp(conn, w_net2, &format!("w-{}-{w}", std::process::id()))?;
+
+        let seed_cmd = cloud_init_seed_cmd(w, &ud_tmp, &w_seed, nc_tmp.as_deref());
         conn.exec_shell(&seed_cmd)
             .map_err(|e| anyhow!("cloud-init seed build for {w} failed: {e}"))?;
 
@@ -896,17 +1027,30 @@ fn plan_worker_spawn(
         conn.remote_cp_reflink(worker_template, &w_qcow)
             .map_err(|e| anyhow!("reflink clone {worker_template} -> {w_qcow} failed: {e}"))?;
 
+        // Primary NIC MAC + optional reservation — see the CP block (#409).
+        if let Some(ip) = worker_ip(plan, i) {
+            ensure_dhcp_reservation(conn, "default", &macs.workers[i], ip, w);
+        }
+
+        // Operator-visible wording mirrors bash line 1118 (incl. primary
+        // mac); `[bg]` is preserved even though the Rust port installs
+        // sequentially — operators grep for the marker.
         log(&format!(
-            "virt-install {w} (memory={} vcpus={}) [bg]",
-            plan.worker_memory, plan.worker_vcpus
+            "virt-install {w} (memory={} vcpus={}, primary mac={}) [bg]",
+            plan.worker_memory, plan.worker_vcpus, macs.workers[i],
         ));
-        conn.virt_install(
-            w,
-            plan.worker_memory as u64,
-            plan.worker_vcpus,
-            &w_qcow,
-            Some(&w_seed),
-        )
+        conn.virt_install_vm(&hbird_virt::VmSpec {
+            name: w,
+            memory_mib: plan.worker_memory as u64,
+            vcpus: plan.worker_vcpus,
+            disk_path: &w_qcow,
+            cdrom: Some(&w_seed),
+            primary_mac: Some(&macs.workers[i]),
+            extra_nic: w_net2.map(|n| hbird_virt::ExtraNic {
+                network: &n.network,
+                mac: &n.mac,
+            }),
+        })
         .map_err(|e| anyhow!("virt-install {w} failed: {e}"))?;
     }
 
@@ -1058,6 +1202,9 @@ fn plan_summary(plan: &Plan, cp_ip: &str) {
 #[tracing::instrument(level = "debug", skip(args), fields(config = ?args.config, kvm_host = ?args.kvm_host, dry_run = args.dry_run), err(Debug))]
 pub fn run(args: DeployClusterArgs) -> Result<()> {
     let config = hbird_config::parse(&args.config).map_err(|e| anyhow!("{e}"))?;
+    // Keep the parser's non-fatal diagnostics past the Plan handoff
+    // (Plan::from_args consumes the config).
+    let config_warnings = config.warnings.clone();
     let plan = Plan::from_args(&args, config)?;
 
     // Hard validation that the bash twin enforces before any side effects.
@@ -1070,18 +1217,73 @@ pub fn run(args: DeployClusterArgs) -> Result<()> {
 
     // ---- Plan summary header (bash 408) ----
     log(&format!("config: {}", plan.config_path.display()));
+    // Bash `source`s the config and silently accepts unknown keys; the
+    // Rust parser reports them. Print at plan time — silent typo-eating
+    // is exactly how the #405-#410 knobs went missing unnoticed.
+    for w in &config_warnings {
+        log(&format!("WARN: config: {w}"));
+    }
+    // Primary-NIC MAC family (#409): malformed / colliding MACs are hard
+    // failures before any side effects (bash extra-network-validation).
+    let primary_macs = resolve_primary_macs(
+        &plan.cp_name,
+        plan.cp_mac.as_deref(),
+        &plan.worker_names,
+        plan.worker_macs.as_deref(),
+    )?;
+    // POD_CIDR / SERVICE_CIDR are printf'd into cloud-init YAML and
+    // sourced as root by k8s-init.sh — validate whenever set,
+    // independent of EXTRA_NETWORK (bash lines 730-734).
+    for (knob, v) in [
+        ("POD_CIDR", plan.pod_cidr.as_deref()),
+        ("SERVICE_CIDR", plan.service_cidr.as_deref()),
+    ] {
+        if let Some(v) = v.filter(|s| !s.is_empty())
+            && !is_valid_cidr(v)
+        {
+            return Err(anyhow!(
+                "{knob} is malformed (need CIDR like 10.244.0.0/16): '{v}'"
+            ));
+        }
+    }
+    // Optional second NIC (#405-#408): validate the whole knob family up
+    // front so a partial config fails here, not as a half-provisioned VM.
+    let extra_net = validate_extra_network(&plan, &primary_macs)?;
+    let (cp_net2, worker_net2s) = match &extra_net {
+        Some((cp, workers)) => (Some(cp), Some(workers.as_slice())),
+        None => (None, None),
+    };
     let workers_str = if plan.worker_names.is_empty() {
         "<none>".to_string()
     } else {
         plan.worker_names.join(" ")
     };
+    // `${EXTRA_NETWORK:+, extra-net=...}` suffix — byte-parity with bash 819.
+    let extra_net_note = match &cp_net2 {
+        Some(n) => format!(", extra-net={}", n.network),
+        None => String::new(),
+    };
     log(&format!(
-        "config OK: CP={}, workers=({workers_str}), source={}, tag={}",
+        "config OK: CP={}, workers=({workers_str}), source={}, tag={}{extra_net_note}",
         plan.cp_name, plan.image_source, plan.ghcr_tag,
     ));
 
     // Build connection once; shared by image acquisition and bib.
     let conn = crate::virt_bridge::build_connection(plan.kvm_host.as_deref());
+
+    // Host-side EXTRA_NETWORK preflight (bash runs it inside the
+    // validation block): defined + active + VF capacity, BEFORE any
+    // template build or clone can waste minutes.
+    if let Some(n) = &cp_net2 {
+        if plan.dry_run {
+            log(&format!(
+                "DRY-RUN would verify EXTRA_NETWORK '{}' is defined + active (and has enough VFs when it is a hostdev pool)",
+                n.network,
+            ));
+        } else {
+            check_extra_network_on_host(&plan, &conn, &n.network)?;
+        }
+    }
 
     // Read the SSH pubkey contents from the KVM host (needed for cloud-init).
     let pubkey_contents = if plan.dry_run {
@@ -1094,8 +1296,9 @@ pub fn run(args: DeployClusterArgs) -> Result<()> {
 
     let (cp_ref, worker_ref) = plan_image_acquisition(&plan, &conn)?;
     let (cp_template, worker_template) = plan_build_qcow2(&plan, &cp_ref, &worker_ref, &conn)?;
-    let cp_seed = plan_cp_seed(&plan, &conn, &pubkey_contents)?;
-    let _cp_qcow = plan_cp_virt_install(&plan, &conn, &cp_template, &cp_seed)?;
+    let cp_seed = plan_cp_seed(&plan, &conn, &pubkey_contents, cp_net2)?;
+    let _cp_qcow =
+        plan_cp_virt_install(&plan, &conn, &cp_template, &cp_seed, &primary_macs, cp_net2)?;
     let cp_ip = plan_cp_ready(&plan, &conn, &privkey_path)?;
     let join_cmd = plan_join_token(&plan, &conn, &cp_ip, &privkey_path)?;
     plan_worker_spawn(
@@ -1103,9 +1306,9 @@ pub fn run(args: DeployClusterArgs) -> Result<()> {
         &conn,
         &worker_template,
         &join_cmd,
-        &cp_ip,
-        &privkey_path,
         &pubkey_contents,
+        &primary_macs,
+        worker_net2s,
     )?;
     plan_cluster_ready(&plan, &conn, &cp_ip, &privkey_path)?;
     plan_verify(&plan, &cp_ip)?;
@@ -1156,6 +1359,9 @@ pub(crate) struct CpOverrides<'a> {
     pub pod_cidr: Option<&'a str>,
     /// `SERVICE_CIDR` — service network passed to kubeadm on first boot.
     pub service_cidr: Option<&'a str>,
+    /// Second-NIC MAC (`EXTRA_NET_CP_MAC`) — when set, the runcmd block
+    /// opens with the IPv6-off entry for that NIC (#407).
+    pub net2_mac: Option<&'a str>,
 }
 
 pub(crate) fn render_cp_user_data(
@@ -1171,6 +1377,7 @@ pub(crate) fn render_cp_user_data(
         bootc_update_repo_k8s,
         pod_cidr,
         service_cidr,
+        net2_mac,
     } = overrides;
     let mut out = String::new();
     out.push_str("#cloud-config\n");
@@ -1237,6 +1444,11 @@ pub(crate) fn render_cp_user_data(
         }
     }
     out.push_str("runcmd:\n");
+    // Before anything else: neutralise the second NIC's IPv6 (the v2
+    // keys never reach NetworkManager — see net2_ipv6_off_runcmd).
+    if let Some(mac) = net2_mac.filter(|s| !s.is_empty()) {
+        out.push_str(&net2_ipv6_off_runcmd(mac));
+    }
     if switch_to_ghcr {
         out.push_str(&format!(
             "  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s:{ghcr_tag} ]\n"
@@ -1258,6 +1470,20 @@ pub(crate) fn render_cp_user_data(
     out
 }
 
+/// Cloud-init override inputs for the worker renderer. Same rationale
+/// as [`CpOverrides`]: a params struct instead of positional
+/// `Option<&str>`s (clippy `too_many_arguments` + transposition safety).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct WorkerOverrides<'a> {
+    /// `BOOTC_UPDATE_SCHEDULE` — systemd `OnCalendar=` override.
+    pub bootc_update_schedule: Option<&'a str>,
+    /// `BOOTC_UPDATE_REPO_WORKER` — registry the semver updater tracks.
+    pub bootc_update_repo_worker: Option<&'a str>,
+    /// Second-NIC MAC (`EXTRA_NET_WORKER_MACS[i]`) — when set, the
+    /// runcmd block opens with the IPv6-off entry for that NIC (#407).
+    pub net2_mac: Option<&'a str>,
+}
+
 /// Render worker cloud-config YAML (bash twin: `worker_user_data`).
 pub(crate) fn render_worker_user_data(
     worker_name: &str,
@@ -1265,9 +1491,13 @@ pub(crate) fn render_worker_user_data(
     join_cmd: &str,
     switch_to_ghcr: bool,
     ghcr_tag: &str,
-    bootc_update_schedule: Option<&str>,
-    bootc_update_repo_worker: Option<&str>,
+    overrides: WorkerOverrides<'_>,
 ) -> String {
+    let WorkerOverrides {
+        bootc_update_schedule,
+        bootc_update_repo_worker,
+        net2_mac,
+    } = overrides;
     let mut out = String::new();
     out.push_str("#cloud-config\n");
     out.push_str(&format!("hostname: {worker_name}\n"));
@@ -1287,6 +1517,7 @@ pub(crate) fn render_worker_user_data(
     // Mirrors deploy-cluster.sh:177-194.
     let bootc_update_schedule = bootc_update_schedule.filter(|s| !s.is_empty());
     let bootc_update_repo_worker = bootc_update_repo_worker.filter(|s| !s.is_empty());
+    let net2_mac = net2_mac.filter(|s| !s.is_empty());
     if let Some(schedule) = bootc_update_schedule {
         // Empty OnCalendar= first clears the image-baked default; see the
         // CP renderer for why the union semantics matter.
@@ -1306,8 +1537,14 @@ pub(crate) fn render_worker_user_data(
         out.push_str(&format!("      REPO={repo}\n"));
         out.push_str("      PREFIX=v\n");
     }
-    if switch_to_ghcr || bootc_update_schedule.is_some() {
+    // Bash gate (line 195): SWITCH_TO_GHCR || BOOTC_UPDATE_SCHEDULE ||
+    // net2_mac — the second NIC alone is enough to need a runcmd block.
+    if switch_to_ghcr || bootc_update_schedule.is_some() || net2_mac.is_some() {
         out.push_str("runcmd:\n");
+        // First: neutralise the second NIC's IPv6 (see the CP path).
+        if let Some(mac) = net2_mac {
+            out.push_str(&net2_ipv6_off_runcmd(mac));
+        }
         if switch_to_ghcr {
             out.push_str(&format!(
                 "  - [ bootc, switch, ghcr.io/aatchison/hummingbird-k8s-worker:{ghcr_tag} ]\n"
@@ -1327,30 +1564,639 @@ pub(crate) fn render_worker_user_data(
 /// Mirrors `scripts/lib/cloud-init-seed.sh`.
 ///
 /// `ud_tmp` is the path to the already-written user-data YAML on the remote.
-fn cloud_init_seed_cmd(hostname: &str, ud_tmp: &str, out_iso: &str) -> String {
+fn cloud_init_seed_cmd(
+    hostname: &str,
+    ud_tmp: &str,
+    out_iso: &str,
+    net_cfg_tmp: Option<&str>,
+) -> String {
     let hostname_q = sh_quote(hostname);
     let ud_q = sh_quote(ud_tmp);
     let iso_q = sh_quote(out_iso);
+    // Optional network-config: NoCloud reads it from the ISO root as
+    // `network-config`. cloud-localds takes it as a flag; the ISO tools
+    // just get another file argument (bash twin: cloud-init-seed.sh's
+    // nc_localds / nc_isofile arrays).
+    let (stage_nc, nc_localds, nc_isofile, rm_nc) = match net_cfg_tmp {
+        Some(nc) => {
+            let nc_q = sh_quote(nc);
+            (
+                format!("cp {nc_q} \"$_tmp/network-config\"; "),
+                " --network-config \"$_tmp/network-config\"".to_string(),
+                " \"$_tmp/network-config\"".to_string(),
+                format!("; rm -f -- {nc_q}"),
+            )
+        }
+        None => (String::new(), String::new(), String::new(), String::new()),
+    };
     format!(
         "set -euo pipefail; \
          _tmp=$(mktemp -d -t hbird-ci-XXXXXX); \
          cp {ud_q} \"$_tmp/user-data\"; \
-         printf 'instance-id: hbird-%s-%s\\nlocal-hostname: %s\\n' \
+         {stage_nc}printf 'instance-id: hbird-%s-%s\\nlocal-hostname: %s\\n' \
            \"$(date +%s)\" \"$$\" {hostname_q} > \"$_tmp/meta-data\"; \
          if command -v cloud-localds >/dev/null 2>&1; then \
-           cloud-localds {iso_q} \"$_tmp/user-data\" \"$_tmp/meta-data\"; \
+           cloud-localds{nc_localds} {iso_q} \"$_tmp/user-data\" \"$_tmp/meta-data\"; \
          elif command -v genisoimage >/dev/null 2>&1; then \
            genisoimage -output {iso_q} -volid cidata -joliet -rock \
-             \"$_tmp/user-data\" \"$_tmp/meta-data\" >/dev/null 2>&1; \
+             \"$_tmp/user-data\" \"$_tmp/meta-data\"{nc_isofile} >/dev/null 2>&1; \
          elif command -v mkisofs >/dev/null 2>&1; then \
            mkisofs -output {iso_q} -volid cidata -joliet -rock \
-             \"$_tmp/user-data\" \"$_tmp/meta-data\" >/dev/null 2>&1; \
+             \"$_tmp/user-data\" \"$_tmp/meta-data\"{nc_isofile} >/dev/null 2>&1; \
          else \
            echo 'build_cloud_init_seed: need cloud-localds / genisoimage / mkisofs' >&2; exit 1; \
          fi; \
          rm -rf -- \"$_tmp\"; \
-         rm -f -- {ud_q}"
+         rm -f -- {ud_q}{rm_nc}"
     )
+}
+
+// ---- Primary-NIC identity (#409) --------------------------------------------
+//
+// Bash twin: deploy-cluster.sh `derive_primary_mac` + `ensure_dhcp_reservation`
+// plus the primary-MAC slice of the extra-network-validation block.
+
+/// SHA-256 (FIPS 180-4), std-only. The workspace deliberately carries no
+/// crypto crate; this is not a security boundary — it only has to produce
+/// the SAME digest `sha256sum` produces so `derive_primary_mac` yields
+/// byte-identical MACs to the bash twin (a rebuilt VM must land on the
+/// lease the bash deploy reserved).
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    // Padded message: data ++ 0x80 ++ zeros ++ 64-bit big-endian bit length.
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut w = [0u32; 64];
+    for chunk in msg.chunks_exact(64) {
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    h.iter().map(|x| format!("{x:08x}")).collect()
+}
+
+/// Deterministic MAC for a VM's PRIMARY NIC, derived from its domain
+/// name. Bash twin: `derive_primary_mac` (deploy-cluster.sh #409).
+///
+/// WHY: the pinned kubelet `--node-ip` is a DHCP lease frozen at first
+/// boot. Without a stable MAC a rebuilt VM gets a libvirt-random MAC,
+/// hence a different lease, while the pinned `--node-ip` stays put —
+/// leaving kubelet with an address on no interface. 52:54:00 is the
+/// QEMU/KVM OUI libvirt itself uses; the low three bytes are the first
+/// 6 hex digits of the name's sha256.
+pub(crate) fn derive_primary_mac(name: &str) -> String {
+    let h = sha256_hex(name.as_bytes());
+    format!("52:54:00:{}:{}:{}", &h[0..2], &h[2..4], &h[4..6])
+}
+
+/// `aa:bb:cc:dd:ee:ff` shape check. Bash twin regex:
+/// `^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$`.
+pub(crate) fn is_valid_mac(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(':').collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Resolved primary-NIC MACs: operator override (`CP_MAC` /
+/// `WORKER_MACS[i]`) or name-derived fallback, validated + collision-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrimaryMacs {
+    /// CP primary MAC.
+    pub cp: String,
+    /// Worker primary MACs, parallel to `Plan::worker_names`.
+    pub workers: Vec<String>,
+}
+
+/// Compute + validate the primary-NIC MAC family. Mirrors the
+/// primary-MAC slice of deploy-cluster.sh's extra-network-validation
+/// block (lines 713-726): malformed values and duplicate MACs are hard
+/// failures BEFORE any side effects.
+///
+/// NOTE the bash twin does NOT length-validate WORKER_MACS against
+/// WORKER_NAMES (unlike the EXTRA_NET_* arrays): a missing/empty entry
+/// falls back to the name-derived MAC. Preserved here.
+pub(crate) fn resolve_primary_macs(
+    cp_name: &str,
+    cp_mac: Option<&str>,
+    worker_names: &[String],
+    worker_macs: Option<&[String]>,
+) -> Result<PrimaryMacs> {
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let cp = match cp_mac.filter(|s| !s.is_empty()) {
+        Some(m) => m.to_string(),
+        None => derive_primary_mac(cp_name),
+    };
+    if !is_valid_mac(&cp) {
+        // Operator-visible wording mirrors the bash `fail` message.
+        return Err(anyhow!(
+            "CP_MAC is malformed (need aa:bb:cc:dd:ee:ff): '{cp}'"
+        ));
+    }
+    seen.insert(cp.to_ascii_lowercase(), cp_name.to_string());
+
+    let mut workers = Vec::with_capacity(worker_names.len());
+    for (i, w) in worker_names.iter().enumerate() {
+        let mac = match worker_macs.and_then(|m| m.get(i)).filter(|s| !s.is_empty()) {
+            Some(m) => m.clone(),
+            None => derive_primary_mac(w),
+        };
+        if !is_valid_mac(&mac) {
+            return Err(anyhow!(
+                "WORKER_MACS[{i}] is malformed (need aa:bb:cc:dd:ee:ff): '{mac}'"
+            ));
+        }
+        if let Some(other) = seen.get(&mac.to_ascii_lowercase()) {
+            return Err(anyhow!(
+                "primary-NIC MAC collision: {w} and {other} would both use {mac} — set CP_MAC/WORKER_MACS explicitly to break the tie"
+            ));
+        }
+        seen.insert(mac.to_ascii_lowercase(), w.clone());
+        workers.push(mac);
+    }
+    Ok(PrimaryMacs { cp, workers })
+}
+
+/// The configured `WORKER_IPS[i]` entry, if present and non-empty.
+/// Bash twin: `"${WORKER_IPS[$w_idx]:-}"` — a short/empty array entry
+/// simply means "no reservation for this worker" (WORKER_IPS is not
+/// length-validated, unlike the EXTRA_NET_* family).
+fn worker_ip(plan: &Plan, i: usize) -> Option<&str> {
+    plan.worker_ips
+        .as_ref()
+        .and_then(|v| v.get(i))
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether the operator explicitly set `WORKER_MACS[i]` (drives the
+/// dry-run plan's `primary mac=` note; the live path always pins).
+fn worker_mac_configured(plan: &Plan, i: usize) -> bool {
+    plan.worker_macs
+        .as_ref()
+        .and_then(|v| v.get(i))
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// What `ensure_dhcp_reservation` should do, decided from the network's
+/// current XML. Mirrors the two greps in the bash twin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservationCheck {
+    /// `mac='<mac>'` already present (case-insensitive, like `grep -qi`)
+    /// — reservation exists, nothing to do.
+    AlreadyPresent,
+    /// `ip='<ip>'` present under a different MAC — reserving an address
+    /// another host already holds is worse than no reservation; skip.
+    IpTakenByOtherMac,
+    /// Neither found — add the reservation.
+    Absent,
+}
+
+/// Classify a `virsh net-dumpxml` payload for the (mac, ip) pair.
+pub(crate) fn classify_dhcp_reservation(net_xml: &str, mac: &str, ip: &str) -> ReservationCheck {
+    // Bash: `grep -qi "mac='${mac}'"` — case-insensitive.
+    let xml_lower = net_xml.to_ascii_lowercase();
+    if xml_lower.contains(&format!("mac='{}'", mac.to_ascii_lowercase())) {
+        return ReservationCheck::AlreadyPresent;
+    }
+    // Bash: `grep -q "ip='${ip}'"` — case-sensitive (IPs have no case).
+    if net_xml.contains(&format!("ip='{ip}'")) {
+        return ReservationCheck::IpTakenByOtherMac;
+    }
+    ReservationCheck::Absent
+}
+
+/// Add a `<host mac ip>` entry to a libvirt network so a VM's primary
+/// address is a RESERVATION, not merely a sticky lease. Idempotent, and
+/// never fatal: a host that cannot net-update, or a network that already
+/// carries the entry, must not abort a deploy. Bash twin:
+/// `ensure_dhcp_reservation` (deploy-cluster.sh #409). Log wording is
+/// preserved byte-for-byte — operators grep for these lines.
+fn ensure_dhcp_reservation(conn: &Connection, net: &str, mac: &str, ip: &str, name: &str) {
+    // Bash pipes net-dumpxml through `2>/dev/null | grep`: a failed dump
+    // classifies as Absent and falls through to the add attempt (whose
+    // failure is a WARN, not an abort). Same here.
+    let net_xml = conn.net_dumpxml(net).unwrap_or_default();
+    match classify_dhcp_reservation(&net_xml, mac, ip) {
+        ReservationCheck::AlreadyPresent => {
+            log(&format!(
+                "DHCP reservation for {name} ({mac} -> {ip}) already present on network '{net}'"
+            ));
+        }
+        ReservationCheck::IpTakenByOtherMac => {
+            log(&format!(
+                "WARN: {ip} is already reserved on network '{net}' under a different MAC — skipping reservation for {name}. Pick a free CP_IP/WORKER_IPS value or clear the stale entry."
+            ));
+        }
+        ReservationCheck::Absent => match conn.net_update_add_ip_dhcp_host(net, mac, name, ip) {
+            Ok(()) => log(&format!(
+                "added DHCP reservation on '{net}': {name} {mac} -> {ip}"
+            )),
+            Err(_) => log(&format!(
+                "WARN: could not add a DHCP reservation for {name} on '{net}' (continuing — the pinned MAC still makes the lease sticky)"
+            )),
+        },
+    }
+}
+
+// ---- Optional second NIC (#405-#408) ----------------------------------------
+//
+// Bash twin: deploy-cluster.sh `render_net2_network_config`,
+// `emit_net2_ipv6_off_runcmd`, and the extra-network-validation block.
+
+/// Octet-range-accurate CIDR check. Bash twin `_cidr_re`: the loose
+/// `^[0-9.]+/[0-9]+$` it replaced accepted `10.0.0.256/24`, `1.2.3/99`
+/// and `10.0.0.241/244` — defeating the fail-early guarantee. No leading
+/// zeros (matches the regex's alternation exactly).
+pub(crate) fn is_valid_cidr(s: &str) -> bool {
+    let Some((addr, prefix)) = s.split_once('/') else {
+        return false;
+    };
+    let octets: Vec<&str> = addr.split('.').collect();
+    if octets.len() != 4 || !octets.iter().all(|o| is_decimal_in_range(o, 255)) {
+        return false;
+    }
+    is_decimal_in_range(prefix, 32)
+}
+
+/// 1-3 digit decimal, no leading zero (except `"0"` itself), `<= max`.
+fn is_decimal_in_range(s: &str, max: u32) -> bool {
+    if s.is_empty() || s.len() > 3 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if s.len() > 1 && s.starts_with('0') {
+        return false;
+    }
+    s.parse::<u32>().is_ok_and(|v| v <= max)
+}
+
+/// `true` when `addr` (bare IPv4) falls inside `cidr`. Bash twin
+/// `_ip_in_cidr`. Malformed inputs return `false` — callers validate
+/// shape first.
+pub(crate) fn ip_in_cidr(addr: &str, cidr: &str) -> bool {
+    fn to_u32(a: &str) -> Option<u32> {
+        let mut out: u32 = 0;
+        let mut n = 0;
+        for part in a.split('.') {
+            out = (out << 8) | u32::from(part.parse::<u8>().ok()?);
+            n += 1;
+        }
+        (n == 4).then_some(out)
+    }
+    let Some((base, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Some(a), Some(c), Ok(p)) = (to_u32(addr), to_u32(base), prefix.parse::<u32>()) else {
+        return false;
+    };
+    if p == 0 {
+        return true;
+    }
+    if p > 32 {
+        return false;
+    }
+    let mask: u32 = u32::MAX << (32 - p);
+    (a & mask) == (c & mask)
+}
+
+/// Emit a cloud-init network-config (v2) YAML for a dual-NIC VM.
+/// Byte-parity with bash `render_net2_network_config`.
+///
+/// Why network-config and not a write_files NM keyfile: this file is
+/// rendered by cloud-init-local BEFORE NetworkManager starts. A keyfile
+/// delivered via write_files (cloud-config stage) loses the race — NM
+/// auto-defaults the new NIC with DHCP first, and if that network's DHCP
+/// hands out a gateway the node grows a second default route and its
+/// identity (apiserver advertise-address, kubelet node IP) can move. The
+/// static stanza below has NO gateway and disables RA, so the second NIC
+/// can never carry a default route. The primary NIC is matched by name
+/// (enp1s0 — deterministic on the q35 machine type these VMs use) and
+/// MUST be declared: providing ANY network-config disables cloud-init's
+/// fallback DHCP config; omitting it would leave the primary NIC dead.
+pub(crate) fn render_net2_network_config(mac: &str, ip: &str) -> String {
+    let mut out = String::new();
+    out.push_str("version: 2\n");
+    out.push_str("ethernets:\n");
+    out.push_str("  primary:\n");
+    out.push_str("    match:\n");
+    out.push_str("      name: enp1s0\n");
+    out.push_str("    dhcp4: true\n");
+    out.push_str("  net2:\n");
+    out.push_str("    match:\n");
+    out.push_str(&format!("      macaddress: \"{mac}\"\n"));
+    out.push_str("    dhcp4: false\n");
+    out.push_str("    dhcp6: false\n");
+    out.push_str("    accept-ra: false\n");
+    out.push_str("    addresses:\n");
+    out.push_str(&format!("      - \"{ip}\"\n"));
+    out
+}
+
+/// The runcmd entry that disables IPv6 on the second NIC. Byte-parity
+/// with bash `emit_net2_ipv6_off_runcmd`.
+///
+/// WHY THIS EXISTS: `render_net2_network_config` emits `accept-ra: false`
+/// and `dhcp6: false`, and cloud-init's NetworkManager renderer SILENTLY
+/// DROPS BOTH — with no IPv6 subnet it never emits an `[ipv6]` section,
+/// so NM normalizes the keyfile to ipv6.method=auto (verified on a live
+/// node by the bash twin's author). Left alone, an EXTRA_NETWORK segment
+/// carrying router advertisements would SLAAC an address onto the second
+/// NIC and install an IPv6 default route there. Resolved MAC -> device ->
+/// connection because the NM renderer names the connection after the
+/// matched INTERFACE, not the network-config key. Non-fatal on lookup
+/// failure: a missing NIC must not block the rest of first boot.
+pub(crate) fn net2_ipv6_off_runcmd(mac: &str) -> String {
+    let mut out = String::new();
+    out.push_str("  - |\n");
+    out.push_str(
+        "    # Disable IPv6 on the second NIC (accept-ra/dhcp6 do not survive the NM renderer).\n",
+    );
+    out.push_str(&format!(
+        "    dev=$(ip -o link | awk -v m={mac} 'tolower($0) ~ tolower(m) {{gsub(/:/,\"\",$2); print $2; exit}}')\n"
+    ));
+    out.push_str(&format!(
+        "    [ -n \"$dev\" ] || {{ echo \"hbird: no interface with MAC {mac}\" >&2; exit 0; }}\n"
+    ));
+    out.push_str("    con=$(nmcli -g GENERAL.CONNECTION device show \"$dev\")\n");
+    out.push_str(
+        "    [ -n \"$con\" ] || { echo \"hbird: no NM connection on $dev\" >&2; exit 0; }\n",
+    );
+    out.push_str("    nmcli connection modify \"$con\" ipv6.method disabled\n");
+    out.push_str("    nmcli connection up \"$con\" >/dev/null\n");
+    out
+}
+
+/// The second-NIC identity for one VM, resolved from the validated
+/// EXTRA_NET_* family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Net2 {
+    /// Libvirt network name (`EXTRA_NETWORK`).
+    pub network: String,
+    /// Guest-visible MAC (`EXTRA_NET_*_MAC`).
+    pub mac: String,
+    /// Static address in CIDR form (`EXTRA_NET_*_IP`).
+    pub ip: String,
+}
+
+/// Validate the whole EXTRA_NET_* knob family up front so a partial
+/// config fails here, not as a half-provisioned VM. Pure (no libvirt
+/// probes — see [`check_extra_network_on_host`] for those). Mirrors
+/// deploy-cluster.sh lines 748-816; `fail` wording preserved.
+///
+/// Returns `(cp_net2, worker_net2s)` — `None` when EXTRA_NETWORK is off.
+fn validate_extra_network(
+    plan: &Plan,
+    primary_macs: &PrimaryMacs,
+) -> Result<Option<(Net2, Vec<Net2>)>> {
+    let Some(net) = plan.extra_network.as_deref().filter(|s| !s.is_empty()) else {
+        // Guard against a half-set family: worker arrays without the
+        // master knob would be silently ignored — that silence is the
+        // #373-family bug class.
+        let half_set = plan
+            .extra_net_cp_mac
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            || plan
+                .extra_net_cp_ip
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            || plan
+                .extra_net_worker_macs
+                .as_ref()
+                .is_some_and(|v| v.iter().any(|s| !s.is_empty()))
+            || plan
+                .extra_net_worker_ips
+                .as_ref()
+                .is_some_and(|v| v.iter().any(|s| !s.is_empty()));
+        if half_set {
+            return Err(anyhow!(
+                "EXTRA_NET_* values are set but EXTRA_NETWORK is empty — set EXTRA_NETWORK=<libvirt network> or clear the family"
+            ));
+        }
+        return Ok(None);
+    };
+
+    let cp_mac = plan.extra_net_cp_mac.as_deref().unwrap_or("");
+    if !is_valid_mac(cp_mac) {
+        return Err(anyhow!(
+            "EXTRA_NETWORK is set but EXTRA_NET_CP_MAC is missing/malformed (need aa:bb:cc:dd:ee:ff): '{cp_mac}'"
+        ));
+    }
+    let cp_ip = plan.extra_net_cp_ip.as_deref().unwrap_or("");
+    if !is_valid_cidr(cp_ip) {
+        return Err(anyhow!(
+            "EXTRA_NETWORK is set but EXTRA_NET_CP_IP is missing/malformed (need CIDR like 10.0.0.241/24): '{cp_ip}'"
+        ));
+    }
+    // Unset arrays count as 0 entries (bash defaults them to `()`), and
+    // unlike WORKER_MACS these ARE length-validated: parallel or fail.
+    let empty: Vec<String> = Vec::new();
+    let w_macs = plan.extra_net_worker_macs.as_ref().unwrap_or(&empty);
+    let w_ips = plan.extra_net_worker_ips.as_ref().unwrap_or(&empty);
+    if w_macs.len() != plan.worker_names.len() {
+        return Err(anyhow!(
+            "EXTRA_NET_WORKER_MACS has {} entries but WORKER_NAMES has {} — the arrays must be parallel",
+            w_macs.len(),
+            plan.worker_names.len(),
+        ));
+    }
+    if w_ips.len() != plan.worker_names.len() {
+        return Err(anyhow!(
+            "EXTRA_NET_WORKER_IPS has {} entries but WORKER_NAMES has {} — the arrays must be parallel",
+            w_ips.len(),
+            plan.worker_names.len(),
+        ));
+    }
+    for (i, m) in w_macs.iter().enumerate() {
+        if !is_valid_mac(m) {
+            return Err(anyhow!("EXTRA_NET_WORKER_MACS[{i}] malformed: '{m}'"));
+        }
+    }
+    for (i, a) in w_ips.iter().enumerate() {
+        if !is_valid_cidr(a) {
+            return Err(anyhow!("EXTRA_NET_WORKER_IPS[{i}] malformed: '{a}'"));
+        }
+    }
+
+    // Uniqueness. A duplicate MAC or address is silently catastrophic:
+    // two VMs on one L2 segment answering for the same identity.
+    let mut primary_by_mac: std::collections::HashMap<String, &str> =
+        std::collections::HashMap::new();
+    primary_by_mac.insert(primary_macs.cp.to_ascii_lowercase(), &plan.cp_name);
+    for (i, m) in primary_macs.workers.iter().enumerate() {
+        primary_by_mac.insert(m.to_ascii_lowercase(), &plan.worker_names[i]);
+    }
+    let mut seen_mac: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in std::iter::once(cp_mac).chain(w_macs.iter().map(String::as_str)) {
+        let mk = m.to_ascii_lowercase();
+        if !seen_mac.insert(mk.clone()) {
+            return Err(anyhow!(
+                "duplicate MAC in the EXTRA_NET_* family: '{m}' — every NIC needs a unique MAC"
+            ));
+        }
+        // Also cross-check against the primary NICs' MACs (#409).
+        if let Some(owner) = primary_by_mac.get(&mk) {
+            return Err(anyhow!(
+                "EXTRA_NET MAC '{m}' collides with the primary-NIC MAC of {owner} — every NIC on the host needs a unique MAC"
+            ));
+        }
+    }
+    let mut seen_ip: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for a in std::iter::once(cp_ip).chain(w_ips.iter().map(String::as_str)) {
+        let bare = a.split('/').next().unwrap_or(a);
+        if !seen_ip.insert(bare) {
+            return Err(anyhow!(
+                "duplicate address in the EXTRA_NET_* family: '{bare}' — every NIC needs a unique address"
+            ));
+        }
+    }
+
+    // Overlap with the cluster's own ranges — the exact collision class
+    // that motivated this work (Cilium's 10.0.0.0/8 default swallowing
+    // the LAN).
+    for a in std::iter::once(cp_ip).chain(w_ips.iter().map(String::as_str)) {
+        let bare = a.split('/').next().unwrap_or(a);
+        for (range_name, range) in [
+            ("POD_CIDR", plan.pod_cidr.as_deref()),
+            ("SERVICE_CIDR", plan.service_cidr.as_deref()),
+        ] {
+            let Some(range) = range.filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if ip_in_cidr(bare, range) {
+                return Err(anyhow!(
+                    "EXTRA_NET address {bare} falls inside {range_name}={range} — traffic to it would be swallowed by the cluster network. Pick ranges that overlap neither."
+                ));
+            }
+        }
+    }
+
+    let cp = Net2 {
+        network: net.to_string(),
+        mac: cp_mac.to_string(),
+        ip: cp_ip.to_string(),
+    };
+    let workers = w_macs
+        .iter()
+        .zip(w_ips.iter())
+        .map(|(m, a)| Net2 {
+            network: net.to_string(),
+            mac: m.clone(),
+            ip: a.clone(),
+        })
+        .collect();
+    Ok(Some((cp, workers)))
+}
+
+/// `Active:` line check on `virsh net-info` output. Bash twin:
+/// `awk '/^Active:/{print $2}' | grep -qi '^yes$'`.
+pub(crate) fn net_info_reports_active(net_info: &str) -> bool {
+    net_info
+        .lines()
+        .find_map(|l| l.strip_prefix("Active:"))
+        .map(str::trim)
+        .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
+}
+
+/// For a hostdev (SR-IOV VF pool) network, the number of VFs in the pool;
+/// `None` for any other forward mode. Bash twin: the `grep -q "forward
+/// mode='hostdev'"` + `grep -c "<address type='pci'"` pair.
+pub(crate) fn hostdev_vf_count(net_xml: &str) -> Option<usize> {
+    if !net_xml.contains("forward mode='hostdev'") {
+        return None;
+    }
+    Some(net_xml.matches("<address type='pci'").count())
+}
+
+/// Live host-side EXTRA_NETWORK preflight: the named libvirt network
+/// must exist, be active, and (for hostdev pools) have enough VFs for
+/// 1 CP + N workers. Mirrors deploy-cluster.sh lines 795-809.
+fn check_extra_network_on_host(plan: &Plan, conn: &Connection, net: &str) -> Result<()> {
+    let info = conn.net_info(net).map_err(|_| {
+        anyhow!(
+            "EXTRA_NETWORK='{net}' is not a defined libvirt network on this host — define it first (see cluster.example.conf for a VF-pool example)"
+        )
+    })?;
+    // Defined is not enough: an inactive network fails at virt-install
+    // time, after the templates are built and the CP qcow2 is cloned.
+    if !net_info_reports_active(&info) {
+        return Err(anyhow!(
+            "EXTRA_NETWORK='{net}' is defined but NOT active — run 'virsh net-start {net}' (and net-autostart) first"
+        ));
+    }
+    // hostdev (SR-IOV VF) pool: ensure enough ports for 1 CP + N workers.
+    // Running out otherwise surfaces as a cryptic virt-install failure on
+    // the Nth VM, halfway through the deploy.
+    let xml = conn.net_dumpxml(net).unwrap_or_default();
+    if let Some(vf_count) = hostdev_vf_count(&xml) {
+        let need = 1 + plan.worker_names.len();
+        if vf_count < need {
+            return Err(anyhow!(
+                "EXTRA_NETWORK='{net}' is a hostdev pool with {vf_count} VF(s) but this deploy needs {need} (1 CP + {} worker(s))",
+                plan.worker_names.len(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -1635,6 +2481,550 @@ mod tests {
         Plan::from_args(&default_args(), cfg(None)).expect("plan")
     }
 
+    // ---- #409 primary-NIC identity tests ------------------------------------
+
+    #[test]
+    fn sha256_hex_matches_reference_vectors() {
+        // FIPS 180-4 vectors — same digests `sha256sum` prints.
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // >1 block (64+ bytes) exercises the multi-chunk path.
+        assert_eq!(
+            sha256_hex(&[b'a'; 100]),
+            "2816597888e4a0d3a36b82b83316ab32680eb8f00f8cd3b904d681246d285a0e"
+        );
+    }
+
+    #[test]
+    fn derive_primary_mac_matches_bash_twin() {
+        // bash: printf hbird-cp1 | sha256sum | cut -c1-6 -> f01dbd
+        assert_eq!(derive_primary_mac("hbird-cp1"), "52:54:00:f0:1d:bd");
+        assert_eq!(derive_primary_mac("hbird-w1"), "52:54:00:4e:09:78");
+    }
+
+    #[test]
+    fn is_valid_mac_accepts_and_rejects() {
+        assert!(is_valid_mac("52:54:00:aa:bb:cc"));
+        assert!(is_valid_mac("52:54:00:AA:BB:CC"));
+        assert!(!is_valid_mac("52:54:00:aa:bb"));
+        assert!(!is_valid_mac("52:54:00:aa:bb:cc:dd"));
+        assert!(!is_valid_mac("52:54:00:aa:bb:cg"));
+        assert!(!is_valid_mac("525400aabbcc"));
+        assert!(!is_valid_mac(""));
+    }
+
+    #[test]
+    fn resolve_primary_macs_derives_when_unset() {
+        let macs = resolve_primary_macs("hbird-cp1", None, &["hbird-w1".to_string()], None)
+            .expect("derived family is valid");
+        assert_eq!(macs.cp, "52:54:00:f0:1d:bd");
+        assert_eq!(macs.workers, vec!["52:54:00:4e:09:78".to_string()]);
+    }
+
+    #[test]
+    fn resolve_primary_macs_prefers_operator_overrides() {
+        let worker_macs = vec!["02:00:00:00:00:02".to_string()];
+        let macs = resolve_primary_macs(
+            "hbird-cp1",
+            Some("02:00:00:00:00:01"),
+            &["hbird-w1".to_string()],
+            Some(&worker_macs),
+        )
+        .expect("override family is valid");
+        assert_eq!(macs.cp, "02:00:00:00:00:01");
+        assert_eq!(macs.workers, vec!["02:00:00:00:00:02".to_string()]);
+    }
+
+    #[test]
+    fn resolve_primary_macs_short_worker_array_falls_back_to_derived() {
+        // Bash does NOT length-validate WORKER_MACS: `${WORKER_MACS[$i]:-derive}`.
+        let worker_macs = vec!["02:00:00:00:00:02".to_string()];
+        let macs = resolve_primary_macs(
+            "hbird-cp1",
+            None,
+            &["hbird-w1".to_string(), "hbird-w2".to_string()],
+            Some(&worker_macs),
+        )
+        .expect("short WORKER_MACS is allowed");
+        assert_eq!(macs.workers[0], "02:00:00:00:00:02");
+        assert_eq!(macs.workers[1], derive_primary_mac("hbird-w2"));
+    }
+
+    #[test]
+    fn resolve_primary_macs_rejects_malformed_cp_mac() {
+        let err = resolve_primary_macs("cp", Some("not-a-mac"), &[], None)
+            .expect_err("malformed CP_MAC must fail");
+        assert!(
+            err.to_string()
+                .contains("CP_MAC is malformed (need aa:bb:cc:dd:ee:ff): 'not-a-mac'"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_primary_macs_rejects_malformed_worker_mac_with_index() {
+        let worker_macs = vec!["02:00:00:00:00:01".to_string(), "bogus".to_string()];
+        let err = resolve_primary_macs(
+            "cp",
+            None,
+            &["w1".to_string(), "w2".to_string()],
+            Some(&worker_macs),
+        )
+        .expect_err("malformed WORKER_MACS[1] must fail");
+        assert!(
+            err.to_string()
+                .contains("WORKER_MACS[1] is malformed (need aa:bb:cc:dd:ee:ff): 'bogus'"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_primary_macs_rejects_collision_case_insensitively() {
+        // Same MAC, different case — one L2 segment, one identity.
+        let worker_macs = vec!["02:AA:BB:CC:DD:EE".to_string()];
+        let err = resolve_primary_macs(
+            "hbird-cp1",
+            Some("02:aa:bb:cc:dd:ee"),
+            &["hbird-w1".to_string()],
+            Some(&worker_macs),
+        )
+        .expect_err("duplicate MAC must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("primary-NIC MAC collision"), "err: {msg}");
+        assert!(msg.contains("hbird-w1"), "err: {msg}");
+        assert!(msg.contains("hbird-cp1"), "err: {msg}");
+        assert!(
+            msg.contains("set CP_MAC/WORKER_MACS explicitly to break the tie"),
+            "err: {msg}"
+        );
+    }
+
+    // ---- classify_dhcp_reservation (bash ensure_dhcp_reservation greps) -----
+
+    const NET_XML: &str = r#"<network>
+  <name>default</name>
+  <mac address='52:54:00:99:99:99'/>
+  <ip address='192.168.122.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.122.2' end='192.168.122.254'/>
+      <host mac='52:54:00:F0:1D:BD' name='hbird-cp1' ip='192.168.122.10'/>
+    </dhcp>
+  </ip>
+</network>"#;
+
+    #[test]
+    fn classify_reservation_same_mac_is_already_present_case_insensitive() {
+        // Bash `grep -qi "mac='${mac}'"` — the XML stores the MAC
+        // uppercase here, the config supplies lowercase.
+        assert_eq!(
+            classify_dhcp_reservation(NET_XML, "52:54:00:f0:1d:bd", "192.168.122.10"),
+            ReservationCheck::AlreadyPresent,
+        );
+    }
+
+    #[test]
+    fn classify_reservation_ip_under_other_mac_is_conflict() {
+        assert_eq!(
+            classify_dhcp_reservation(NET_XML, "52:54:00:00:00:01", "192.168.122.10"),
+            ReservationCheck::IpTakenByOtherMac,
+        );
+    }
+
+    #[test]
+    fn classify_reservation_absent_pair_wants_add() {
+        assert_eq!(
+            classify_dhcp_reservation(NET_XML, "52:54:00:00:00:01", "192.168.122.11"),
+            ReservationCheck::Absent,
+        );
+    }
+
+    #[test]
+    fn classify_reservation_ip_match_is_exact_not_prefix() {
+        // The grep pattern includes the closing quote: ip='192.168.122.1'
+        // must NOT match the ...122.10 host entry (or the <ip address=...>
+        // element, which uses a different attribute name).
+        assert_eq!(
+            classify_dhcp_reservation(NET_XML, "52:54:00:00:00:01", "192.168.122.1"),
+            ReservationCheck::Absent,
+        );
+    }
+
+    #[test]
+    fn classify_reservation_empty_xml_wants_add() {
+        // A failed `net-dumpxml` classifies as Absent — the add attempt's
+        // failure is a WARN, never an abort (bash `2>/dev/null | grep`).
+        assert_eq!(
+            classify_dhcp_reservation("", "52:54:00:00:00:01", "10.0.0.5"),
+            ReservationCheck::Absent,
+        );
+    }
+
+    // ---- #405-#408 second-NIC tests ------------------------------------------
+
+    #[test]
+    fn render_net2_network_config_matches_bash_byte_for_byte() {
+        // Expected block captured from the bash twin:
+        //   render_net2_network_config 02:11:22:33:44:55 10.0.0.241/24
+        let expected = "version: 2\n\
+                        ethernets:\n\
+                        \x20 primary:\n\
+                        \x20   match:\n\
+                        \x20     name: enp1s0\n\
+                        \x20   dhcp4: true\n\
+                        \x20 net2:\n\
+                        \x20   match:\n\
+                        \x20     macaddress: \"02:11:22:33:44:55\"\n\
+                        \x20   dhcp4: false\n\
+                        \x20   dhcp6: false\n\
+                        \x20   accept-ra: false\n\
+                        \x20   addresses:\n\
+                        \x20     - \"10.0.0.241/24\"\n";
+        assert_eq!(
+            render_net2_network_config("02:11:22:33:44:55", "10.0.0.241/24"),
+            expected,
+        );
+    }
+
+    #[test]
+    fn net2_ipv6_off_runcmd_matches_bash_byte_for_byte() {
+        // Expected block captured from the bash twin:
+        //   emit_net2_ipv6_off_runcmd 02:11:22:33:44:55
+        let expected = concat!(
+            "  - |\n",
+            "    # Disable IPv6 on the second NIC (accept-ra/dhcp6 do not survive the NM renderer).\n",
+            "    dev=$(ip -o link | awk -v m=02:11:22:33:44:55 'tolower($0) ~ tolower(m) {gsub(/:/,\"\",$2); print $2; exit}')\n",
+            "    [ -n \"$dev\" ] || { echo \"hbird: no interface with MAC 02:11:22:33:44:55\" >&2; exit 0; }\n",
+            "    con=$(nmcli -g GENERAL.CONNECTION device show \"$dev\")\n",
+            "    [ -n \"$con\" ] || { echo \"hbird: no NM connection on $dev\" >&2; exit 0; }\n",
+            "    nmcli connection modify \"$con\" ipv6.method disabled\n",
+            "    nmcli connection up \"$con\" >/dev/null\n",
+        );
+        assert_eq!(net2_ipv6_off_runcmd("02:11:22:33:44:55"), expected);
+    }
+
+    #[test]
+    fn cp_user_data_opens_runcmd_with_ipv6_off_when_net2_set() {
+        let ud = render_cp_user_data(
+            "hbird-cp1",
+            "k",
+            true,
+            "v0.1.0",
+            true,
+            CpOverrides {
+                net2_mac: Some("02:11:22:33:44:55"),
+                ..Default::default()
+            },
+        );
+        let runcmd_pos = ud.find("runcmd:\n").expect("runcmd block");
+        // The IPv6-off entry must be the FIRST runcmd item (bash puts it
+        // before the bootc switch so it runs before any network egress).
+        assert_eq!(
+            &ud[runcmd_pos + "runcmd:\n".len()..runcmd_pos + "runcmd:\n".len() + 6],
+            "  - |\n",
+        );
+        assert!(ud.contains("no interface with MAC 02:11:22:33:44:55"));
+        let switch_pos = ud.find("bootc, switch").expect("switch entry");
+        assert!(
+            runcmd_pos < switch_pos && ud.find("  - |").expect("ipv6 entry") < switch_pos,
+            "ipv6-off must precede the bootc switch:\n{ud}"
+        );
+    }
+
+    #[test]
+    fn worker_user_data_net2_mac_alone_triggers_runcmd() {
+        // Bash gate (line 195): net2_mac is a runcmd trigger on its own.
+        let ud = render_worker_user_data(
+            "hbird-w1",
+            "k",
+            "kubeadm join ...",
+            false,
+            "v0.1.0",
+            WorkerOverrides {
+                net2_mac: Some("02:11:22:33:44:56"),
+                ..Default::default()
+            },
+        );
+        assert!(ud.contains("runcmd:\n"), "runcmd must be emitted:\n{ud}");
+        assert!(ud.contains("no interface with MAC 02:11:22:33:44:56"));
+        // And without it (all overrides off, switch off) — no runcmd.
+        let ud_off = render_worker_user_data(
+            "hbird-w1",
+            "k",
+            "kubeadm join ...",
+            false,
+            "v0.1.0",
+            WorkerOverrides::default(),
+        );
+        assert!(!ud_off.contains("runcmd:"), "no runcmd expected:\n{ud_off}");
+    }
+
+    #[test]
+    fn cloud_init_seed_cmd_with_network_config_feeds_all_tool_branches() {
+        let cmd = cloud_init_seed_cmd(
+            "hbird-cp1",
+            "/tmp/ud.yaml",
+            "/mnt/pool/hbird-cp1-seed.iso",
+            Some("/tmp/nc.yaml"),
+        );
+        // Staged into the ISO root as `network-config` (NoCloud contract).
+        assert!(
+            cmd.contains("cp /tmp/nc.yaml \"$_tmp/network-config\""),
+            "cmd: {cmd}"
+        );
+        // cloud-localds takes it as a flag…
+        assert!(
+            cmd.contains("cloud-localds --network-config \"$_tmp/network-config\""),
+            "cmd: {cmd}"
+        );
+        // …the ISO tools as another file argument.
+        assert_eq!(
+            cmd.matches("\"$_tmp/meta-data\" \"$_tmp/network-config\"")
+                .count(),
+            2,
+            "genisoimage + mkisofs branches must both carry the file: {cmd}"
+        );
+        // And the remote tmpfile is cleaned up.
+        assert!(
+            cmd.trim_end()
+                .ends_with("rm -f -- /tmp/ud.yaml; rm -f -- /tmp/nc.yaml"),
+            "cmd: {cmd}"
+        );
+    }
+
+    #[test]
+    fn cloud_init_seed_cmd_without_network_config_is_unchanged() {
+        let cmd = cloud_init_seed_cmd("h", "/tmp/ud.yaml", "/tmp/out.iso", None);
+        assert!(!cmd.contains("network-config"), "cmd: {cmd}");
+    }
+
+    // ---- CIDR helpers --------------------------------------------------------
+
+    #[test]
+    fn is_valid_cidr_matches_bash_regex_semantics() {
+        for ok in [
+            "10.0.0.241/24",
+            "0.0.0.0/0",
+            "255.255.255.255/32",
+            "192.168.1.0/9",
+        ] {
+            assert!(is_valid_cidr(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "10.0.0.256/24", // octet out of range — the exact bug the strict regex fixed
+            "1.2.3/99",
+            "10.0.0.241/244",
+            "10.0.0.241",
+            "10.0.0.01/24", // leading zero — regex alternation rejects
+            "10.0.0.1/033",
+            "a.b.c.d/24",
+            "",
+        ] {
+            assert!(!is_valid_cidr(bad), "{bad} should be invalid");
+        }
+    }
+
+    #[test]
+    fn ip_in_cidr_matches_bash_arithmetic() {
+        assert!(ip_in_cidr("10.244.3.7", "10.244.0.0/16"));
+        assert!(!ip_in_cidr("10.245.0.1", "10.244.0.0/16"));
+        assert!(ip_in_cidr("10.0.0.241", "0.0.0.0/0")); // p==0 → everything
+        assert!(ip_in_cidr("192.168.122.10", "192.168.122.10/32"));
+        assert!(!ip_in_cidr("192.168.122.11", "192.168.122.10/32"));
+    }
+
+    // ---- validate_extra_network branches --------------------------------------
+
+    /// Plan with a full, coherent EXTRA_NET family for 1 worker.
+    fn plan_with_extra_net() -> Plan {
+        let mut plan = Plan::from_args(&default_args(), cfg(Some(vec!["hbird-w1"]))).expect("plan");
+        plan.extra_network = Some("vf-pool".to_string());
+        plan.extra_net_cp_mac = Some("02:11:22:33:44:55".to_string());
+        plan.extra_net_cp_ip = Some("10.0.0.241/24".to_string());
+        plan.extra_net_worker_macs = Some(vec!["02:11:22:33:44:56".to_string()]);
+        plan.extra_net_worker_ips = Some(vec!["10.0.0.242/24".to_string()]);
+        plan
+    }
+
+    fn macs_for(plan: &Plan) -> PrimaryMacs {
+        resolve_primary_macs(
+            &plan.cp_name,
+            plan.cp_mac.as_deref(),
+            &plan.worker_names,
+            plan.worker_macs.as_deref(),
+        )
+        .expect("primary macs")
+    }
+
+    #[test]
+    fn validate_extra_network_off_and_clean_returns_none() {
+        let plan = minimal_plan();
+        let macs = macs_for(&plan);
+        assert!(validate_extra_network(&plan, &macs).expect("ok").is_none());
+    }
+
+    #[test]
+    fn validate_extra_network_happy_path_returns_family() {
+        let plan = plan_with_extra_net();
+        let macs = macs_for(&plan);
+        let (cp, workers) = validate_extra_network(&plan, &macs)
+            .expect("valid family")
+            .expect("family present");
+        assert_eq!(cp.network, "vf-pool");
+        assert_eq!(cp.mac, "02:11:22:33:44:55");
+        assert_eq!(cp.ip, "10.0.0.241/24");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].mac, "02:11:22:33:44:56");
+    }
+
+    #[test]
+    fn validate_extra_network_half_set_family_fails() {
+        let mut plan = minimal_plan();
+        plan.extra_net_cp_mac = Some("02:11:22:33:44:55".to_string());
+        let macs = macs_for(&plan);
+        let err = validate_extra_network(&plan, &macs).expect_err("half-set must fail");
+        assert!(
+            err.to_string().contains(
+                "EXTRA_NET_* values are set but EXTRA_NETWORK is empty — set EXTRA_NETWORK=<libvirt network> or clear the family"
+            ),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_extra_network_missing_cp_mac_fails() {
+        let mut plan = plan_with_extra_net();
+        plan.extra_net_cp_mac = None;
+        let macs = macs_for(&plan);
+        let err = validate_extra_network(&plan, &macs).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("EXTRA_NETWORK is set but EXTRA_NET_CP_MAC is missing/malformed"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_extra_network_malformed_cp_ip_fails() {
+        let mut plan = plan_with_extra_net();
+        plan.extra_net_cp_ip = Some("10.0.0.256/24".to_string());
+        let macs = macs_for(&plan);
+        let err = validate_extra_network(&plan, &macs).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("EXTRA_NET_CP_IP is missing/malformed (need CIDR like 10.0.0.241/24): '10.0.0.256/24'"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_extra_network_unparallel_arrays_fail() {
+        let mut plan = plan_with_extra_net();
+        plan.extra_net_worker_macs = Some(vec![]);
+        let macs = macs_for(&plan);
+        let err = validate_extra_network(&plan, &macs).expect_err("must fail");
+        assert!(
+            err.to_string().contains(
+                "EXTRA_NET_WORKER_MACS has 0 entries but WORKER_NAMES has 1 — the arrays must be parallel"
+            ),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_extra_network_duplicate_mac_fails_case_insensitively() {
+        let mut plan = plan_with_extra_net();
+        plan.extra_net_worker_macs = Some(vec!["02:11:22:33:44:55".to_uppercase()]);
+        let macs = macs_for(&plan);
+        let err = validate_extra_network(&plan, &macs).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("duplicate MAC in the EXTRA_NET_* family"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_extra_network_collision_with_primary_mac_fails() {
+        let mut plan = plan_with_extra_net();
+        // Point the CP's second NIC at the worker's (derived) primary MAC.
+        plan.extra_net_cp_mac = Some(derive_primary_mac("hbird-w1"));
+        let macs = macs_for(&plan);
+        let err = validate_extra_network(&plan, &macs).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("collides with the primary-NIC MAC of hbird-w1"),
+            "err: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_extra_network_duplicate_bare_ip_fails() {
+        let mut plan = plan_with_extra_net();
+        // Same bare address, different prefix — still a duplicate.
+        plan.extra_net_worker_ips = Some(vec!["10.0.0.241/16".to_string()]);
+        let macs = macs_for(&plan);
+        let err = validate_extra_network(&plan, &macs).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("duplicate address in the EXTRA_NET_* family: '10.0.0.241'"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_extra_network_overlap_with_pod_cidr_fails() {
+        let mut plan = plan_with_extra_net();
+        plan.pod_cidr = Some("10.0.0.0/8".to_string());
+        let macs = macs_for(&plan);
+        let err = validate_extra_network(&plan, &macs).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("EXTRA_NET address 10.0.0.241 falls inside POD_CIDR=10.0.0.0/8"),
+            "err: {err}"
+        );
+    }
+
+    // ---- host-side EXTRA_NETWORK probe parsers --------------------------------
+
+    #[test]
+    fn net_info_active_parses_yes_no_and_garbage() {
+        assert!(net_info_reports_active(
+            "Name:           vf-pool\nUUID:           x\nActive:         yes\n"
+        ));
+        assert!(!net_info_reports_active(
+            "Name:           vf-pool\nActive:         no\n"
+        ));
+        assert!(!net_info_reports_active(""));
+        assert!(!net_info_reports_active("Name: x\n"));
+    }
+
+    #[test]
+    fn hostdev_vf_count_only_counts_hostdev_pools() {
+        let hostdev = "<network>\n  <forward mode='hostdev' managed='yes'>\n    <address type='pci' domain='0x0000' bus='0x03' slot='0x10' function='0x0'/>\n    <address type='pci' domain='0x0000' bus='0x03' slot='0x10' function='0x2'/>\n  </forward>\n</network>";
+        assert_eq!(hostdev_vf_count(hostdev), Some(2));
+        let nat = "<network>\n  <forward mode='nat'/>\n</network>";
+        assert_eq!(hostdev_vf_count(nat), None);
+    }
+
+    #[test]
+    fn worker_ip_helper_treats_short_or_empty_entries_as_none() {
+        let mut plan = minimal_plan();
+        plan.worker_names = vec!["w1".to_string(), "w2".to_string()];
+        plan.worker_ips = Some(vec!["192.168.122.21".to_string(), String::new()]);
+        assert_eq!(worker_ip(&plan, 0), Some("192.168.122.21"));
+        assert_eq!(worker_ip(&plan, 1), None); // empty entry
+        plan.worker_ips = Some(vec!["192.168.122.21".to_string()]);
+        assert_eq!(worker_ip(&plan, 1), None); // short array
+        plan.worker_ips = None;
+        assert_eq!(worker_ip(&plan, 0), None);
+    }
+
     #[test]
     fn plan_carries_worker_default_when_unset() {
         let plan = Plan::from_args(&default_args(), cfg(None)).expect("plan");
@@ -1880,6 +3270,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: None,
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(
@@ -1917,6 +3308,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: None,
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(yaml.contains("runcmd:\n"), "must have runcmd: {yaml}");
@@ -1939,6 +3331,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: None,
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(
@@ -1964,6 +3357,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: None,
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(
@@ -1993,6 +3387,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: Some("10.244.0.0/16"),
                 service_cidr: Some("10.96.0.0/12"),
+                net2_mac: None,
             },
         );
         assert!(yaml.contains("write_files:"), "{yaml}");
@@ -2024,6 +3419,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: Some("10.244.0.0/16"),
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(yaml.contains("POD_CIDR=10.244.0.0/16"), "{yaml}");
@@ -2048,6 +3444,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: None,
                 service_cidr: Some("10.96.0.0/12"),
+                net2_mac: None,
             },
         );
         assert!(yaml.contains("write_files:"), "{yaml}");
@@ -2073,6 +3470,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: None,
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(yaml.contains("write_files:"), "{yaml}");
@@ -2110,6 +3508,7 @@ mod tests {
                 bootc_update_repo_k8s: Some("ghcr.io/example/repo"),
                 pod_cidr: None,
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(yaml.contains("/etc/hummingbird/bootc-update.env"), "{yaml}");
@@ -2133,6 +3532,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: None,
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(!yaml.contains("write_files:"), "must stay clean: {yaml}");
@@ -2154,6 +3554,7 @@ mod tests {
                 bootc_update_repo_k8s: Some(""),
                 pod_cidr: None,
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(!yaml.contains("write_files:"), "empty == unset: {yaml}");
@@ -2175,6 +3576,7 @@ mod tests {
                 bootc_update_repo_k8s: None,
                 pod_cidr: None,
                 service_cidr: None,
+                net2_mac: None,
             },
         );
         assert!(
@@ -2195,8 +3597,11 @@ mod tests {
             "kubeadm join ...",
             false,
             "v0.1.0",
-            Some("weekly"),
-            Some("ghcr.io/example/worker"),
+            WorkerOverrides {
+                bootc_update_schedule: Some("weekly"),
+                bootc_update_repo_worker: Some("ghcr.io/example/worker"),
+                net2_mac: None,
+            },
         );
         assert!(yaml.contains("/etc/hummingbird/worker-join.env"), "{yaml}");
         assert!(
@@ -2223,8 +3628,11 @@ mod tests {
             "kubeadm join ...",
             false,
             "v0.1.0",
-            Some(""),
-            Some(""),
+            WorkerOverrides {
+                bootc_update_schedule: Some(""),
+                bootc_update_repo_worker: Some(""),
+                net2_mac: None,
+            },
         );
         assert!(!yaml.contains("schedule.conf"), "empty == unset: {yaml}");
         assert!(!yaml.contains("bootc-update.env"), "empty == unset: {yaml}");
@@ -2239,8 +3647,11 @@ mod tests {
             join_cmd,
             false,
             "v0.1.0",
-            None,
-            None,
+            WorkerOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_worker: None,
+                net2_mac: None,
+            },
         );
         assert!(yaml.contains(join_cmd), "must embed join command: {yaml}");
         assert!(
@@ -2261,8 +3672,11 @@ mod tests {
             "kubeadm join ...",
             false,
             "v0.1.0",
-            None,
-            None,
+            WorkerOverrides {
+                bootc_update_schedule: None,
+                bootc_update_repo_worker: None,
+                net2_mac: None,
+            },
         );
         assert!(
             yaml.contains("hostname: hbird-w2\n"),
@@ -2272,7 +3686,12 @@ mod tests {
 
     #[test]
     fn cloud_init_seed_cmd_uses_cloud_localds() {
-        let cmd = cloud_init_seed_cmd("hbird-cp1", "/tmp/ud.yaml", "/mnt/pool/hbird-cp1-seed.iso");
+        let cmd = cloud_init_seed_cmd(
+            "hbird-cp1",
+            "/tmp/ud.yaml",
+            "/mnt/pool/hbird-cp1-seed.iso",
+            None,
+        );
         assert!(
             cmd.contains("cloud-localds"),
             "must try cloud-localds first: {cmd}"

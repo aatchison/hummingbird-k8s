@@ -137,6 +137,37 @@ pub struct ClusterConfig {
     /// `None` = use the image-baked default.
     pub service_cidr: Option<String>,
 
+    // ---- Primary-NIC MAC overrides (#409) -----------------------------------
+    /// Optional primary-NIC MAC override for the CP. When unset the deploy
+    /// derives a deterministic MAC from the domain name (bash twin:
+    /// `derive_primary_mac`), so a rebuilt VM keeps its DHCP lease.
+    pub cp_mac: Option<String>,
+    /// Optional per-worker primary-NIC MAC overrides. Indexed parallel to
+    /// `resolved_worker_names()`; the bash twin does NOT length-validate
+    /// this array — a missing/empty entry falls back to the name-derived
+    /// MAC (`${WORKER_MACS[$i]:-$(derive_primary_mac ...)}`).
+    pub worker_macs: Option<Vec<String>>,
+
+    // ---- Optional second NIC (#405-#408) ------------------------------------
+    /// Name of a pre-existing libvirt network to attach as each VM's
+    /// second NIC (VF pool, bridge, ...). Empty/unset = single-NIC deploy.
+    pub extra_network: Option<String>,
+    /// Second-NIC MAC for the CP. REQUIRED (by the deploy) when
+    /// `extra_network` is set — the cloud-init network-config matches the
+    /// NIC by MAC.
+    pub extra_net_cp_mac: Option<String>,
+    /// Second-NIC static address for the CP in CIDR form
+    /// (e.g. `10.0.0.241/24`). REQUIRED (by the deploy) when
+    /// `extra_network` is set.
+    pub extra_net_cp_ip: Option<String>,
+    /// Second-NIC MACs for the workers; must be parallel to
+    /// `resolved_worker_names()` when `extra_network` is set (the bash
+    /// twin length-validates the EXTRA_NET_* arrays, unlike WORKER_MACS).
+    pub extra_net_worker_macs: Option<Vec<String>>,
+    /// Second-NIC static addresses (CIDR form) for the workers; parallel
+    /// to `resolved_worker_names()` when `extra_network` is set.
+    pub extra_net_worker_ips: Option<Vec<String>>,
+
     // ---- Non-fatal parser diagnostics --------------------------------------
     /// Warnings emitted while parsing — keys present in the input that
     /// no `ClusterConfig` field consumed. Empty on a clean parse.
@@ -256,6 +287,70 @@ mod tests {
             cfg.resolved_worker_names(),
             vec!["hbird-cp1-w1".to_string(), "hbird-cp1-w2".to_string()]
         );
+    }
+
+    #[test]
+    fn mac_and_extra_net_family_parses_without_warnings() {
+        // The exact key set the bash twin reads for #405-#410. Before
+        // these fields existed every one of them tripped
+        // `Warning::UnknownKey` — which is how the deploy-parity gap
+        // went unnoticed (deploy-cluster never printed warnings).
+        let cfg = parse_str(
+            r#"
+            CP_NAME=hbird-cp1
+            SSH_PUBKEY_FILE=/k
+            CP_MAC=52:54:00:aa:bb:cc
+            WORKER_MACS=(52:54:00:aa:bb:01 52:54:00:aa:bb:02)
+            EXTRA_NETWORK=vf-pool
+            EXTRA_NET_CP_MAC=02:11:22:33:44:55
+            EXTRA_NET_CP_IP=10.0.0.241/24
+            EXTRA_NET_WORKER_MACS=(02:11:22:33:44:56 02:11:22:33:44:57)
+            EXTRA_NET_WORKER_IPS=(10.0.0.242/24 10.0.0.243/24)
+            "#,
+        )
+        .expect("dual-NIC config parses");
+        assert_eq!(cfg.cp_mac.as_deref(), Some("52:54:00:aa:bb:cc"));
+        assert_eq!(
+            cfg.worker_macs,
+            Some(vec![
+                "52:54:00:aa:bb:01".to_string(),
+                "52:54:00:aa:bb:02".to_string(),
+            ])
+        );
+        assert_eq!(cfg.extra_network.as_deref(), Some("vf-pool"));
+        assert_eq!(cfg.extra_net_cp_mac.as_deref(), Some("02:11:22:33:44:55"));
+        assert_eq!(cfg.extra_net_cp_ip.as_deref(), Some("10.0.0.241/24"));
+        assert_eq!(
+            cfg.extra_net_worker_macs,
+            Some(vec![
+                "02:11:22:33:44:56".to_string(),
+                "02:11:22:33:44:57".to_string(),
+            ])
+        );
+        assert_eq!(
+            cfg.extra_net_worker_ips,
+            Some(vec![
+                "10.0.0.242/24".to_string(),
+                "10.0.0.243/24".to_string()
+            ])
+        );
+        assert!(
+            cfg.warnings.is_empty(),
+            "no UnknownKey warnings for the parsed family: {:?}",
+            cfg.warnings
+        );
+    }
+
+    #[test]
+    fn mac_and_extra_net_family_defaults_to_none() {
+        let cfg = parse_str("CP_NAME=cp\nSSH_PUBKEY_FILE=/k\n").expect("parses");
+        assert_eq!(cfg.cp_mac, None);
+        assert_eq!(cfg.worker_macs, None);
+        assert_eq!(cfg.extra_network, None);
+        assert_eq!(cfg.extra_net_cp_mac, None);
+        assert_eq!(cfg.extra_net_cp_ip, None);
+        assert_eq!(cfg.extra_net_worker_macs, None);
+        assert_eq!(cfg.extra_net_worker_ips, None);
     }
 
     #[test]

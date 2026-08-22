@@ -91,6 +91,41 @@ pub struct Domain {
     pub name: String,
 }
 
+/// Full VM description for [`Connection::virt_install_vm`] (#405/#409).
+///
+/// Groups what would otherwise be seven positional arguments (clippy's
+/// `too_many_arguments`, and four adjacent `&str`s a call site could
+/// silently transpose). Lifetimed borrows — the spec is a per-call view,
+/// not an owned model.
+#[derive(Debug, Clone)]
+pub struct VmSpec<'a> {
+    /// Libvirt domain name.
+    pub name: &'a str,
+    /// Memory in MiB (`--memory`).
+    pub memory_mib: u64,
+    /// vCPU count (`--vcpus`).
+    pub vcpus: u32,
+    /// Primary qcow2 disk path.
+    pub disk_path: &'a str,
+    /// Optional cloud-init seed ISO attached as a read-only cdrom.
+    pub cdrom: Option<&'a str>,
+    /// Optional pinned MAC for the primary NIC (deploy-cluster #409).
+    /// Callers must pass a validated `aa:bb:cc:dd:ee:ff` string.
+    pub primary_mac: Option<&'a str>,
+    /// Optional second NIC (deploy-cluster #405 `EXTRA_NETWORK`).
+    pub extra_nic: Option<ExtraNic<'a>>,
+}
+
+/// Second-NIC attachment for [`VmSpec`]: a named libvirt network plus the
+/// guest-visible MAC that the cloud-init network-config matches on.
+#[derive(Debug, Clone)]
+pub struct ExtraNic<'a> {
+    /// Libvirt network name (`EXTRA_NETWORK`).
+    pub network: &'a str,
+    /// Validated `aa:bb:cc:dd:ee:ff` MAC (`EXTRA_NET_*_MAC`).
+    pub mac: &'a str,
+}
+
 /// Parsed `virsh dominfo <NAME>` output (subset).
 ///
 /// The bash twin's `update-cluster` flow reads exactly four fields from
@@ -631,27 +666,119 @@ impl Connection {
         disk_path: &str,
         cdrom: Option<&str>,
     ) -> Result<()> {
+        self.virt_install_vm(&VmSpec {
+            name,
+            memory_mib,
+            vcpus,
+            disk_path,
+            cdrom,
+            primary_mac: None,
+            extra_nic: None,
+        })
+    }
+
+    /// `virt-install` with full NIC control (#405/#409).
+    ///
+    /// Same command skeleton as [`Connection::virt_install`], plus:
+    /// - `spec.primary_mac` pins the primary NIC's MAC
+    ///   (`--network network=default,model=virtio,mac=<mac>`) so a rebuilt
+    ///   VM keeps its DHCP lease — bash twin `deploy-cluster.sh` #409.
+    /// - `spec.extra_nic` appends a second `--network network=<net>,mac=<mac>`.
+    ///   No `model=` on the second NIC: for a hostdev/VF-pool network
+    ///   libvirt ignores it (bash twin comment, deploy-cluster.sh ~L1010).
+    ///
+    /// Takes a [`VmSpec`] rather than positional args: seven-plus
+    /// parameters is clippy's `too_many_arguments` territory and the
+    /// string-typed fields would be silently transposable at call sites.
+    pub fn virt_install_vm(&self, spec: &VmSpec<'_>) -> Result<()> {
         let mut cmd = format!(
             "virt-install --connect {} --name {} --memory {} --vcpus {} --disk {},format=qcow2,bus=virtio",
             self.uri.remote_uri(),
-            shell_quote(name),
-            memory_mib,
-            vcpus,
-            shell_quote(disk_path),
+            shell_quote(spec.name),
+            spec.memory_mib,
+            spec.vcpus,
+            shell_quote(spec.disk_path),
         );
-        if let Some(cdrom_path) = cdrom {
+        if let Some(cdrom_path) = spec.cdrom {
             cmd.push_str(&format!(
                 " --disk path={},device=cdrom,readonly=on",
                 shell_quote(cdrom_path),
             ));
         }
+        // NIC arguments stay unquoted (byte-parity with the historical
+        // command shape pinned by tests/virsh_commands.rs). MACs are
+        // caller-validated `aa:bb:cc:dd:ee:ff` strings; only the operator-
+        // supplied extra-network NAME goes through shell_quote.
         cmd.push_str(
-            " --import --os-variant fedora-unknown --network network=default,model=virtio \
-             --graphics vnc,listen=127.0.0.1 --noautoconsole",
+            " --import --os-variant fedora-unknown --network network=default,model=virtio",
         );
+        if let Some(mac) = spec.primary_mac {
+            cmd.push_str(&format!(",mac={mac}"));
+        }
+        if let Some(extra) = &spec.extra_nic {
+            cmd.push_str(&format!(
+                " --network network={},mac={}",
+                shell_quote(extra.network),
+                extra.mac,
+            ));
+        }
+        cmd.push_str(" --graphics vnc,listen=127.0.0.1 --noautoconsole");
         self.run(&cmd)
             .map(|_| ())
             .inspect_err(|err| tracing::debug!(error = ?err, "virt-install failed"))
+    }
+
+    /// `virsh net-dumpxml <network>` — raw XML of a libvirt network.
+    ///
+    /// Used by deploy-cluster's DHCP-reservation idempotency probe (bash
+    /// twin `ensure_dhcp_reservation`, deploy-cluster.sh #409): the caller
+    /// greps the XML for an existing `mac='…'` / `ip='…'` entry before
+    /// attempting `net-update`.
+    pub fn net_dumpxml(&self, network: &str) -> Result<String> {
+        let cmd = format!(
+            "virsh -c {} net-dumpxml {}",
+            self.uri.remote_uri(),
+            shell_quote(network),
+        );
+        self.run(&cmd)
+    }
+
+    /// `virsh net-info <network>` — raw human-readable network summary.
+    ///
+    /// deploy-cluster's EXTRA_NETWORK preflight (#405) reads two facts
+    /// from it: whether the network is defined at all (exit code) and the
+    /// `Active:` line (bash: `awk '/^Active:/{print $2}' | grep -qi yes`).
+    pub fn net_info(&self, network: &str) -> Result<String> {
+        let cmd = format!(
+            "virsh -c {} net-info {}",
+            self.uri.remote_uri(),
+            shell_quote(network),
+        );
+        self.run(&cmd)
+    }
+
+    /// `virsh net-update <network> add ip-dhcp-host "<host …/>" --live --config`.
+    ///
+    /// Adds a DHCP reservation so a VM's primary address is a RESERVATION,
+    /// not merely a sticky lease. XML payload mirrors the bash twin
+    /// byte-for-byte: `<host mac='<mac>' name='<name>' ip='<ip>'/>`.
+    pub fn net_update_add_ip_dhcp_host(
+        &self,
+        network: &str,
+        mac: &str,
+        name: &str,
+        ip: &str,
+    ) -> Result<()> {
+        let xml = format!("<host mac='{mac}' name='{name}' ip='{ip}'/>");
+        let cmd = format!(
+            "virsh -c {} net-update {} add ip-dhcp-host {} --live --config",
+            self.uri.remote_uri(),
+            shell_quote(network),
+            shell_quote(&xml),
+        );
+        self.run(&cmd)
+            .map(|_| ())
+            .inspect_err(|err| tracing::debug!(error = ?err, "net-update failed"))
     }
 
     /// Execute an arbitrary shell command via this connection's transport.
