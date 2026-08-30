@@ -2416,8 +2416,11 @@ pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
     // Triple-quoted TOML string (`"""..."""`) matches the bash twin's
     // `printf 'key = """%s"""\n'` output and tolerates embedded double-quotes
     // in unusual key material.
+    // VM_USER: default to "core" when unset (matches bash `: "${VM_USER:=core}"`).
+    let user_name = std::env::var("VM_USER").unwrap_or_else(|_| "core".to_string());
+
     format!(
-        "[[customizations.user]]\nname = \"core\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n\n[[customizations.user]]\nname = \"root\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n"
+        "[[customizations.user]]\nname = \"{user_name}\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n\n[[customizations.user]]\nname = \"root\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n"
     )
 }
 
