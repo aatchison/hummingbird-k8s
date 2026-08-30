@@ -2399,18 +2399,21 @@ pub(crate) fn git_diff_cmd(
 
 /// Generate a bib TOML configuration with `core` and `root` users.
 ///
-/// Emits two `[[customizations.user]]` stanzas, each with only the `key`
-/// field set to `pubkey_contents`. Password, groups, and env-knobs
-/// (VM_USER, ENABLE_ROOT_SSH) are not emitted — filed as a parity
-/// follow-up.
+/// Emits two `[[customizations.user]]` stanzas: a non-root user stanza
+/// always, plus a root user stanza only when `ENABLE_ROOT_SSH` is not
+/// `"0"` (default `"1"`, matching the bash twin rule at lib/build-common.sh:139
+/// and :226-234). VM_PASSWORD is hashed with `openssl passwd -6` before it
+/// is emitted as a `password` field - never plaintext. The root stanza
+/// carries the real pubkey (format!-interpolated), not the obsolete
+/// literal `{pubkey_contents}` placeholder.
 ///
-/// Uses the `key` field (BIB's `UserCustomization.Key` — a single
+/// Uses the `key` field (BIB's `UserCustomization.Key` - a single
 /// authorized-key string). The earlier `ssh_authorized_keys = [...]` array
 /// form caused BIB to reject the config with "unknown keys found"; `key`
 /// is the correct field. Matches the bash twin's `_render_user_block`
 /// which emits `key = """<pubkey>"""`. Fixed by S4-bug #33b.
 ///
-/// `pubkey_contents` must not contain `"""` — true for all standard SSH
+/// `pubkey_contents` must not contain `"""` - true for all standard SSH
 /// public key material.
 pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
     // VM_USER: default to "core" when unset (matches bash `: "${VM_USER:=core}"`).
@@ -2465,17 +2468,92 @@ pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
         _ => String::new()
     };
 
-    // ENABLE_ROOT_SSH env var is honored at the caller level.
-    // For now, the Rust twin always emits the root block, matching bash twin default.
-    let root_block = "
-[[customizations.user]]
-name = \"root\"
-key = \"\"\"{pubkey_contents}\"\"\"";
+    // ENABLE_ROOT_SSH env var: default "1" (matching bash twin `: "${ENABLE_ROOT_SSH:=1}"`).
+    // Root block is emitted only when ENABLE_ROOT_SSH != "0".
+    let enable_root_ssh = std::env::var("ENABLE_ROOT_SSH").unwrap_or_else(|_| "1".to_string());
+    let root_section = if enable_root_ssh != "0" {
+        format!(
+            "\n[[customizations.user]]\nname = \"root\"\nkey = \"\"\"{pubkey}\"\"\"",
+            pubkey = pubkey_contents.trim()
+        )
+    } else {
+        String::new()
+    };
 
     format!(
-        "[[customizations.user]]\nname = \"{user_name}\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n{groups_str}\n{password_str}{root_block}"
+        "[[customizations.user]]\nname = \"{user_name}\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n{groups_str}\n{password_str}{root_section}"
     )
 
+}
+
+/// Pure (env-free) core of [`render_bib_config`]: a parameterized twin used
+/// to cover the `ENABLE_ROOT_SSH=0` branch in tests without mutating process
+/// env vars (unsafe under edition 2024, and this crate forbids
+/// `unsafe_code` at workspace level). Call sites that need the default
+/// env behavior use [`render_bib_config`]; tests branch on the explicit
+/// `enable_root_ssh` parameter.
+pub(crate) fn render_bib_config_with(
+    pubkey_contents: &str,
+    user_name: &str,
+    groups: Option<&str>,
+    password: Option<&str>,
+    enable_root_ssh: &str,
+) -> String {
+    let groups_str = match (groups, user_name) {
+        (Some(groups), name) if name != "root" => {
+            let items: Vec<&str> = groups
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if items.is_empty() {
+                String::new()
+            } else {
+                let quoted: Vec<String> = items.iter().map(|s| {
+                    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("\"{}\"", escaped)
+                }).collect();
+                format!("groups = [{}]", quoted.join(", "))
+            }
+        }
+        _ => String::new()
+    };
+
+    let password_str = match password {
+        Some(pw) if !pw.is_empty() => {
+            use std::process::Command;
+            let output = Command::new("openssl")
+                .args(&["passwd", "-6", pw.trim()])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let pwd_str = String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .to_string();
+                    if !pwd_str.is_empty() {
+                        format!("password = \"{}\"", pwd_str)
+                    } else {
+                        String::new()
+                    }
+                }
+                _ => String::new(),
+            }
+        }
+        _ => String::new()
+    };
+
+    let root_section = if enable_root_ssh != "0" {
+        format!(
+            "\n[[customizations.user]]\nname = \"root\"\nkey = \"\"\"{pubkey}\"\"\"",
+            pubkey = pubkey_contents.trim()
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "[[customizations.user]]\nname = \"{user_name}\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n{groups_str}\n{password_str}{root_section}"
+    )
 }
 
 // ---- Image ref helpers (for tests + dry-run) --------------------------------
@@ -3222,6 +3300,7 @@ mod tests {
 
     #[test]
     fn render_bib_config_embeds_pubkey() {
+        // --- Default: ENABLE_ROOT_SSH=1 (root stanza emitted, key appears twice) ---
         let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI test-key";
         let toml = render_bib_config(key);
         assert!(
@@ -3232,7 +3311,19 @@ mod tests {
         assert_eq!(
             toml.matches(key).count(),
             2,
-            "key must appear for both users"
+            "key must appear for both users when ENABLE_ROOT_SSH=1"
+        );
+        // --- ENABLE_ROOT_SSH=0 (root stanza omitted, key appears once) ---
+        let toml0 = render_bib_config_with(key, "core", None, None, "0");
+        assert!(
+            toml0.contains(key),
+            "pubkey must appear in rendered TOML (ENABLE_ROOT_SSH=0); toml0: {toml0}"
+        );
+        // Should appear only once (core user only, root omitted).
+        assert_eq!(
+            toml0.matches(key).count(),
+            1,
+            "key should appear once when ENABLE_ROOT_SSH=0 (root omitted)"
         );
     }
 
@@ -3244,13 +3335,11 @@ mod tests {
     #[test]
     fn render_bib_config_parses_as_valid_toml_with_key_per_user() {
         let pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI testuser@testhost";
+        // --- Case 1: ENABLE_ROOT_SSH=1 (default) -> two entries, both with key ---
         let rendered = render_bib_config(pubkey);
-
-        // Must parse as valid TOML without errors.
         let val: toml::Value =
             toml::from_str(&rendered).expect("render_bib_config must produce valid TOML");
 
-        // Must have a customizations.user array with exactly two entries.
         let users = val
             .get("customizations")
             .and_then(|c| c.get("user"))
@@ -3259,11 +3348,8 @@ mod tests {
         assert_eq!(
             users.len(),
             2,
-            "must have exactly 2 user entries (core + root)"
+            "must have exactly 2 user entries (core + root) when ENABLE_ROOT_SSH=1"
         );
-
-        // Each entry must have `key` (BIB's authorized-key field) and must NOT
-        // have `ssh_authorized_keys` (the field BIB rejects as unknown).
         for user in users {
             let name = user
                 .get("name")
@@ -3282,6 +3368,49 @@ mod tests {
                 "user '{name}' must NOT have ssh_authorized_keys (BIB rejects it as unknown)"
             );
         }
+        // --- Case 2: ENABLE_ROOT_SSH=0 -> one entry (core only) ---
+        let rendered0 = render_bib_config_with(pubkey, "core", None, None, "0");
+        let val0: toml::Value =
+            toml::from_str(&rendered0).expect("render_bib_config must produce valid TOML");
+        let users0 = val0
+            .get("customizations")
+            .and_then(|c| c.get("user"))
+            .and_then(|u| u.as_array())
+            .expect("customizations.user must be a TOML array");
+        assert_eq!(
+            users0.len(),
+            1,
+            "must have exactly 1 user entry when ENABLE_ROOT_SSH=0 (root omitted)"
+        );
+        let name0 = users0[0]
+            .get("name")
+            .and_then(|n| n.as_str())
+            .expect("user entry must have a name");
+        assert_eq!(name0, "core", "core user name must be preserved");
+        let key_val0 = users0[0]
+            .get("key")
+            .and_then(|k| k.as_str())
+            .expect("user must have a 'key' field");
+        assert!(
+            key_val0.contains(pubkey),
+            "core user key must contain the pubkey when ENABLE_ROOT_SSH=0"
+        );
+        assert!(
+            users0[0].get("ssh_authorized_keys").is_none(),
+            "core user must NOT have ssh_authorized_keys when ENABLE_ROOT_SSH=0"
+        );
+        // --- VM_PASSWORD: must render as $6$ crypt hash, never plaintext ---
+        let rendered_pw = render_bib_config_with(pubkey, "core", None, Some("mypassword"), "1");
+        let pwd_contains_6hash = rendered_pw.contains("$6$");
+        let pwd_not_plain = !rendered_pw.contains("mypassword");
+        assert!(
+            pwd_contains_6hash,
+            "VM_PASSWORD must render as $6$ crypt hash; got: {rendered_pw}"
+        );
+        assert!(
+            pwd_not_plain,
+            "VM_PASSWORD must NOT render as plaintext; got: {rendered_pw}"
+        );
     }
 
     // ---- S2c helper tests --------------------------------------------------
