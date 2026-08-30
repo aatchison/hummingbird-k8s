@@ -2413,15 +2413,69 @@ pub(crate) fn git_diff_cmd(
 /// `pubkey_contents` must not contain `"""` — true for all standard SSH
 /// public key material.
 pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
-    // Triple-quoted TOML string (`"""..."""`) matches the bash twin's
-    // `printf 'key = """%s"""\n'` output and tolerates embedded double-quotes
-    // in unusual key material.
     // VM_USER: default to "core" when unset (matches bash `: "${VM_USER:=core}"`).
     let user_name = std::env::var("VM_USER").unwrap_or_else(|_| "core".to_string());
 
+    // VM_USER_GROUPS: comma-separated groups for the non-root user.
+    let vm_user_groups = std::env::var("VM_USER_GROUPS").ok();
+    let groups_str = match (&vm_user_groups, user_name.as_str()) {
+        (Some(groups), name) if name != "root" => {
+            let items: Vec<&str> = groups
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if items.is_empty() {
+                String::new()
+            } else {
+                let quoted: Vec<String> = items.iter().map(|s| {
+                    // Escape double quotes and backslashes for TOML string.
+                    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("\"{}\"", escaped)
+                }).collect();
+                format!("groups = [{}]", quoted.join(", "))
+            }
+        }
+        _ => String::new()
+    };
+
+    // VM_PASSWORD: only emit when set (matching the bash twin's
+    // `[[ -n "${VM_PASSWORD:-}" ]]` conditional and `openssl passwd -6` hash).
+    let vm_password = std::env::var("VM_PASSWORD").ok();
+    let password_str = match &vm_password {
+        Some(pw) if !pw.is_empty() => {
+            use std::process::Command;
+            let output = Command::new("openssl")
+                .args(&["passwd", "-6", pw.trim()])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let pwd_str = String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .to_string();
+                    if !pwd_str.is_empty() {
+                        format!("password = \"{}\"", pwd_str)
+                    } else {
+                        String::new()
+                    }
+                }
+                _ => String::new(),
+            }
+        }
+        _ => String::new()
+    };
+
+    // ENABLE_ROOT_SSH env var is honored at the caller level.
+    // For now, the Rust twin always emits the root block, matching bash twin default.
+    let root_block = "
+[[customizations.user]]
+name = \"root\"
+key = \"\"\"{pubkey_contents}\"\"\"";
+
     format!(
-        "[[customizations.user]]\nname = \"{user_name}\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n\n[[customizations.user]]\nname = \"root\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n"
+        "[[customizations.user]]\nname = \"{user_name}\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n{groups_str}\n{password_str}{root_block}"
     )
+
 }
 
 // ---- Image ref helpers (for tests + dry-run) --------------------------------
