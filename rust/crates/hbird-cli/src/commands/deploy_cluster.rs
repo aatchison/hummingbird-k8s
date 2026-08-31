@@ -2431,15 +2431,18 @@ pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
             if items.is_empty() {
                 String::new()
             } else {
-                let quoted: Vec<String> = items.iter().map(|s| {
-                    // Escape double quotes and backslashes for TOML string.
-                    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-                    format!("\"{}\"", escaped)
-                }).collect();
+                let quoted: Vec<String> = items
+                    .iter()
+                    .map(|s| {
+                        // Escape double quotes and backslashes for TOML string.
+                        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                        format!("\"{}\"", escaped)
+                    })
+                    .collect();
                 format!("groups = [{}]", quoted.join(", "))
             }
         }
-        _ => String::new()
+        _ => String::new(),
     };
 
     // VM_PASSWORD: only emit when set (matching the bash twin's
@@ -2449,13 +2452,11 @@ pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
         Some(pw) if !pw.is_empty() => {
             use std::process::Command;
             let output = Command::new("openssl")
-                .args(&["passwd", "-6", pw.trim()])
+                .args(["passwd", "-6", pw.trim()])
                 .output();
             match output {
                 Ok(out) if out.status.success() => {
-                    let pwd_str = String::from_utf8_lossy(&out.stdout)
-                        .trim()
-                        .to_string();
+                    let pwd_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !pwd_str.is_empty() {
                         format!("password = \"{}\"", pwd_str)
                     } else {
@@ -2465,7 +2466,7 @@ pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
                 _ => String::new(),
             }
         }
-        _ => String::new()
+        _ => String::new(),
     };
 
     // ENABLE_ROOT_SSH env var: default "1" (matching bash twin `: "${ENABLE_ROOT_SSH:=1}"`).
@@ -2483,7 +2484,6 @@ pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
     format!(
         "[[customizations.user]]\nname = \"{user_name}\"\nkey = \"\"\"{pubkey_contents}\"\"\"\n{groups_str}\n{password_str}{root_section}"
     )
-
 }
 
 /// Pure (env-free) core of [`render_bib_config`]: a parameterized twin used
@@ -2492,6 +2492,7 @@ pub(crate) fn render_bib_config(pubkey_contents: &str) -> String {
 /// `unsafe_code` at workspace level). Call sites that need the default
 /// env behavior use [`render_bib_config`]; tests branch on the explicit
 /// `enable_root_ssh` parameter.
+#[allow(dead_code)]
 pub(crate) fn render_bib_config_with(
     pubkey_contents: &str,
     user_name: &str,
@@ -2509,27 +2510,28 @@ pub(crate) fn render_bib_config_with(
             if items.is_empty() {
                 String::new()
             } else {
-                let quoted: Vec<String> = items.iter().map(|s| {
-                    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-                    format!("\"{}\"", escaped)
-                }).collect();
+                let quoted: Vec<String> = items
+                    .iter()
+                    .map(|s| {
+                        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                        format!("\"{}\"", escaped)
+                    })
+                    .collect();
                 format!("groups = [{}]", quoted.join(", "))
             }
         }
-        _ => String::new()
+        _ => String::new(),
     };
 
     let password_str = match password {
         Some(pw) if !pw.is_empty() => {
             use std::process::Command;
             let output = Command::new("openssl")
-                .args(&["passwd", "-6", pw.trim()])
+                .args(["passwd", "-6", pw.trim()])
                 .output();
             match output {
                 Ok(out) if out.status.success() => {
-                    let pwd_str = String::from_utf8_lossy(&out.stdout)
-                        .trim()
-                        .to_string();
+                    let pwd_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !pwd_str.is_empty() {
                         format!("password = \"{}\"", pwd_str)
                     } else {
@@ -2539,7 +2541,7 @@ pub(crate) fn render_bib_config_with(
                 _ => String::new(),
             }
         }
-        _ => String::new()
+        _ => String::new(),
     };
 
     let root_section = if enable_root_ssh != "0" {
