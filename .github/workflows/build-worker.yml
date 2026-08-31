@@ -142,6 +142,14 @@ jobs:
           exit-code: '0'
           format: sarif
           output: trivy-results.sarif
+      - name: Upload Trivy SARIF
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-hummingbird-k8s-worker
+
 
       # github/codeql-action/upload-sarif is a sub-path action not mirrored
       # on Forgejo; it causes parse-time rejection even behind an if-guard.
