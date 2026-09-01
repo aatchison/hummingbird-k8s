@@ -20,7 +20,7 @@
 
 setup() {
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
-  GATE="$REPO_ROOT/scripts/ci-trivy-gate.sh"
+  GATE="$REPO_ROOT/tests/scripts/ci-trivy-gate-test-wrapper.sh"
   TMP="$BATS_TEST_TMPDIR"
 
   BASELINE="$TMP/baseline"
@@ -202,6 +202,26 @@ _run_gate() { # $1 = scan command
 
 @test "PREDICTED RED: Vulnerabilities is a scalar" {
   _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":7}]}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: vulnerability entry is not an object" {
+  _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":[\"broken\"]}]}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: vulnerability entry missing id" {
+  _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":[{}]}]}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: mixed valid and malformed vulnerability entries" {
+  _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":[{\"VulnerabilityID\":\"CVE-2025-68121\"},{}]}]}'"
+  [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
+}
+
+@test "PREDICTED RED: vulnerability id must be a non-empty string" {
+  _run_gate "printf '{\"Results\":[{\"Vulnerabilities\":[{\"VulnerabilityID\":null}]}]}'"
   [ "$status" -ne 0 ]; [[ "$output" == *"expected scan schema"* ]]
 }
 

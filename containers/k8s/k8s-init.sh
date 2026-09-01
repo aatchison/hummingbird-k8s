@@ -236,7 +236,7 @@ KUBECONFIG=/etc/kubernetes/admin.conf kubectl taint nodes --all \
   node-role.kubernetes.io/control-plane- 2>/dev/null || true
 
 # World-readable admin.conf for the wheel user to use kubectl.
-# kubeadm v1.31 may tighten /etc/kubernetes to 0755 (or even 0700 in some
+# kubeadm may tighten /etc/kubernetes to 0755 (or even 0700 in some
 # distros' kubelet packaging) during init — re-assert traversability so the
 # wheel user can actually read admin.conf. See issue #36.
 chmod 0755 /etc/kubernetes
