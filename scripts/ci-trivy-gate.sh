@@ -16,8 +16,8 @@
 #                     swapping N old ids for N new ones).
 #   2. count ratchet— fail above the committed baseline; notice below it.
 #
-# The scan command is injectable via SCAN_CMD so the failure modes are
-# testable without a container engine. Default is the real trivy invocation.
+# The production path always invokes the pinned Trivy image directly.
+# Tests use a separate wrapper and fake docker.
 #
 # Usage: ci-trivy-gate.sh <flavor> <baseline-file> <image-ref>
 set -euo pipefail
