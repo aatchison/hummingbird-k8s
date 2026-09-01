@@ -16,14 +16,14 @@ FROM quay.io/hummingbird-community/bootc-os@sha256:2e29eb2ba2d17b304529e7b2503ea
 # schedule) — the pin must move before then (#399).
 ARG FEDORA_RELEASE=43
 
-# K8S_VERSION pins the major.minor only (e.g. v1.31). pkgs.k8s.io URLs are
-# major.minor-scoped, so dnf installs the latest 1.31.x patch at build time.
+# K8S_VERSION pins the major.minor only (e.g. v1.32). pkgs.k8s.io URLs are
+# major.minor-scoped, so dnf installs the latest 1.32.x patch at build time.
 # This means patch-level CVE fixes ride in on every rebuild without manual
 # bumps; the trade-off is determinism — two builds of the same Containerfile
 # at different times can produce different images. Acceptable for a lab.
 #
 # Bump deliberately (e.g., v1.32) when promoting to a new minor release.
-ARG K8S_VERSION=v1.31
+ARG K8S_VERSION=v1.32
 ARG POD_CIDR=10.244.0.0/16
 ARG APISERVER_EXTRA_SANS=127.0.0.1,localhost
 

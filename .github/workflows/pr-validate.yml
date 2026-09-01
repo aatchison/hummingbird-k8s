@@ -13,7 +13,7 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Run shellcheck (errors fail; warnings printed)
         run: |
           shopt -s nullglob
@@ -33,7 +33,7 @@ jobs:
   hadolint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Run hadolint on each Containerfile (errors fail; warnings printed)
         run: |
           shopt -s nullglob
@@ -41,7 +41,7 @@ jobs:
           # Per-flavor Containerfiles live under containers/<flavor>/.
           for f in containers/*/Containerfile; do
             echo "::group::hadolint $f"
-            docker run --rm -i hadolint/hadolint:latest hadolint --failure-threshold error - < "$f" || rc=$?
+            docker run --rm -i hadolint/hadolint@sha256:30a8fd2e785ab6176eed53f74769e04f125afb2f74a6c52aef7d463583b6d45e hadolint --failure-threshold error - < "$f" || rc=$?
             echo "::endgroup::"
           done
           exit $rc
@@ -49,7 +49,7 @@ jobs:
   actionlint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Run actionlint (workflow YAML only, no embedded-script linting)
         run: |
           ACTIONLINT_VERSION=1.7.7
@@ -65,7 +65,7 @@ jobs:
     # Bakes repo into bats/bats image via docker build (no bind mounts needed).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: bats unit tests for lib/
         run: |
           docker build -t ci-bats-lib -f - . <<'DOCKERFILE'
@@ -80,11 +80,14 @@ jobs:
     # post-v0.1.0 cutover (#353). Same docker build pattern as unit-tests-lib.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: bats unit tests for scripts/
         run: |
           docker build -t ci-bats-scripts -f - . <<'DOCKERFILE'
           FROM bats/bats@sha256:79d759937f23b7ca8743b01c1a5e3843c556edee1bb29cb3450d55c8436e1300
+          # ci-trivy-gate.sh parses scan JSON with jq; the bats base image
+          # does not ship it, so its tests would error out without this.
+          RUN apk add --no-cache jq
           COPY . /repo
           WORKDIR /repo
           DOCKERFILE
@@ -99,7 +102,7 @@ jobs:
     # a drift fence that never ran. Same docker build pattern as the others.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: bats unit tests for containers/
         run: |
           docker build -t ci-bats-containers -f - . <<'DOCKERFILE'
@@ -112,7 +115,7 @@ jobs:
   render-bib-config-snapshot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Render bib-config fixtures and diff against committed snapshots
         run: |
           set -euo pipefail
@@ -141,7 +144,7 @@ jobs:
     # containerfile-build downloads packages during docker build).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
       - name: Run bats Makefile tests
         run: |
           docker build -t ci-bats-make -f - . <<'DOCKERFILE'
@@ -159,7 +162,7 @@ jobs:
       matrix:
         flavor: [k8s, k8s-worker]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
 
       - name: Stub worker-join.env for the worker OCI build
         if: matrix.flavor == 'k8s-worker'
@@ -196,47 +199,27 @@ jobs:
       # exit-code 0 — so a vulnerable base layer was invisible until after
       # merge, and never failed anything.
       #
-      # This is a RATCHET, not an absolute gate: measured on the images at
-      # the time it was added, both carry 12 fixable CRITICALs inherited
-      # from the base image (CVE-2025-68121 Go stdlib crypto/tls cert
-      # validation, CVE-2026-33186, GHSA-5w5r-mf82-595p capnp). A blocking
-      # gate would therefore fail every PR on day one. Instead we fail only
-      # when a PR pushes the count ABOVE the committed baseline, so
-      # inherited debt does not block work while regressions still cannot
-      # land silently. Lower the baseline when the base image is bumped —
-      # it only ever ratchets down.
-      - name: Trivy scan (ratchet against committed baseline)
+      # This is a RATCHET, not an absolute gate. The images had existing
+      # fixable CRITICAL findings when this was introduced, from both the
+      # base and layered packages. A zero-tolerance gate would have failed
+      # every PR on day one. Instead we fail only when a PR pushes the count
+      # ABOVE the committed baseline, so existing debt does not block work
+      # while regressions still cannot land silently. Lower the baseline
+      # after any dependency bump that reduces the count — it only ratchets
+      # down.
+      # The gate logic lives in scripts/ci-trivy-gate.sh, NOT inline here.
+      # Two consecutive fail-open defects shipped while it was an inline
+      # `run:` block, because embedded CI shell has no tests. As a script it
+      # is linted by the shellcheck job and exercised by
+      # tests/scripts/ci-trivy-gate.bats, whose predicted-red cases assert
+      # the gate can actually go RED (scanner failure, malformed output,
+      # count>0 with no ids, vendor-namespace ids, and equal-count id
+      # substitution).
+      - name: Trivy scan (fail-closed count ratchet + known-id gate)
         env:
-          IMAGE_TAG: ${{ steps.cf.outputs.image }}:pr-${{ github.event.pull_request.number || github.run_id }}
+          TRIVY: aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7
         run: |
-          set -euo pipefail
-          baseline_file=.github/trivy-critical-baseline
-          baseline=$(grep -E "^${{ matrix.flavor }}=" "$baseline_file" | cut -d= -f2)
-          [ -n "$baseline" ] || { echo "no baseline row for ${{ matrix.flavor }} in $baseline_file" >&2; exit 1; }
-
-          # Count via trivy's own template renderer — no inline python, so no
-          # heredoc-indentation or shell-quoting hazards. NOTE: the naive
-          # `{{ len (index . 0).Vulnerabilities }}` returns 0 here — the
-          # criticals are spread across SEVERAL result sections (OS packages,
-          # each gobinary), not just the first. Verified against a real image:
-          # this template returns 12, the naive one returns 0.
-          count=$(docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest image --scanners vuln \
-            --severity CRITICAL --ignore-unfixed \
-            --format template --template '{{- range . }}{{- range .Vulnerabilities }}x{{ end }}{{ end }}' \
-            "$IMAGE_TAG" 2>/dev/null | tr -dc 'x' | wc -c)
-          count=$(printf '%s' "${count:-0}" | tr -d '[:space:]')
-          echo "fixable CRITICAL count: $count (baseline $baseline)"
-
-          # Always show what they are, so the log is actionable.
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest image --scanners vuln \
-            --severity CRITICAL --ignore-unfixed "$IMAGE_TAG" || true
-
-          if [ "$count" -gt "$baseline" ]; then
-            echo "::error::${{ matrix.flavor }}: $count fixable CRITICAL vulns exceeds baseline $baseline — this PR introduces new critical vulnerabilities." >&2
-            exit 1
-          fi
-          if [ "$count" -lt "$baseline" ]; then
-            echo "::notice::${{ matrix.flavor }}: criticals dropped to $count (baseline $baseline) — lower the baseline in $baseline_file to lock in the improvement."
-          fi
+          scripts/ci-trivy-gate.sh \
+            "${{ matrix.flavor }}" \
+            .github/trivy-critical-baseline \
+            "${{ steps.cf.outputs.image }}:pr-${{ github.event.pull_request.number || github.run_id }}"

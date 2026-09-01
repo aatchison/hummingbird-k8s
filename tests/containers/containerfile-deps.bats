@@ -32,6 +32,8 @@
 #      the exclude list that shields the pkgs.k8s.io version locks
 #      (cri-o, cri-tools — incl. Fedora's versioned names like cri-tools1.35,
 #      hence the glob — and kubernetes-cni via containernetworking-plugins).
+#   3. Kubernetes minor symmetry: control-plane and worker Containerfiles must
+#      carry the same `ARG K8S_VERSION`, so kubelet/kubeadm cannot drift.
 #
 # Run via:
 #   bats tests/containers/containerfile-deps.bats
@@ -115,6 +117,23 @@ _extract_primary_dnf_install() {
       return 1
     }
   done
+}
+
+# ---- Cross-flavor version pin fence --------------------------------------
+
+_k8s_version_arg() {
+  sed -n 's/^ARG K8S_VERSION=\(v[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$1" | head -1
+}
+
+@test "containerfiles: CP and worker agree on one ARG K8S_VERSION" {
+  cp_version="$(_k8s_version_arg "$CP_CONTAINERFILE")"
+  worker_version="$(_k8s_version_arg "$WORKER_CONTAINERFILE")"
+  [ -n "$cp_version" ] || { echo "containers/k8s/Containerfile: ARG K8S_VERSION missing or malformed"; return 1; }
+  [ -n "$worker_version" ] || { echo "containers/k8s-worker/Containerfile: ARG K8S_VERSION missing or malformed"; return 1; }
+  [ "$cp_version" = "$worker_version" ] || {
+    echo "K8S_VERSION skew: CP=$cp_version worker=$worker_version — bump both flavors together"
+    return 1
+  }
 }
 
 # ---- Fedora era pin fences (#397/#399) ----------------------------------

@@ -1072,8 +1072,8 @@ mod tests {
     #[test]
     fn live_pin_pair_is_supported() {
         // containers/k8s/k8s-init.sh: --version 1.17.16
-        // containers/k8s/Containerfile: ARG K8S_VERSION=v1.31
-        let v = classify(&pins_from("1.17.16", "v1.31"));
+        // containers/k8s/Containerfile: ARG K8S_VERSION=v1.32
+        let v = classify(&pins_from("1.17.16", "v1.32"));
         assert!(
             matches!(v, Verdict::Supported { .. }),
             "committed pins must be compatible, got {v:?}"
