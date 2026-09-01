@@ -57,19 +57,12 @@ fi
 # PRODUCES gate input: that turns scanner/docker/template failure into
 # "0 findings", which SATISFIES the gate. A gate that reports green when the
 # scanner did not run is worse than no gate at all.
-# Production path is a direct argv call — no `eval` on anything that runs in
-# CI. SCAN_CMD is an explicitly TEST-ONLY injection interface used by
-# tests/scripts/ci-trivy-gate.bats to simulate scanner failure modes.
-if [ -n "${SCAN_CMD:-}" ]; then
-  scan_ok=0
-  bash -c "$SCAN_CMD" > "$json" || scan_ok=$?
-else
-  scan_ok=0
-  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-    "${TRIVY:-aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7}" \
-    image --scanners vuln --severity CRITICAL --ignore-unfixed \
-    --format json "$image" > "$json" || scan_ok=$?
-fi
+# Production path is a direct argv call — no shell-evaluated command override.
+scan_ok=0
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  "${TRIVY:-aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7}" \
+  image --scanners vuln --severity CRITICAL --ignore-unfixed \
+  --format json "$image" > "$json" || scan_ok=$?
 if [ "$scan_ok" -ne 0 ]; then
   echo "::error::${flavor}: scanner invocation failed (rc=${scan_ok}) — refusing to treat this as a clean image." >&2
   exit 1
@@ -84,15 +77,23 @@ fi
 # no findings).
 if ! jq -e '
       (.Results | type) == "array"
-      and (all(
-            .Results[];
-            (type == "object")
-            and ((has("Vulnerabilities") | not)
-                 or (.Vulnerabilities == null)
-                 or ((.Vulnerabilities | type) == "array"))
-          ))
+      and all(.Results[];
+        type == "object"
+        and (
+          (has("Vulnerabilities") | not)
+          or (.Vulnerabilities == null)
+          or (
+            (.Vulnerabilities | type) == "array"
+            and all(.Vulnerabilities[];
+              type == "object"
+              and (.VulnerabilityID | type) == "string"
+              and ((.VulnerabilityID | gsub("^[[:space:]]+|[[:space:]]+$"; "")) | length) > 0
+            )
+          )
+        )
+      )
     ' "$json" > /dev/null 2>&1; then
-  echo "::error::${flavor}: scanner output does not match the expected scan schema (.Results must be an array of objects whose Vulnerabilities is absent/null/array) — refusing to infer 0 findings." >&2
+  echo "::error::${flavor}: scanner output does not match the expected scan schema (.Results must contain objects with absent/null/array Vulnerabilities, and every vulnerability must have a non-empty string VulnerabilityID) — refusing to infer 0 findings." >&2
   exit 1
 fi
 
